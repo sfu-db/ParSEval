@@ -1,0 +1,521 @@
+
+from __future__ import annotations
+import sqlglot.generator
+import ast, re, z3, sqlglot, random, logging
+from sqlglot import expressions as exp
+from sqlglot.helper import name_sequence
+from collections.abc import Iterator
+from typing import List, Dict, Any, Optional, Union, Set, Sequence, TypeVar, Generic, Tuple, Generator
+from src.uexpr import rex
+from src.symbols.ssa_factory import ssa_factory
+from collections import defaultdict, deque, OrderedDict
+from src.corekit import DBManager
+logger = logging.getLogger('src.parseval.instance')
+def random_value_from_list(values, skips = [], default = None):
+    import random
+    candidates = [v for v in values if v not in skips ]
+    if candidates:
+        return random.choice(candidates)
+    return default
+
+
+def generate_unique_value(table_name, column_name, dtype, existing_values, max_attempts = 5):
+    dtype = exp.DataType.build(dtype)
+    v = None
+    for idx in range(max_attempts):
+        if dtype.is_type(*exp.DataType.NUMERIC_TYPES):
+            v = random.randint(1, 6553500)
+        elif dtype.is_type(*exp.DataType.TEXT_TYPES):
+            v = f'{table_name}_{column_name}_{dtype}_{len(existing_values) + 1}'
+        elif dtype.is_type(*exp.DataType.TEMPORAL_TYPES):
+            v = None
+        else:
+            raise ValueError(f'could not generate unique values for datatype: {dtype}')
+        if v not in existing_values:
+            break
+            
+    # logger.info(f'return {v}')
+    return v
+
+def convert(value: Any, copy: bool = False) -> exp.Expression:
+    """A wrapper of exp.convert. Convert a symbolic value into an expression object.
+    Raises an error if a conversion is not possible.
+    Args:
+        value: A python object.
+        copy: Whether to copy `value` (only applies to Expressions and collections).
+
+    Returns:
+        The equivalent expression object.
+    """
+    v = value
+    if hasattr(value, 'dtype'):
+        v = value.value
+        if value.dtype == 'Str':
+            v = v.replace(':', '\:')
+        elif value.dtype == 'Datetime':
+            from datetime import datetime
+            v = datetime.fromtimestamp(v)
+    return exp.convert(value= v, copy= copy)
+
+def clean_name(name) -> str:
+    pattern = r'[^a-zA-Z0-9_]'
+    cleaned_str = re.sub(pattern, '', name)
+    return cleaned_str
+
+class RowIterator(Iterator):
+    _position: int = None
+    _reverse: bool = False
+    def __init__(self, collection: DataFrame, reverse: bool = False) -> None:
+        super().__init__()
+        self._collection = collection
+        self._reverse = reverse
+        self._position = -1 if reverse else 0
+    def __next__(self) -> Any:
+        try:
+            value = self._collection[self._position]
+            self._position += -1 if self._reverse else 1
+        except IndexError:
+            raise StopIteration()
+        return value
+
+class DataFrame:
+    @classmethod
+    def create(cls, stmt: exp.Expression):
+        assert isinstance(stmt, exp.Create), f'Cannot initialize database instance based on ddl : {stmt}'
+        schema_obj = stmt.this
+        primary_key = []
+        foreign_keys = []
+        column_defs = []
+        for column_def in schema_obj.expressions:
+            if isinstance(column_def, exp.ColumnDef):
+                for constraint in column_def.constraints[:]:
+                    if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+                        column_def.constraints.remove(constraint)
+                        if column_def.this not in primary_key: primary_key.append(column_def.this)
+                    elif isinstance(constraint.kind, exp.AutoIncrementColumnConstraint):
+                        column_def.constraints.remove(constraint)
+                column_defs.append(column_def)
+            elif isinstance(column_def, exp.PrimaryKey):
+                primary_key.extend([item for item in column_def.expressions if item not in primary_key])
+            elif isinstance(column_def, exp.ForeignKey):
+                foreign_keys.append(column_def)
+        pk = exp.PrimaryKey(expressions = list(primary_key))
+        return cls(name = schema_obj.this.name, column_defs = tuple(column_defs), primary_key = pk, foreign_keys = foreign_keys)
+
+    def __init__(self, name: str, column_defs: Tuple[exp.ColumnDef] | None = None, **kwargs) -> None:
+        self.name = name
+        self.column_defs: Tuple[exp.ColumnDef] = column_defs if column_defs is not None else []
+        self.tuples : List = []
+        self.primary_key: exp.PrimaryKey = kwargs.get('primary_key', exp.PrimaryKey(expressions = []))
+        self.foreign_keys: List[exp.ForeignKey] = kwargs.get('foreign_keys', [])
+    
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return len(self.tuples), len(self.column_defs)
+    
+    def __getitem__(self, index :int) -> List[Any]:
+        return self.tuples[index]
+    
+    def __iter__(self):
+        return RowIterator(self)
+    
+    def get_column(self, column: Union[str, int]) -> exp.ColumnDef:
+        '''return Column named `column_name` '''
+        if isinstance(column, int):
+            return self.column_defs[column]
+        for c in self.column_defs:
+            if c.name == column:
+                return c
+        raise RuntimeError(f'There is no columns named {column} in table {self.name}')
+
+    def is_primarykey(self, column_name: Union[str, exp.ColumnDef]):
+        column_def = self.get_column(column_name) if isinstance(column_name, str) else column_name
+        if column_def.this in self.primary_key.expressions:
+            return True
+        return False
+
+    def is_foreignkey(self, column_name: Union[str, exp.ColumnDef]):
+        column_def = self.get_column(column_name) if isinstance(column_name, str) else column_name
+        if any(column_def.this in k.expressions for k in self.foreign_keys):
+            return True
+        return False
+
+    def is_notnull(self, column_name: Union[str, exp.ColumnDef]) -> bool:
+        column_def = self.get_column(column_name) if isinstance(column_name, str) else column_name
+        if self.is_primarykey(column_def) or self.is_foreignkey(column_def):
+            return True
+        if any(isinstance(constraint.kind, (exp.NotNullColumnConstraint, exp.PrimaryKeyColumnConstraint)) for constraint in column_def.constraints):
+            return True
+        return False
+
+    def is_unique(self, column_name: Union[str, exp.ColumnDef]) -> bool:
+        column_def = self.get_column(column_name) if isinstance(column_name, str) else column_name
+        if self.is_primarykey(column_def):
+            return True
+        if any(isinstance(constraint.kind, (exp.UniqueColumnConstraint, exp.PrimaryKeyColumnConstraint)) for constraint in column_def.constraints):
+            return True
+        return False
+    
+    def get_column_index(self, column: Union[str, exp.Identifier]) -> int:
+        for cidx, column_def in enumerate(self.column_defs):
+            if str(column) == column_def.name:
+                return cidx
+        raise RuntimeError(f'Could not find column named {column} in table {self.name}')
+
+    def get_column_data(self, column: Union[str, exp.Identifier]) -> List[Any]:
+        cidx = self.get_column_index(column)
+        return [row[cidx] for row in self.tuples]
+
+
+class Instance:
+    @classmethod
+    def create(cls, schema: str, name = 'pulic', dialect = 'sqlite'):
+        ddls = sqlglot.parse(schema, dialect = dialect)
+        deps = defaultdict(int)
+        tables = OrderedDict()
+        foreign_keys = {}
+        for stmt_expr in ddls:
+            tbl = DataFrame.create(stmt_expr)
+            tables[tbl.name] = tbl
+            foreign_keys[tbl.name] = tbl.foreign_keys
+            if tbl.name not in deps: deps[tbl.name] = 0
+            for fk in tbl.foreign_keys:
+                from_table = str(fk.args.get('reference').find(exp.Table))
+                deps[from_table] += 1
+        sorted_table = OrderedDict({tbl_name[0]: tables[tbl_name[0]] for tbl_name in sorted(deps.items(), key=lambda item: item[1], reverse=True)})
+        return cls(name, sorted_table, foreign_keys = foreign_keys, dialect = dialect)
+    
+    @classmethod
+    def initialize(cls, context,  schema: str, initial_values: Dict[str, List[Dict[str, Any]]], size = 5, name = 'public', dialect = 'sqlite'):
+        instance = cls.create(schema, name, dialect= dialect)
+        for table_name in instance._tables:
+            concretes = initial_values.get(table_name, [])
+            row_size = max(size, len(concretes))
+            for index in range(row_size):
+                initials = concretes[index] if index < len(concretes) else {}
+                # multiplicity = initials.pop('multiplicity', 1)
+                instance.increase_size(context,  table_name, values = initials)
+                # instance.append_tuple2(table_name, context= context, initial_values = initials, multiplicity= multiplicity)
+
+        return instance
+    def __init__(self, name, tables: Dict[str, DataFrame] | None = None, **kw) -> None:
+        self.name = name
+        self.foreign_keys: Dict[str, List[exp.ForeignKey]] = kw.get('foreign_keys', {})
+        self._tables: Dict[str, DataFrame] = tables
+
+    def get_table(self, table_name) -> DataFrame:
+        return self._tables[table_name]
+
+
+    def increase_size(self, context, table_name: str, values: Dict) -> Dict[str, rex.Row]:
+        '''
+            Increase the size of a table and its dependent tables to maintain referential integrity.            
+            Args:
+                table_name: Name of the table to expand
+                values: Initial values for the new tuple                
+            Returns:
+                Dict[str, int]: Map of table names to their new tuple indices
+        '''
+        new_tuples = defaultdict(list)
+        referenced_tables = set()
+        table = self.get_table(table_name)
+
+        for foreign_key in table.foreign_keys:
+            ref_table = str(foreign_key.args.get('reference').find(exp.Table))
+            ref_column = str(foreign_key.args.get('reference').this.expressions[0].this)
+            local_column = str(foreign_key.expressions[0].this)
+            # If we don't have a concrete value for this FK column
+            if local_column not in values:
+                referenced_tables.add((ref_table, ref_column, local_column))
+
+        for ref_table, ref_column, local_column in referenced_tables:
+            ref_values = {}  # Values for the new tuple in referenced table            
+            ref_table_obj = self.get_table(ref_table)
+            existing_values = ref_table_obj.get_column_data(ref_column)
+            need_new_tuple = True
+            if existing_values:
+                available_values = []
+                used_values = [d.value for d in table.get_column_data(local_column)]
+                for idx, val in enumerate(existing_values):
+                    can_use = True
+                    if table.is_unique(local_column) and val.value in used_values:
+                        can_use = False
+                    if can_use:
+                        available_values.append((idx, val.value))
+                if available_values:
+                    need_new_tuple = False
+                    idx, chosen_value = random.choice(available_values)
+                    values[local_column] = chosen_value
+            if need_new_tuple:
+                ref_pos = self._add_single_tuple(context, ref_table, ref_values)
+                new_tuples[ref_table].append( ref_table_obj[ref_pos])
+                ref_value = ref_table_obj[ref_pos][ref_table_obj.get_column_index(ref_column)]
+                values[local_column] = ref_value.value
+        main_pos = self._add_single_tuple(context, table_name, values, multiplicity = 1)
+        new_tuples[table_name].append(table[main_pos])
+        return new_tuples
+
+
+    def _add_single_tuple(self, context, table_name,  values, multiplicity = 1) -> int:
+        '''
+            Helper method to add a single tuple to a table
+        '''
+        table = self.get_table(table_name)
+        tuple_index = table.shape[0]
+        tuple_name = f'R_{clean_name(table_name)}_t{tuple_index}'
+        relation = ssa_factory.create_symbol('int', context, tuple_name, min(multiplicity, 5))
+        new_values = []
+        for column_def in table.column_defs:
+            z_name = clean_name("%s_%s_%s_%s" % (table_name, column_def.name, column_def.kind.this.name, tuple_index))
+            concrete = values.get(column_def.name, None)
+            
+            # if table.is_foreignkey(column_def) and concrete is None:
+            #     fk_values = self.get_reference_values(table_name, column_def.name)
+            #     skips = []
+            #     if table.is_unique(column_def):
+            #         skips = [d.value for d in table.get_column_data(column_def.name)]
+            #     concrete = random_value_from_list(fk_values[column_def.name], skips= skips, default= None)
+
+            if table.is_unique(column_def) and concrete is None:
+                skips = [d.value for d in table.get_column_data(column_def.name)]
+                concrete = generate_unique_value(table_name, column_def.name, dtype= column_def.kind, existing_values= skips)
+            
+            z_value = ssa_factory.create_symbol(column_def.kind.this.name, context, z_name, concrete)
+            new_values.append(z_value)
+            context[2][str(z_value.expr)] = (table_name, column_def.name)
+            context[7][str(z_value.expr)] = relation
+            context[8][str(relation.expr)].append(z_value)
+            if table.is_unique(column_def) or table.is_foreignkey(column_def):
+                context[3].add(z_value.expr)
+        table.tuples.append(rex.Row(expressions = new_values, multiplicity = relation))
+        return tuple_index
+
+
+
+    def get_reference_values(self, to_table: str, to_column: str):
+        '''
+            Return a dict of columns in to_table and associated values in (from_table, from_column)
+        '''
+        fk_values = {}
+        for foreign_key in self.foreign_keys.get(to_table, []):
+            if to_column == str(foreign_key.expressions[0].this):
+                from_table = str(foreign_key.args.get('reference').find(exp.Table))
+                from_column = str(foreign_key.args.get('reference').this.expressions[0].this)
+                from_column_data = self.get_table(from_table).get_column_data(from_column)
+                fk_values[to_column] = [d.value for d in from_column_data]
+        return fk_values
+
+    def update(self, context, values: Dict):
+        '''
+            update current instance based on solved value
+        '''
+        concretes = defaultdict(list)
+        for key, value in values.items():
+            if key in context[0]:
+                context[0][key].value = value
+        
+        for table_name, table in self._tables.items():
+            for row in table.tuples[:]:
+                if row.multiplicity == 0:
+                    table.tuples.remove(row)
+                    continue
+                v = {'multiplicity' : row.multiplicity.value}
+                for column_name, column_value in zip(table.column_defs, row):
+                    if str(column_value.expr) in values:
+                        v[column_name.name] = column_value.value
+                if v:
+                    concretes[table_name].append(v)
+        return concretes
+
+        
+    def append_tuple2(self, table_name, context, initial_values, multiplicity = 1):
+        table = self.get_table(table_name)
+        tuple_index = table.shape[0]
+        tuple_name = f'R_{clean_name(table_name)}_t{tuple_index}'
+        relation = ssa_factory.create_symbol('int', context, tuple_name, min(multiplicity, 5))
+        values = []
+        for column_def in table.column_defs:
+            z_name = clean_name("%s_%s_%s_%s" % (table_name, column_def.name, column_def.kind.this.name, tuple_index))
+            concrete = initial_values.get(column_def.name, None)
+            
+            if table.is_foreignkey(column_def) and concrete is None:
+                fk_values = self.get_reference_values(table_name, column_def.name)
+                skips = []
+                if table.is_unique(column_def):
+                    skips = [d.value for d in table.get_column_data(column_def.name)]
+                concrete = random_value_from_list(fk_values[column_def.name], skips= skips, default= None)
+            if table.is_unique(column_def) and concrete is None:
+                skips = [d.value for d in table.get_column_data(column_def.name)]
+                concrete = generate_unique_value(table_name, column_def.name, dtype= column_def.kind, existing_values= skips)
+            
+            z_value = ssa_factory.create_symbol(column_def.kind.this.name, context, z_name, concrete)
+            values.append(z_value)           
+            context[2][str(z_value.expr)] = (table_name, column_def.name)
+            context[7][str(z_value.expr)] = relation
+            context[8][str(relation.expr)].append(z_value.expr)
+
+            if table.is_unique(column_def) or table.is_foreignkey(column_def):
+                context[3].add(z_value.expr)
+
+        table.tuples.append(rex.Row(expressions = values, multiplicity = relation))
+
+    def get_db_constraints(self)-> Dict[str, List[z3.Expr]]:
+        pk_constraints = []
+        for table_name, table in self._tables.items():
+            for pk_expr in table.primary_key.expressions:
+                pk_vals = [v.expr for v in table.get_column_data(pk_expr.name)]
+                pk_constraints.append(z3.Distinct(*pk_vals))
+        
+        fk_constraints = []
+        for to_table_name, foreign_keys in self.foreign_keys.items():
+            for foreign_key in foreign_keys:
+                to_column_name = str(foreign_key.expressions[0].this)
+                from_table_name = str(foreign_key.args.get('reference').find(exp.Table))
+                from_column_name = str(foreign_key.args.get('reference').this.expressions[0].this)
+                from_table = self.get_table(from_table_name)
+                to_table = self.get_table(to_table_name)
+                smt_exprs = []
+                for to_row in to_table:
+                    to_data = to_row[to_table.get_column_index(to_column_name)]
+                    exprs = []
+                    for from_row in from_table:
+                        from_data = from_row[from_table.get_column_index(from_column_name)]
+                        c1 = to_data == from_data
+                        c2 = to_row.multiplicity <= from_row.multiplicity
+                        exprs.append(z3.And(c1.expr, c2.expr))
+                    smt_exprs.append(z3.Or(exprs))
+                smt = z3.And(smt_exprs)
+                fk_constraints.append(smt)
+        ## unique constraints
+        ## range constraints
+        return {'PK': pk_constraints, 'FK': fk_constraints}
+
+    def get_size_constraints(self):        
+        size_constraints = []
+        for to_table_name, foreign_keys in self.foreign_keys.items():
+            for foreign_key in foreign_keys:
+                to_column_name = str(foreign_key.expressions[0].this)
+                from_table_name = str(foreign_key.args.get('reference').find(exp.Table))
+                from_column_name = str(foreign_key.args.get('reference').this.expressions[0].this)
+                from_table = self.get_table(from_table_name)
+                to_table = self.get_table(to_table_name)
+                to_table_size = []
+                from_table_size = []
+                for to_row in to_table:
+                    to_table_size.append(to_row.multiplicity.expr)
+                for from_row in from_table:
+                    from_table_size.append(from_row.multiplicity.expr)
+                size_constraints.append(sum(to_table_size) <= sum(from_table_size))
+        return size_constraints
+
+
+    def print_schema(self, table_name = None, indent = 2):
+        for t, tbl in self._tables.items():
+            print(f'************************ Table: {t}')
+            column_str = "\t".join([f"{column_def.name}({column_def.kind.this.name})" for column_def in tbl.column_defs])
+            print(column_str)
+            print(f'*' * len(column_str))
+            for row in tbl:
+                print(row)
+
+    def to_ddl(self, dialect = 'sqlite') -> List[str]:
+        stmts = []
+        for table_name, table in self._tables.items():
+            column_defs = [c for c in table.column_defs]
+            if table.primary_key and table.primary_key.expressions:
+                column_defs.append(table.primary_key)
+            column_defs.extend(table.foreign_keys)
+
+            ddl = exp.Create(this = exp.Schema(this = exp.Table(this = exp.to_identifier(table_name, quoted= True)), expressions = column_defs), exists = True, kind = 'TABLE')
+            stmts.append(ddl.sql(dialect= dialect))
+        return stmts
+
+    def to_insert(self, dialect = 'sqlite'):
+        stmts = []
+        for table_name, table in self._tables.items():
+            table_identifier = exp.to_identifier(table_name, quoted= True)
+            columns = [exp.column(c.name) for c in table.column_defs]
+            values = []
+            for row in table:
+                values.append(exp.tuple_(*(convert(col) for col in row)))
+
+            if values:
+                stmt = exp.Insert(this = exp.Schema(this = exp.Table(this = table_identifier), expressions = columns), expression = exp.Values(expressions = values))
+                stmts.append((stmt.sql(dialect= dialect), None))
+        return stmts
+    
+
+    def get_reference_table_column_names(self, table_name, column_name):
+
+        for foreign_key in self.foreign_keys.get(table_name, []):
+            if column_name == str(foreign_key.expressions[0].this):
+                from_table = str(foreign_key.args.get('reference').find(exp.Table))
+                from_column = str(foreign_key.args.get('reference').this.expressions[0].this)
+                return from_table, from_column
+        return None, None
+
+
+
+    def to_insert2(self, dialect = 'sqlite'):
+        stmts = []
+
+        data = defaultdict(lambda : defaultdict(list))
+
+        for table_name, table in self._tables.items():
+            table_identifier = exp.to_identifier(table_name, quoted= True)
+            columns = [exp.column(c.name) for c in table.column_defs]
+            values = []
+            for row in table:
+                tup = []
+                if row.multiplicity < 1:
+                    continue
+                for column_def, column_value in zip(table.column_defs, row):
+                    concrete = convert(column_value)
+                    data[table_name][column_def.name].append(concrete)
+                    tup.append(concrete)
+                values.append(exp.tuple_(*tup))
+            for row in table:
+                for _ in range(1, row.multiplicity.value):
+                    tup = []
+                    for column_def, column_value in zip(table.column_defs, row):
+                        concrete = convert(column_value)
+                        if table.is_unique(column_def):
+                            existing_values = [v.sql() for v in data[table_name][column_def.name]]
+                            concrete = generate_unique_value(table_name= table_name, 
+                                                            column_name= column_def.name,
+                                                            dtype= column_def.kind,
+                                                            existing_values= set(existing_values))
+                            concrete = convert(concrete)
+
+                        if table.is_foreignkey(column_def):
+                            from_table, from_column = self.get_reference_table_column_names(table_name, column_def.name)
+                            ref_table_values = data[from_table][from_column]
+                            if table.is_unique(column_def):
+                                existing_values =  data[table_name][column_def.name]
+                                concrete = random_value_from_list(ref_table_values, skips= existing_values,  default = None)
+                            elif concrete not in ref_table_values:
+                                concrete = random_value_from_list(ref_table_values, skips= [],  default = concrete)
+
+                        if concrete is None:
+                            logger.info(row.multiplicity.value)
+                            logger.info(column_value)
+                            logger.info(repr(column_value))
+                            raise RuntimeError('Concrete value should not be None')
+                        data[table_name][column_def.name].append(concrete)
+                        tup.append(concrete)
+                    if tup:
+                        # logger.info(tup)
+                        values.append(exp.tuple_(*tup))
+            if values:
+                stmt = exp.Insert(this = exp.Schema(this = exp.Table(this = table_identifier), expressions = columns), expression = exp.Values(expressions = values))
+                stmts.append((stmt.sql(dialect= dialect), None))
+        return stmts
+
+    def to_db(self, host_or_path, database, port = None, username = None, password = None, dialect = 'sqlite'):
+        with DBManager().get_connection(host_or_path= host_or_path, database= database,
+                                        port = port, username= username, password= password, dialect= dialect) as conn:
+            conn.create_tables(*self.to_ddl(dialect))
+            inserts = self.to_insert2(dialect= dialect)
+            for insert_stmt, data in inserts:
+                conn.insert(insert_stmt, data)
+            
