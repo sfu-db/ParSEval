@@ -161,32 +161,49 @@ class Union(Step):
 
 
 class Intersect(Union):
-    ...
+    """Represents an INTERSECT operation between two query plans."""
+    arg_types = {
+        "this" : True,
+        "expression": True,
+        "all": True
+    }
+    
+    @property
+    def right(self) -> Step:
+        return self.expression
+
 
 class Minus(Union):
-    ...
-class Correlate(Step):
-    ...
-
-
-
-class Row(exp.Expression):
-    arg_types = {'expressions' : True, 'multiplicity': True}
-
-    @property
-    def multiplicity(self):
-        return self.args.get('multiplicity')
-    def __str__(self):
-        s = ', '.join([str(e) for e in self.expressions])
-        return f"{self.multiplicity} :Row({s})"
+    """Represents a MINUS (EXCEPT) operation between two query plans."""
+    arg_types = {
+        "this" : True,
+        "expression": True,
+        "all": True
+    }
     
-    def __getitem__(self, other):
-        return self.expressions[other]
+    @property
+    def right(self) -> Step:
+        return self.expression
 
-    def __mul__(self, other):
-        c = [*self.expressions, *other.expressions]
-        multiplicity = self.multiplicity * other.multiplicity
-        return Row(expressions = c, multiplicity = multiplicity)
+
+class Correlate(Step):
+    """Represents a correlated subquery operation."""
+    arg_types = {
+        "this": True,
+        "right": True,
+        "correlation": True
+    }
+    
+    @property
+    def right(self) -> Step:
+        return self.args.get('right')
+    
+    @property
+    def correlation(self) -> List[str]:
+        """Get the correlation variables."""
+        return self.args.get('correlation', [])
+
+
 
 # class Row(exp.Expression):
 #     arg_types = {'this': True, 'expressions' : True}

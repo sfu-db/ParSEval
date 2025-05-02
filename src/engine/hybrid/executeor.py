@@ -70,9 +70,21 @@ class HybridExecutor:
             
         output, smt_exprs, op_exprs = [], [], []
         try:
-            for row in inputs:
+            for row_idx, row in enumerate(inputs):
                 output.append(row)
-                self.coverage.traceit(operator.key, operator.i(), 1, 'path')
+                # Track path coverage with detailed information
+                self.coverage.traceit(
+                    operator_key=operator.key, 
+                    operator_id=operator.i(), 
+                    constraint_id=1, 
+                    event=CoverageType.PATH, 
+                    label=True,
+                    details={
+                        "row_index": row_idx,
+                        "table_name": operator.table,
+                        "row_multiplicity": row.multiplicity if hasattr(row, 'multiplicity') else 1
+                    }
+                )
         except Exception as e:
             logging.error(f"Error processing scan operation: {e}")
             raise
@@ -97,13 +109,42 @@ class HybridExecutor:
         try:
             p = self.execute(operator.this, **kwargs)
             outputs, smt_exprs, op_exprs = [], [], []
-            for row in p.data:
+            for row_idx, row in enumerate(p.data):
                 with PathChangeTracker(self.context) as tracker:
                     branch = False
                     sat = self.execute(operator.condition, row=row, **kwargs)
                     if sat:
                         branch = True
                         outputs.append(row)
+                        # Track predicate coverage with detailed information
+                        self.coverage.traceit(
+                            operator_key=operator.key, 
+                            operator_id=operator.i(), 
+                            constraint_id=f'predicate_{row_idx}', 
+                            event=CoverageType.PREDICATE, 
+                            label=True,
+                            details={
+                                "row_index": row_idx,
+                                "condition": str(operator.condition),
+                                "satisfied": True
+                            },
+                            parent_operator_id=operator.this.i() if hasattr(operator.this, 'i') else None
+                        )
+                    else:
+                        # Track unsatisfied predicates
+                        self.coverage.traceit(
+                            operator_key=operator.key, 
+                            operator_id=operator.i(), 
+                            constraint_id=f'predicate_{row_idx}', 
+                            event=CoverageType.PREDICATE, 
+                            label=False,
+                            details={
+                                "row_index": row_idx,
+                                "condition": str(operator.condition),
+                                "satisfied": False
+                            },
+                            parent_operator_id=operator.this.i() if hasattr(operator.this, 'i') else None
+                        )
                     smt = tracker.get_delta()
                     self.add.which_branch(operator.key, operator.i(), smt, split_conditions(operator.condition), branch)
             self.add.advance(operator.key, operator.i())
@@ -341,9 +382,34 @@ class HybridExecutor:
                 tup.append(d)
             output.append(Row(expressions = tup, multiplicity = 1))
             smt_exprs.append(Pred(this = logical_all(exprs)))
-            self.coverage.traceit(operator.key, operator.i(), f'size', f'group', len(data) > 2)
+            
+            # Track group size coverage with detailed information
+            self.coverage.traceit(
+                operator_key=operator.key, 
+                operator_id=operator.i(), 
+                constraint_id=f'size', 
+                event=CoverageType.GROUP, 
+                label=len(data) > 2,
+                details={
+                    "group_index": gidx,
+                    "group_size": len(data),
+                    "group_key": str(group_key),
+                    "has_multiple_rows": len(data) > 2
+                }
+            )
         
-        self.coverage.traceit(operator.key, operator.i(), f'count', f'group', len(output) > 1) 
+        # Track group count coverage
+        self.coverage.traceit(
+            operator_key=operator.key, 
+            operator_id=operator.i(), 
+            constraint_id=f'count', 
+            event=CoverageType.GROUP, 
+            label=len(output) > 1,
+            details={
+                "group_count": len(output),
+                "has_multiple_groups": len(output) > 1
+            }
+        )
 
         ## Ensure Aggregate Constraints
         for func in operator.agg_funcs:
@@ -356,7 +422,21 @@ class HybridExecutor:
                     func_input = self.execute(func.this, row = row)
                     null_exprs.append(logical_all(func_input.is_null(), expr.to_smt() > 0))
 
-            self.coverage.traceit(operator.key, operator.i(), f'{func.key}_{ref}_NULL', f'group', any(null_exprs))            
+            # Track NULL handling coverage with detailed information
+            has_nulls = any(null_exprs)
+            self.coverage.traceit(
+                operator_key=operator.key, 
+                operator_id=operator.i(), 
+                constraint_id=f'{func.key}_{ref}_NULL', 
+                event=CoverageType.GROUP, 
+                label=has_nulls,
+                details={
+                    "function": func.key,
+                    "reference": ref,
+                    "has_nulls": has_nulls,
+                    "null_count": sum(1 for expr in null_exprs if expr)
+                }
+            )            
             self.path(logical_any(null_exprs), f'{func.key}_{ref}_NULL', 'negative')
 
         return p.update(_id = operator.i(), data = output, expr = smt_exprs)

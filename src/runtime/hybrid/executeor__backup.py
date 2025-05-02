@@ -2,10 +2,15 @@
 from typing import Any, List, Any, Tuple, Dict
 from src.uexpr.rex import *
 from collections import defaultdict
+from src.instance import Instance
+from src.uexpr.coverage import Coverage
 import datetime, logging, z3
 from dataclasses import dataclass, asdict, field
 from functools import reduce
-
+from src.symbols import create_symbol, create_ite, logical_all, logical_any
+from src.uexpr.helper import split_conditions
+from ..utils import rename_variable
+from src.context import PathChangeTracker
 logger = logging.getLogger('src.parseval.hybrid')
 # z3.Implies
 LABELED_NULL = {
@@ -21,8 +26,9 @@ def make_null(condition, values):
     tup = [v.nullif(condition) for v in values]
     return Row(expressions = tup, multiplicity = values.multiplicity)
 
+
 @dataclass
-class SymbolTable:
+class STable:
     _id: str
     data: List
     expr: List
