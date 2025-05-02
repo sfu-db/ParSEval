@@ -9,7 +9,7 @@ The code adapted from sqlglo expressions.py. Thanks for the authors.
 ----
 """
 from ..types import DATA_TYPE, DataType, SymbolLiterals, can_coerce
-from typing import Any, Dict, Optional, List, TYPE_CHECKING, Iterator, Union, Sequence, Mapping
+from typing import Any, Dict, Optional, List, TYPE_CHECKING, Iterator, Union, Sequence, Mapping, Set
 from ..exceptions import *
 from decimal import Decimal
 import numbers, datetime, logging
@@ -27,7 +27,7 @@ class _Expr(type):
 class Expr(metaclass=_Expr):
     """Base class for all expressions"""
     key = "Expr"
-    arg_types = {"this": True, "value": True}
+    arg_types = {"this": True, "operand": False,"value": True}
     __slots__ = ("args", "parent", "arg_key", "index", "_type")
     def __init__(self, **args: Any):
         self.args: Dict[str, Any] = args
@@ -79,12 +79,14 @@ class Expr(metaclass=_Expr):
 
     def _set_parent(self, arg_key: str, value: Any, index: Optional[int] = None) -> None:
         if hasattr(value, "parent"):
+            # print(f'set parent {arg_key} {value}')
             value.parent = self
             value.arg_key = arg_key
             value.index = index
         elif type(value) is list:
             for index, v in enumerate(value):
                 if hasattr(v, "parent"):
+                    # print('set parent', arg_key, v)
                     v.parent = self
                     v.arg_key = arg_key
                     v.index = index
@@ -176,6 +178,7 @@ class Expr(metaclass=_Expr):
     def iter_expressions(self, reverse: bool = False) -> Iterator[Expr]:
         """Yields the key and expression for all arguments, exploding list args."""
         for vs in reversed(tuple(self.args.values())) if reverse else self.args.values():
+            # print(vs)
             if type(vs) is list:
                 for v in reversed(vs) if reverse else vs:
                     if hasattr(v, "parent"):
@@ -184,12 +187,24 @@ class Expr(metaclass=_Expr):
                 if hasattr(vs, "parent"):
                     yield vs
 
+    def dfs(self):
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            yield node
+            for v in node.iter_expressions(reverse=True):
+                stack.append(v)
+
     def _ensure_expr(self, other: Any) -> Expr:
         """Ensure the other value is an Expr by converting if necessary"""
         if isinstance(other, Expr):
             return other
         return convert(other)
     
+
+    def __bool__(self):
+        return bool(self.value)
+
     def _binop(self, op: str, other: Any, expr_class) -> Expr:
         """
         Apply an operation to both symbolic expression and concrete values
@@ -322,7 +337,7 @@ class Expr(metaclass=_Expr):
             result += child.tree_str(child_indent, is_last_child)
         return result
     def __repr__(self) -> str:
-        return self.tree_str()
+        return str(self) #self.tree_str()
     
 
     def __str__(self) -> str:
@@ -375,8 +390,8 @@ class Predicate(Condition):
 class Binary(Condition):
     arg_types = {"this": True, "operand": True, "value": True}
 
-    def __init__(self, **args: Any):
-        super().__init__(**args)
+    # def __init__(self, **args: Any):
+    #     super().__init__(**args)
         # if args:
         #     self._validate_operand_types()
         #     self._validate_concrete_values()
@@ -532,6 +547,8 @@ class Distinct(Expr):
     arg_types = {"operands": False, "on": False}
 
 
+class ITE(Expr):
+    arg_types = {"this": True, "operand": True, "else": True}
 
 class Is_Null(Unary, Predicate):
     pass
@@ -541,7 +558,7 @@ class Is_NotNull(Unary, Predicate):
     
 
 class Variable(Expr):
-    arg_types = {"this": True, "value": True}
+    # arg_types = {"this": True, "value": True}
 
     def resolve_type(self) -> Optional[DataType]:
         """Variables should already have their type set"""
@@ -556,14 +573,14 @@ class Literal(Expr):
         """Create a numeric literal"""
         if isinstance(number, int):
             return cls(
-                this=str(number),
+                this= int(number),
                 _type=DataType.build("INT"),
-                value=number
+                value=int(number)
             )
         return cls(
-            this=str(number),
+            this= float(number),
             _type=DataType.build("DOUBLE"),
-            value=number
+            value=float(number)
         )
 
     @classmethod
@@ -574,9 +591,9 @@ class Literal(Expr):
     def boolean(cls, value: bool) -> 'Literal':
         """Create a boolean literal"""
         return cls(
-            this=str(value).lower(),
+            this= bool(value),
             _type=DataType.build("BOOLEAN"),
-            value=value
+            value=bool(value)
         )
 
     def null(cls) -> 'Literal':
@@ -602,6 +619,60 @@ class Literal(Expr):
     
 
 
+
+
+class Row(Expr):
+    arg_types = {'this': True,'operands' : True, 'value': False}
+
+    @property
+    def multiplicity(self):
+        return self.args.get('this')
+    
+    def __str__(self):
+        s = ', '.join([str(e) for e in self.operands])
+        return f"{self.multiplicity}: {s}"
+    
+    def __getitem__(self, other):
+        return self.operands[other]
+    
+    def __len__(self):
+        return len(self.operands)
+    
+    def __eq__(self, other):
+        if not isinstance(other, Row):
+            return False
+        return (self.operands == other.operands and 
+                self.multiplicity == other.multiplicity)
+    
+    def __hash__(self):
+        return hash((tuple(self.operands), self.multiplicity))
+
+    def __mul__(self, other):
+        c = [*self.operands, *other.operands]
+        multiplicity = self.multiplicity * other.multiplicity
+        return Row(operands = c, this = multiplicity)
+    
+    # def project(self, indices):
+    #     """Project the row to only include the specified indices."""
+    #     projected_expressions = [self.expressions[i] for i in indices]
+    #     return Row(expressions=projected_expressions, multiplicity=self.multiplicity)
+    
+    # def filter(self, condition_func):
+    #     """Filter the row based on a condition function."""
+    #     if condition_func(self):
+    #         return self
+    #     else:
+    #         return Row(expressions=self.expressions, multiplicity=0)
+    
+    # def combine(self, other, condition_func=None):
+    #     """Combine this row with another row, optionally applying a condition."""
+    #     combined = self * other
+    #     if condition_func:
+    #         return combined.filter(condition_func)
+    #     return combined
+
+
+
 def convert(value: Any, copy: bool = False) -> Expr:
     """
     Convert any Python value to an appropriate Expr instance.
@@ -620,6 +691,7 @@ def convert(value: Any, copy: bool = False) -> Expr:
     if isinstance(value, bool):
         return Literal.boolean(value)
     if isinstance(value, numbers.Number):
+        
         return Literal.number(value)
     if isinstance(value, str):
         return Literal.string(value)
@@ -663,6 +735,20 @@ def to_variable(dtype: DATA_TYPE, name: ExprOrStr, value: SymbolLiterals, copy =
         raise ValueError(f"Name needs to be a string or an Variable, got: {name.__class__}")
     return identifier
 
+
+def to_literal(value: Any, to_type: DataType = None, copy = True):
+
+    value = value
+    if to_type:
+        dtype = DataType.build(to_type)
+        if dtype.is_type(*DataType.TEXT_TYPES):
+            value = str(value)
+        elif dtype.is_type(*DataType.INTEGER_TYPES):
+            value = int(value)
+        elif dtype.is_type(*DataType.REAL_TYPES):
+            value = float(value)
+    return convert(value, copy)
+
 def distinct(operands: List[Expr]) -> Distinct:
     return Distinct(operands= operands)
 
@@ -672,3 +758,9 @@ def or_(operands: List[Expr]) -> Or:
 def and_(operands: List[Expr]) -> And:
     return And(operands= operands)
 
+def get_all_variables(expr: Expr) -> Set[Variable]:
+    variables = set()
+    for e in expr.dfs():
+        if isinstance(e, Variable):
+            variables.add(e)
+    return variables

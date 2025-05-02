@@ -6,8 +6,8 @@ import z3
 class Z3Visitor(ExprVisitor):
     """Visitor that converts expressions to Z3 formulas"""
     
-    def __init__(self):
-        self.var_cache: Dict[str, Any] = {}
+    def __init__(self, variables: Optional[Dict[str, z3.ExprRef]] = None):
+        self.var_cache: Dict[str, z3.ExprRef] = variables or {}
         
     def visit_Variable(self, expr: Variable) -> Any:
         if expr.this in self.var_cache:
@@ -20,6 +20,8 @@ class Z3Visitor(ExprVisitor):
             z3_var = z3.Real(expr.this)
         elif expr.dtype.is_type("BOOLEAN"):
             z3_var = z3.Bool(expr.this)
+        elif expr.dtype.is_type(*DataType.TEXT_TYPES):
+            z3_var = z3.String(expr.this)
         else:
             raise TypeError(f"Unsupported type for Z3: {expr.dtype}")
             
@@ -35,6 +37,8 @@ class Z3Visitor(ExprVisitor):
             return z3.RealVal(expr.value)
         if expr.dtype.is_type("BOOLEAN"):
             return z3.BoolVal(expr.value)
+        if expr.dtype.is_type(*DataType.TEXT_TYPES):
+            return z3.StringVal(expr.value)
         raise TypeError(f"Unsupported literal type: {expr.dtype}")
         
     def visit_And(self, expr: And) -> Any:

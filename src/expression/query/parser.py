@@ -9,7 +9,7 @@ from functools import reduce
 from .calcite import get_logical_plan
 from .rel import *
 from src.exceptions import *
-import json, math
+import json, math, logging
 
 
 RELOP = 'relOp'
@@ -246,6 +246,7 @@ class QParser(Dialect):
         return func    
 
     def on_literal(self, node):
+        logging.info(node)
         value = node.get('value')
         dtype = exp.DataType.build(dtype= node.pop('type'))
         if dtype.is_type(*exp.DataType.INTEGER_TYPES, *exp.DataType.REAL_TYPES):

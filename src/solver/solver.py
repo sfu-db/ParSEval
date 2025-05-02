@@ -1,9 +1,9 @@
 from __future__ import annotations
-from sqlglot import exp
-from typing import List, Dict, Any, Tuple, TYPE_CHECKING, Optional, Set
-from src.expr import Symbol
-if TYPE_CHECKING:    
-    from src.context import Context
+from typing import List, Dict, Any, Tuple, TYPE_CHECKING, Optional, Set, Union
+from src.expression.visitors.z3_visitor import Z3Visitor
+
+if TYPE_CHECKING:
+    from src.expression.symbol import Expr
 import z3
 from contextlib import contextmanager
 
@@ -13,29 +13,59 @@ def checkpoint(z3solver):
     yield z3solver
     z3solver.pop()
 
-
-
-
 class Solver:
-    def __init__(self, context: Context, **kwargs):
-        self.context = context
+    def __init__(self, timeout: int = 3000, debug = False, **kwargs):
+        self.solver = z3.Solver()
+        self.timeout = timeout
+        self.debug = debug
+        self.solver.set('timeout', self.timeout)
 
-        self.solver = z3.Solver() ### we could switch to different solvers in the future.
+        self.expressions: List[z3.ExprRef] = []
+        self.last_model: Optional[z3.ModelRef] = None
+        self.variable_mapping: Dict[str, z3.ExprRef] = {}
+
+    
+    def add(self, expr: Union[Expr, List[Expr]]):
+        ''''''
+        if not isinstance(expr, list):
+            expr = [expr]
+        for e in expr:
+            self._add_expr(e)
+
+    def _add_expr(self, expr: Expr):
+        visitor = Z3Visitor(self.variable_mapping)
+        e = expr.accept(visitor)
+        self.expressions.append(e)
+        self.solver.add(e)
+
+    def check(self) -> bool:
+        result = self.solver.check()
+        if result == z3.sat:
+            self.last_model = self.solver.model()
+            return True
+        return False
+
+    def model(self):
+        if self.last_model is None:
+            return None
+        
+        return {d.name(): self._to_concrete(self.last_model[d]) for d in self.last_model.decls()}
+        
 
 
-    def preprocess(self, paths: Dict[str, List[Symbol]]):
+    def preprocess(self, paths: Dict[str, List]):
         ...
 
-    def to_smt_expr(self, paths: Dict[str, List[Symbol]]) -> z3.ExprRef:
+    def to_smt_expr(self, paths: Dict[str, List]) -> z3.ExprRef:
         ...
 
     def evaluate(self, expressions, target_symbols: Optional[List] = None):
         ...
 
-    def check_sat(self, smt_exprs: List[Symbol]) -> bool:
+    def check_sat(self, smt_exprs: List) -> bool:
         ...
 
-    def find_model(self, paths: Dict[str, List[Symbol]]) -> Tuple[str, Dict[str, Any], Set[str]]:
+    def find_model(self, paths: Dict[str, List]) -> Tuple[str, Dict[str, Any], Set[str]]:
         unsolved = set()
 
         # with checkpoint(self.solver) as s:

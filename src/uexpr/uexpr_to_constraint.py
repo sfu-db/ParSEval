@@ -148,7 +148,6 @@ class UExprToConstraint:
             for row in new_symbols[tbl]:
                 new_symbol = row[col_index]
                 if constraint_type == PathConstraintType.PATH:
-                    
                     logger.info(f'replace: {v} --> {new_symbol}')
                     new_constraint = extend_smt_clause(new_constraint, (v, new_symbol.expr))
                 elif constraint_type == PathConstraintType.VALUE:
