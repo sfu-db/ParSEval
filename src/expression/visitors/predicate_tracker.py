@@ -64,6 +64,12 @@ class PredicateTracker(ExprVisitor):
                 self.visit(op)
         except Exception as e:
             raise
+    def visit_Is_Null(self, expr) -> None:
+        if str(expr) in self.visited_nodes:
+            return
+        self.visited_nodes.add(str(expr))
+        self.push_condition(expr)
+
     visit_Or = visit_And
     visit_GTE = visit_LTE = visit_LT = visit_EQ = visit_NEQ = visit_GT 
 

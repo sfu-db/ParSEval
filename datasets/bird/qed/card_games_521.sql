@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS "cards" ("id" INT, "artist" VARCHAR, "asciiName" VARCHAR, "availability" VARCHAR, "borderColor" VARCHAR, "cardKingdomFoilId" VARCHAR, "cardKingdomId" VARCHAR, "colorIdentity" VARCHAR, "colorIndicator" VARCHAR, "colors" VARCHAR, "convertedManaCost" FLOAT, "duelDeck" VARCHAR, "edhrecRank" INT, "faceConvertedManaCost" FLOAT, "faceName" VARCHAR, "flavorName" VARCHAR, "flavorText" VARCHAR, "frameEffects" VARCHAR, "frameVersion" VARCHAR, "hand" VARCHAR, "hasAlternativeDeckLimit" INT, "hasContentWarning" INT, "hasFoil" INT, "hasNonFoil" INT, "isAlternative" INT, "isFullArt" INT, "isOnlineOnly" INT, "isOversized" INT, "isPromo" INT, "isReprint" INT, "isReserved" INT, "isStarter" INT, "isStorySpotlight" INT, "isTextless" INT, "isTimeshifted" INT, "keywords" VARCHAR, "layout" VARCHAR, "leadershipSkills" VARCHAR, "life" VARCHAR, "loyalty" VARCHAR, "manaCost" VARCHAR, "mcmId" VARCHAR, "mcmMetaId" VARCHAR, "mtgArenaId" VARCHAR, "mtgjsonV4Id" VARCHAR, "mtgoFoilId" VARCHAR, "mtgoId" VARCHAR, "multiverseId" VARCHAR, "name" VARCHAR, "number" VARCHAR, "originalReleaseDate" VARCHAR, "originalText" VARCHAR, "originalType" VARCHAR, "otherFaceIds" VARCHAR, "power" VARCHAR, "printings" VARCHAR, "promoTypes" VARCHAR, "purchaseUrls" VARCHAR, "rarity" VARCHAR, "scryfallId" VARCHAR, "scryfallIllustrationId" VARCHAR, "scryfallOracleId" VARCHAR, "setCode" VARCHAR, "side" VARCHAR, "subtypes" VARCHAR, "supertypes" VARCHAR, "tcgplayerProductId" VARCHAR, "text" VARCHAR, "toughness" VARCHAR, "type" VARCHAR, "types" VARCHAR, "uuid" VARCHAR, "variations" VARCHAR, "watermark" VARCHAR, PRIMARY KEY ("id"));
+
+CREATE TABLE IF NOT EXISTS "foreign_data" ("id" INT, "flavorText" VARCHAR, "language" VARCHAR, "multiverseid" INT, "name" VARCHAR, "text" VARCHAR, "type" VARCHAR, "uuid" VARCHAR, PRIMARY KEY ("id"));
+
+CREATE TABLE IF NOT EXISTS "legalities" ("id" INT, "format" VARCHAR, "status" VARCHAR, "uuid" VARCHAR, PRIMARY KEY ("id"));
+
+CREATE TABLE IF NOT EXISTS "sets" ("id" INT, "baseSetSize" INT, "block" VARCHAR, "booster" VARCHAR, "code" VARCHAR, "isFoilOnly" INT, "isForeignOnly" INT, "isNonFoilOnly" INT, "isOnlineOnly" INT, "isPartialPreview" INT, "keyruneCode" VARCHAR, "mcmId" INT, "mcmIdExtras" INT, "mcmName" VARCHAR, "mtgoCode" VARCHAR, "name" VARCHAR, "parentCode" VARCHAR, "releaseDate" DATE, "tcgplayerGroupId" INT, "totalSetSize" INT, "type" VARCHAR, PRIMARY KEY ("id"));
+
+CREATE TABLE IF NOT EXISTS "set_translations" ("id" INT, "language" VARCHAR, "setCode" VARCHAR, "translation" VARCHAR, PRIMARY KEY ("id"));
+
+CREATE TABLE IF NOT EXISTS "rulings" ("id" INT, "date" DATE, "text" VARCHAR, "uuid" VARCHAR, PRIMARY KEY ("id"));
+
+SELECT T1.artist, T2.format FROM cards AS T1 INNER JOIN legalities AS T2 ON T2.uuid = T1.uuid GROUP BY T1.artist ORDER BY COUNT(T1.id) ASC LIMIT 1;
+
+SELECT T1.artist, T3.format FROM cards AS T1 LEFT JOIN foreign_data AS T2 ON T1.uuid = T2.uuid LEFT JOIN legalities AS T3 ON T1.uuid = T3.uuid GROUP BY T1.artist ORDER BY COUNT(T1.artist) ASC LIMIT 1

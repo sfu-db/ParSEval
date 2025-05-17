@@ -115,7 +115,6 @@ class UExprGenerator:
     def get_positive_constraints(self):
         additional = []
         for key, constraints in self.positives.items():
-
             if key.startswith('CASE'):
                 additional.append(sum(constraints).expr < len(constraints))
                 additional.append(sum(constraints).expr > 0)

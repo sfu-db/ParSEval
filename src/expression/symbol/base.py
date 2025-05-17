@@ -312,8 +312,12 @@ class Expr(metaclass=_Expr):
         }
         if self.__class__ in negation_map:
             return negation_map[self.__class__](this=self.left, operand = self.right, value = new_value)
+        if isinstance(self, Not):
+            return self.this
         return Not(this = self, value = new_value)
-    
+    def is_null(self) -> Expr:
+        return Is_Null(this=self, value=self.value is None)
+
     def tree_str(self, indent: str = "", is_last: bool = True) -> str:
         """
         Returns a tree-like string representation of the expression.
@@ -564,7 +568,6 @@ class Variable(Expr):
         """Variables should already have their type set"""
         return self._type
 
-
 class Literal(Expr):
     arg_types = {"this": True, "value": True}
 
@@ -595,13 +598,15 @@ class Literal(Expr):
             _type=DataType.build("BOOLEAN"),
             value=bool(value)
         )
-
-    def null(cls) -> 'Literal':
+    
+    
+    @classmethod
+    def null(cls, dtype) -> 'Literal':
         """Create a NULL literal"""
         return cls(
-            this="NULL",
-            _type=DataType.build("NULL"),
-            value=None
+            this = "NULL",
+            _type = DataType.build(dtype),
+            value = None
         )
 
     @classmethod
@@ -630,10 +635,13 @@ class Row(Expr):
     
     def __str__(self):
         s = ', '.join([str(e) for e in self.operands])
-        return f"{self.multiplicity}: {s}"
+        return f"[{s}]" #{self.multiplicity}:
     
     def __getitem__(self, other):
         return self.operands[other]
+
+    def __iter__(self):
+        return iter(self.operands)
     
     def __len__(self):
         return len(self.operands)
@@ -753,10 +761,10 @@ def distinct(operands: List[Expr]) -> Distinct:
     return Distinct(operands= operands)
 
 def or_(operands: List[Expr]) -> Or:
-    return Or(operands= operands)
+    return Or(operands= operands, value = any(operands))
 
 def and_(operands: List[Expr]) -> And:
-    return And(operands= operands)
+    return And(operands= operands, value = all(operands))
 
 def get_all_variables(expr: Expr) -> Set[Variable]:
     variables = set()

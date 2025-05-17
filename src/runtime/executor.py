@@ -1,14 +1,28 @@
 from typing import Any, List, Dict, Optional
 from dataclasses import dataclass, field
 from .constant import BranchType
-
-from src.expression.symbol import Row, to_literal
+from src.expression.symbol import Row, to_literal, and_, or_, Literal, get_all_variables
 from src.expression.visitors import get_predicates
 from src.expression.query import rel
-from .helper import split_conditions
+from .helper import split_sql_conditions
+from sqlglot import exp
 import logging
 
 logger = logging.getLogger('src.parseval.executor')
+@dataclass
+class InputRef:
+    #  {'kind': 'INPUT_REF', 'index': 1, 'name': '$1', 'type': 'VARCHAR'}
+    name: str
+    index: int
+    typ: str
+    table: str = field(default = None)
+    nullable: bool = field(default =False)
+    unique: bool = field(default = False)
+
+    # def __repr__(self):
+    #     return str(self)
+
+
 @dataclass
 class SymbolTable:
     _id: str
@@ -68,65 +82,103 @@ class Executor:
             raise
     
     def execute_scan(self, operator: rel.Step, **kwargs):
+        '''
+        we would not encode scan because of instance.
+        '''
         instance = kwargs.get('instance')
         table = instance.get_table(operator.table)
         output, smt_exprs, op_exprs = [], [], []
         for row in table:
             output.append(row)
+
+        metadata = [InputRef(name = col.name, 
+                             index = index, 
+                             typ = col.kind.this.name, 
+                             table = operator.table, 
+                             nullable = not table.is_notnull(col), 
+                             unique = table.is_unique(col)) for index, col in enumerate(table.column_defs)]
         st = SymbolTable(_id = operator.i(), data = output, row_expr = smt_exprs, 
-                         tbl_expr = op_exprs, metadata= {'table': [{operator.table : list(table.column_defs)}]})
+                         tbl_expr = op_exprs, metadata= {'table': metadata})
         return st
     
     def execute_project(self, operator, **kwargs):
         st = self.execute(operator.this, **kwargs)
-        output = []
+        output, smt_exprs = [], []
+        
+        metadata = []
+        for projection in operator.projections:
+            if isinstance(projection, exp.Column):
+                ref = int(projection.args.get('ref'))
+                metadata.append(st.metadata['table'][ref])
+            elif isinstance(projection, exp.Literal):
+                raise NotImplementedError('Literal is not implemented in Project')
+            elif isinstance(projection, exp.Case):
+                raise NotImplementedError('Case is not implemented in Project')
         for row in st.data:
+            projections = []
+            for project in operator.projections:
+                projections.append(self.execute(project, row = row))
             projections = [self.execute(project, row = row) for project in operator.projections]
             r = Row(this = row.multiplicity, operands = projections)
             output.append(r)
-        return st.update(_id = operator.i(), data = output)
+            tuples = get_all_variables(row.this)
+            self.add.which_branch(operator.key, operator.i(), projections, operator.projections, [True] * len(projections), 1, st.metadata, tuples = tuples)
+
+        self.add.advance(operator.key, operator.i())
+        return st.update(_id = operator.i(), data = output, metadata = {'table': metadata})
     
     def execute_filter(self, operator: rel.Step, **kwargs):
         p = self.execute(operator.this, **kwargs)
         outputs, smt_exprs, op_exprs = [], [], []
+        
         for row in p.data:
+            tuples = set()
             smt = self.execute(operator.condition, row = row, **kwargs)
             if smt:
-                outputs.append(row)            
+                outputs.append(row)
             predicates = get_predicates(smt)
-            self.add.which_branch(operator.key, operator.i(), predicates, split_conditions(operator.condition), smt.value, p.metadata)
+            tuples.update(get_all_variables(row.this))
+            takens = [p.value for p in predicates]
+            self.add.which_branch(operator.key, operator.i(), predicates, split_sql_conditions(operator.condition), takens, smt.value, p.metadata, tuples = tuples)
         self.add.advance(operator.key, operator.i())
         return p.update(_id = operator.i(), data = outputs, expr = smt_exprs, op_exprs = op_exprs)
+
 
     def execute_join(self, operator: rel.Join, **kwargs):
         left = self.execute(operator.this, **kwargs)
         right = self.execute(operator.right, **kwargs)
         outputs, smt_exprs, op_exprs = [], [], []
-        # Handle different join types
+
+        metadata = {'table': [*left.metadata['table'], *right.metadata['table']]}
+
+        for new_index, ref in enumerate(metadata['table']):
+            ref.index = new_index
+
         join_type = operator.kind.lower()
         for l_row in left.data:
+            predicates = []
             for r_row in right.data:
-                # Create a combined row
                 combined_row = l_row * r_row
-                # Evaluate join condition
-                condition_sat = self.execute(operator.condition, row=combined_row, **kwargs)                
-                if condition_sat:
+                smt = self.execute(operator.condition, row=combined_row, **kwargs)                
+                if smt:
                     outputs.append(combined_row)
-                    # smt_exprs.append(operator.condition)
-        # Handle outer joins if needed
-        if join_type in ['left', 'full']:
-            # Add rows from left that didn't match
-            for l_row in left.data:
-                if not any(l_row in row.expressions for row in outputs):
-                    outputs.append(l_row)
+                predicates.extend(get_predicates(smt))
+            predicate = or_(predicates)
+            if join_type in ['inner']:
+                self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], [predicate.value], predicate.value, metadata)
+
+            if join_type in ['left', 'full']:
+                # logger.info(f"predicate: {predicate}")
+                if predicate:
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [True], predicate.value, metadata)
+                else:
+                    null_row = [Literal.null(md.typ) for md in right.metadata['table']]
+                    combined_row = Row(operands = [*l_row.operands, *null_row], this = l_row.this)
+                    outputs.append(combined_row)
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [exp.Not(this = operator.condition)], [True], 1, metadata)
         
-        if join_type in ['right', 'full']:
-            # Add rows from right that didn't match
-            for r_row in right.data:
-                if not any(r_row in row.expressions for row in outputs):
-                    outputs.append(r_row)
-        # self.add.advance(operator.key, operator.i())
-        return left.update(_id=operator.i(), data=outputs, row_expr=smt_exprs, tbl_expr=op_exprs)
+        self.add.advance(operator.key, operator.i())
+        return left.update(_id=operator.i(), data=outputs, row_expr=smt_exprs, tbl_expr=op_exprs, metadata = metadata)
     
     def execute_union(self, operator: rel.Union, **kwargs):
         left = self.execute(operator.this, **kwargs)
@@ -225,28 +277,52 @@ class Executor:
         return input_table.update(_id=operator.i(), data=outputs, row_expr=smt_exprs, tbl_expr=op_exprs)
     
     def execute_sort(self, operator: rel.Sort, **kwargs):
+        def sorted_pure(iterable, key=None, reverse=False):
+            def merge_sort(lst):
+                if len(lst) <= 1:
+                    return lst
+                mid = len(lst) // 2
+                left = merge_sort(lst[:mid])
+                right = merge_sort(lst[mid:])
+                return merge(left, right)
+
+            def merge(left, right):
+                result = []
+                i = j = 0
+                while i < len(left) and j < len(right):
+                    a = key(left[i]) if key else left[i]
+                    b = key(right[j]) if key else right[j]
+                    if (a < b and not reverse) or (a > b and reverse):
+                        result.append(left[i])
+                        i += 1
+                    else:
+                        result.append(right[j])
+                        j += 1
+                result.extend(left[i:])
+                result.extend(right[j:])
+                return result
+
+            return merge_sort(list(iterable))
         # Execute the input
         input_table = self.execute(operator.this, **kwargs)
-        
         # Sort the data based on the specified direction
-        direction = operator.args.get('dir', 'ASC')
-        sort_key = operator.args.get('sort_key')
-        
+        direction = operator.args.get('dir', 'ASCENDING')
+        sort_keys = operator.args.get('sort')
         # Sort the rows
         sorted_data = sorted(
             input_table.data,
-            key=lambda row: self.execute(sort_key, row=row, **kwargs),
-            reverse=(direction.upper() == 'DESC')
+            key=lambda row: (row[sort_key] for sort_key in sort_keys),
+            reverse=('DESCENDING' in direction)
         )
         
         # Apply offset and limit if specified
-        offset = operator.offset or 0
-        limit = operator.limit or float('inf')
+        offset = int( operator.offset) or 0
+        limit = float(operator.limit) or float('inf')
         
         if offset > 0 or limit < float('inf'):
             sorted_data = sorted_data[offset:offset+limit]
         
-        self.add.advance(operator.key, operator.i())
+        # self.add.advance(operator.key, operator.i())
         return input_table.update(_id=operator.i(), data=sorted_data)
     
     def execute_values(self, operator: rel.Values, **kwargs):
@@ -293,7 +369,7 @@ class Executor:
         left = self.execute(operator.this, **kwargs)
         right = self.execute(operator.expression, **kwargs)
         result = left.or_(right)
-        logger.info(f'or: {result}, {left.value} OR {right.value}, {result.value}')
+        # logger.info(f'or: {result}, {left.value} OR {right.value}, {result.value}')
         return left.or_(right)
     
     def execute_and(self, operator, **kwargs):
@@ -312,6 +388,9 @@ class Executor:
         dtype = operator.args.get('datatype')
         return to_literal(operator.this, to_type= str(dtype)) 
 
+    def execute_is_null(self, operator, **kwargs):
+        this = self.execute(operator.this, **kwargs)
+        return this.is_null()
 
 ops =[
       ("gt", ">" ),\

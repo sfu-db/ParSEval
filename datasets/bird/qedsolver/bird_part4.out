@@ -1,0 +1,60 @@
+#0: ./bird/part4/debit_card_specializing_1471.json
+Trivially true!
+Equivalence is provable for debit_card_specializing_1471.json
+#1: ./bird/part4/debit_card_specializing_1524.json
+Equivalence is not provable for debit_card_specializing_1524.json
+#2: ./bird/part4/debit_card_specializing_1528.json
+Equivalence is not provable for debit_card_specializing_1528.json
+#3: ./bird/part4/debit_card_specializing_1509.json
+Trivially true!
+Equivalence is provable for debit_card_specializing_1509.json
+#4: ./bird/part4/debit_card_specializing_1506.json
+Equivalence is not provable for debit_card_specializing_1506.json
+#5: ./bird/part4/debit_card_specializing_1511.json
+Equivalence is not provable for debit_card_specializing_1511.json
+#6: ./bird/part4/debit_card_specializing_1533.json
+Trivially true!
+Equivalence is provable for debit_card_specializing_1533.json
+#7: ./bird/part4/debit_card_specializing_1507.json
+Equivalence is not provable for debit_card_specializing_1507.json
+#8: ./bird/part4/debit_card_specializing_1512.json
+Equivalence is not provable for debit_card_specializing_1512.json
+#9: ./bird/part4/debit_card_specializing_1503.json
+Equivalence is not provable for debit_card_specializing_1503.json
+#10: ./bird/part4/debit_card_specializing_1504.json
+Equivalence is not provable for debit_card_specializing_1504.json
+#11: ./bird/part4/debit_card_specializing_1495.json
+Equivalence is not provable for debit_card_specializing_1495.json
+#12: ./bird/part4/debit_card_specializing_1472.json
+Trivially true!
+Equivalence is provable for debit_card_specializing_1472.json
+#13: ./bird/part4/debit_card_specializing_1492.json
+Equivalence is not provable for debit_card_specializing_1492.json
+#14: ./bird/part4/debit_card_specializing_1529.json
+Equivalence is not provable for debit_card_specializing_1529.json
+#15: ./bird/part4/debit_card_specializing_1491.json
+Trivially true!
+Equivalence is provable for debit_card_specializing_1491.json
+#16: ./bird/part4/debit_card_specializing_1485.json
+Equivalence is not provable for debit_card_specializing_1485.json
+
+
+STATISTICS
+./bird/part4/debit_card_specializing_1471.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1472.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1485.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 2.537969157s, equiv_class_timed_out: false, smt_duration: 317.401915ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 1.226397ms, normal_duration: 7.015376ms, stable_duration: 2.556542414s, unify_duration: 326.624496ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1491.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1492.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 805.160298ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 1.062566ms, normal_duration: 2.332800404s, stable_duration: 814.924089ms, unify_duration: 8.91µs, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1495.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 703.192209ms, equiv_class_timed_out: false, smt_duration: 255.367781ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 355.881µs, normal_duration: 4.765957ms, stable_duration: 719.870356ms, unify_duration: 259.263116ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1503.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 59.845024ms, equiv_class_timed_out: false, smt_duration: 50.258719ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 342.392µs, normal_duration: 3.096515ms, stable_duration: 64.656131ms, unify_duration: 50.559404ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1504.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 115.767691ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 363.765µs, normal_duration: 3.407501ms, stable_duration: 120.526791ms, unify_duration: 438ns, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1506.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 94.70456ms, equiv_class_timed_out: false, smt_duration: 60.198563ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 760.067µs, normal_duration: 6.774777ms, stable_duration: 101.495276ms, unify_duration: 60.563953ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1507.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 98.961417ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 459.137µs, normal_duration: 3.25455ms, stable_duration: 103.193565ms, unify_duration: 8.155µs, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1509.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1511.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 109.712931ms, equiv_class_timed_out: false, smt_duration: 152.225511ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 615.8µs, normal_duration: 5.467232ms, stable_duration: 116.113611ms, unify_duration: 154.610991ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1512.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 77.962698ms, equiv_class_timed_out: false, smt_duration: 58.146361ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 486.369µs, normal_duration: 5.443912ms, stable_duration: 84.12933ms, unify_duration: 58.53412ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1524.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 29.253021ms, equiv_class_timed_out: false, smt_duration: 63.5379ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 887.639µs, normal_duration: 5.560173ms, stable_duration: 33.481961ms, unify_duration: 63.735694ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1528.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 74.352624ms, equiv_class_timed_out: false, smt_duration: 327.677968ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 545.116µs, normal_duration: 237.186131ms, stable_duration: 78.766439ms, unify_duration: 329.235697ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1529.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 885.052709ms, equiv_class_timed_out: false, smt_duration: 155.96778ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 394.515µs, normal_duration: 5.145617ms, stable_duration: 901.640287ms, unify_duration: 158.883131ms, total_duration: 0ns })
+./bird/part4/debit_card_specializing_1533.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+Provable: 5 / 17

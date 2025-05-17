@@ -211,7 +211,7 @@ class QParser(Dialect):
         this = self.walk(node.pop('inputs')[0])
         parameters = {k: v for k, v in node.items() if k != 'inputs'}
         groupby = tuple(exp.Column(this = f'${gid}', ref = key.get('column'), 
-                                   datatype = exp.DataType.build(dtype= key.get('type'), dialect= self.dialect)) 
+                                   datatype = exp.DataType.build(dtype= key.get('type'))) 
                                    for gid, key in enumerate(parameters.pop('keys')))
         agg_funcs = tuple(self.walk(func_def) for func_def in parameters.pop('aggs'))
         return Aggregate(this = this, groupby = groupby, agg_funcs = agg_funcs, **parameters)
@@ -259,6 +259,7 @@ class QParser(Dialect):
         return literal
         
     def on_input_ref(self, node):
+        # logging.info(node)
         return exp.Column(this = exp.parse_identifier(node.pop('name')), 
                           datatype = exp.DataType.build(dtype=node.pop('type')), 
                           ref = node.pop('index'))

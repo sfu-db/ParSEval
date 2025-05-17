@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional
-from ..symbol.base import Expr
+from ..symbol.base import Expr, Or, And, Not
 from .base import ExprVisitor
 
 class SubstitutionVisitor(ExprVisitor):
@@ -128,7 +128,12 @@ class SubstitutionVisitor(ExprVisitor):
     def visit_Or(self, expr: Expr) -> Expr:
         """Transform Or expressions by visiting their operands"""
         return self.visit_Nary(expr)
-    
+    # def visit_Is_Null(self, expr):
+    #     return self.visit_Unary(expr)
+    # def visit_Not(self, expr) -> Any:
+    #     return self.visit_Unary(expr)
+
+    visit_Is_Null = visit_Not = visit_Unary
     def generic_visit(self, expr: Expr) -> Any:
         return expr
     
@@ -151,3 +156,41 @@ for op in BINARY_OPS:
 def substitute(expr: Expr, substitutions: Dict[Expr, Expr], inplace: bool = False):
     visitor = SubstitutionVisitor(substitutions, inplace= inplace)
     return expr.transform(visitor)
+
+
+def extend_summation(expr: Expr, substitutions: Dict[Expr, Expr], inplace: bool = False, extend = False):
+    '''
+        Extend the existing expression with new variables.
+        The new variables are added to the existing expression.
+        Args:
+            existing_expr: The existing expression.
+            varis: The new variables (src, tar) to add to the expression.
+        Returns:
+            The extended expression.
+        Example Usage:
+        >>> expr: Or(Or(a0 == b0, a0 == b1), Or(a0 == b2, a0 == b3))
+        >>> src: a0
+        >>> tar: a1
+        >>> result: Or(Or(a0 == b0, a0 == b1), Or(a0 == b2, a0 == b3), a1 == b0, a1 == b1, a1 == b2, a1 == b3)        
+    '''
+    
+    if isinstance(expr, Or):
+        operands = set()
+        for op in expr.operands:
+            if extend:
+                operands.add(op)
+            for src, tar in substitutions.items():
+                if str(src) in str(op):
+                    operands.add(extend_summation(op, substitutions, inplace, extend))
+        if extend:
+            operands.update(expr.operands)
+        return Or(operands = list(operands), value = any(operands))
+    elif isinstance(expr, And):
+        operands = []
+        for op in expr.operands:
+            operands.append(extend_summation(op, substitutions, inplace))
+        return And(operands = operands, value = all(operands))
+    elif isinstance(expr, Not):
+        return Not(this = extend_summation(expr.this, substitutions, inplace))
+    else:
+        return substitute(expr, substitutions, inplace)

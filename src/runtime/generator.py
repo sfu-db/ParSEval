@@ -1,10 +1,10 @@
 from __future__ import annotations
-
-from collections import defaultdict
+from typing import Union
+from collections import defaultdict, OrderedDict
 from src.instance.instance import Instance
-
 from .uexpr_to_constraint import UExprToConstraint
-from .executor import Executor
+# from .executor import Executor
+from .encoder import Encoder
 from .constant import Action
 from src.solver.solver import Solver
 import logging
@@ -16,15 +16,11 @@ class Generator:
         self.schema = schema
         self.query = query
         self.dialect = dialect
-
         self.name = kwargs.get('name', 'public')
-
         self.plan = self.parser(query, schema)
-        
-
-        self.constraints = defaultdict(list)
-
-        
+        self.constraints = OrderedDict()
+        # defaultdict(list)
+        self.variables = set()
 
     def parser(self, query, schema):
         from src.expression.query import parser
@@ -32,55 +28,110 @@ class Generator:
         self.plan = parse.explain(query, schema)
         return self.plan
 
-    def add_constraint(self, constraint, identity, label):
-        self.constraints[label].append(constraint)
-    
-
-    def update_instance(self, instance):
-        ...
-                
-
-    def generate(self, size = 5, **kwargs):
-        ...
+    def add_constraint(self, constraints, label):
+        if not isinstance(constraints, list):
+            constraints = [constraints]
+        if label not in self.constraints:
+            self.constraints[label] = []
+        self.constraints[label].extend(constraints)
 
     def reset(self):
         self.path.reset()
         self.constraints.clear()
 
-    def _one_execution(self, max_iter = 5, **kwargs):
+
+    
+
+    def get_coverage(self, instance, **kwargs):
+        instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
+        values = {
+            'frpm': [
+                {'Academic Year': "2024", "District Code": 16, 'CDSCode': "CDSCode1"},
+                {'Academic Year': "2024", "District Code": 15, 'CDSCode': "CDSCode1"},
+                {'Academic Year': "2023", "District Code": 16},
+                {'Academic Year': "2023", "District Code": 15}
+            ],
+            'satscores': [
+                {'cds': "CDSCode1"}
+            ]
+        }
+        for tbl, value in values.items():
+            for val in value:
+                instance.create_row(tbl, val)
+        
+        self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
+        self.encoder = Encoder(self.path)
+        self.reset()
+        st = self.encoder(self.plan, instance = instance)
+        from .to_dot import display_constraints
+        print(display_constraints(self.path.root_constraint))
+        print(st)
+        instance.to_db(self.workspace, database = self.name + '.sqlite')
+
+
+    def _one_execution(self, max_iter = 8, **kwargs):
+        skips = set()
 
         size = 1
         instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
-        for _ in range(size):
-            for tbl in instance._tables:
-                instance.create_row(tbl, {})
+        values = {
+            'frpm': [
+                {'Academic Year': "2023", "District Code`": 16},
+                {'Academic Year': "2023", "District Code`": 15},
+                {'Academic Year': "2024", "District Code`": 16},
+                {'Academic Year': "2024", "District Code`": 15}
+            ]
+        }
+        for tbl, value in values.items():
+            for val in value:
+                instance.create_row(tbl, val)
+            # for tbl in instance._tables:
+                # instance.create_row(tbl, {})
 
         for _ in range(max_iter):
-            self.path = UExprToConstraint(lambda constraint, identity, label: self.add_constraint(constraint, identity, label))
-            self.executor = Executor(self.path)
+            self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
+            self.executor = Encoder(self.path)
             self.reset()
             st = self.executor(self.plan, instance = instance)
+            pattern = self.path.next_branch(instance)
+            target_vars = self.constraints.pop('variable', [])
+            solver = Solver(target_vars)
+            for label, constraints in self.constraints.items():
+                solver.append(constraints)
+                # solver.add(constraints)
+                logging.info(constraints)
+                # if pattern == '111':
+                #     logging.info(constraints)
+            db_constraints = instance.get_db_constraints()
+            solver.appendleft(db_constraints.pop('SIZE'))
+            # solver.add(db_constraints.pop('SIZE'))
+            for label, constraints in db_constraints.items():
+                if constraints:
+                    flag = solver.add_conditional(constraints)
+                    # logging.info(f'DB Constraints: {label} --> {flag}')
+            if solver.check():
+                concretes = solver.model()
+                instance.update_values(concretes)
+                logging.info(f'solved : {pattern}, {concretes}')
+            else:
+                skips.add(pattern)
+                concretes = solver.model()
+                instance.update_values(concretes)
+                logging.info(self.constraints)
+                logging.info(f'unsat: {pattern}')
+            logging.info('**' * 30)
+
             
-            next_action = self.path.next_branch(instance)
-            # logging.info(f'next action: {next_action}')
-            if next_action in [Action.UPDATE, Action.APPEND] and self.constraints:
-                solver = Solver()
-                for label, constraints in self.constraints.items():
-                    solver.add(constraints)
-                if solver.check():
-                    concretes = solver.model()
-                    # logging.info(f'constraints: {self.constraints}')
-                    # logging.info(f'concretes: {concretes}')
-                    instance.update_values(concretes)
-            # elif next_action == Action.APPEND:
-            #     for tbl in instance._tables:
-            #         instance.create_row(tbl, {})
-            elif next_action == Action.DONE:
-                break
+        
+        from .to_dot import display_constraints
+        # print(self.path.pprint())
+        print(display_constraints(self.path.root_constraint))
+
+        print('leaves: ',self.path.leaves)
 
         instance.to_db(self.workspace, database = self.name + '.sqlite')
-        from .to_dot import display_constraints
-        print(display_constraints(self.path.root_constraint))
+
+        # print(self.path.pprint())
         return st
 
 

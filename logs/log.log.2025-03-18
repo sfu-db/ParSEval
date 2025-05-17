@@ -1,0 +1,657 @@
+Mar 17 16:40:53 | src.hybrid |     INFO | generator.py line:199 | attempt: 0
+Mar 17 16:50:28 | src.hybrid |     INFO | generator.py line:199 | attempt: 0
+Mar 17 16:50:36 | src.hybrid |     INFO | generator.py line:199 | attempt: 0
+Mar 17 17:03:10 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:03:34 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:04:03 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:04:03 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(And(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)), False)]
+Mar 17 17:08:39 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:08:54 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:08:54 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:08:54 | src.hybrid |     INFO | generator.py line:200 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 17:10:01 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:10:01 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:10:01 | src.hybrid |     INFO | generator.py line:200 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 17:10:09 | src.hybrid |     INFO | generator.py line:197 | attempt: 0
+Mar 17 17:10:09 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:10:09 | src.hybrid |     INFO | generator.py line:200 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 17:10:09 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:10:51 | src.hybrid |     INFO | generator.py line:199 | attempt: 0
+Mar 17 17:10:51 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:10:51 | src.hybrid |     INFO | generator.py line:202 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 17:10:51 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:199 | attempt: 0
+Mar 17 17:11:17 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:202 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 17:11:17 | src.parseval.hybrid |     INFO | executeor.py line:85 | [Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:227 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:230 | frpm: 1
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:230 | satscores: 1
+Mar 17 17:11:17 | src.hybrid |     INFO | generator.py line:230 | schools: 1
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:222 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:225 | frpm: 1
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:225 | satscores: 1
+Mar 17 21:55:12 | src.hybrid |     INFO | generator.py line:225 | schools: 1
+Mar 17 22:24:52 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name3
+Mar 17 22:24:52 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name1
+Mar 17 22:24:52 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name
+Mar 17 22:24:52 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name2
+Mar 17 22:26:24 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name3
+Mar 17 22:26:24 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name1
+Mar 17 22:26:25 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name
+Mar 17 22:26:25 | src.parseval.symbol |     INFO | symbol.py line:106 | Adding path: name2
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(And(name3, name1), Or(name, name2))
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(name3, name1)
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(name, name2)
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name3
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: name3
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name1
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: name1
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: name
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name2
+Mar 17 22:26:54 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: name2
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(And(name3, name1), Or(name, name2))
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(name3, name1)
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(name, name2)
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name3
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(Identifier(name3), True)
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name1
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(Identifier(name1), True)
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(Identifier(name), True)
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: name2
+Mar 17 22:27:11 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(Identifier(name2), True)
+Mar 17 22:28:04 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:28:04 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:28:04 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:28:04 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:28:04 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:29:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:29:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:29:15 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:29:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:29:15 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:29:15 | src.test.naive |     INFO | test_context.py line:72 | Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:29:15 | src.test.naive |     INFO | test_context.py line:72 | Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(LT(Integer(Identifier(name2), 256), Literal(this=100, is_string=False)), False)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:30:29 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(LT(Integer(Identifier(name2), 256), Literal(this=100, is_string=False)), False)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:30:48 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(LT(Integer(Identifier(name2), 256), Literal(this=100, is_string=False)), False)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Add(Integer(Identifier(name1), 257), Integer(Identifier(name2), 256)), 513), Literal(this=0, is_string=False)), True)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:31:23 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: Boolean(GT(Integer(Identifier(name1), 257), Literal(this=50, is_string=False)), True)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: LT(name2,100)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(Add(name1, name2),0)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:31:55 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(name1,50)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: LT(name2,100)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(Add(name1, name2),0)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:32:15 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(name1,50)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(LT(name2,100), Or(GT(Add(name1, name2),0), GT(name1,50)))
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: LT(name2,100)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: LT(name2,100)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: Or(GT(Add(name1, name2),0), GT(name1,50))
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(Add(name1, name2),0)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(Add(name1, name2),0)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(name1,50)
+Mar 17 22:32:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(name1,50)
+Mar 17 22:32:42 | src.test.naive |     INFO | test_context.py line:75 | LT(name2,100)
+Mar 17 22:32:42 | src.test.naive |     INFO | test_context.py line:75 | GT(Add(name1, name2),0)
+Mar 17 22:32:42 | src.test.naive |     INFO | test_context.py line:75 | GT(name1,50)
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(GT(frpm_DistrictCode_INT_0,15), EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:199 | defaultdict(<class 'list'>, {})
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:200 | {}
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: And(GT(frpm_DistrictCode_INT_0,15), EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:100 | Processing path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.parseval.symbol |     INFO | symbol.py line:107 | Adding path: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:225 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:228 | frpm: 1
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:228 | satscores: 1
+Mar 17 22:33:42 | src.hybrid |     INFO | generator.py line:228 | schools: 1
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:199 | defaultdict(<class 'list'>, {})
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:200 | {}
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:225 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:228 | frpm: 1
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:228 | satscores: 1
+Mar 17 22:34:00 | src.hybrid |     INFO | generator.py line:228 | schools: 1
+Mar 17 22:47:46 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 22:47:46 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 22:47:46 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary vars: set()
+Mar 17 22:48:11 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 22:48:11 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 22:48:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 22:48:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:03:21 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:03:21 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:03:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:03:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:04:05 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:04:05 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 23:04:05 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:04:05 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:05 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:04:05 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:04:05 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:04:39 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:04:39 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 23:04:39 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:04:39 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:39 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:04:39 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:04:39 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:39 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:04:39 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:05:21 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:05:21 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 23:05:40 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: GT(frpm_DistrictCode_INT_0,15)
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:252 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:252 | Args: set()
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:252 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:252 | Args: set()
+Mar 17 23:05:40 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:246 | Visiting: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:05:40 | src.parseval.symbol |     INFO | symbol.py line:252 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:05:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:05:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:06:52 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.Integer'>
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:06:52 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:06:52 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:06:52 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:06:52 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:07:31 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: GT(frpm_DistrictCode_INT_0,15), False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.Integer'>
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: <generator object visit_expr at 0x7f356cd1a900>, False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.Integer'>
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: Not(GT(frpm_DistrictCode_INT_0,15)), False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: EQ(frpm_AcademicYear_TEXT_0,'2023'), False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: <generator object visit_expr at 0x7f356d56b270>, False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: Not(EQ(frpm_AcademicYear_TEXT_0,'2023')), False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: set()
+Mar 17 23:07:31 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: EQ(frpm_AcademicYear_TEXT_0,'2023'), False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: <generator object visit_expr at 0x7f356cd1a660>, False
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:07:31 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.String'>
+Mar 17 23:07:31 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:07:31 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: set()
+Mar 17 23:07:56 | src.test.naive |     INFO | test_context.py line:75 | LT(name2,100)
+Mar 17 23:07:56 | src.test.naive |     INFO | test_context.py line:75 | GT(Add(name1, name2),0)
+Mar 17 23:07:56 | src.test.naive |     INFO | test_context.py line:75 | GT(name1,50)
+Mar 17 23:08:05 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: GT(frpm_DistrictCode_INT_0,15), False
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.Integer'>
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:260 | Sub: frpm_DistrictCode_INT_0, True
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:248 | Args: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:08:05 | src.parseval.symbol |     INFO | symbol.py line:251 | type <class 'src.expr.symbol.Integer'>
+Mar 17 23:08:47 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:08:47 | src.parseval.symbol |     INFO | symbol.py line:257 | Sub: GT(frpm_DistrictCode_INT_0,15), False
+Mar 17 23:08:47 | src.parseval.symbol |     INFO | symbol.py line:257 | Sub: frpm_DistrictCode_INT_0, True
+Mar 17 23:09:00 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:09:46 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:09:46 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: frpm_DistrictCode_INT_0
+Mar 17 23:10:00 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:10:00 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.Integer'>, Integer(Identifier(frpm_DistrictCode_INT_0), 1)
+Mar 17 23:11:10 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:11:10 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.Integer'>, Integer(Identifier(frpm_DistrictCode_INT_0), 1)
+Mar 17 23:11:54 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:11:54 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.Integer'>, frpm_DistrictCode_INT_0
+Mar 17 23:13:26 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:13:26 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.Integer'>, frpm_DistrictCode_INT_0
+Mar 17 23:13:26 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.String'>, frpm_AcademicYear_TEXT_0
+Mar 17 23:13:26 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:13:26 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:13:26 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:13:26 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | all vars: set()
+Mar 17 23:13:26 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:14:40 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:14:40 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.Integer'>, frpm_DistrictCode_INT_0
+Mar 17 23:14:40 | src.parseval.constraitn |     INFO | constraint.py line:127 | SMT VAR: <class 'src.expr.symbol.String'>, frpm_AcademicYear_TEXT_0
+Mar 17 23:14:40 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:150 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: set()
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:14:40 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:14:57 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:14:57 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:150 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: set()
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:14:57 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:17:05 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:17:05 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:149 | primary predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:150 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:17:05 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:18:59 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:18:59 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:144 | primary predicate222: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:150 | primary predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:151 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:18:59 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:19:21 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:19:21 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:19:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:20:21 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:20:21 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:20:21 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:20:21 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(Not(EQ(frpm_AcademicYear_TEXT_0,'2023')))
+Mar 17 23:20:21 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:22:16 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:22:16 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:22:16 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:22:16 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:22:16 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:24:25 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:24:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:24:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:24:25 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:24:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:26:27 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:26:27 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:26:27 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:26:27 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {Integer(Identifier(frpm_DistrictCode_INT_0), 1)}
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:108 | predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:26:27 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:109 | all vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:27:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:27:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:27:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:143 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:27:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:27:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:151 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:27:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:27:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:175 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 17 23:27:25 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 17 23:27:41 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:27:41 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:143 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:151 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:175 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_0), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0), Literal(this=2023, is_string=True)), False)]
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 17 23:27:41 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 17 23:27:41 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:22:11 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:22:11 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:22:11 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:11 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:22:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:144 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:146 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:11 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:22:24 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:22:24 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:144 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:146 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:176 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:178 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:22:24 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:178 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:22:24 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:22:44 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:22:44 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:153 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:121 | new constraint: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:121 | new constraint: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:179 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:22:44 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:179 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:22:44 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:23:03 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:23:03 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:146 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:154 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:155 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:121 | new symbol: frpm_DistrictCode_INT_1
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:122 | new constraint: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:121 | new symbol: frpm_AcademicYear_TEXT_1
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:122 | new constraint: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:178 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:180 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:23:03 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:180 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:23:03 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:23:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:23:25 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:150 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:156 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:157 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:120 | new_constraint: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:123 | new symbol: frpm_DistrictCode_INT_1
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:124 | new constraint: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:120 | new_constraint: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:123 | new symbol: frpm_AcademicYear_TEXT_1
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:124 | new constraint: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:180 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:182 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:23:25 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:182 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:23:25 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:23:53 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(GT(frpm_DistrictCode_INT_0,15))
+Mar 18 17:23:53 | src.parseval.constraitn |     INFO | constraint.py line:163 | p: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:143 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:151 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:175 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:23:53 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:23:53 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:143 | tt: Not(EQ(frpm_AcademicYear_TEXT_0,'2023'))
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:145 | primary predicate222: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:151 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:152 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:175 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:24:06 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:177 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:24:06 | src.hybrid |     INFO | generator.py line:227 | schools: 1
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:194 | attempt: 0
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:197 | STable(_id='2', data=[], expr=[], op_exprs=[], label='POSITIVE')
+Mar 18 17:24:28 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:147 | primary predicate: EQ(frpm_AcademicYear_TEXT_0,'2023')
+Mar 18 17:24:28 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:148 | primary vars: {String(Identifier(frpm_AcademicYear_TEXT_0), frpm_AcademicYear_TEXT_0)}
+Mar 18 17:24:28 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:171 | constraints: [Boolean(Not(Boolean(GT(Integer(Identifier(frpm_DistrictCode_INT_1), 1), Literal(this=15, is_string=False)), False)), True), Boolean(EQ(String(Identifier(frpm_AcademicYear_TEXT_1), frpm_AcademicYear_TEXT_1), Literal(this=2023, is_string=True)), False)]
+Mar 18 17:24:28 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:173 | c: Not(GT(frpm_DistrictCode_INT_1,15))
+Mar 18 17:24:28 | src.parseval.uexpr |     INFO | uexpr_to_constraint.py line:173 | c: EQ(frpm_AcademicYear_TEXT_1,'2023')
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:224 | digraph G {
+ROOT0 [label=<<font face="lucida console">ROOT:(positive = ROOT)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $3  15)1" [label=<<font face="lucida console">filter1(NOT $3  15):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($3  15)2" [label=<<font face="lucida console">filter1($3  15):(positive = POSITIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1(NOT $1 = 2023)3" [label=<<font face="lucida console">filter1(NOT $1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+"filter1($1 = 2023)4" [label=<<font face="lucida console">filter1($1 = 2023):(positive = NEGATIVE)</font>>, shape=box, color="#eef7ff", fillcolor="#eef7ff"];
+ROOT0 -> "filter1(NOT $3  15)1" [label=1, color=blue];
+ROOT0 -> "filter1($3  15)2" [label=0, color=red];
+"filter1(NOT $3  15)1" -> "filter1(NOT $1 = 2023)3" [label=1, color=blue];
+"filter1(NOT $3  15)1" -> "filter1($1 = 2023)4" [label=0, color=red];
+}
+
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:227 | frpm: 2
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:227 | satscores: 1
+Mar 18 17:24:28 | src.hybrid |     INFO | generator.py line:227 | schools: 1
