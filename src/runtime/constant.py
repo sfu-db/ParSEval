@@ -11,18 +11,21 @@ ConstraintId = NewType('ConstraintId', str)
 
 class BranchType(Enum):
     """Represents different types of branches in the AST.
-    
     Attributes:
         NEGATIVE: Branch that evaluates to false
         POSITIVE: Branch that evaluates to true
         STRAIGHT: Branch that doesn't change evaluation
         ROOT: Root node of the AST
+        PLAUSIBLE: Branch that is plausible
     """
 
     NEGATIVE = 0
     POSITIVE = 1
     STRAIGHT = 2
     ROOT = 3
+    PLAUSIBLE = 4
+    UNREACHABLE = 5
+    
     def __bool__(self):
         return self in {BranchType.POSITIVE, BranchType.STRAIGHT}
     

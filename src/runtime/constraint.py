@@ -1,30 +1,41 @@
 from __future__ import annotations
-from collections import defaultdict
 from typing import List, Optional, Dict, Union, Set
 from .constant import *
 from sqlglot import exp
 
+from .helper import negate_sql_condition
 from src.expression.symbol import Expr
 import logging
 logger = logging.getLogger('src.parseval.constraitn')
 
 
 class PlausibleChild:
-    def __init__(self, parent, branch_type: BranchType, cond, tree):
+    def __init__(self, parent, branch_type: BranchType, tree):
         self.parent = parent
         self.branch_type = branch_type
-        self.cond = cond
         self.tree = tree
 
+    def __str__(self):
+        return 'PlausibleChild[%s]' % (self.parent.pattern() + ':' + str(self.branch_type))
     def __repr__(self):
-        return 'PlausibleChild[%s]' % (self.parent.pattern() + ':' + self.cond)
+        return 'PlausibleChild[%s]' % (self.parent.pattern() + ':' + str(self.branch_type))
 
     @property
-    def identifier(self):
-        return f"{self.parent.identifier + self.cond}"
-
+    def covered(self):
+        return len(self.parent.delta) or 0
+    
+    def sibling(self):
+        for bit, child in self.parent.children.items():
+            if child != self:
+                return child
+        raise ValueError(f'No sibling found for {self}')
+    
+    def bit(self):
+        if self.parent and self.parent.yes() == self:
+            return self.tree.yes_bit
+        return self.tree.no_bit
+    
 class Constraint:
-    cnt = 0
     def __init__(self, 
                  tree, 
                  parent: Optional[Constraint], 
@@ -32,8 +43,8 @@ class Constraint:
                  operator_i: OperatorId,
                  delta: List = None,
                  sql_condition: exp.Condition = None, 
-                 branch_type: BranchType = BranchType.ROOT, 
-                 constraint_type: PathConstraintType = PathConstraintType.UNKNOWN, metadata = None):
+                 taken: Optional[bool] = None, 
+                 constraint_type: PathConstraintType = PathConstraintType.UNKNOWN, metadata = None, **kwargs):
         self.tree = tree
         self.parent: Optional[Constraint] = parent
         self.children: Dict[str, Constraint] = {}
@@ -41,38 +52,24 @@ class Constraint:
         self.operator_i = operator_i
         self.delta:List[Expr] = delta
         self.sql_condition = sql_condition
-        self.branch_type = branch_type
+        self.taken = taken
         self.constraint_type = constraint_type
         self.metadata = metadata
-
-        self.unique_id = f"{self.identifier}{self.__class__.cnt}"
-        self.__class__.cnt += 1
-        
-        self.processed = False
+        self.tuples = set()
         self._pattern = None
         self.path = None
-
-    @property
-    def identifier(self) -> str:
-        identifier = self.operator_key
-        if self.operator_i:
-            identifier += self.operator_i
-        if self.sql_condition:
-            identifier += f"({str(self.sql_condition)})"
-        return identifier
-       
-        # for k,v in kwargs.items():
-        #     setattr(self, k, v)
+        self.tables = None
 
     def no(self):
         return self.children.get(self.tree.no_bit, None)
+    
     def yes(self):
         return self.children.get(self.tree.yes_bit, None)
 
-    def has_sibiling(self):
+    def has_sibling(self):
         return self.no() is not None and self.yes() is not None
     
-    def sibiling(self) -> Constraint:
+    def sibling(self) -> Constraint:
         if self.bit() == self.tree.no_bit :
             return self.parent.yes()
         return self.parent.no()
@@ -81,12 +78,61 @@ class Constraint:
         if self.parent and self.parent.yes() == self:
             return self.tree.yes_bit
         return self.tree.no_bit
-    
+
+    def get_tables(self) -> List:
+        if self.tables:
+            return self.tables
+        self.tables = []
+        for inputref in self.metadata['table']:
+            if inputref.table not in self.tables:
+                self.tables.append(inputref.table)
+        return self.tables
+
+    def upsert_plausible_node(self, branch_type):
+        '''
+            update plausible node accordingly.            
+            For filter and join, we should add two plausible nodes, one child, one sibling.
+            1. If current node has no sibling or sibling is a PlausibleChild, add plausible node to current node's parent node
+            2. if bit in current node's children, update branch type accordingly, else, add a PlausibleChild to current node
+        '''
+        branch_type = BranchType.from_value(branch_type)
+
+        if self.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
+            bit =self.tree.yes_bit if branch_type else self.tree.no_bit
+        
+            if bit not in self.children:
+                plausible_child = PlausibleChild(self, branch_type, self.tree)
+                self.children[bit] = plausible_child
+                self.tree.leaves.pop(self.pattern(), None)
+                self.tree.leaves[self.pattern()] = plausible_child
+            elif isinstance(self.children[bit], Constraint):
+                self.children[bit].branch_type = branch_type
+        
+            if not self.sibling() or isinstance(self.sibling(), PlausibleChild):
+                bit = self.tree.yes_bit if self.bit() == self.tree.no_bit else self.tree.no_bit
+                plausible_child = PlausibleChild(self.parent, BranchType.PLAUSIBLE, self.tree)
+                self.parent.children[bit] = plausible_child
+                self.tree.leaves.pop(self.parent.pattern(), None)
+                self.tree.leaves[self.parent.pattern() + bit] = plausible_child
+        
+        
+        elif self.constraint_type == PathConstraintType.SIZE:
+            bit = self.tree.yes_bit
+            if bit not in self.children:
+                plausible_child = PlausibleChild(self, branch_type, self.tree)
+                self.children[bit] = plausible_child
+                self.tree.leaves.pop(self.parent.pattern(), None)
+                self.tree.leaves[self.pattern()] = plausible_child
+
+
     def __repr__(self):
         return str(self)
     def __str__(self):
-        return f"Constraint({self.identifier}, predicates = {self.delta})"
+        return f"Constraint({self.operator_key}, {self.operator_i})" # , predicates = {self.delta}
     
+    def __hash__(self):
+        return hash(f"Constraint({self.operator_key}, {self.operator_i}, {self.sql_condition})")
+
     def get_path_to_root(self) -> List[Constraint]:
         if self.path is not None:
             return self.path
@@ -103,102 +149,62 @@ class Constraint:
         self._pattern = ''.join(p.bit() for p in path[1:])
         return self._pattern
 
-    def _analyze_branch_info(self, operator_key, is_positive) -> BranchType:
-        '''
-            Determine branch type of child node based on the operator key and current branch type.
-            if operator is project or aggregate, return STRAIGHT
-            if operator is filter, return CURRENT_BRANCH_TYPE & is_positive
-        '''
-        if operator_key in {'project', 'aggregate'}:
-            return BranchType.STRAIGHT
-        return self.branch_type & is_positive
-
-    def _analyze_constraint_type(self, condition: exp.Condition) -> PathConstraintType:
+    def _analyze_constraint_type(self, operator_key, condition: exp.Condition) -> PathConstraintType:
         '''
             Analyze the type of constraint based on the condition.
             Return
                 SIZE, VALUE, PATH
         '''
-        if isinstance(condition, (exp.Count, exp.Exists)):
+        if isinstance(condition, (exp.Count, exp.Exists, exp.Column, exp.Case)):
             return PathConstraintType.SIZE
         if isinstance(condition, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)):
             if isinstance(condition.expression, exp.Literal):
                 return PathConstraintType.VALUE
             if isinstance(condition.this, exp.Column) and isinstance(condition.expression, exp.Column):
                 return PathConstraintType.PATH
-        elif isinstance(condition, exp.Unary):
-            return self._analyze_constraint_type(condition.this)
+        elif condition.key == 'is_null':
+            return PathConstraintType.VALUE
+        elif isinstance(condition, exp.Unary):            
+            return self._analyze_constraint_type(operator_key, condition.this)
+        else:
+            raise ValueError(f'cannot parse constraint type {condition}')
         return PathConstraintType.VALUE
+    def _analyze_sql_condition(self, operator_key: str, sql_condition: exp.Condition, taken) -> Dict:
+        if not taken:
+            sql_condition = negate_sql_condition(sql_condition)
+        return sql_condition
     
-    def _analyze_constraint_info(self, operator_key: str, sql_condition: exp.Condition, smt_expr) -> Dict:
-        if not smt_expr:
-            sql_condition = exp.Not(this = sql_condition) if sql_condition.key != 'not' else sql_condition.this
-        ## Determine path constraint type
-        c_type = PathConstraintType.PATH  # by default
-        if operator_key not in {'join', 'aggregate'}:
-            c_type = self._analyze_constraint_type(sql_condition)
-        ## find out all related tables and columns
-        # tables = defaultdict(set)
-        # for smt_var in get_all_symbols(smt_expr):
-        #     table_name, column_name, column_index = self.tree.context.get('symbol_to_table', str(smt_var))
-        #     tables[table_name].add(column_name)
-        # identifier = clean_str(f"{operator_key}{operator_i}({str(sql_condition)})")
-        return {
-            # 'identifier': identifier,
-            'constraint_type' : c_type,
-            'sql_condition': sql_condition,
-            # 'tables': tables
-        }
-    
-    def add_child(self, operator_key, operator_i, sql_condition: exp.Condition, symbolic_expr, branch, metadata,**kwargs):        
-        branch_type = self._analyze_branch_info(operator_key, branch)
-        constraint_info = self._analyze_constraint_info(operator_key, sql_condition, symbolic_expr)        
-        bit = self.tree.yes_bit if symbolic_expr else self.tree.no_bit
-        identifier = f"{operator_key}{operator_i}({str(constraint_info['sql_condition'])})"
-        child_node = self.find_child(identifier)
-
+    def add_child(self, operator_key, operator_i, sql_condition: exp.Condition, symbolic_expr, branch, metadata, taken: bool, tuples, **kwargs):        
+        child_node = self.find_child(operator_key, operator_i, taken)
+        # logger.info(f'{operator_key}, {operator_i}, {taken}, {child_node}')
         if child_node is None:
-            child_node = Constraint(tree= self.tree, 
-                                    parent = self, 
-                                    operator_key = operator_key, 
-                                    operator_i = operator_i,
-                                    delta= [], branch_type = branch_type, **constraint_info, metadata = metadata)
+            constraint_type = self._analyze_constraint_type(operator_key, sql_condition)
+            sql_condition = self._analyze_sql_condition(operator_key, sql_condition, taken)
+            bit = self.tree.yes_bit if taken else self.tree.no_bit            
+            child_node = Constraint(
+                tree = self.tree,
+                parent = self, 
+                operator_key = operator_key, 
+                operator_i = operator_i,
+                delta= [],
+                taken = taken, 
+                constraint_type= constraint_type,
+                sql_condition= sql_condition,
+                metadata = metadata
+                )
             self.children[bit] = child_node
-            self.tree.leaves.pop(self.pattern(), None)
-            self.tree.leaves[self.pattern() + bit] = child_node
-
-        if branch_type in {BranchType.POSITIVE, BranchType.NEGATIVE}:
-            '''add sibiling node to current node'''
-            sibiling_constraint_info = self._analyze_constraint_info(operator_key, sql_condition, symbolic_expr.not_())
-            sibiling_constraint_identifier = f"{operator_key}{operator_i}({str(sibiling_constraint_info['sql_condition'])})"
-            sibiling_branch_type = self._analyze_branch_info(operator_key, not branch)
-            if self.find_child(sibiling_constraint_identifier) is None:
-                sibiling_node = Constraint(tree = self.tree,
-                                           parent = self, 
-                                           operator_key= operator_key,
-                                           operator_i= operator_i, delta= [],
-                                           branch_type = sibiling_branch_type,  **sibiling_constraint_info, metadata = metadata)
-                sibiling_bit = self.tree.no_bit if symbolic_expr else self.tree.yes_bit
-                self.children[sibiling_bit] = sibiling_node
-                self.tree.leaves.pop(self.pattern(), None)
-                self.tree.leaves[self.pattern() + sibiling_bit] = sibiling_node
-                # sibiling_node.add_plausiblechild()
+            child_node.upsert_plausible_node(branch)
+        p = symbolic_expr if taken else symbolic_expr.not_()
         
-        p = symbolic_expr if symbolic_expr else symbolic_expr.not_()
-        child_node.branch_type = child_node.branch_type  & branch_type
         child_node.delta.append(p)
+        child_node.tuples.update(tuples)
         return child_node
     
-    def add_plausiblechild(self):
-        if self.branch_type not in {BranchType.POSITIVE, BranchType.NEGATIVE}:
-            return
-        for bit in [self.tree.yes_bit, self.tree.no_bit]:
-            self.children[bit] = PlausibleChild(self, bit, self.tree)
-
-
-    
-    def find_child(self, identifier):
-        for bit, child in self.children.items():
-            if isinstance(child, Constraint) and child.identifier == identifier:
-                return child
+    def find_child(self, operator_key, operator_i, taken):
+        bit = self.tree.yes_bit if taken else self.tree.no_bit
+        child = self.children.get(bit, None)
+        if isinstance(child, Constraint) and \
+            child.operator_key == operator_key and \
+            child.operator_i == operator_i:
+            return child
         return None

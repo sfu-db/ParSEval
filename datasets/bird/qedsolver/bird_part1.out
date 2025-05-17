@@ -1,0 +1,223 @@
+#0: ./bird/part1/california_schools_83.json
+Equivalence is not provable for california_schools_83.json
+#1: ./bird/part1/california_schools_59.json
+Equivalence is not provable for california_schools_59.json
+#2: ./bird/part1/california_schools_87.json
+Equivalence is not provable for california_schools_87.json
+#3: ./bird/part1/california_schools_70.json
+Equivalence is not provable for california_schools_70.json
+#4: ./bird/part1/california_schools_55.json
+Trivially true!
+Equivalence is provable for california_schools_55.json
+#5: ./bird/part1/california_schools_12.json
+Equivalence is not provable for california_schools_12.json
+#6: ./bird/part1/california_schools_65.json
+Equivalence is provable for california_schools_65.json
+#7: ./bird/part1/california_schools_18.json
+Equivalence is provable for california_schools_18.json
+#8: ./bird/part1/california_schools_61.json
+Equivalence is provable for california_schools_61.json
+#9: ./bird/part1/california_schools_32.json
+Equivalence is not provable for california_schools_32.json
+#10: ./bird/part1/california_schools_9.json
+Equivalence is not provable for california_schools_9.json
+#11: ./bird/part1/california_schools_54.json
+Equivalence is not provable for california_schools_54.json
+#12: ./bird/part1/california_schools_20.json
+Equivalence is provable for california_schools_20.json
+#13: ./bird/part1/california_schools_11.json
+Equivalence is provable for california_schools_11.json
+#14: ./bird/part1/california_schools_15.json
+Equivalence is not provable for california_schools_15.json
+#15: ./bird/part1/california_schools_89.json
+Equivalence is not provable for california_schools_89.json
+#16: ./bird/part1/california_schools_8.json
+Equivalence is not provable for california_schools_8.json
+#17: ./bird/part1/california_schools_86.json
+Equivalence is not provable for california_schools_86.json
+#18: ./bird/part1/california_schools_81.json
+Equivalence is not provable for california_schools_81.json
+#19: ./bird/part1/california_schools_14.json
+Equivalence is not provable for california_schools_14.json
+#20: ./bird/part1/california_schools_64.json
+Equivalence is not provable for california_schools_64.json
+#21: ./bird/part1/california_schools_31.json
+Equivalence is not provable for california_schools_31.json
+#22: ./bird/part1/california_schools_4.json
+Equivalence is not provable for california_schools_4.json
+#23: ./bird/part1/california_schools_79.json
+Trivially true!
+Equivalence is provable for california_schools_79.json
+#24: ./bird/part1/california_schools_34.json
+Equivalence is not provable for california_schools_34.json
+#25: ./bird/part1/california_schools_57.json
+Equivalence is not provable for california_schools_57.json
+#26: ./bird/part1/california_schools_35.json
+#27: ./bird/part1/california_schools_62.json
+Equivalence is not provable for california_schools_62.json
+#28: ./bird/part1/california_schools_58.json
+Equivalence is not provable for california_schools_58.json
+#29: ./bird/part1/california_schools_45.json
+Equivalence is not provable for california_schools_45.json
+#30: ./bird/part1/california_schools_52.json
+Equivalence is not provable for california_schools_52.json
+#31: ./bird/part1/california_schools_7.json
+Equivalence is not provable for california_schools_7.json
+#32: ./bird/part1/california_schools_43.json
+Equivalence is not provable for california_schools_43.json
+#33: ./bird/part1/california_schools_47.json
+Equivalence is not provable for california_schools_47.json
+#34: ./bird/part1/california_schools_46.json
+Equivalence is not provable for california_schools_46.json
+#35: ./bird/part1/california_schools_36.json
+Equivalence is provable for california_schools_36.json
+#36: ./bird/part1/california_schools_10.json
+Equivalence is not provable for california_schools_10.json
+#37: ./bird/part1/california_schools_2.json
+Equivalence is not provable for california_schools_2.json
+#38: ./bird/part1/california_schools_17.json
+Equivalence is not provable for california_schools_17.json
+#39: ./bird/part1/california_schools_74.json
+Equivalence is not provable for california_schools_74.json
+#40: ./bird/part1/california_schools_22.json
+Equivalence is not provable for california_schools_22.json
+#41: ./bird/part1/california_schools_19.json
+Equivalence is not provable for california_schools_19.json
+#42: ./bird/part1/california_schools_76.json
+Equivalence is not provable for california_schools_76.json
+#43: ./bird/part1/california_schools_16.json
+Equivalence is not provable for california_schools_16.json
+#44: ./bird/part1/california_schools_38.json
+Equivalence is not provable for california_schools_38.json
+#45: ./bird/part1/california_schools_51.json
+Equivalence is not provable for california_schools_51.json
+#46: ./bird/part1/california_schools_3.json
+Equivalence is not provable for california_schools_3.json
+#47: ./bird/part1/california_schools_37.json
+Trivially true!
+Equivalence is provable for california_schools_37.json
+#48: ./bird/part1/california_schools_80.json
+Equivalence is provable for california_schools_80.json
+#49: ./bird/part1/california_schools_25.json
+Equivalence is not provable for california_schools_25.json
+#50: ./bird/part1/california_schools_41.json
+Equivalence is not provable for california_schools_41.json
+#51: ./bird/part1/california_schools_6.json
+Equivalence is not provable for california_schools_6.json
+#52: ./bird/part1/california_schools_1.json
+Equivalence is not provable for california_schools_1.json
+#53: ./bird/part1/california_schools_53.json
+Equivalence is not provable for california_schools_53.json
+#54: ./bird/part1/california_schools_44.json
+Equivalence is not provable for california_schools_44.json
+#55: ./bird/part1/california_schools_39.json
+Equivalence is not provable for california_schools_39.json
+#56: ./bird/part1/california_schools_5.json
+#57: ./bird/part1/california_schools_60.json
+Equivalence is not provable for california_schools_60.json
+#58: ./bird/part1/california_schools_13.json
+Equivalence is not provable for california_schools_13.json
+#59: ./bird/part1/california_schools_33.json
+Equivalence is not provable for california_schools_33.json
+#60: ./bird/part1/california_schools_21.json
+Equivalence is not provable for california_schools_21.json
+#61: ./bird/part1/california_schools_71.json
+Equivalence is not provable for california_schools_71.json
+#62: ./bird/part1/california_schools_30.json
+Equivalence is not provable for california_schools_30.json
+#63: ./bird/part1/california_schools_72.json
+Equivalence is not provable for california_schools_72.json
+#64: ./bird/part1/california_schools_84.json
+Equivalence is not provable for california_schools_84.json
+#65: ./bird/part1/california_schools_78.json
+#66: ./bird/part1/california_schools_26.json
+Equivalence is not provable for california_schools_26.json
+#67: ./bird/part1/california_schools_63.json
+Equivalence is not provable for california_schools_63.json
+#68: ./bird/part1/california_schools_56.json
+Equivalence is not provable for california_schools_56.json
+#69: ./bird/part1/california_schools_66.json
+Equivalence is not provable for california_schools_66.json
+#70: ./bird/part1/california_schools_77.json
+Equivalence is not provable for california_schools_77.json
+#71: ./bird/part1/california_schools_49.json
+Equivalence is not provable for california_schools_49.json
+#72: ./bird/part1/california_schools_29.json
+Equivalence is not provable for california_schools_29.json
+
+
+STATISTICS
+./bird/part1/california_schools_1.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.01683279s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 438.222µs, normal_duration: 10.089961496s, stable_duration: 10.02170044s, unify_duration: 9.573µs, total_duration: 0ns })
+./bird/part1/california_schools_10.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 628.298781ms, equiv_class_timed_out: false, smt_duration: 54.649936ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 724.51µs, normal_duration: 6.679061ms, stable_duration: 636.222214ms, unify_duration: 55.136246ms, total_duration: 0ns })
+./bird/part1/california_schools_11.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 54.428771ms, equiv_class_timed_out: false, smt_duration: 185.745857ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 319.519µs, normal_duration: 135.053327ms, stable_duration: 57.764785ms, unify_duration: 186.526587ms, total_duration: 0ns })
+./bird/part1/california_schools_12.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 51.588719ms, equiv_class_timed_out: false, smt_duration: 104.390466ms, smt_timed_out: false, nontrivial_perms: true, translate_duration: 315.677µs, normal_duration: 2.790034ms, stable_duration: 54.707703ms, unify_duration: 104.93092ms, total_duration: 0ns })
+./bird/part1/california_schools_13.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 19.656394089s, equiv_class_timed_out: true, smt_duration: 84.662139ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 591.336µs, normal_duration: 6.261123ms, stable_duration: 19.663773138s, unify_duration: 84.982725ms, total_duration: 0ns })
+./bird/part1/california_schools_14.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 148.491066ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 193.842µs, normal_duration: 2.306119ms, stable_duration: 152.499017ms, unify_duration: 10.477µs, total_duration: 0ns })
+./bird/part1/california_schools_15.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 172.51584ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 285.833µs, normal_duration: 3.428111ms, stable_duration: 176.254519ms, unify_duration: 279ns, total_duration: 0ns })
+./bird/part1/california_schools_16.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 494.782564ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 324.961µs, normal_duration: 1.424193763s, stable_duration: 500.480354ms, unify_duration: 421ns, total_duration: 0ns })
+./bird/part1/california_schools_17.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 672.641554ms, equiv_class_timed_out: false, smt_duration: 64.621709ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 446.138µs, normal_duration: 4.798858ms, stable_duration: 679.651367ms, unify_duration: 65.022787ms, total_duration: 0ns })
+./bird/part1/california_schools_18.json	Provable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 95.154752ms, equiv_class_timed_out: false, smt_duration: 42.832096ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 211.868µs, normal_duration: 2.454097ms, stable_duration: 98.46433ms, unify_duration: 43.024752ms, total_duration: 0ns })
+./bird/part1/california_schools_19.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 799.786796ms, equiv_class_timed_out: false, smt_duration: 123.374366ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 505.739µs, normal_duration: 6.099888ms, stable_duration: 809.078287ms, unify_duration: 127.164123ms, total_duration: 0ns })
+./bird/part1/california_schools_2.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.014528584s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 221.564µs, normal_duration: 2.532158ms, stable_duration: 10.018772744s, unify_duration: 624ns, total_duration: 0ns })
+./bird/part1/california_schools_20.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 115.332932ms, equiv_class_timed_out: false, smt_duration: 197.303362ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 179.88µs, normal_duration: 248.100128ms, stable_duration: 118.578133ms, unify_duration: 198.076394ms, total_duration: 0ns })
+./bird/part1/california_schools_21.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 2.773315582s, equiv_class_timed_out: false, smt_duration: 59.665271ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 427.075µs, normal_duration: 4.962791ms, stable_duration: 2.780561218s, unify_duration: 60.116697ms, total_duration: 0ns })
+./bird/part1/california_schools_22.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 468.648694ms, equiv_class_timed_out: false, smt_duration: 66.531425ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 591.837µs, normal_duration: 4.972356ms, stable_duration: 476.330656ms, unify_duration: 67.031826ms, total_duration: 0ns })
+./bird/part1/california_schools_25.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 10.002531025s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 348.007µs, normal_duration: 3.037321ms, stable_duration: 10.008414139s, unify_duration: 10.191µs, total_duration: 0ns })
+./bird/part1/california_schools_26.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 14.795106928s, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 600.142µs, normal_duration: 5.560929ms, stable_duration: 14.803804316s, unify_duration: 13.597µs, total_duration: 0ns })
+./bird/part1/california_schools_29.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.002892232s, equiv_class_timed_out: true, smt_duration: 18.270086824s, smt_timed_out: false, nontrivial_perms: true, translate_duration: 1.971831ms, normal_duration: 23.00805ms, stable_duration: 10.01584855s, unify_duration: 18.393055061s, total_duration: 0ns })
+./bird/part1/california_schools_3.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 723.993611ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 316.92µs, normal_duration: 3.025881ms, stable_duration: 730.461007ms, unify_duration: 11.54µs, total_duration: 0ns })
+./bird/part1/california_schools_30.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 60.43130492s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 739.081µs, normal_duration: 10.666555794s, stable_duration: 60.463855525s, unify_duration: 6.368µs, total_duration: 0ns })
+./bird/part1/california_schools_31.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 190.525322ms, equiv_class_timed_out: false, smt_duration: 161.870462ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 317.159µs, normal_duration: 3.698907ms, stable_duration: 195.092995ms, unify_duration: 162.318221ms, total_duration: 0ns })
+./bird/part1/california_schools_32.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.017291266s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 197.86µs, normal_duration: 2.268395ms, stable_duration: 10.021554694s, unify_duration: 612ns, total_duration: 0ns })
+./bird/part1/california_schools_33.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 197.476064ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 321.725µs, normal_duration: 3.241256ms, stable_duration: 201.850799ms, unify_duration: 602ns, total_duration: 0ns })
+./bird/part1/california_schools_34.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 237.73572ms, equiv_class_timed_out: false, smt_duration: 55.400545ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 207.206µs, normal_duration: 2.092041ms, stable_duration: 240.852847ms, unify_duration: 55.597007ms, total_duration: 0ns })
+./bird/part1/california_schools_35.json	Panic(Any { .. })
+./bird/part1/california_schools_36.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 126.443035ms, equiv_class_timed_out: false, smt_duration: 188.00785ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 237.151µs, normal_duration: 262.059819ms, stable_duration: 129.987171ms, unify_duration: 188.923176ms, total_duration: 0ns })
+./bird/part1/california_schools_37.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part1/california_schools_38.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 797.620678ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 214.154µs, normal_duration: 1.1933518s, stable_duration: 801.724395ms, unify_duration: 15.52µs, total_duration: 0ns })
+./bird/part1/california_schools_39.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 494.169588ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 414.373µs, normal_duration: 3.999568ms, stable_duration: 498.641605ms, unify_duration: 10.007µs, total_duration: 0ns })
+./bird/part1/california_schools_4.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 540.76387ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 296.235µs, normal_duration: 437.149961ms, stable_duration: 547.628625ms, unify_duration: 599ns, total_duration: 0ns })
+./bird/part1/california_schools_41.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 280.140857ms, equiv_class_timed_out: false, smt_duration: 218.127098ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 263.724µs, normal_duration: 620.699152ms, stable_duration: 284.151534ms, unify_duration: 218.927068ms, total_duration: 0ns })
+./bird/part1/california_schools_43.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 374.916575ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 424.574µs, normal_duration: 313.688408ms, stable_duration: 382.113757ms, unify_duration: 5.498µs, total_duration: 0ns })
+./bird/part1/california_schools_44.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 189.955704ms, equiv_class_timed_out: false, smt_duration: 230.7441ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 297.281µs, normal_duration: 378.175223ms, stable_duration: 193.605957ms, unify_duration: 231.627158ms, total_duration: 0ns })
+./bird/part1/california_schools_45.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 242.334371ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 311.201µs, normal_duration: 128.183068ms, stable_duration: 249.675586ms, unify_duration: 10.082µs, total_duration: 0ns })
+./bird/part1/california_schools_46.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 887.04273ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 310.429µs, normal_duration: 3.582977ms, stable_duration: 892.345165ms, unify_duration: 9.351µs, total_duration: 0ns })
+./bird/part1/california_schools_47.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 147.047312ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 190.081µs, normal_duration: 309.156344ms, stable_duration: 150.784894ms, unify_duration: 230ns, total_duration: 0ns })
+./bird/part1/california_schools_49.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.062109912s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 1.309723ms, normal_duration: 16.186238ms, stable_duration: 10.077615608s, unify_duration: 471ns, total_duration: 0ns })
+./bird/part1/california_schools_5.json	Panic(Any { .. })
+./bird/part1/california_schools_51.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 577.951439ms, equiv_class_timed_out: false, smt_duration: 226.035319ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 293.52µs, normal_duration: 1.036172116s, stable_duration: 581.797656ms, unify_duration: 227.023535ms, total_duration: 0ns })
+./bird/part1/california_schools_52.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 215.63921ms, equiv_class_timed_out: false, smt_duration: 203.667392ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 205.665µs, normal_duration: 387.633317ms, stable_duration: 219.345555ms, unify_duration: 204.487607ms, total_duration: 0ns })
+./bird/part1/california_schools_53.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 572.174453ms, equiv_class_timed_out: false, smt_duration: 62.481667ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 510.201µs, normal_duration: 4.544464ms, stable_duration: 579.758676ms, unify_duration: 62.88551ms, total_duration: 0ns })
+./bird/part1/california_schools_54.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 195.213068ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 248.349µs, normal_duration: 3.299335ms, stable_duration: 200.012818ms, unify_duration: 6.896µs, total_duration: 0ns })
+./bird/part1/california_schools_55.json	Provable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part1/california_schools_56.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 7.832340755s, equiv_class_timed_out: false, smt_duration: 236.003143ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 666.583µs, normal_duration: 6.19637ms, stable_duration: 7.853991434s, unify_duration: 239.531181ms, total_duration: 0ns })
+./bird/part1/california_schools_57.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 1.386961916s, equiv_class_timed_out: false, smt_duration: 119.540297ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 357.867µs, normal_duration: 4.21079ms, stable_duration: 1.394684224s, unify_duration: 123.611308ms, total_duration: 0ns })
+./bird/part1/california_schools_58.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 297.329242ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 301.264µs, normal_duration: 253.397851ms, stable_duration: 303.890893ms, unify_duration: 9.286µs, total_duration: 0ns })
+./bird/part1/california_schools_59.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 292.698051ms, equiv_class_timed_out: false, smt_duration: 49.007598ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 160.572µs, normal_duration: 1.897096ms, stable_duration: 296.370458ms, unify_duration: 49.205572ms, total_duration: 0ns })
+./bird/part1/california_schools_6.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 873.673826ms, equiv_class_timed_out: false, smt_duration: 122.976768ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 803.031µs, normal_duration: 5.687716ms, stable_duration: 880.804711ms, unify_duration: 125.621137ms, total_duration: 0ns })
+./bird/part1/california_schools_60.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 4.080796189s, equiv_class_timed_out: false, smt_duration: 1.403379821s, smt_timed_out: false, nontrivial_perms: true, translate_duration: 336.665µs, normal_duration: 2.901089ms, stable_duration: 4.08546615s, unify_duration: 1.416408555s, total_duration: 0ns })
+./bird/part1/california_schools_61.json	Provable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 185.031963ms, equiv_class_timed_out: false, smt_duration: 42.237248ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 161.823µs, normal_duration: 1.69854ms, stable_duration: 188.657219ms, unify_duration: 42.469009ms, total_duration: 0ns })
+./bird/part1/california_schools_62.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 389.496789ms, equiv_class_timed_out: false, smt_duration: 55.997424ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 325.363µs, normal_duration: 3.577392ms, stable_duration: 396.137276ms, unify_duration: 56.405134ms, total_duration: 0ns })
+./bird/part1/california_schools_63.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.004137072s, equiv_class_timed_out: true, smt_duration: 88.086965ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 638.694µs, normal_duration: 5.858239ms, stable_duration: 10.010758483s, unify_duration: 88.429525ms, total_duration: 0ns })
+./bird/part1/california_schools_64.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 1.950717289s, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 172.485µs, normal_duration: 1.898733ms, stable_duration: 1.954452148s, unify_duration: 385ns, total_duration: 0ns })
+./bird/part1/california_schools_65.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 188.137048ms, equiv_class_timed_out: false, smt_duration: 122.595103ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 382.661µs, normal_duration: 4.06632ms, stable_duration: 194.530118ms, unify_duration: 125.493401ms, total_duration: 0ns })
+./bird/part1/california_schools_66.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 1.700354353s, equiv_class_timed_out: false, smt_duration: 163.828441ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 652.759µs, normal_duration: 6.048228ms, stable_duration: 1.71979949s, unify_duration: 166.601672ms, total_duration: 0ns })
+./bird/part1/california_schools_7.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 178.829904ms, equiv_class_timed_out: false, smt_duration: 103.484381ms, smt_timed_out: false, nontrivial_perms: true, translate_duration: 398.268µs, normal_duration: 2.958127ms, stable_duration: 182.23658ms, unify_duration: 103.91419ms, total_duration: 0ns })
+./bird/part1/california_schools_70.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 110.551576ms, equiv_class_timed_out: false, smt_duration: 102.155332ms, smt_timed_out: false, nontrivial_perms: true, translate_duration: 183.807µs, normal_duration: 2.086881ms, stable_duration: 113.659665ms, unify_duration: 102.619517ms, total_duration: 0ns })
+./bird/part1/california_schools_71.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 3.697177154s, equiv_class_timed_out: false, smt_duration: 89.027174ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 579.733µs, normal_duration: 4.962619ms, stable_duration: 3.707417s, unify_duration: 89.63301ms, total_duration: 0ns })
+./bird/part1/california_schools_72.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.002670379s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 545.889µs, normal_duration: 5.79152ms, stable_duration: 10.007954386s, unify_duration: 6.698µs, total_duration: 0ns })
+./bird/part1/california_schools_74.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 837.370985ms, equiv_class_timed_out: false, smt_duration: 122.195389ms, smt_timed_out: false, nontrivial_perms: true, translate_duration: 287.183µs, normal_duration: 3.190376ms, stable_duration: 841.883951ms, unify_duration: 123.011086ms, total_duration: 0ns })
+./bird/part1/california_schools_76.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 1.587761239s, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 366.436µs, normal_duration: 3.382206ms, stable_duration: 1.592116721s, unify_duration: 10.942µs, total_duration: 0ns })
+./bird/part1/california_schools_77.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 10.002785156s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 635.979µs, normal_duration: 5.448706ms, stable_duration: 10.008006324s, unify_duration: 6.967µs, total_duration: 0ns })
+./bird/part1/california_schools_78.json	Panic(Any { .. })
+./bird/part1/california_schools_79.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 0ns, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 0ns, normal_duration: 0ns, stable_duration: 0ns, unify_duration: 0ns, total_duration: 0ns })
+./bird/part1/california_schools_8.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 191.470198ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 253.132µs, normal_duration: 160.026727ms, stable_duration: 197.506497ms, unify_duration: 6.865µs, total_duration: 0ns })
+./bird/part1/california_schools_80.json	Provable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 705.666338ms, equiv_class_timed_out: false, smt_duration: 248.184132ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 360.972µs, normal_duration: 2.203750413s, stable_duration: 713.034193ms, unify_duration: 252.804634ms, total_duration: 0ns })
+./bird/part1/california_schools_81.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 216.362837ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 385.445µs, normal_duration: 202.40625ms, stable_duration: 220.688613ms, unify_duration: 12.466µs, total_duration: 0ns })
+./bird/part1/california_schools_83.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 37.872822ms, equiv_class_timed_out: false, smt_duration: 177.718585ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 840.249µs, normal_duration: 125.928115ms, stable_duration: 41.026877ms, unify_duration: 178.198935ms, total_duration: 0ns })
+./bird/part1/california_schools_84.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 4.159976678s, equiv_class_timed_out: false, smt_duration: 61.96707ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 553.256µs, normal_duration: 5.377578ms, stable_duration: 4.169273772s, unify_duration: 62.504142ms, total_duration: 0ns })
+./bird/part1/california_schools_86.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 10.002388402s, equiv_class_timed_out: true, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 160.731µs, normal_duration: 1.947972ms, stable_duration: 10.00694028s, unify_duration: 726ns, total_duration: 0ns })
+./bird/part1/california_schools_87.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: true, equiv_class_duration: 469.576031ms, equiv_class_timed_out: false, smt_duration: 51.158898ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 160.294µs, normal_duration: 1.657835ms, stable_duration: 473.058792ms, unify_duration: 51.36159ms, total_duration: 0ns })
+./bird/part1/california_schools_89.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 287.326678ms, equiv_class_timed_out: false, smt_duration: 221.94338ms, smt_timed_out: false, nontrivial_perms: false, translate_duration: 210.343µs, normal_duration: 528.85135ms, stable_duration: 290.874526ms, unify_duration: 222.806188ms, total_duration: 0ns })
+./bird/part1/california_schools_9.json	NotProvable(Stats { provable: false, panicked: false, complete_fragment: false, equiv_class_duration: 136.894411ms, equiv_class_timed_out: false, smt_duration: 0ns, smt_timed_out: false, nontrivial_perms: false, translate_duration: 224.736µs, normal_duration: 114.612791ms, stable_duration: 142.620016ms, unify_duration: 7.677µs, total_duration: 0ns })
+Provable: 10 / 73

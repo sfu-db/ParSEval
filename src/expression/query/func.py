@@ -30,3 +30,6 @@ class Implies(exp.Condition):
 class Strftime(exp.Func):
     arg_types = {"this": True, "format": True, "culture": False}
 
+
+from sqlglot.generator import Generator
+Generator.TRANSFORMS[Is_Null] = lambda self, e: f"{self.sql(e, 'this')} IS NULL"
