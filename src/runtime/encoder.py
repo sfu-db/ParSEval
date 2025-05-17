@@ -214,9 +214,9 @@ class Encoder:
         st = self.encode(operator.this, **kwargs)
         metadata = []
         for index, expr in enumerate(operator.groupby):
-            logger.info(f"{expr}, {type(expr)}")
+            
             ref = int(expr.args.get('ref'))
-            logger.info(repr(expr))
+            
             metadata.append(InputRef(name= expr.name, index= index, typ= expr.args.get("datatype").this.name, nullable= False, unique= True, table = st.metadata['table'][ref].table))
         
         for agg_func in operator.agg_funcs:
@@ -287,8 +287,7 @@ class Encoder:
         outputs = sorted_pure(st.data, key = lambda row: tuple(row[sort_key['column']] for sort_key in sort_keys), reverse=('DESCENDING' in direction))
         offset = int(operator.offset) or 0
         limit = operator.limit or 100
-        if offset > 0 or limit < 100:
-            outputs = outputs[offset : offset + limit]
+        
 
         tuples = set()
         predicates = []
@@ -302,6 +301,10 @@ class Encoder:
             sql_conditions.append(exp.to_column(f"${sort_key['column']}", datatype = exp.DataType.build(dtype= sort_key.get('type'))))
         metadata = self.update_metadata(st.metadata)
         self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, [True] * len(sort_keys), 1, metadata, tuples = tuples)
+
+        if offset > 0 or limit < 100:
+            outputs = outputs[offset : offset + limit]
+            
         st = SymbolTable(_id = operator.i(), data = outputs, metadata= st.metadata)
         self.add.advance(operator.key, operator.i())
         return st

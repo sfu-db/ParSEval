@@ -41,26 +41,15 @@ class UExprToConstraint:
             if node.operator_key != 'ROOT' and not node.tuples.intersection(tuples):
                 continue
             for smt_expr, condition, taken in zip(predicates, sql_conditions, takens):
-
                 node = node.add_child(operator_key, operator_i, condition, smt_expr, branch = branch, metadata = metadata, taken = taken, tuples = tuples)
-                
-            
-            # if operator_key in {'project'}:
-            #     self.positive_path[f'{operator_key}_{operator_i}'].clear()
-            #     self.positive_path[f'{operator_key}_{operator_i}'].append(node)
-            # el
             if branch and node not in self.positive_path[f'{operator_key}_{operator_i}']:
                 self.positive_path[f'{operator_key}_{operator_i}'].append(node)
-
-            # if branch and node not in self.positive_path[f'{operator_key}_{operator_i}']:
-            #     self.positive_path[f'{operator_key}_{operator_i}'].append(node)
         return node
 
     def _determine_action(self, plausible: PlausibleChild) -> Action:
         parent = plausible.parent
         # if plausible.branch_type == BranchType.POSITIVE and len(parent.delta) > 2:
         #     return Action.DONE
-
         if parent.constraint_type in {PathConstraintType.SIZE, PathConstraintType.PATH}:
             return Action.APPEND
         # if plausible.branch_type == BranchType.PLAUSIBLE and len(plausible.sibling().delta) > 1:
@@ -102,14 +91,24 @@ class UExprToConstraint:
             else:
                 branches['unreachable'].append((plausible, pattern))
         plausible, pattern = None, None
-        if not branches['uncovered'] and branches['positive']:
-            plausible, pattern = branches['positive'][-1] #random.choice()
-        elif branches['uncovered']:
-            plausible, pattern = branches['uncovered'][0]
-        if plausible:
-            action = self._determine_action(plausible)
-            if action == Action.APPEND:
+        
+        if branches['positive']:
+            '''
+                For all positive branches, we should consider NULL values, Duplicate, SIZE
+            '''
+            positives = sorted(branches['positive'], key = lambda node: len(node[0].parent.delta))
+            plausible, pattern =  positives[0]
+            if len(plausible.parent.delta) < 2 and pattern not in skips:
                 self._handle_tuple_append(instance, plausible, pattern)
+            
+        # if not branches['uncovered'] and branches['positive']:
+        #     plausible, pattern = branches['positive'][-1] #random.choice()
+        # elif branches['uncovered']:
+        #     plausible, pattern = branches['uncovered'][0]
+        # if plausible:
+        #     action = self._determine_action(plausible)
+        #     if action == Action.APPEND:
+        #         self._handle_tuple_append(instance, plausible, pattern)
         return pattern
        
     def _get_involved_tables_path(self, plausible: PlausibleChild):

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS `schools` (`CDSCode` TEXT, `NCESDist` TEXT, `NCESScho
 
 # sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 INNER JOIN satscores AS T2 on T1.CDSCode = T2.cds where T1.`Academic Year` <> '2023' or T1.`District Code` > 15 """ 
 
-sql = """SELECT  T1.`CDSCode`  FROM frpm AS T1  where T1.`Academic Year` <> '2023' or T1.`District Code` > 15 GROUP BY T1.`CDSCode`""" 
+sql = """SELECT  T1.`CDSCode`  FROM frpm AS T1  where T1.`Academic Year` <> '2023' or T1.`District Code` > 15""" 
 
 # ORDER BY T2.`NumGE1500`
 # sql = """SELECT T1.`Academic Year`, T1.CDSCode FROM frpm AS T1 where T1.`District Code` > 15 or T1.`Academic Year` <> '2023'  """ 
@@ -53,6 +53,7 @@ logging.basicConfig(
 # print(a > z3.CharVal('2023'))
 
 class TestGenerator(unittest.TestCase):
+    @unittest.skip("skip covaerage")
     def test_executor(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
 
@@ -67,10 +68,22 @@ class TestGenerator(unittest.TestCase):
 
         # if result:
         #     generator.instance.to_
-
-        
-
         print(result)
+    def test_generate(self):
+        from src.instance.generators import ValueGeneratorRegistry, register_default_generators
+
+        register_default_generators()
+        from src.instance.instance import Instance
+        from src.runtime.generator import Generator
+
+        generator = Generator('tests/db', schema, sql, name = 'test')
+        print(generator.plan)        
+        result =generator.generate()
+
+        # if result:
+        #     generator.instance.to_
+        # print(result)
+
 if __name__ == '__main__':
     reset_folder('tests/db')
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)

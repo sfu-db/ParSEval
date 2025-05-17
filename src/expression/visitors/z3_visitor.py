@@ -70,8 +70,7 @@ class Z3Visitor(ExprVisitor):
     def visit_EQ(self, expr: EQ) -> Any:
         left = self.visit(expr.left)
         right = self.visit(expr.right)
-        print(f'left: {left}, sort: {left.sort()}, {expr}')
-        print(f'right: {right}, sort: {right.sort()}, {expr.right}')
+        
         return self.visit(expr.left) == self.visit(expr.right)
         
     def visit_NEQ(self, expr: NEQ) -> Any:
