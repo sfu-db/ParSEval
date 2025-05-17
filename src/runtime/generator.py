@@ -9,6 +9,7 @@ from .constant import Action
 from src.solver.solver import Solver
 import logging
 
+logger = logging.getLogger('src.parseval.generator')
 
 class Generator:
     def __init__(self, workspace, schema, query, dialect = 'sqlite', **kwargs):
@@ -43,21 +44,22 @@ class Generator:
     
 
     def get_coverage(self, instance, **kwargs):
-        instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
-        values = {
-            'frpm': [
-                {'Academic Year': "2024", "District Code": 16, 'CDSCode': "CDSCode1"},
-                {'Academic Year': "2024", "District Code": 15, 'CDSCode': "CDSCode1"},
-                {'Academic Year': "2023", "District Code": 16},
-                {'Academic Year': "2023", "District Code": 15}
-            ],
-            'satscores': [
-                {'cds': "CDSCode1"}
-            ]
-        }
-        for tbl, value in values.items():
-            for val in value:
-                instance.create_row(tbl, val)
+        if instance is None:
+            instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
+            values = {
+                'frpm': [
+                    {'Academic Year': "2024", "District Code": 16, 'CDSCode': "CDSCode1"},
+                    {'Academic Year': "2024", "District Code": 15, 'CDSCode': "CDSCode1"},
+                    {'Academic Year': "2023", "District Code": 16},
+                    {'Academic Year': "2023", "District Code": 15}
+                ],
+                'satscores': [
+                    {'cds': "CDSCode1"}
+                ]
+            }
+            for tbl, value in values.items():
+                for val in value:
+                    instance.create_row(tbl, val)
         
         self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
         self.encoder = Encoder(self.path)
@@ -67,6 +69,54 @@ class Generator:
         print(display_constraints(self.path.root_constraint))
         print(st)
         instance.to_db(self.workspace, database = self.name + '.sqlite')
+
+    def generate(self, max_iter = 8, **kwargs):
+        skips = set()
+        size = 1
+        instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
+        for tbl in instance._tables:
+            instance.create_row(tbl, {})
+
+
+        for _ in range(max_iter):
+            self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
+            self.encoder = Encoder(self.path)
+            self.reset()
+            st = self.encoder(self.plan, instance = instance)
+            pattern = self.path.next_branch(instance)
+
+            logger.info(pattern)
+            target_vars = self.constraints.pop('variable', [])
+
+            solver = Solver(target_vars)
+            for label, constraints in self.constraints.items():
+                solver.append(constraints)
+            db_constraints = instance.get_db_constraints()
+            solver.appendleft(db_constraints.pop('SIZE'))
+            for label, constraints in db_constraints.items():
+                if constraints:
+                    flag = solver.add_conditional(constraints)
+
+            concretes = None
+            if solver.check():
+                logging.info(f'solved : {pattern}')
+            else:
+                skips.add(pattern)
+                logging.info(f'unsat: {pattern}')
+            concretes = solver.model()
+            instance.update_values(concretes)
+            logging.info(self.constraints)
+            logger.info(concretes)
+            
+            
+
+
+        self.get_coverage(instance)
+
+
+
+        
+
 
 
     def _one_execution(self, max_iter = 8, **kwargs):
