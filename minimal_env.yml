@@ -1,0 +1,13 @@
+name: /home/chunyu/Projects/Dockers/autotest/.conda
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - requests
+  - pandas
+  - fasteners
+  - sqlalchemy
+  - ipykernel
+  - graphviz
+prefix: /home/chunyu/Projects/Dockers/autotest/.conda
