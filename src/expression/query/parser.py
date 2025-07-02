@@ -11,6 +11,7 @@ from .rel import *
 from src.exceptions import *
 import json, math, logging
 
+from sqlglot.optimizer import simplify
 
 RELOP = 'relOp'
 CONDITION = 'condition'
@@ -34,7 +35,6 @@ BINARY_OPERATORS = {
     "PLUS": 'exp.Add',
     "MINUS": 'exp.Sub',
     "TIMES": 'exp.Mul',
-    "DIVIDE": 'exp.Div',
     "AND" : 'exp.And',
     "OR": 'exp.Or',
     "PLUS": 'exp.Add',
@@ -152,6 +152,8 @@ class QParser(Dialect):
         if isinstance(schema, str):
             schema = schema.split(';')
         raw = get_logical_plan(ddl= schema, queries= [sql])
+        with open("datasets/bird/plan/california_schools_5_gold.sql") as fp:
+            raw = fp.read()
         src = json.loads(raw)[0]
         if src['state'] == 'SYNTAX_ERROR':
             raise QuerySyntaxError(src['error'])
@@ -160,6 +162,16 @@ class QParser(Dialect):
         root = self.walk(json.loads(src.get('plan')))
         root.set('dialect', self)
         return root
+    
+    def explain_local(self, plan_path) -> Step:
+                
+        with open(plan_path) as fp:
+            plan = fp.read()
+            root = self.walk(json.loads(plan))
+            root.set('dialect', self)
+            return root
+    
+
         
     def walk(self, node):
         fname = None
@@ -191,7 +203,8 @@ class QParser(Dialect):
     
     def on_filter(self, node):
         this = self.walk(node.pop('inputs')[0])
-        condition = self.walk(node.pop(CONDITION))
+        # simplify.simplify()
+        condition = simplify.simplify(self.walk(node.pop(CONDITION)))
         parameters = {k: v for k, v in node.items() if k != 'inputs'}
         return Filter(this = this, condition = condition, **parameters)
     
@@ -298,6 +311,14 @@ class QParser(Dialect):
             this = self.walk(operands[index])
             true = self.walk(operands[index + 1])
             ifs.append(exp.If(this = this, true = true))
+            # logging.info(f"this: {this}, true: {true}")
+        # if len(ifs) == 1 and \
+        #     isinstance(ifs[0], exp.EQ) and \
+        #         isinstance(ifs[0].this, exp.Column) and \
+        #             isinstance(ifs[0].this.expression, exp.Literal) and \
+        #                 ifs[0].this.expression.name == '0.0':
+        #     return default
+            
         return exp.Case( ifs = ifs, default = default)
 
     def on_in(self, node):

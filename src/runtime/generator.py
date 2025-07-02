@@ -18,7 +18,7 @@ class Generator:
         self.query = query
         self.dialect = dialect
         self.name = kwargs.get('name', 'public')
-        self.plan = self.parser(query, schema)
+        self.plan = self.parser_local(query)
         self.constraints = OrderedDict()
         # defaultdict(list)
         self.variables = set()
@@ -27,6 +27,11 @@ class Generator:
         from src.expression.query import parser
         parse = parser.QParser()
         self.plan = parse.explain(query, schema)
+        return self.plan
+    def parser_local(self, fp):
+        from src.expression.query import parser
+        parse = parser.QParser()
+        self.plan = parse.explain_local(fp)
         return self.plan
 
     def add_constraint(self, constraints, label):
@@ -49,7 +54,7 @@ class Generator:
             values = {
                 'frpm': [
                     {'Academic Year': "2024", "District Code": 16, 'CDSCode': "CDSCode1"},
-                    {'Academic Year': "2024", "District Code": 15, 'CDSCode': "CDSCode1"},
+                    {'Academic Year': "2024", "District Code": 15},
                     {'Academic Year': "2023", "District Code": 16},
                     {'Academic Year': "2023", "District Code": 15}
                 ],
@@ -66,26 +71,33 @@ class Generator:
         self.reset()
         st = self.encoder(self.plan, instance = instance)
         from .to_dot import display_constraints
-        print(display_constraints(self.path.root_constraint))
-        print(st)
+        
+        graph = display_constraints(self.path.root_constraint)
+        # graph.write_pdf(self.workspace + "/cov.pdf")    # PDF
+        graph.write_png(self.workspace + f"/{self.name}_cov.png")
+        
+        print("****" * 20)
+        print(f"SymbolTable Shape: {len(st.data)}")
         instance.to_db(self.workspace, database = self.name + '.sqlite')
+        return st
 
     def generate(self, max_iter = 8, **kwargs):
         skips = set()
+        solved = []
         size = 1
         instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
         for tbl in instance._tables:
             instance.create_row(tbl, {})
-
 
         for _ in range(max_iter):
             self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
             self.encoder = Encoder(self.path)
             self.reset()
             st = self.encoder(self.plan, instance = instance)
-            pattern = self.path.next_branch(instance)
+            pattern = self.path.next_branch(instance, skips, solved)
 
-            logger.info(pattern)
+            if pattern is None and st.data:
+                break
             target_vars = self.constraints.pop('variable', [])
 
             solver = Solver(target_vars)
@@ -99,19 +111,19 @@ class Generator:
 
             concretes = None
             if solver.check():
+                solved.append(pattern)
                 logging.info(f'solved : {pattern}')
+                
             else:
                 skips.add(pattern)
                 logging.info(f'unsat: {pattern}')
+                logging.info(self.constraints)
             concretes = solver.model()
+            # logger.info(concretes)
             instance.update_values(concretes)
-            logging.info(self.constraints)
-            logger.info(concretes)
-            
-            
-
-
         self.get_coverage(instance)
+
+        return st
 
 
 

@@ -1,6 +1,6 @@
 from .base import ExprVisitor
 
-from .substitution import substitute, extend_summation
+from .substitution import substitute, extend_summation, extend_distinct
 
 from .predicate_tracker import PredicateTracker, get_predicates
 

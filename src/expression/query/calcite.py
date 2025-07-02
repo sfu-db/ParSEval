@@ -128,7 +128,7 @@ FUNCTION_DEF = [
     {
         "type": "SCALAR",
         "identifier": "STRFTIME",
-        "parameters": ["STRING", "STRING"],
+        "parameters": ["DATE", "STRING"],
         "return_type": "STRING"
       },
       {
