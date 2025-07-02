@@ -8,7 +8,6 @@ from src.expression.symbol import Expr
 import logging
 logger = logging.getLogger('src.parseval.constraitn')
 
-
 class PlausibleChild:
     def __init__(self, parent, branch_type: BranchType, tree):
         self.parent = parent
@@ -44,7 +43,8 @@ class Constraint:
                  delta: List = None,
                  sql_condition: exp.Condition = None, 
                  taken: Optional[bool] = None, 
-                 constraint_type: PathConstraintType = PathConstraintType.UNKNOWN, metadata = None, **kwargs):
+                 constraint_type: PathConstraintType = PathConstraintType.UNKNOWN,
+                 info = None, **kwargs):
         self.tree = tree
         self.parent: Optional[Constraint] = parent
         self.children: Dict[str, Constraint] = {}
@@ -54,8 +54,8 @@ class Constraint:
         self.sql_condition = sql_condition
         self.taken = taken
         self.constraint_type = constraint_type
-        self.metadata = metadata
-        self.tuples = set()
+        self.info = info
+        self.tuples: List[List] = []
         self._pattern = None
         self.path = None
         self.tables = None
@@ -82,11 +82,17 @@ class Constraint:
     def get_tables(self) -> List:
         if self.tables:
             return self.tables
-        self.tables = []
-        for inputref in self.metadata['table']:
-            if inputref.table not in self.tables:
-                self.tables.append(inputref.table)
+        tables = set()
+        for inputref in self.info['table']:
+            tables.update(inputref.table)
+        self.tables = list(tables)
         return self.tables
+
+    def get_all_tuples(self)-> Set:
+        all_tuples = set()
+        for t in self.tuples:
+            all_tuples.update(t)
+        return all_tuples
 
     def upsert_plausible_node(self, branch_type):
         '''
@@ -95,11 +101,12 @@ class Constraint:
             1. If current node has no sibling or sibling is a PlausibleChild, add plausible node to current node's parent node
             2. if bit in current node's children, update branch type accordingly, else, add a PlausibleChild to current node
         '''
+        # logger.info(f'branch_type: {branch_type}')
         branch_type = BranchType.from_value(branch_type)
+        # logger.info(f"{self.constraint_type} --> {self.operator_key}, {self.sql_condition}, {branch_type}")
 
         if self.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
             bit =self.tree.yes_bit if branch_type else self.tree.no_bit
-        
             if bit not in self.children:
                 plausible_child = PlausibleChild(self, branch_type, self.tree)
                 self.children[bit] = plausible_child
@@ -108,21 +115,26 @@ class Constraint:
             elif isinstance(self.children[bit], Constraint):
                 self.children[bit].branch_type = branch_type
         
-            if not self.sibling() or isinstance(self.sibling(), PlausibleChild):
+            if not self.sibling() or isinstance(self.sibling(), PlausibleChild) :
                 bit = self.tree.yes_bit if self.bit() == self.tree.no_bit else self.tree.no_bit
                 plausible_child = PlausibleChild(self.parent, BranchType.PLAUSIBLE, self.tree)
                 self.parent.children[bit] = plausible_child
                 self.tree.leaves.pop(self.parent.pattern(), None)
                 self.tree.leaves[self.parent.pattern() + bit] = plausible_child
-        
-        
         elif self.constraint_type == PathConstraintType.SIZE:
-            bit = self.tree.yes_bit
+            bit = self.tree.yes_bit if self.taken else self.tree.no_bit
             if bit not in self.children:
                 plausible_child = PlausibleChild(self, branch_type, self.tree)
                 self.children[bit] = plausible_child
                 self.tree.leaves.pop(self.parent.pattern(), None)
                 self.tree.leaves[self.pattern()] = plausible_child
+
+            null_bit = self.tree.no_bit if self.taken else self.tree.yes_bit
+            if  self.sql_condition.key in {'count', 'sum', 'max', 'min', 'avg'} and null_bit not in self.children:
+                plausible_child = PlausibleChild(self, BranchType.NULLABLE, self.tree)
+                self.children[null_bit] = plausible_child
+                self.tree.leaves.pop(self.parent.pattern(), None)
+                self.tree.leaves[self.pattern() + null_bit] = plausible_child
 
 
     def __repr__(self):
@@ -155,15 +167,17 @@ class Constraint:
             Return
                 SIZE, VALUE, PATH
         '''
-        if isinstance(condition, (exp.Count, exp.Exists, exp.Column, exp.Case)):
+        if isinstance(condition, (exp.Count, exp.Exists, exp.Column, exp.Case, exp.AggFunc)):
             return PathConstraintType.SIZE
-        if isinstance(condition, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)):
+        if isinstance(condition, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Like)):
             if isinstance(condition.expression, exp.Literal):
                 return PathConstraintType.VALUE
             if isinstance(condition.this, exp.Column) and isinstance(condition.expression, exp.Column):
                 return PathConstraintType.PATH
         elif condition.key == 'is_null':
             return PathConstraintType.VALUE
+        elif isinstance(condition, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
+            return PathConstraintType.SIZE
         elif isinstance(condition, exp.Unary):            
             return self._analyze_constraint_type(operator_key, condition.this)
         else:
@@ -174,9 +188,8 @@ class Constraint:
             sql_condition = negate_sql_condition(sql_condition)
         return sql_condition
     
-    def add_child(self, operator_key, operator_i, sql_condition: exp.Condition, symbolic_expr, branch, metadata, taken: bool, tuples, **kwargs):        
+    def add_child(self, operator_key, operator_i, sql_condition: exp.Condition, symbolic_expr, branch, info, taken: bool, tuples, **kwargs):        
         child_node = self.find_child(operator_key, operator_i, taken)
-        # logger.info(f'{operator_key}, {operator_i}, {taken}, {child_node}')
         if child_node is None:
             constraint_type = self._analyze_constraint_type(operator_key, sql_condition)
             sql_condition = self._analyze_sql_condition(operator_key, sql_condition, taken)
@@ -190,14 +203,17 @@ class Constraint:
                 taken = taken, 
                 constraint_type= constraint_type,
                 sql_condition= sql_condition,
-                metadata = metadata
-                )
+                info = info
+            )
             self.children[bit] = child_node
             child_node.upsert_plausible_node(branch)
-        p = symbolic_expr if taken else symbolic_expr.not_()
+        p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
+        if child_node.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
+            p = [symbolic_expr if taken else symbolic_expr.not_()]
         
-        child_node.delta.append(p)
-        child_node.tuples.update(tuples)
+        child_node.delta.extend(p)
+        child_node.tuples.append(tuples)
+        child_node.info.update(info)
         return child_node
     
     def find_child(self, operator_key, operator_i, taken):

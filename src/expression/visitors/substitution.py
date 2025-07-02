@@ -1,5 +1,5 @@
-from typing import Any, Dict, Optional
-from ..symbol.base import Expr, Or, And, Not
+from typing import Any, Dict, Optional, Union
+from ..symbol.base import Expr, Or, And, Not, Distinct, distinct, Variable
 from .base import ExprVisitor
 
 class SubstitutionVisitor(ExprVisitor):
@@ -128,10 +128,33 @@ class SubstitutionVisitor(ExprVisitor):
     def visit_Or(self, expr: Expr) -> Expr:
         """Transform Or expressions by visiting their operands"""
         return self.visit_Nary(expr)
-    # def visit_Is_Null(self, expr):
-    #     return self.visit_Unary(expr)
-    # def visit_Not(self, expr) -> Any:
-    #     return self.visit_Unary(expr)
+    def visit_StrToInt(self, expr: Expr) -> Expr:
+        return self.visit_Unary(expr)
+    
+    def visit_IntToStr(self, expr: Expr)    -> Expr:
+        return self.visit_Unary(expr)
+    
+    def visit_Strftime(self, expr: Expr):
+        operand = expr.this.transform(self)
+        
+        if self.inplace:
+            # Update the existing expression in place
+            expr.set('this', operand)
+            return expr
+        else:
+            # Create new expression with transformed operand
+            new_expr = expr.__class__(
+                this=operand,
+                value=expr.value,
+                format = expr.args.get('format')
+            )
+            # Set parent and arg_key relationships
+            operand.parent = new_expr
+            operand.arg_key = 'this'
+            # operand.format = 
+            return new_expr
+        
+        return self.visit_Unary(expr)
 
     visit_Is_Null = visit_Not = visit_Unary
     def generic_visit(self, expr: Expr) -> Any:
@@ -147,7 +170,8 @@ BINARY_OPS =  {
         'GT': '>',
         'GTE': '≥',
         'LT': '<',
-        'LTE': '≤'
+        'LTE': '≤',
+        'LIKE': 'LIKE'
     }
 for op in BINARY_OPS:
     setattr(SubstitutionVisitor, f'visit_{op}' , getattr(SubstitutionVisitor, 'visit_Binary'))
@@ -194,3 +218,22 @@ def extend_summation(expr: Expr, substitutions: Dict[Expr, Expr], inplace: bool 
         return Not(this = extend_summation(expr.this, substitutions, inplace))
     else:
         return substitute(expr, substitutions, inplace)
+    
+
+def extend_distinct(expr: Union[Distinct, Variable], substitutions: Dict[Expr, Expr], inplace: bool = False, extend = False):
+    assert isinstance(expr, (Distinct, Variable)), f"should only handle distinct expression, get {type(expr)}"
+    operands = set()
+
+    if isinstance(expr, Variable):
+        expr = distinct([expr])
+        
+    # operands.add(substitute(replaced, substitutions))
+    
+    for operand in expr.operands:
+        operands.add(operand)
+        operands.add(substitute(operand, substitutions))
+    
+    return distinct(list(operands))
+
+        
+

@@ -25,6 +25,7 @@ class BranchType(Enum):
     ROOT = 3
     PLAUSIBLE = 4
     UNREACHABLE = 5
+    NULLABLE = 6
     
     def __bool__(self):
         return self in {BranchType.POSITIVE, BranchType.STRAIGHT}

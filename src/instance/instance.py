@@ -210,32 +210,59 @@ class Instance:
 
     def _get_foreign_key_constraints(self) -> List[Expr]:
         fk_constraints = []
+        for to_table_name, fk_info in self._foreign_key_cache.items():
+            # logger.info(f"{to_table_name} --> {fk_info}")
 
-        for from_table_name, fk_info in self._foreign_key_cache.items():
             for local_col, (ref_table, ref_col) in fk_info.items():
-                from_table = self.get_table(from_table_name)
-                to_table = self.get_table(ref_table)
+                to_table = self.get_table(to_table_name)
+                from_table = self.get_table(ref_table)
                 smt_exprs = []
-                for ref_row in to_table:
-                    to_data = ref_row[to_table.get_column_index(ref_col)]
+
+                for to_row in to_table:
+                    to_data = to_row[to_table.get_column_index(local_col)]
                     exprs = []
                     for from_row in from_table:
-                        from_data = from_row[from_table.get_column_index(local_col)]
+                        from_data = from_row[from_table.get_column_index(ref_col)]
                         cond1 = to_data == from_data
-                        cond2 = ref_row.multiplicity >= from_row.multiplicity
+                        cond2 = from_row.multiplicity >= to_row.multiplicity
                         exprs.append(cond1.and_(cond2))
                     smt_exprs.append(or_(exprs))
+
+
+
+
+
+
+                # for ref_row in to_table:
+                #     to_data = ref_row[to_table.get_column_index(ref_col)]
+                #     exprs = []
+                #     for from_row in from_table:
+                #         from_data = from_row[from_table.get_column_index(local_col)]
+                #         cond1 = to_data == from_data
+                #         cond2 = ref_row.multiplicity >= from_row.multiplicity
+                #         exprs.append(cond1.and_(cond2))
+                #     smt_exprs.append(or_(exprs))
                 fk_constraints.append(and_(smt_exprs))
         return fk_constraints
     def _get_size_constraints(self) -> List[Expr]:
         size_constraints = []
-        for from_table_name, fk_info in self._foreign_key_cache.items():
+        for to_table_name, fk_info in self._foreign_key_cache.items():
             for local_col, (ref_table, ref_col) in fk_info.items():
-                from_table = self.get_table(from_table_name)
-                to_table = self.get_table(ref_table)
-                to_table_size = [to_row.multiplicity for to_row in to_table]
-                from_table_size = [from_row.multiplicity for from_row in from_table]
+                to_table = self.get_table(to_table_name)
+                from_table = self.get_table(ref_table)
+                from_table_size = [row.multiplicity for row in from_table]
+                to_table_size = [row.multiplicity for row in to_table]
+            
                 size_constraints.append(sum(to_table_size) <= sum(from_table_size))
+
+
+        # for from_table_name, fk_info in self._foreign_key_cache.items():
+        #     for local_col, (ref_table, ref_col) in fk_info.items():
+        #         from_table = self.get_table(from_table_name)
+        #         to_table = self.get_table(ref_table)
+        #         to_table_size = [to_row.multiplicity for to_row in to_table]
+        #         from_table_size = [from_row.multiplicity for from_row in from_table]
+        #         size_constraints.append(sum(to_table_size) <= sum(from_table_size))
         return size_constraints
 
     def get_db_constraints(self)-> Dict[str, List[Expr]]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple, TYPE_CHECKING, Optional, Set, Union
 from src.expression.visitors.z3_visitor import Z3Visitor, LABELED_NULL
+from src.expression.types import DataType
 from collections import deque
 
 if TYPE_CHECKING:
@@ -76,7 +77,11 @@ class Solver:
             expr = [expr]
         visitor = Z3Visitor(self.variable_mapping, self.symbol_mapping)
         for e in expr:
+            
             smt_expr = e.accept(visitor)
+            if "IS NULL" in str(e):
+                import logging 
+                logging.info(f"IS NULL CONSTRAING: {e}, smt: {smt_expr}")
             self.coverage_expressions.insert(0, smt_expr)        
                 
     def check(self) -> bool:
@@ -91,7 +96,6 @@ class Solver:
             else:
                 self.solver.pop(num = 1)
                 sat = False
-        
         self.log_smt()
         return sat
     
@@ -103,8 +107,13 @@ class Solver:
     def preprocess(self) -> List[z3.ExprRef]:
         smt_exprs = []
         for v_name, symbol in self.symbol_mapping.items():
+                # smt_exprs.append(self.ensure_printable(symbol))
+            if self.variable_mapping[v_name].dtype.is_type(*DataType.TEMPORAL_TYPES):
+                smt_exprs.append(self.ensure_datetime(symbol))
+                
             if isinstance(symbol.sort(), z3.SeqSortRef):
                 smt_exprs.append(z3.Length(symbol) > 0)
+            
         visitor = Z3Visitor(self.variable_mapping, self.symbol_mapping)
         for v_name, variable in self.variable_mapping.items():
             if variable in self.target_vars:
@@ -113,6 +122,60 @@ class Solver:
             smt_exprs.append(e.accept(visitor))
         
         return smt_exprs
+    def ensure_datetime(self, s):
+        # Extract substrings
+        year    = z3.SubString(s, 0, 4)
+        month   = z3.SubString(s, 5, 2)
+        day     = z3.SubString(s, 8, 2)
+        hour    = z3.SubString(s, 11, 2)
+        minute  = z3.SubString(s, 14, 2)
+        second  = z3.SubString(s, 17, 2)
+        ms      = z3.SubString(s, 20, 3)
+
+        # Convert to integers
+        year_i    = z3.StrToInt(year)
+        month_i   = z3.StrToInt(month)
+        day_i     = z3.StrToInt(day)
+        hour_i    = z3.StrToInt(hour)
+        minute_i  = z3.StrToInt(minute)
+        second_i  = z3.StrToInt(second)
+        ms_i      = z3.StrToInt(ms)
+
+        digit = z3.Range('0', '9')
+        two_digits = z3.Concat(digit, digit)
+        three_digits = z3.Concat(digit, digit, digit)
+        four_digits = z3.Concat(digit, digit, digit, digit)
+
+        # YYYY/MM/DD HH:MM:SS.mmm
+        datetime_re = z3.Concat(
+            four_digits, z3.Re('-'),
+            two_digits, z3.Re('-'),
+            two_digits, z3.Re(' '),
+            two_digits, z3.Re(':'),
+            two_digits, z3.Re(':'),
+            two_digits, z3.Re('.'),
+            three_digits
+        )
+        smt_exprs = [year_i >= 1900, year_i <= 2100, month_i >= 1,  month_i <= 12
+                    ,hour_i >= 0,    hour_i <= 23,
+                    day_i >= 1,     day_i <= 31,
+                     minute_i >= 0,  minute_i <= 59,
+                     second_i >= 0,  second_i <= 59 ,
+                      ms_i >= 0,      ms_i <= 999,
+                      z3.InRe(s, datetime_re)]
+        
+        return z3.And(*smt_exprs)
+
+        
+    def ensure_printable(self, s):
+        # ASCII printable range: from code point 32 (' ') to 126 ('~')
+        ascii_printable = z3.Range(chr(32), chr(126))
+
+        # Require the string to be made of printable ASCII chars only
+        ascii_printable_word = z3.Plus(ascii_printable)  # allows zero or more
+        # Constraint: s ∈ ascii_printable_word
+        constraint =z3.InRe(s, ascii_printable_word)
+        return constraint
         
     def log_smt(self):
         if self.debug:

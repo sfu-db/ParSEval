@@ -42,22 +42,17 @@ class UExprToConstraint:
     def which_branch(self, operator_key: OperatorKey, operator_i: OperatorId, predicates: List[Expr], sql_conditions: List, takens: List[bool], branch, infos: List[Dict[str, Any]], tuples, **kwargs):
         """
             For each operator, we should track all possible predicates, since we are using concrete values, we could know which path is covered.
-            predicates: all predicates
-            sql_conditions: all sql conditions in operator
-            takens: if value of each predicate
-            branch: positive or negative
-            infos: tables in each tuple
-            tuples: tuples in each line
         """
-        assert len(infos) == len(sql_conditions), f"infos: {len(infos)}, sql_conditions: {len(sql_conditions)}"
-        for node in self.positive_path[self.prev_operator]: # positive_nodes
-            if node.operator_key != 'ROOT' and not node.get_all_tuples().intersection(tuples): # node.tuples.intersection(tuples)
+        assert len(infos) == len(sql_conditions)
+        for node in self.positive_path[self.prev_operator]: #positive_nodes
+            if node.operator_key != 'ROOT' and not node.tuples.intersection(tuples):
                 continue
             for smt_expr, condition, taken, info in zip(predicates, sql_conditions, takens, infos):
                 node = node.add_child(operator_key, operator_i, condition, smt_expr, branch = branch, info = info, taken = taken, tuples = tuples,**kwargs)
+
             if branch and node not in self.positive_path[f'{operator_key}_{operator_i}']:
                 self.positive_path[f'{operator_key}_{operator_i}'].append(node)
-        # return node
+        return node
 
     def _determine_action(self, plausible: PlausibleChild) -> Action:
         parent = plausible.parent
@@ -105,6 +100,7 @@ class UExprToConstraint:
                 if parent_node.operator_key in {'aggregate', 'aggfunc'}:
                     """we consider group count and group size here"""
                     return self._is_covered_aggregate(parent_node)
+                        # return len(set(sizes)) != len(sizes)
                 if len(parent_node.delta) < BRANCH_HIT:
                     return False
                 null_values = [variable.is_null() for variable in parent_node.delta]
@@ -142,7 +138,6 @@ class UExprToConstraint:
             'positive': [],
             'negative': [],
             'uncovered': [],
-            'nullable': [],
             'unreachable': []
         }
         for pattern, plausible in self.leaves.items():
@@ -152,8 +147,6 @@ class UExprToConstraint:
                 branches['negative'].append((plausible, pattern))
             elif plausible.branch_type == BranchType.PLAUSIBLE and pattern not in skips:
                 branches['uncovered'].append((plausible, pattern))
-            elif plausible.branch_type == BranchType.NULLABLE and pattern not in skips:
-                branches['nullable'].append((plausible, pattern))
             else:
                 branches['unreachable'].append((plausible, pattern))
         plausible, pattern = None, None
@@ -171,12 +164,12 @@ class UExprToConstraint:
 
         uncovered = branches['uncovered']
         uncovered = sorted(filter(lambda x: x[1] not in skips and solved.count(x[1]) < MAX_RETRY, uncovered), key = lambda node: len(node[1]), reverse= True)
+
+        # logger.info(uncovered)
         if uncovered:
             plausible, pattern = uncovered[0]
             self._handle_tuple_append(instance, plausible, pattern)
             return pattern
-        if branches['nullable']:
-            logger.info('thhħe branch is nullable')
         return None
        
     def _get_involved_tables_path(self, plausible: PlausibleChild):
@@ -205,6 +198,71 @@ class UExprToConstraint:
         if plausible.branch_type != BranchType.PLAUSIBLE:
             path = path[:-1]        
         return path
+        
+    def _derive_constraint_from_project(self, instance, node: Constraint, new_symbols: Dict[str, List],primary_table, primary_tuple_id):
+        assert node.constraint_type == PathConstraintType.SIZE
+        if node.operator_key in {'project'}:
+            return None
+        if node.operator_key in {'aggregate'}:
+            new_constraint = self._derive_constraint_from_aggregate(instance, node, new_symbols, primary_table, primary_tuple_id)
+            return new_constraint
+        return None
+
+    def _derive_constraint_from_aggregate(self, instance, node: Constraint, new_symbols: Dict[str, List], primary_table, primary_tuple_id):
+        assert node.operator_key in {'aggregate'}
+        new_constraint, source_vars = None, None
+        substitutions = defaultdict(dict)
+        if node.taken:
+            """we should increase group count, i.e. extend Operands in Distinct Expression"""
+            predicate = node.delta[0]
+            source_vars = get_all_variables(predicate)
+            for v in source_vars:
+                tbl, _, col_index = instance.symbol_to_table[v.this]
+                for row in new_symbols[tbl]:
+                    new_symbol = row[col_index]
+                    if new_symbol not in substitutions[tbl].values():
+                        substitutions[tbl][v] = new_symbol
+            new_constraint = predicate
+            for tbl, mapping in substitutions.items():
+                new_constraint = extend_distinct(new_constraint, mapping)
+        else:
+            """we should increase group size"""
+            logger.info(f'primary tbale: {primary_table} , {node.get_tables()}')
+            if primary_table in node.get_tables():
+                for predicate in node.delta:
+                    source_vars = get_all_variables(predicate)
+                    tuples_ = set(instance.symbol_to_tuple_id[v.this] for v in source_vars)
+                    logger.info(f'delta: {predicate}, tuples: {tuples_}, primary tuple: {primary_tuple_id}')
+                    if primary_tuple_id not in tuples_:
+                        continue
+                    new_constraint = predicate == predicate.value
+                    new_constraint = self._derive_constraints(new_constraint, instance, source_vars, new_symbols, orders= new_symbols.keys(), extend= False)
+            else:
+                predicate = node.delta[-1]
+                source_vars = get_all_variables(predicate)
+                tuples_ = set(instance.symbol_to_tuple_id[v.this] for v in source_vars)
+                new_constraint = predicate == predicate.value
+                logger.info(new_constraint)
+                new_constraint = self._derive_constraints(new_constraint, instance, source_vars, new_symbols, orders= new_symbols.keys(), extend= False)
+        return new_constraint
+    
+    def _derive_constraint_from_aggfunc(self, instance, node: Constraint, new_symbols: Dict[str, List], primary_table, primary_tuple_id):
+        if primary_table in node.get_tables():
+            for predicate in node.delta:
+                source_vars = get_all_variables(predicate)
+                tuples_ = set(instance.symbol_to_tuple_id[v.this] for v in source_vars)
+                if primary_tuple_id not in tuples_:
+                    continue
+                new_constraint = predicate == predicate.value
+                new_constraint = self._derive_constraints(new_constraint, instance, source_vars, new_symbols, orders= new_symbols.keys(), extend= False)
+        else:
+            predicate = node.delta[-1]
+            source_vars = get_all_variables(predicate)
+            tuples_ = set(instance.symbol_to_tuple_id[v.this] for v in source_vars)
+            new_constraint = predicate == predicate.value
+            new_constraint = self._derive_constraints(new_constraint, instance, source_vars, new_symbols, orders= new_symbols.keys(), extend= False)
+
+        return new_constraint
 
     def _handle_tuple_append(self, instance, plausible, pattern):
         involved_tables = self._get_involved_tables_path(plausible)
@@ -230,6 +288,7 @@ class UExprToConstraint:
             new_constraint = self._derive_constraints(primary_predicate, instance, primary_vars, new_symbols, tables, extend= False)
         else:
             raise RuntimeError(f'cannot handle constraint type: {primary_constraint_type}')
+            
 
         if new_constraint is not None:
             logger.info(f'new constraint for primary requirement: {new_constraint}')

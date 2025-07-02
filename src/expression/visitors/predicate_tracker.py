@@ -40,7 +40,8 @@ class PredicateTracker(ExprVisitor):
         self.push_condition(expr)
         self.visited_nodes.add(str(expr))
 
-    
+    # def visit_LIKE(self, expr):
+
     def visit_Not(self, expr) -> None:
         if str(expr) in self.visited_nodes:
             return
@@ -71,7 +72,14 @@ class PredicateTracker(ExprVisitor):
         self.push_condition(expr)
 
     visit_Or = visit_And
-    visit_GTE = visit_LTE = visit_LT = visit_EQ = visit_NEQ = visit_GT 
+    visit_LIKE = visit_GTE = visit_LTE = visit_LT = visit_EQ = visit_NEQ = visit_GT 
+
+    def visit_Strftime(self, expr):
+        if str(expr) in self.visited_nodes:
+            return
+        self.visited_nodes.add(str(expr))
+        # self.push_condition(expr)
+
 
 
 def get_predicates(expr: Expr) -> List[Predicate]:

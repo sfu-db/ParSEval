@@ -1,22 +1,27 @@
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass, field, replace
+from collections import defaultdict
 from .constant import BranchType
-from src.expression.symbol import Row, to_literal, and_, or_, Literal, get_all_variables, distinct
+from src.expression.symbol import Row, to_literal, and_, or_, Literal, get_all_variables, distinct, Strftime
 from src.expression.visitors import get_predicates
 from src.expression.query import rel
-from .helper import split_sql_conditions
+from .helper import split_sql_conditions, get_datatype, get_ref, get_refs
 from sqlglot import exp
 import logging
 
 logger = logging.getLogger('src.parseval.executor')
+
 @dataclass(frozen= True)
 class InputRef:
     name: str
     index: int
     typ: str
-    table: str = field(default = None)
+    table: List[str] = field(default_factory= list)
     nullable: bool = field(default =False)
     unique: bool = field(default = False)
+    is_computed: bool = False
+    checks: List[Any] = field(default_factory=list)
+    depends_on: List[str] = field(default_factory=list)
 
 @dataclass
 class SymbolTable:
@@ -30,7 +35,6 @@ class SymbolTable:
 
 class Encoder:
     def __init__(self, add):
-        # self.instance = instance
         self.add = add
 
     def __call__(self, root, instance, *args: Any, **kwds: Any) -> Any:
@@ -64,37 +68,59 @@ class Encoder:
         for row in table:
             output.append(row)
 
-        metadata = [InputRef(name = col.name, 
-                             index = index, 
-                             typ = col.kind.this.name, 
-                             table = operator.table, 
-                             nullable = not table.is_notnull(col), 
-                             unique = table.is_unique(col)) for index, col in enumerate(table.column_defs)]
-        st = SymbolTable(_id = operator.i(), data = output, metadata= {'table': metadata})
+        md = [InputRef(name= column.name, 
+                       index= index, 
+                       typ= column.kind, 
+                       table= [operator.table], 
+                       nullable= not table.is_notnull(column),
+                       unique= table.is_unique(column)) for index, column in enumerate(table.column_defs)]
+        st = SymbolTable(_id = operator.i(), data = output, metadata= {'table': md})
         return st
     
     def encode_project(self, operator, **kwargs):
         st = self.encode(operator.this, **kwargs)
-        outputs = []
-        
-        metadata = []
+        outputs, metadata, infos = [], [], []
         for projection in operator.projections:
             if isinstance(projection, exp.Column):
-                ref = int(projection.args.get('ref'))
-                metadata.append(st.metadata['table'][ref])
+                inputref = st.metadata['table'][get_ref(projection)]
+                metadata.append(inputref)
+                infos.append({'table': [inputref]})
             elif isinstance(projection, exp.Literal):
                 raise NotImplementedError('Literal is not implemented in Project')
+            elif isinstance(projection, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
+                # logger.info(repr(projection))
+                inputref = InputRef(name= projection.name, 
+                                    index= len(metadata), 
+                                    typ= get_datatype(projection), 
+                                    table = st.metadata['table'][get_ref(projection)].table, 
+                                    nullable = False, unique= False, is_computed= True, 
+                                    depends_on= [st.metadata['table'][ref] for ref in get_refs(projection.this)])
+                # logger.info(f'project: {projection}, {inputref}')
+                metadata.append(inputref)
+                infos.append({'table': [inputref]})
             elif isinstance(projection, exp.Case):
+                # Handle CASE expressions
+                ref = get_ref(projection)
+                
+                # inputref = InputRef(name= projection.name, 
+                #                     index= len(metadata), 
+                #                     typ= get_datatype(projection), 
+                #                     table = st.metadata['table'], 
+                #                     nullable = False, unique= False, is_computed= True, 
+                #                     depends_on= [st.metadata['table'][ref]])
+
                 raise NotImplementedError('Case is not implemented in Project')
+        
         for row in st.data:
-            projections = []
+            projections, takens = [], []
             for project in operator.projections:
                 projections.append(self.encode(project, row = row))
-            projections = [self.encode(project, row = row) for project in operator.projections]
+                takens.append(True)
             outputs.append(Row(this = row.multiplicity, operands = projections))
             tuples = [row.this]
-            taken = [True] * len(projections)
-            self.add.which_branch(operator.key, operator.i(), projections, operator.projections, taken, 1, st.metadata, tuples = tuples)
+            # logger.info(infos)
+            self.add.which_branch(operator.key, operator.i(), projections, operator.projections, takens, 1, infos, tuples = tuples)
+
         self.add.advance(operator.key, operator.i())
         st = SymbolTable(operator.i(), data= outputs, metadata=  {'table': metadata})
         return st
@@ -102,17 +128,24 @@ class Encoder:
     def encode_filter(self, operator: rel.Step, **kwargs):
         st = self.encode(operator.this, **kwargs)
         outputs = []
-        
         for row in st.data:
             smt = self.encode(operator.condition, row = row, **kwargs)
             if smt:
                 outputs.append(row)
             predicates = get_predicates(smt)
-            tuples = set([row.this])
-            # get_all_variables(row.this)
-            takens = [p.value for p in predicates]
-            node = self.add.which_branch(operator.key, operator.i(), predicates, split_sql_conditions(operator.condition), takens, smt.value, st.metadata, tuples = tuples)
-            
+            tuples = [row.this]
+            takens = [bool(p.value) for p in predicates]
+            md = [st.metadata] * len(takens)
+            # for c in split_sql_conditions(operator.condition):
+            #     logger.info(c)
+            #     logger.info('*********')
+            # logger.info(f"len(md): {len(md)},  {predicates}")
+            sql_conditions = list( operator.condition.find_all(exp.Predicate))
+
+            #  split_sql_conditions(operator.condition)
+            # for c in operator.condition.find_all(exp.Predicate):
+            #     logger.info(c)
+            self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, takens, bool(smt.value), md, tuples = tuples)
         self.add.advance(operator.key, operator.i())
         st = SymbolTable(_id = operator.i(), data = outputs, metadata= st.metadata)
         return st
@@ -121,32 +154,49 @@ class Encoder:
     def encode_join(self, operator: rel.Join, **kwargs):
         left = self.encode(operator.this, **kwargs)
         right = self.encode(operator.right, **kwargs)
-        outputs = []
+        outputs, infos = [], []
         metadata = self.update_metadata(left.metadata, right.metadata)        
         join_type = operator.kind.lower()
+        
         for l_row in left.data:
             predicates = []
-            tuples = set()
+            tuples = []
             for r_row in right.data:
                 combined_row = l_row * r_row
                 smt = self.encode(operator.condition, row=combined_row, **kwargs)                
                 if smt:
                     outputs.append(combined_row)
-                    tuples.add(combined_row.this)
+                    tuples.append(combined_row.this)
                 predicates.append(smt)
             predicate = or_(predicates)
             if join_type in ['inner']:
                 takens = [predicate.value]
-                self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], takens, predicate.value, metadata, tuples = tuples)
+                self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], takens, predicate.value, [metadata], tuples = tuples)
+
             if join_type in ['left', 'full']:
                 if predicate:
-                    self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], [True], 1, metadata, tuples = tuples)
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], [True], 1, [metadata], tuples = tuples)
                 else:
                     null_row = [Literal.null(md.typ) for md in right.metadata['table']]
                     combined_row = Row(operands = [*l_row.operands, *null_row], this = l_row.this)
                     outputs.append(combined_row)
-                    tuples.add(combined_row.this)
-                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [False], 1, metadata, tuples = tuples)
+                    tuples.append(combined_row.this)
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [False], 1, [metadata], tuples = tuples)
+        
+        if join_type == 'inner':
+            for r_row in right.data:
+                smt_exprs = []
+                for l_row in left.data:
+                    combined_row = l_row * r_row
+                    smt = self.encode(operator.condition, row=combined_row, **kwargs)
+                    smt_exprs.append(smt.not_())
+
+                predicate = and_(smt_exprs)
+                if predicate:
+                    takens = [False]
+                    tuples = [r_row.this]
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], takens, 0, [metadata], tuples = tuples)
+        
         self.add.advance(operator.key, operator.i())
         st = SymbolTable(_id = operator.i(), data = outputs, metadata= metadata)
         return st
@@ -210,48 +260,158 @@ class Encoder:
         return left.update(_id=operator.i(), data=outputs, row_expr=smt_exprs, tbl_expr=op_exprs)
     
     def encode_aggregate(self, operator: rel.Aggregate, **kwargs):
-        # First execute the input
         st = self.encode(operator.this, **kwargs)
-        metadata = []
-        for index, expr in enumerate(operator.groupby):
-            
-            ref = int(expr.args.get('ref'))
-            
-            metadata.append(InputRef(name= expr.name, index= index, typ= expr.args.get("datatype").this.name, nullable= False, unique= True, table = st.metadata['table'][ref].table))
-        
-        for agg_func in operator.agg_funcs:
-            metadata.append(InputRef(name= agg_func.name, index= 0, typ= agg_func.type, nullable = False, unique= False, table = st.metadata['table'][agg_func.index].table))
+        metadata, infos, sql_conditions = [], [], []
+        ## get metadata info
+        for expr in operator.groupby:
+            ref = get_ref(expr)
+            datatype = get_datatype(expr) 
+            inputref = InputRef(name= expr.name, index= len(metadata), typ=datatype, nullable= False, unique= True, table = st.metadata['table'][ref].table)
+            metadata.append(inputref)
+            infos.append({'table': [inputref], 'group_size': [], 'group_stats': []})
+            sql_conditions.append(expr)
+
+        for func in operator.agg_funcs:
+            ref = get_ref(func)
+            datatype = get_datatype(func) 
+            inputref = InputRef(name= func.name, index= len(metadata), typ=datatype, nullable= False, unique= False, 
+                                table = st.metadata['table'][ref].table,
+                                is_computed= True, depends_on = [st.metadata['table'][ref]])
+            metadata.append(inputref)
+            infos.append({'table': [inputref], 'group_size': [], 'group_stats': []})
+            sql_conditions.append(func)
+        metadata = self.update_metadata({'table': metadata})
 
         # Group by the specified columns
         groups = {}
+        tuples = []
         for row in st.data:
-            # Evaluate group by expressions
             group_key = tuple(self.encode(expr, row=row, **kwargs) for expr in operator.groupby)
-            if group_key not in groups:
-                groups[group_key] = []
-            groups[group_key].append(row)
-        
-        # Apply aggregate functions to each group
+            contain_group_key = False
+            for existing_key, group_data in groups.items():
+                if all(left == right for left, right in zip(existing_key, group_key)):
+                    group_data.append(row)
+                    contain_group_key = True
+                    break
+            if not contain_group_key:
+                groups[group_key] = [row]
+                tuples.append(row.this)
+
+
+        group_keys = list(zip(*groups.keys()))
+        group_count_predicates =  [distinct(list(col)) for col in group_keys]           ### process group by predicates
+
+        takens = [True]  * len(group_count_predicates)
+        self.add.which_branch(operator.key, operator.i(), group_count_predicates, sql_conditions[:len(group_count_predicates)], takens, 1, infos[:len(group_count_predicates)], tuples = tuples)
+
+        agg_func_prediacates = [[]] * len(operator.agg_funcs)
+
         outputs = []
-        for group_key, group_rows in groups.items():
-            # Create a new row with group key values and aggregate results
+        for group_index, (group_key, group_rows) in enumerate(groups.items()):
             row_expressions = list(group_key)
-            # Apply aggregate functions if specified
-            if operator.agg_funcs:
-                for agg_func in operator.agg_funcs:
-                    # Evaluate aggregate function on the group
-                    agg_result = self.encode(agg_func, rows=group_rows, **kwargs)
-                    row_expressions.append(agg_result)
-            
-            # Create a new row with multiplicity 1 (aggregate result)
-            outputs.append(Row(this = row.multiplicity, operands = row_expressions))
-            # rel.Row(expressions=row_expressions, multiplicity=1)
-            
-        
-        # Track constraints
-        
-        st = SymbolTable(_id = operator.i(), data = outputs, metadata= self.update_metadata({'table': metadata}))
-        return st
+            for func_index, agg_func in enumerate(operator.agg_funcs):
+                agg_result,has_null, has_duplicate = self.encode(agg_func, rows=group_rows, **kwargs)
+                row_expressions.append(agg_result)
+                agg_func_prediacates[func_index].append(agg_result)
+            outputs.append(Row(this = group_rows[0].this, operands = row_expressions))
+            for info in infos:
+                info['group_stats'].append((group_index, has_null, has_duplicate))
+                info[f'group_size'].append((group_index, len(group_rows)))
+            takens = [False]  * len(row_expressions)
+            self.add.which_branch(operator.key, operator.i(), row_expressions, sql_conditions, takens, 1, infos, tuples = [tuples[group_index]])
+
+        return SymbolTable(_id = operator.i(), data = outputs, metadata= metadata)
+    
+    def encode_sum(self, operator, **kwargs):
+        """ Sum(this=Column(this=Identifier(this=$1, quoted=False), datatype=DataType(this=Type.FLOAT, nested=False)ref=1),
+                distinct=False,
+                datatype=DataType(this=Type.FLOAT, nested=False))
+        """
+        distinct = operator.args.get('distinct', False)
+        rows = kwargs.get('rows')
+        result = 0
+        values = [self.encode(operator.this, row = row) for row in rows]
+        concretes = set()
+        has_null, has_duplicate = False, False
+        for value in values:
+            if value.is_null():
+                has_null = True
+                continue
+            if value.value in concretes:
+                has_duplicate = True
+                if distinct:
+                    continue
+            concretes.add(value.value)
+            result += value
+        return result, has_null, has_duplicate
+    
+    def encode_count(self, operator, **kwargs):
+        """Count
+        """
+        distinct = operator.args.get('distinct', False)
+        rows = kwargs.get('rows')
+        values = [self.encode(operator.this, row = row) for row in rows]
+        has_null = any(value.is_null() for value in values)
+        concretes = [v.value for v in values]
+        has_duplicate = len(set(concretes)) != len(concretes)
+        result = len(set(concretes)) if distinct else len(concretes)
+
+        result = sum(values)
+        # result = to_literal(result, to_type= 'int')s
+        return result, has_null, has_duplicate
+    
+    def encode_star(self, operator, **kwargs):
+        row = kwargs.get('row')
+        return row[0]
+        # logger.info(repr(operator))
+
+    def encode_max(self, operator, **kwargs):
+        """ Max(this=Column(this=Identifier(this=$1, quoted=False), datatype=DataType(this=Type.FLOAT, nested=False)ref=1),
+                distinct=False,
+                datatype=DataType(this=Type.FLOAT, nested=False))
+        """
+        distinct = operator.args.get('distinct', False)
+        rows = kwargs.get('rows')
+        result = values[0]
+        values = [self.encode(operator.this, row = row) for row in rows]
+        concretes = set()
+        has_null, has_duplicate = False, False
+        for value in values[1:]:
+            if value.is_null():
+                has_null = True
+                continue
+            if value.value in concretes:
+                has_duplicate = True
+                if distinct:
+                    continue
+            concretes.add(value.value)
+            if value > result:
+                result = value
+        return result, has_null, has_duplicate
+
+    def encode_min(self, operator, **kwargs):
+        """ Max(this=Column(this=Identifier(this=$1, quoted=False), datatype=DataType(this=Type.FLOAT, nested=False)ref=1),
+                distinct=False,
+                datatype=DataType(this=Type.FLOAT, nested=False))
+        """
+        distinct = operator.args.get('distinct', False)
+        rows = kwargs.get('rows')
+        result = values[0]
+        values = [self.encode(operator.this, row = row) for row in rows]
+        concretes = set()
+        has_null, has_duplicate = False, False
+        for value in values[1:]:
+            if value.is_null():
+                has_null = True
+                continue
+            if value.value in concretes:
+                has_duplicate = True
+                if distinct:
+                    continue
+            concretes.add(value.value)
+            if value < result:
+                result = value
+        return result, has_null, has_duplicate
         
     
     def encode_sort(self, operator: rel.Sort, **kwargs):
@@ -292,15 +452,15 @@ class Encoder:
         tuples = set()
         predicates = []
         sql_conditions = []
-        for sort_key in sort_keys:
-            smt_exprs = []
-            for row in outputs:
-                smt_exprs.append(row[sort_key['column']])
-                tuples.add(row.this)
-            predicates.append(or_([smt_exprs[i] != smt_exprs[j] for i in range(len(smt_exprs)) for j in range(i+1, len(smt_exprs))]))            
-            sql_conditions.append(exp.to_column(f"${sort_key['column']}", datatype = exp.DataType.build(dtype= sort_key.get('type'))))
         metadata = self.update_metadata(st.metadata)
-        self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, [True] * len(sort_keys), 1, metadata, tuples = tuples)
+
+        for row in outputs:
+            for sort_key in sort_keys:
+                sql_condition = exp.to_column(f"${sort_key['column']}", ref = sort_key['column'], datatype = exp.DataType.build(dtype= sort_key.get('type')))  
+                predicate = row[sort_key['column']]
+                tuples = [row.this]
+
+                self.add.which_branch(operator.key, operator.i(), [predicate], [sql_condition], [True], 1, [metadata], tuples = tuples)
 
         if offset > 0 or limit < 100:
             outputs = outputs[offset : offset + limit]
@@ -373,10 +533,59 @@ class Encoder:
     def encode_literal(self, operator, **kwargs):
         dtype = operator.args.get('datatype')
         return to_literal(operator.this, to_type= str(dtype)) 
+    
+    def encode_like(self, operator, **kwargs):
+        this = self.encode(operator.this, **kwargs)
+        expression = self.encode(operator.expression, **kwargs)
+        # logger.info(this.like(expression))
+        return this.like(expression)
+    
+    def encode_case(self, operator, **kwargs):
+        # logger.info(repr(operator))
+        else_val = self.encode(operator.args.get('default'), **kwargs)
+        # case a > 20, b, when a > 10, b2,  else b3
+        value = else_val
+        for if_ in reversed(operator.args.get('ifs')):
+            condition = self.encode(if_.this, **kwargs)
+            true = self.encode(if_.args.get('true'), **kwargs)
+            # if condition:
+            #     else_val = true
+            #     break
+            else_val = condition.ite(true, else_val)
+        # logger.info(else_val)
+        return else_val
+    
+    def encode_cast(self, operator, **kwargs):
+        """
+        Casts a value to a specified type.
+        """
+        this = self.encode(operator.this, **kwargs)
+        # datatype = operator.args.get('datatype')
+        # logger.info(f"datatype: {datatype}, {this}")
+        # logger.info(f"cast {repr(operator)}")
+        # logger.info(this)
+        to_type = operator.args.get('to')
+        this = this.cast(to_type= str(to_type))
+        # logger.info(this)
+        return this
 
     def encode_is_null(self, operator, **kwargs):
         this = self.encode(operator.this, **kwargs)
         return this.is_null()
+    
+    def encode_strftime(self, operator, **kwargs):
+        this = self.encode(operator.this, **kwargs)
+
+        fmt = self.encode(operator.args.get('format'))
+        from datetime import datetime
+        try:
+            from dateutil.parser import parse as dateutil_parse
+            dt = dateutil_parse(this.value)
+            value = datetime.strftime(dt, fmt.value)
+        except Exception as e:
+            value = None
+        return Strftime(this = this, format = fmt, value = value)
+
 
 ops =[
       ("gt", ">" ),\
@@ -403,7 +612,8 @@ for (name, op) in ops:
 binary_ops = [    
     ('mul', '*'),
     ('add', '+'),
-    ('sub', '-')
+    ('sub', '-'),
+    ('div', '/')
 ]
 
 def make_binary_method(method, op):

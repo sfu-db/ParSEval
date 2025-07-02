@@ -124,6 +124,22 @@ class PrinterVistor(ExprVisitor):
             part = self._parenthesize_if_needed(expr, op, part)
             parts.append(part)
         return f"DISTINCT({', '.join(parts)})"
+    def visit_ITE(self, expr):
+        """Format IF-THEN-ELSE operation"""
+        condition = self.visit(expr.this)
+        operand = self.visit(expr.operand)
+        else_ = self.visit(expr.args.get('else_'))
+        return f"CASE WHEN {condition} THEN {operand} ELSE {else_} END"
+    
+    def visit_StrToInt(self, expr):
+        return f"StrToInt({self.visit(expr.this)})"
+    def visit_IntToStr(self, expr):
+        return f"IntToStr({self.visit(expr.this)})"
+    def visit_LIKE(self, expr):
+        return f"{self.visit(expr.this)} LIKE {self.visit(expr.operand)}"
+    
+    def visit_Strftime(self, expr):
+        return f"STRFTIME({self.visit(expr.this)})"
     
 BINARY_OPS =  {
         'Add': '+',

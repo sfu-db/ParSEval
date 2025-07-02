@@ -41,7 +41,8 @@ class Expr(metaclass=_Expr):
     @property
     def dtype(self) -> Optional['DataType']:
         """Get the data type of this expression"""
-        if self._type is None:
+        if self.args.get('_type', None) is None: 
+        # if self._type is None:
             self._type = self.resolve_type()
         return self._type
     
@@ -204,6 +205,38 @@ class Expr(metaclass=_Expr):
 
     def __bool__(self):
         return bool(self.value)
+    
+    # def coerce_to_same_sort(e1, e2):
+    # if e1.sort() == e2.sort():
+    #     return e1, e2
+    # if e1.sort() == z3.StringSort() and e2.sort() == z3.IntSort():
+    #     return z3.StrToInt(e1), e2
+    # if e2.sort() == z3.StringSort() and e1.sort() == z3.IntSort():
+    #     return e1, z3.StrToInt(e2)
+    # if e1.sort() == z3.IntSort() and e2.sort() == z3.RealSort():
+    #     return e1, e2
+    
+    # raise TypeError(f"Cannot coerce: {e1.sort()} vs {e2.sort()}")
+
+    def coerce(self, left_value, other_value):
+        if type(left_value) == type(other_value):
+            return left_value, other_value
+        
+        try:
+            if isinstance(left_value, int) and isinstance(other_value, float):
+                return left_value, other_value
+            if isinstance(left_value, float) and isinstance(other_value, int):
+                return left_value, float(other_value)
+            if isinstance(left_value, str) and isinstance(other_value, int):
+                return left_value, str(other_value)
+            if isinstance(left_value, int) and isinstance(other_value, str):
+                return left_value, int(other_value)
+        except Exception as e:
+            print(e)
+            return left_value, other_value
+        # finally:
+            
+
 
     def _binop(self, op: str, other: Any, expr_class) -> Expr:
         """
@@ -225,8 +258,7 @@ class Expr(metaclass=_Expr):
                 op_func = getattr(operator, op)
                 new_value = op_func(left_val, right_val)
             except Exception as e:
-                raise ValueError(f"Operation {op} failed between {left_val} and {right_val}: {str(e)}")
-                
+                raise ValueError(f"Operation {op} failed between {self} and {other}: {str(e)}")
         try:
             return expr_class(this=self, operand=other, value=new_value)
         except Exception as e:
@@ -300,6 +332,52 @@ class Expr(metaclass=_Expr):
         return self._logicop('and', other, And)
     def or_(self, other: Any) -> Expr:
         return self._logicop('or', other, Or)
+    def ite(self, true, default):
+        if self.value:
+            value = true.value
+        else:
+            value = default.value
+        return ITE(this = self, operand = true, else_ = default, value = value)
+    
+    def cast(self, to_type):
+        to_type = DataType.build(to_type)
+        if self.dtype.is_type(to_type):
+            return self
+        
+        if self.dtype.is_type(*DataType.NUMERIC_TYPES) and to_type.is_type(*DataType.TEXT_TYPES):
+            return IntToStr(this = self, value = str(self.value), _type = DataType.build("TEXT"))
+        if self.dtype.is_type(*DataType.TEXT_TYPES) and to_type.is_type(*DataType.NUMERIC_TYPES):
+            try:
+                value = int(self.value)
+            except Exception as e:
+                value = None
+            return StrToInt(this = self, value = value,  _type = DataType.build("INT"))
+        
+        if self.dtype.is_type(*DataType.INTEGER_TYPES) and to_type.is_type(*DataType.REAL_TYPES):
+            return self
+        
+        if self.dtype.is_type(*DataType.TEMPORAL_TYPES) and to_type.is_type(*DataType.TEMPORAL_TYPES):
+            return self
+        if self.dtype.is_type(*DataType.TEMPORAL_TYPES) and to_type.is_type(*DataType.TEXT_TYPES):
+            return self
+        
+        
+        raise ValueError(f'Cannot cast {self.dtype} to {to_type}. Casting not supported for this type combination.')
+        
+
+    def like(self, pattern):
+        import re
+        regex = re.escape(pattern.value)
+        # Unescape the % and _ characters
+        regex = regex.replace(r'\%', '%').replace(r'\_', '_')
+        # Convert SQL wildcards to regex
+        regex = regex.replace('%', '.*').replace('_', '.')
+        try:
+            value =  bool(re.match(regex, str(self.value)))
+        except Exception as e:
+            value = None
+        return LIKE(this = self, operand = pattern, value = value, _type = DataType.build("BOOLEAN"))
+        
     def not_(self) -> Expr:
         new_value = None if self.value is None else not self.value
         negation_map = {
@@ -470,7 +548,8 @@ class Binary(Condition):
             
         elif isinstance(self, (And, Or)):
             return DataType.build("BOOLEAN")
-        return None
+        
+        return left_type
 
 class Nary(Condition):
     arg_types = {"operands": True, "value": True}
@@ -526,6 +605,9 @@ class LT(Binary, Predicate):
 class LTE(Binary, Predicate):
     pass
 
+class LIKE(Binary, Predicate):
+    pass
+
 class Add(Binary):
     pass
 
@@ -552,7 +634,17 @@ class Distinct(Expr):
 
 
 class ITE(Expr):
-    arg_types = {"this": True, "operand": True, "else": True}
+    arg_types = {"this": True, "operand": True, "else_": True}
+
+
+class StrToInt(Expr):
+    arg_types = {"this": True, "value": True}
+
+class Strftime(Expr):
+    arg_types = {"this": True, "format": True, "value": True}
+
+class IntToStr(Expr):
+    arg_types = {"this": True, "value": True}
 
 class Is_Null(Unary, Predicate):
     pass
@@ -692,14 +784,13 @@ def convert(value: Any, copy: bool = False) -> Expr:
         Expr: An appropriate expression instance for the value
     """
     # Handle None/NULL
-    if value is None:
+    if value is None or value == 'NULL':
         return Literal(this="NULL", value=None, _type=DataType.build("NULL"))
     if isinstance(value, Expr):
         return maybe_copy(value, copy)
     if isinstance(value, bool):
         return Literal.boolean(value)
     if isinstance(value, numbers.Number):
-        
         return Literal.number(value)
     if isinstance(value, str):
         return Literal.string(value)
@@ -745,6 +836,8 @@ def to_variable(dtype: DATA_TYPE, name: ExprOrStr, value: SymbolLiterals, copy =
 
 
 def to_literal(value: Any, to_type: DataType = None, copy = True):
+    if value == 'NULL':
+        return Literal.null(to_type or DataType.build("NULL"))
 
     value = value
     if to_type:
@@ -765,6 +858,8 @@ def or_(operands: List[Expr]) -> Or:
 
 def and_(operands: List[Expr]) -> And:
     return And(operands= operands, value = all(operands))
+
+
 
 def get_all_variables(expr: Expr) -> Set[Variable]:
     variables = set()
