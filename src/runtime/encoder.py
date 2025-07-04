@@ -34,6 +34,9 @@ class SymbolTable:
 
 
 class Encoder:
+
+    PREDEFINED = {}
+
     def __init__(self, add):
         self.add = add
 
@@ -49,6 +52,7 @@ class Encoder:
             raise NotImplementedError(f'Operator {root.key} is not implemented') from e
         except Exception as e:
             raise
+    
     def update_metadata(self, *args):
         tables = []
         for arg in args:
@@ -88,9 +92,8 @@ class Encoder:
             elif isinstance(projection, exp.Literal):
                 raise NotImplementedError('Literal is not implemented in Project')
             elif isinstance(projection, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
-                # logger.info(repr(projection))
                 inputref = InputRef(name= projection.name, 
-                                    index= len(metadata), 
+                                    index= len(metadata),
                                     typ= get_datatype(projection), 
                                     table = st.metadata['table'][get_ref(projection)].table, 
                                     nullable = False, unique= False, is_computed= True, 
@@ -118,7 +121,6 @@ class Encoder:
                 takens.append(True)
             outputs.append(Row(this = row.multiplicity, operands = projections))
             tuples = [row.this]
-            # logger.info(infos)
             self.add.which_branch(operator.key, operator.i(), projections, operator.projections, takens, 1, infos, tuples = tuples)
 
         self.add.advance(operator.key, operator.i())
@@ -136,16 +138,9 @@ class Encoder:
             tuples = [row.this]
             takens = [bool(p.value) for p in predicates]
             md = [st.metadata] * len(takens)
-            # for c in split_sql_conditions(operator.condition):
-            #     logger.info(c)
-            #     logger.info('*********')
-            # logger.info(f"len(md): {len(md)},  {predicates}")
-            sql_conditions = list( operator.condition.find_all(exp.Predicate))
-
-            #  split_sql_conditions(operator.condition)
-            # for c in operator.condition.find_all(exp.Predicate):
-            #     logger.info(c)
+            sql_conditions = list(operator.condition.find_all(exp.Predicate))
             self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, takens, bool(smt.value), md, tuples = tuples)
+        
         self.add.advance(operator.key, operator.i())
         st = SymbolTable(_id = operator.i(), data = outputs, metadata= st.metadata)
         return st

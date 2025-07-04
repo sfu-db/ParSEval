@@ -30,8 +30,10 @@ class PlausibleChild:
         raise ValueError(f'No sibling found for {self}')
     
     def bit(self):
-        if self.parent and self.parent.yes() == self:
-            return self.tree.yes_bit
+        if self.parent:
+            for bit, node in self.parent.children.items():
+                if node == self:
+                    return bit
         return self.tree.no_bit
     
 class Constraint:
@@ -65,6 +67,9 @@ class Constraint:
     
     def yes(self):
         return self.children.get(self.tree.yes_bit, None)
+    
+    def null_bit(self):
+        return self.children.get(self.tree.null_bit, None)
 
     def has_sibling(self):
         return self.no() is not None and self.yes() is not None
@@ -77,6 +82,7 @@ class Constraint:
     def bit(self):
         if self.parent and self.parent.yes() == self:
             return self.tree.yes_bit
+        
         return self.tree.no_bit
 
     def get_tables(self) -> List:
@@ -101,9 +107,7 @@ class Constraint:
             1. If current node has no sibling or sibling is a PlausibleChild, add plausible node to current node's parent node
             2. if bit in current node's children, update branch type accordingly, else, add a PlausibleChild to current node
         '''
-        # logger.info(f'branch_type: {branch_type}')
         branch_type = BranchType.from_value(branch_type)
-        # logger.info(f"{self.constraint_type} --> {self.operator_key}, {self.sql_condition}, {branch_type}")
 
         if self.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
             bit =self.tree.yes_bit if branch_type else self.tree.no_bit
@@ -114,7 +118,6 @@ class Constraint:
                 self.tree.leaves[self.pattern()] = plausible_child
             elif isinstance(self.children[bit], Constraint):
                 self.children[bit].branch_type = branch_type
-        
             if not self.sibling() or isinstance(self.sibling(), PlausibleChild) :
                 bit = self.tree.yes_bit if self.bit() == self.tree.no_bit else self.tree.no_bit
                 plausible_child = PlausibleChild(self.parent, BranchType.PLAUSIBLE, self.tree)
@@ -128,6 +131,19 @@ class Constraint:
                 self.children[bit] = plausible_child
                 self.tree.leaves.pop(self.parent.pattern(), None)
                 self.tree.leaves[self.pattern()] = plausible_child
+
+            if self.tree.null_bit not in self.children:
+                plausible_child = PlausibleChild(self, BranchType.NULLABLE, self.tree)
+                self.children[self.tree.null_bit] = plausible_child
+                self.tree.leaves.pop(self.parent.pattern(), None)
+                self.tree.leaves[self.pattern() + self.tree.null_bit] = plausible_child
+            
+            if self.tree.distinct_bit not in self.children:
+                plausible_child = PlausibleChild(self, BranchType.UNIQUE, self.tree)
+                self.children[self.tree.distinct_bit] = plausible_child
+                self.tree.leaves.pop(self.parent.pattern(), None)
+                self.tree.leaves[self.pattern() + self.tree.distinct_bit] = plausible_child
+
 
             null_bit = self.tree.no_bit if self.taken else self.tree.yes_bit
             if  self.sql_condition.key in {'count', 'sum', 'max', 'min', 'avg'} and null_bit not in self.children:
@@ -183,6 +199,7 @@ class Constraint:
         else:
             raise ValueError(f'cannot parse constraint type {condition}')
         return PathConstraintType.VALUE
+    
     def _analyze_sql_condition(self, operator_key: str, sql_condition: exp.Condition, taken) -> Dict:
         if not taken:
             sql_condition = negate_sql_condition(sql_condition)
@@ -193,7 +210,7 @@ class Constraint:
         if child_node is None:
             constraint_type = self._analyze_constraint_type(operator_key, sql_condition)
             sql_condition = self._analyze_sql_condition(operator_key, sql_condition, taken)
-            bit = self.tree.yes_bit if taken else self.tree.no_bit            
+            bit = self.tree.yes_bit if taken else self.tree.no_bit
             child_node = Constraint(
                 tree = self.tree,
                 parent = self, 
@@ -210,7 +227,7 @@ class Constraint:
         p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
         if child_node.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
             p = [symbolic_expr if taken else symbolic_expr.not_()]
-        
+            
         child_node.delta.extend(p)
         child_node.tuples.append(tuples)
         child_node.info.update(info)

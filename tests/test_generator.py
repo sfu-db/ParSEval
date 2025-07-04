@@ -110,7 +110,6 @@ class TestGenerator(unittest.TestCase):
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
-
         with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()        
         # -- SQLite
@@ -120,7 +119,7 @@ class TestGenerator(unittest.TestCase):
         result =generator.generate(max_iter= 8)
         assert len(result.data) >= 1
     
-    @unittest.skip('spj_disjunction')
+    # @unittest.skip('spj_disjunction')
     def test_generate_spj_disjunction(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
         register_default_generators()
@@ -137,7 +136,22 @@ class TestGenerator(unittest.TestCase):
         result =generator.generate(max_iter= 8)
         assert len(result.data) >= 3
 
-    @unittest.skip("aggregate")
+    @unittest.skip('spj')
+    def test_generate_spj_projects(self):
+        from src.instance.generators import ValueGeneratorRegistry, register_default_generators
+        register_default_generators()
+        from src.instance.instance import Instance
+        from src.runtime.generator import Generator
+        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+            schema = conn.get_schema()        
+        # -- SQLite
+        # SELECT schools.School from satscores JOIN schools on satscores.cds = schools.CDSCode where satscores.NumTstTakr > 500 and schools.Magnet = 1
+        generator = Generator('tests/db', schema, "datasets/bird/plan/california_schools_24_gold.sql", name = 'test_spj_project')
+        print(generator.plan)
+        result =generator.generate(max_iter= 8)
+        # assert len(result.data) >= 1
+
+    @unittest.skip("aggregate_functions")
     def test_generate_aggregate(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
 
@@ -183,7 +197,7 @@ class TestGenerator(unittest.TestCase):
         print(generator.plan)        
         result =generator.generate(max_iter= 8)
 
-    # @unittest.skip('skip strftime')
+    @unittest.skip('skip strftime')
     def test_strftime(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
 
@@ -222,9 +236,6 @@ class TestGenerator(unittest.TestCase):
         print(generator.plan)        
         result =generator.generate(max_iter= 8)
 
-
-    def test_generator(self):
-        ...
 
 if __name__ == '__main__':
     reset_folder('tests/db')

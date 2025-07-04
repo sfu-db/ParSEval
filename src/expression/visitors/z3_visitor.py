@@ -22,6 +22,8 @@ def coerce_to_same_sort(e1, e2):
         return e1, z3.StrToInt(e2)
     if e1.sort() == z3.IntSort() and e2.sort() == z3.RealSort():
         return e1, e2
+    if e1.sort() == z3.RealSort() and e2.sort() == z3.IntSort():
+        return e1, e2
     
     raise TypeError(f"Cannot coerce: {e1.sort()} vs {e2.sort()}")
 class Z3Visitor(ExprVisitor):

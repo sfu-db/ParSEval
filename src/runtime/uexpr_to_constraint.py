@@ -28,10 +28,21 @@ class UExprToConstraint:
         self.root_constraint = Constraint(self, None, 'ROOT', None)
         self.positive_path = defaultdict(list)
         self.positive_path['ROOT'].append(self.root_constraint) ## we use this to cache all positive paths' operators.
-        self.no_bit, self.yes_bit = '0', '1'
-
+        self.no_bit, self.yes_bit, self.null_bit, self.distinct_bit = '0', '1', '-1', '-2'
         self.prev_operator = 'ROOT'
         self.add = add
+
+    def _ensure_bit(self, taken):
+        bits = {
+            '0': '0',
+            '1': '1',
+            '-1': '-1',
+            '-2': '-2',
+            True: '1', 
+            False: '0', 
+            None: '-1'
+        }
+        return bits.get(taken)
     
     def add_constraint(self, constraint: Constraint):
         self.constraints.append(constraint)
@@ -97,26 +108,42 @@ class UExprToConstraint:
         return True
     
     def _is_covered(self, plausible: PlausibleChild):
+        logger.info(f'testing plausible: {plausible.branch_type} is covered')
         if plausible.branch_type in {BranchType.POSITIVE, BranchType.STRAIGHT}:
             parent_node: Constraint = plausible.parent
-            if parent_node.constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}:
-                return len(parent_node.delta) >= BRANCH_HIT
-            elif parent_node.constraint_type in {PathConstraintType.SIZE}:
-                if parent_node.operator_key in {'aggregate', 'aggfunc'}:
-                    """we consider group count and group size here"""
-                    return self._is_covered_aggregate(parent_node)
-                if len(parent_node.delta) < BRANCH_HIT:
-                    return False
-                null_values = [variable.is_null() for variable in parent_node.delta]
-                # ref = parent_node.sql_condition.args.get('ref')
-                if parent_node.info['table'][0].nullable and not any(null_values):
-                    return False
-                if not parent_node.info['table'][0].unique:
-                    duplicates = [v.value for v in parent_node.delta]
-                    return len(set(duplicates)) != len(parent_node.delta)
-                return True
+
+            # if parent_node.constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}:
+            return len(parent_node.delta) >= BRANCH_HIT
+            # return True
+            # elif parent_node.constraint_type in {PathConstraintType.SIZE}:
+            #     if parent_node.operator_key in {'aggregate', 'aggfunc'}:
+            #         """we consider group count and group size here"""
+            #         return self._is_covered_aggregate(parent_node)
+            #     if len(parent_node.delta) < BRANCH_HIT:
+            #         return False
+            #     null_values = [variable.is_null() for variable in parent_node.delta]
+            #     # ref = parent_node.sql_condition.args.get('ref')
+            #     if parent_node.info['table'][0].nullable and not any(null_values):
+            #         return False
+            #     if not parent_node.info['table'][0].unique:
+            #         duplicates = [v.value for v in parent_node.delta]
+            #         return len(set(duplicates)) != len(parent_node.delta)
+            #     return True
         
-        raise RuntimeError("encounter unsupported positive branches")
+        if plausible.branch_type in {BranchType.UNIQUE}:
+            ...
+        if plausible.branch_type in {BranchType.NULLABLE}:
+            parent_node = plausible.parent
+            null_values = [variable.is_null() for variable in parent_node.delta]
+
+            logger.info(f'plausible branch type : {plausible.branch_type} --> NULL : {any(null_values)}')
+            if parent_node.info['table'][0].nullable and not any(null_values):
+                return False
+            
+            return True
+            
+        
+        raise RuntimeError(f"encounter unsupported positive branches: {plausible.branch_type}")
         
     def _get_affected_tables(self, path: List[Constraint]) -> Dict[str, set]:
         '''
@@ -160,7 +187,8 @@ class UExprToConstraint:
         
         if branches['positive']:
             '''
-                For all positive branches, we should consider NULL values, Duplicate, SIZE
+                For all positive branches, we should consider number of hits
+                
             '''
             positives = sorted(branches['positive'], key = lambda node: len(node[0].parent.delta))
             for plausible, pattern in positives:
@@ -168,7 +196,7 @@ class UExprToConstraint:
                 if not is_covered and pattern not in skips:
                     self._handle_tuple_append(instance, plausible, pattern)
                     return pattern
-
+        #  NULL values, Duplicate, SIZE
         uncovered = branches['uncovered']
         uncovered = sorted(filter(lambda x: x[1] not in skips and solved.count(x[1]) < MAX_RETRY, uncovered), key = lambda node: len(node[1]), reverse= True)
         if uncovered:
@@ -234,7 +262,6 @@ class UExprToConstraint:
         if new_constraint is not None:
             logger.info(f'new constraint for primary requirement: {new_constraint}')
             self.add(new_constraint, 'primary')
-
 
     def _derive_constraints(self, predicate, instance, source_vars, target_vars: Dict[str, List], orders, extend = False):
         '''

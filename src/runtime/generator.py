@@ -11,6 +11,8 @@ import logging
 
 logger = logging.getLogger('src.parseval.generator')
 
+# Speculative value assignment
+
 class Generator:
     def __init__(self, workspace, schema, query, dialect = 'sqlite', **kwargs):
         self.workspace = workspace
@@ -91,6 +93,7 @@ class Generator:
 
         for _ in range(max_iter):
             self.path = UExprToConstraint(lambda constraint, label: self.add_constraint(constraint, label))
+            ### to track the operator in Expression Tree, we will repeat the encoding process from the root
             self.encoder = Encoder(self.path)
             self.reset()
             st = self.encoder(self.plan, instance = instance)
