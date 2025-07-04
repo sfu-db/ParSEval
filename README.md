@@ -45,7 +45,7 @@ To test the equivalence of two queries:
 python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --pred SQL2
 ```
 
-You can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
+One can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
 
 ```python
 # Integer generator
