@@ -34,3 +34,14 @@ conda activate parseval-dev
 ```bash
 pip install -r requirements.txt
 ```
+
+### Experiment Setup
+
+- [Install Docker](https://docs.docker.com/engine/install/)
+- Dataset
+    - Download Leetcode/Literature/Bird/Spider datasets here.
+    - Could also download official database instances.
+
+### Running Experiments
+Commands needed can be found in the tests folder.
+
