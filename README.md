@@ -71,8 +71,8 @@ ValueGeneratorRegistry.register('int', int_generator)
 ### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
 - Dataset
-    - Download Leetcode/Literature/Bird/Spider datasets here.
-    - Could also download official database instances.
+    - Download Leetcode/Literature/Bird/Spider datasets [here](https://drive.google.com/drive/folders/12y5tR2JeSf2cVpp_woHn6CiQ9YiY7J25?usp=drive_link).
+    - Could also download official database instances for [bird](https://bird-bench.github.io/) and [spider](https://yale-lily.github.io/spider).
 
 ### Running Experiments
 Commands needed can be found in the tests folder.
