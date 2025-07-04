@@ -40,7 +40,33 @@ python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --offline
 ```
 to generate test database instances for input query SQL1.
 
+To test the equivalence of two queries:
+```bash
+python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --pred SQL2
+```
+
 You can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
+
+```python
+# Integer generator
+def int_generator(existing_values: Optional[Set[Any]] = None, is_unique: bool = False) -> int:
+    """
+    Generate a random integer value.        
+    Args:
+        existing_values: Set of existing values to avoid duplicates if is_unique is True
+        is_unique: Whether the value should be unique
+        
+    Returns:
+        int: A random integer value
+    """
+    value = random.randint(1, 100)
+    if is_unique and existing_values:
+        while value in existing_values:
+            value = random.randint(1, 100)
+    return value
+from .registry import ValueGeneratorRegistry
+ValueGeneratorRegistry.register('int', int_generator)
+```
 
 ### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
