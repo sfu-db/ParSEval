@@ -20,9 +20,6 @@ Please download and set up the query parser from the [repository](https://github
 
 ### Set Up the Python Environment
 
-
-### Install Requirements
-
 1. Please use conda or venv to create a virtual environment. Run following command to install requirements.
 
 ```bash
@@ -33,7 +30,7 @@ source venv/bin/activate
 conda create -n parseval-dev python=3.8
 conda activate parseval-dev
 ```
-Then install the required dependencies:
+2. Install the required dependencies:
 ```bash
 pip install -r requirements.txt
 ```
