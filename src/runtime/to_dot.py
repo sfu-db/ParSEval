@@ -99,3 +99,8 @@ def display_constraints(root_constraint):
 
     to_dot(root_constraint, dot_graph)
     return dot_graph
+
+
+
+def to_uexpr(root_constraint):
+    ...
