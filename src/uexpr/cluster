@@ -1,0 +1,25 @@
+
+
+
+
+class Cluster:
+    def __init__(self, cluster_id = None, parent = None):
+        '''
+            cluster_id: id
+            parent: parent cluster id
+        '''
+        self.cluster_id = cluster_id
+        self.parent = parent
+        self.nodes = []
+
+        self.current_node = self.parent
+
+    def add_node(self, node):
+        self.nodes.append(node)
+        self.current_node = node
+    
+    def __repr__(self):
+        return f'cluster(ID = {self.cluster_id}, parent= {self.parent}, nodes = {len(self.nodes)})'
+
+    # def __eq__(self, value):
+    #     return self.cluster_id == value.cluster_id

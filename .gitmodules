@@ -1,0 +1,3 @@
+[submodule "src/corekit"]
+	path = src/corekit
+	url = git@github.com:chency87/corekit.git
