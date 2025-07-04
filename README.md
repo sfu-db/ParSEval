@@ -15,11 +15,8 @@ The repo contains following supplemental materials:
 
 ## Get started 
 ### Install the Query Parser
-
 Please download and set up the query parser from the [repository](https://github.com/sfu-db/qParser).
-
 ### Set Up the Python Environment
-
 1. Please use conda or venv to create a virtual environment. Run following command to install requirements.
 
 ```bash
@@ -35,8 +32,17 @@ conda activate parseval-dev
 pip install -r requirements.txt
 ```
 
-### Experiment Setup
+### Usage
 
+Normally, one invoke the tool as 
+```bash
+python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --offline
+```
+to generate test database instances for input query SQL1.
+
+You can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
+
+### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
 - Dataset
     - Download Leetcode/Literature/Bird/Spider datasets here.
@@ -44,4 +50,9 @@ pip install -r requirements.txt
 
 ### Running Experiments
 Commands needed can be found in the tests folder.
+
+
+### Planed features
+- NULL-related constraints
+
 
