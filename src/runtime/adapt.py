@@ -15,7 +15,6 @@ logger = logging.getLogger('src.parseval')
 if TYPE_CHECKING:
     from .constraint import Constraint
 
-
 def adapt_constraint(instance, node: Constraint, new_symbols: Dict[str, List], primary_table, primary_tuple_id):
     new_constraint = None
     if node.constraint_type in { PathConstraintType.VALUE, PathConstraintType.PATH}:

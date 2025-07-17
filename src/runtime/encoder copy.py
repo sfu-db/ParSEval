@@ -1,9 +1,6 @@
 from typing import Any, List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass, field, replace
 from collections import defaultdict
-from copy import deepcopy
-from collections.abc import MutableSequence
-
 from .constant import BranchType
 from src.expression.symbol import Row, to_literal, and_, or_, Literal, get_all_variables, distinct, Strftime
 from src.expression.visitors import get_predicates
@@ -26,38 +23,16 @@ class InputRef:
     checks: List[Any] = field(default_factory=list)
     depends_on: List[str] = field(default_factory=list)
 
-class InputRefs(MutableSequence):
-    def __init__(self, items = None):
-        self._items = list(items) if items else []
-
-    def __getitem__(self, index):
-        return self._items[index]
-
-    def __setitem__(self, index, value):
-        self._items[index] = value
-
-    def __delitem__(self, index):
-        del self._items[index]
-
-    def __len__(self):
-        return len(self._items)
-
-    def insert(self, index, value):
-        self._items.insert(index, value)
-
-    def __or__(self, other):
-        new_input_refs = [replace(ref, index = new_index) for new_index, ref in enumerate([self, *other])]
-        return InputRefs(new_input_refs)
-    
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self._items!r})"
-
 @dataclass
 class SymbolTable:
     _id: str
     data: List
-    row_exprs: List = field(default_factory=list, repr= False)
-    tbl_exprs: List[InputRef] = field(default_factory=list, repr= False)
+    label: str = field(default = BranchType.POSITIVE, repr= False)
+    row_expr: List = field(default_factory=list, repr= False)
+    tbl_expr: List = field(default_factory=list, repr= False)
+    attributes: List[InputRef] = field(default_factory=list, repr= False)
+    metadata: Dict = field(default_factory=dict, repr = False)
+
 
 class Encoder:
     PREDEFINED = {}
@@ -77,49 +52,63 @@ class Encoder:
         except Exception as e:
             raise
     
-    def __extend_inputrefs(self, left: List[InputRef], right: List[InputRef]):
-        new_tbl_exprs = [replace(ref, index = new_index) for new_index, ref in enumerate([*left, *right])]
-        return new_tbl_exprs
-
-
+    def update_metadata(self, *args):
+        tables = []
+        for arg in args:
+            tables.extend(arg['table'])
+        new_tables = []
+        for new_index, ref in enumerate(tables):
+            new_tables.append(replace(ref, index = new_index))
+        return {'table': tables}
+    
     def encode_scan(self, operator: rel.Step, **kwargs):
         '''
         we would not encode scan because of instance.
         '''
         instance = kwargs.get('instance')
         table = instance.get_table(operator.table)
-        output = [row for row in table]
+        output = []
+        for row in table:
+            output.append(row)
+
         md = [InputRef(name= column.name, 
                        index= index, 
                        typ= column.kind, 
                        table= [operator.table], 
                        nullable= not table.is_notnull(column),
                        unique= table.is_unique(column)) for index, column in enumerate(table.column_defs)]
-        return SymbolTable(_id = operator.i(), data = output, tbl_exprs = md)
+        return SymbolTable(_id = operator.i(), data = output, metadata= {'table': md}, attributes= md)
     
     def encode_project(self, operator, **kwargs):
         st = self.encode(operator.this, **kwargs)
-        outputs, tbl_exprs = [], []
+        outputs, metadata, infos = [], [], []
         for projection in operator.projections:
             if isinstance(projection, exp.Column):
-                inputref = st.tbl_exprs[get_ref(projection)]
-                tbl_exprs.append(inputref)
-                # infos.append({'table': [inputref]})
+                inputref = st.metadata['table'][get_ref(projection)]
+                metadata.append(inputref)
+                infos.append({'table': [inputref]})
             elif isinstance(projection, exp.Literal):
-                # InputRef(name= projection.output_name, index= len(inputrefs), typ= )
                 raise NotImplementedError('Literal is not implemented in Project')
             elif isinstance(projection, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
                 inputref = InputRef(name= projection.name, 
-                                    index= len(tbl_exprs),
+                                    index= len(metadata),
                                     typ= get_datatype(projection), 
-                                    table = st.tbl_exprs[get_ref(projection)].table, 
+                                    table = st.metadata['table'][get_ref(projection)].table, 
                                     nullable = False, unique= False, is_computed= True, 
-                                    depends_on= [st.tbl_exprs[ref] for ref in get_refs(projection.this)])
-                tbl_exprs.append(inputref)
-                # infos.append({'table': [inputref]})
+                                    depends_on= [st.metadata['table'][ref] for ref in get_refs(projection.this)])
+                metadata.append(inputref)
+                infos.append({'table': [inputref]})
             elif isinstance(projection, exp.Case):
                 # Handle CASE expressions
- 
+                ref = get_ref(projection)
+                
+                # inputref = InputRef(name= projection.name, 
+                #                     index= len(metadata), 
+                #                     typ= get_datatype(projection), 
+                #                     table = st.metadata['table'], 
+                #                     nullable = False, unique= False, is_computed= True, 
+                #                     depends_on= [st.metadata['table'][ref]])
+
                 raise NotImplementedError('Case is not implemented in Project')
         
         for row in st.data:
@@ -129,15 +118,14 @@ class Encoder:
                 takens.append(True)
             outputs.append(Row(this = row.multiplicity, operands = projections))
             tuples = [row.this]
-            self.add.which_branch(operator.key, operator.i(), projections, operator.projections, takens, 1, tbl_exprs, tuples = tuples)
+            self.add.which_branch(operator.key, operator.i(), projections, operator.projections, takens, 1, infos, tuples = tuples)
 
         self.add.advance(operator.key, operator.i())
-        st = SymbolTable(operator.i(), data= outputs, tbl_exprs= tbl_exprs)
+        st = SymbolTable(operator.i(), data= outputs, metadata=  {'table': metadata})
         return st
     
     def encode_filter(self, operator: rel.Step, **kwargs):
         st = self.encode(operator.this, **kwargs)
-        tbl_exprs = deepcopy(st.tbl_exprs)
         outputs = []
         for row in st.data:
             smt = self.encode(operator.condition, row = row, **kwargs)
@@ -146,20 +134,20 @@ class Encoder:
             predicates = get_predicates(smt)
             tuples = [row.this]
             takens = [bool(p.value) for p in predicates]
+            md = [st.metadata] * len(takens)
             sql_conditions = list(operator.condition.find_all(exp.Predicate))
-            self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, takens, bool(smt.value), tbl_exprs, tuples = tuples)
+            self.add.which_branch(operator.key, operator.i(), predicates, sql_conditions, takens, bool(smt.value), md, tuples = tuples)
         
         self.add.advance(operator.key, operator.i())
-        st = SymbolTable(_id = operator.i(), data = outputs, tbl_exprs= tbl_exprs)
+        st = SymbolTable(_id = operator.i(), data = outputs, metadata= st.metadata)
         return st
 
 
     def encode_join(self, operator: rel.Join, **kwargs):
         left = self.encode(operator.this, **kwargs)
         right = self.encode(operator.right, **kwargs)
-        outputs = []
-        
-        tbl_exprs = self.__extend_inputrefs(left.tbl_exprs, right.tbl_exprs)
+        outputs, infos = [], []
+        metadata = self.update_metadata(left.metadata, right.metadata)        
         join_type = operator.kind.lower()
         
         for l_row in left.data:
@@ -174,37 +162,37 @@ class Encoder:
                 predicates.append(smt)
             predicate = or_(predicates)
             if join_type in ['inner']:
-                self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [predicate.value], predicate.value, tbl_exprs, tuples = tuples)
+                takens = [predicate.value]
+                self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], takens, predicate.value, [metadata], tuples = tuples)
 
             if join_type in ['left', 'full']:
                 if predicate:
-                    self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], [True], 1, [tbl_exprs], tuples = tuples)
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [ operator.condition], [True], 1, [metadata], tuples = tuples)
                 else:
                     null_row = [Literal.null(md.typ) for md in right.metadata['table']]
                     combined_row = Row(operands = [*l_row.operands, *null_row], this = l_row.this)
                     outputs.append(combined_row)
                     tuples.append(combined_row.this)
-                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [False], 1, [tbl_exprs], tuples = tuples)
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], [False], 1, [metadata], tuples = tuples)
         
-        # if join_type == 'inner':
-        #     for r_row in right.data:
-        #         smt_exprs = []
-        #         for l_row in left.data:
-        #             combined_row = l_row * r_row
-        #             smt = self.encode(operator.condition, row=combined_row, **kwargs)
-        #             smt_exprs.append(smt.not_())
+        if join_type == 'inner':
+            for r_row in right.data:
+                smt_exprs = []
+                for l_row in left.data:
+                    combined_row = l_row * r_row
+                    smt = self.encode(operator.condition, row=combined_row, **kwargs)
+                    smt_exprs.append(smt.not_())
 
-        #         predicate = and_(smt_exprs)
-        #         if predicate:
-        #             takens = [False]
-        #             tuples = [r_row.this]
-        #             self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], takens, 0, [tbl_exprs], tuples = tuples)
+                predicate = and_(smt_exprs)
+                if predicate:
+                    takens = [False]
+                    tuples = [r_row.this]
+                    self.add.which_branch(operator.key, operator.i(), [predicate], [operator.condition], takens, 0, [metadata], tuples = tuples)
         
         self.add.advance(operator.key, operator.i())
-        st = SymbolTable(_id = operator.i(), data = outputs, tbl_exprs= tbl_exprs)
+        st = SymbolTable(_id = operator.i(), data = outputs, metadata= metadata)
         return st
     
-        
     def encode_union(self, operator: rel.Union, **kwargs):
         left = self.encode(operator.this, **kwargs)
         right = self.encode(operator.right, **kwargs)
@@ -265,15 +253,12 @@ class Encoder:
     
     def encode_aggregate(self, operator: rel.Aggregate, **kwargs):
         st = self.encode(operator.this, **kwargs)
-        
-        metadata, infos, sql_conditions, tbl_exprs = [], [], [], []
-        
+        metadata, infos, sql_conditions = [], [], []
         ## get metadata info
         for expr in operator.groupby:
             ref = get_ref(expr)
-            datatype = get_datatype(expr)
-            inputref = InputRef(name= expr.name, index= len(metadata), typ=datatype, nullable= False, unique= True, table = st.tbl_exprs[ref].table)
-            tbl_exprs.append(inputref)
+            datatype = get_datatype(expr) 
+            inputref = InputRef(name= expr.name, index= len(metadata), typ=datatype, nullable= False, unique= True, table = st.metadata['table'][ref].table)
             metadata.append(inputref)
             infos.append({'table': [inputref], 'group_size': [], 'group_stats': []})
             sql_conditions.append(expr)
@@ -282,12 +267,12 @@ class Encoder:
             ref = get_ref(func)
             datatype = get_datatype(func) 
             inputref = InputRef(name= func.name, index= len(metadata), typ=datatype, nullable= False, unique= False, 
-                                table = st.tbl_exprs[ref].table,
-                                is_computed= True, depends_on = [st.tbl_exprs[ref]])
+                                table = st.metadata['table'][ref].table,
+                                is_computed= True, depends_on = [st.metadata['table'][ref]])
             metadata.append(inputref)
-            tbl_exprs.append(inputref)
             infos.append({'table': [inputref], 'group_size': [], 'group_stats': []})
             sql_conditions.append(func)
+        metadata = self.update_metadata({'table': metadata})
 
         # Group by the specified columns
         groups = {}
@@ -309,8 +294,7 @@ class Encoder:
         group_count_predicates =  [distinct(list(col)) for col in group_keys]           ### process group by predicates
 
         takens = [True]  * len(group_count_predicates)
-        if takens:
-            self.add.which_branch(operator.key, operator.i(), group_count_predicates, sql_conditions[:len(group_count_predicates)], takens, 1, tbl_exprs, tuples = tuples)
+        self.add.which_branch(operator.key, operator.i(), group_count_predicates, sql_conditions[:len(group_count_predicates)], takens, 1, infos[:len(group_count_predicates)], tuples = tuples)
 
         agg_func_prediacates = [[]] * len(operator.agg_funcs)
 
@@ -328,7 +312,7 @@ class Encoder:
             takens = [False]  * len(row_expressions)
             self.add.which_branch(operator.key, operator.i(), row_expressions, sql_conditions, takens, 1, infos, tuples = [tuples[group_index]])
 
-        return SymbolTable(_id = operator.i(), data = outputs, tbl_exprs = tbl_exprs)
+        return SymbolTable(_id = operator.i(), data = outputs, metadata= metadata)
     
     def encode_sum(self, operator, **kwargs):
         """ Sum(this=Column(this=Identifier(this=$1, quoted=False), datatype=DataType(this=Type.FLOAT, nested=False)ref=1),
@@ -458,10 +442,9 @@ class Encoder:
         
 
         tuples = set()
-        tbl_exprs = deepcopy(st.tbl_exprs)
-        for i, tbl_expr in enumerate(tbl_exprs):
-            tbl_exprs[i] = replace(tbl_expr, unique=tbl_expr.unique | (limit == 1))
-        metadata = tbl_exprs
+        predicates = []
+        sql_conditions = []
+        metadata = self.update_metadata(st.metadata)
 
         for row in outputs:
             for sort_key in sort_keys:
@@ -473,11 +456,8 @@ class Encoder:
 
         if offset > 0 or limit < 100:
             outputs = outputs[offset : offset + limit]
-        
-        
-
-
-        st = SymbolTable(_id = operator.i(), data = outputs, tbl_exprs = tbl_exprs)
+            
+        st = SymbolTable(_id = operator.i(), data = outputs, metadata= st.metadata)
         self.add.advance(operator.key, operator.i())
         return st
         

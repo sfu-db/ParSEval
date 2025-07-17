@@ -1,0 +1,106 @@
+{
+  "relOp": "LogicalProject",
+  "project": [
+    {
+      "kind": "INPUT_REF",
+      "index": 17,
+      "name": "$17",
+      "type": "VARCHAR"
+    }
+  ],
+  "id": "4",
+  "inputs": [
+    {
+      "relOp": "LogicalFilter",
+      "condition": {
+        "kind": "AND",
+        "operator": "AND",
+        "type": "BOOLEAN",
+        "operands": [
+          {
+            "kind": "EQUALS",
+            "operator": "=",
+            "type": "BOOLEAN",
+            "operands": [
+              {
+                "kind": "INPUT_REF",
+                "index": 47,
+                "name": "$47",
+                "type": "INTEGER"
+              },
+              {
+                "kind": "LITERAL",
+                "value": 1,
+                "type": "INTEGER",
+                "nullable": false,
+                "precision": 10
+              }
+            ]
+          },
+          {
+            "kind": "GREATER_THAN",
+            "operator": ">",
+            "type": "BOOLEAN",
+            "operands": [
+              {
+                "kind": "INPUT_REF",
+                "index": 6,
+                "name": "$6",
+                "type": "INTEGER"
+              },
+              {
+                "kind": "LITERAL",
+                "value": 500,
+                "type": "INTEGER",
+                "nullable": false,
+                "precision": 10
+              }
+            ]
+          }
+        ]
+      },
+      "variableset": "[]",
+      "id": "3",
+      "inputs": [
+        {
+          "relOp": "LogicalJoin",
+          "joinType": "left",
+          "condition": {
+            "kind": "EQUALS",
+            "operator": "=",
+            "type": "BOOLEAN",
+            "operands": [
+              {
+                "kind": "INPUT_REF",
+                "index": 0,
+                "name": "$0",
+                "type": "VARCHAR"
+              },
+              {
+                "kind": "INPUT_REF",
+                "index": 11,
+                "name": "$11",
+                "type": "VARCHAR"
+              }
+            ]
+          },
+          "id": "2",
+          "inputs": [
+            {
+              "relOp": "LogicalTableScan",
+              "table": "satscores",
+              "id": "0",
+              "inputs": []
+            },
+            {
+              "relOp": "LogicalTableScan",
+              "table": "schools",
+              "id": "1",
+              "inputs": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

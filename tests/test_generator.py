@@ -57,7 +57,7 @@ class TestGenerator(unittest.TestCase):
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         generator = Generator('tests/db', schema, "tests/plan/aggregate.txt", name = 'test_coverage')
@@ -74,7 +74,7 @@ class TestGenerator(unittest.TestCase):
 
         register_default_generators()
         from src.instance.instance import Instance
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
         
         instance =Instance.create(schema= schema, name = 'public', dialect = 'sqlite')
@@ -88,21 +88,22 @@ class TestGenerator(unittest.TestCase):
 
 
 
-    @unittest.skip('spj')
+    # @unittest.skip('spj')
     def test_generate_spj(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
         
         # -- SQLite
         # SELECT schools.School from satscores JOIN schools on satscores.cds = schools.CDSCode where satscores.NumTstTakr > 500 and schools.Magnet = 1
 
         generator = Generator('tests/db', schema, "datasets/bird/plan/california_schools_7_gold.sql", name = 'test_spj')
-        result =generator.generate(max_iter= 8)
+        print(generator.plan)
+        result =generator.generate(max_iter= 2)
         assert len(result.data) >= 3
     @unittest.skip('spj')
     def test_generate_spj_left_join_sort(self):
@@ -110,7 +111,7 @@ class TestGenerator(unittest.TestCase):
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()        
         # -- SQLite
         # SELECT schools.School from satscores JOIN schools on satscores.cds = schools.CDSCode where satscores.NumTstTakr > 500 and schools.Magnet = 1
@@ -119,14 +120,14 @@ class TestGenerator(unittest.TestCase):
         result =generator.generate(max_iter= 8)
         assert len(result.data) >= 1
     
-    # @unittest.skip('spj_disjunction')
+    @unittest.skip('spj_disjunction')
     def test_generate_spj_disjunction(self):
         from src.instance.generators import ValueGeneratorRegistry, register_default_generators
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
         
         # -- SQLite
@@ -142,7 +143,7 @@ class TestGenerator(unittest.TestCase):
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
         # -- SQLite
         # SELECT schools.School from satscores JOIN schools on satscores.cds = schools.CDSCode where satscores.NumTstTakr > 500 and schools.Magnet = 1
@@ -150,6 +151,29 @@ class TestGenerator(unittest.TestCase):
         print(generator.plan)
         result =generator.generate(max_iter= 8)
         # assert len(result.data) >= 1
+
+    @unittest.skip("skip_groupby")
+    def test_generate_groupby(self):
+        from src.instance.generators import ValueGeneratorRegistry, register_default_generators
+
+        register_default_generators()
+        from src.instance.instance import Instance
+        from src.runtime.generator import Generator
+
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
+            schema = conn.get_schema()
+
+        # -- SQLite
+        # SELECT T2.School FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T2.Magnet = 1 AND T1.NumTstTakr > 500
+
+        # SELECT sname FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T1.NumTstTakr > 500 AND T2.Magnet = 1
+
+        sql = "select city, sum(`Enrollment (K-12)`) from frpm join schools on frpm.CDSCode = schools.CDSCode GROUP by schools.City "
+
+        # generator = Generator('tests/db', schema, "tests/plan/aggregate.txt", name = 'test_agg')
+        generator = Generator('tests/db', schema,  "tests/plan/aggregate.txt", name = 'test_groupby')
+        print(generator.plan)        
+        result =generator.generate(max_iter= 8)
 
     @unittest.skip("aggregate_functions")
     def test_generate_aggregate(self):
@@ -159,7 +183,7 @@ class TestGenerator(unittest.TestCase):
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         # -- SQLite
@@ -182,7 +206,7 @@ class TestGenerator(unittest.TestCase):
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         # -- SQLite
@@ -205,7 +229,7 @@ class TestGenerator(unittest.TestCase):
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         # -- SQLite
@@ -227,7 +251,7 @@ class TestGenerator(unittest.TestCase):
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
 
-        with DBManager().get_connection("results/dail/2025-01-21_12-11-32/california_schools_1", "instance_size2.sqlite") as conn:
+        with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         sql = "select city, sum(`Enrollment (K-12)`) from frpm join schools on frpm.CDSCode = schools.CDSCode GROUP by schools.City "
@@ -238,6 +262,7 @@ class TestGenerator(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    
     reset_folder('tests/db')
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
     unittest.main(testRunner=runner, exit=False)

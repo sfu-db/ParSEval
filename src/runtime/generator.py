@@ -47,9 +47,6 @@ class Generator:
         self.path.reset()
         self.constraints.clear()
 
-
-    
-
     def get_coverage(self, instance, **kwargs):
         if instance is None:
             instance =Instance.create(schema= self.schema, name = self.name, dialect = self.dialect)
@@ -80,7 +77,7 @@ class Generator:
         
         print("****" * 20)
         print(f"SymbolTable Shape: {len(st.data)}")
-        instance.to_db(self.workspace, database = self.name + '.sqlite')
+        # instance.to_db(self.workspace, database = self.name + '.sqlite')
         return st
 
     def generate(self, max_iter = 8, **kwargs):
@@ -102,10 +99,10 @@ class Generator:
             if pattern is None and st.data:
                 break
             target_vars = self.constraints.pop('variable', [])
-
             solver = Solver(target_vars)
             for label, constraints in self.constraints.items():
                 solver.append(constraints)
+                logger.info(f'label: {label} : {constraints}')
             db_constraints = instance.get_db_constraints()
             solver.appendleft(db_constraints.pop('SIZE'))
             for label, constraints in db_constraints.items():
@@ -194,7 +191,7 @@ class Generator:
 
         print('leaves: ',self.path.leaves)
 
-        instance.to_db(self.workspace, database = self.name + '.sqlite')
+        # instance.to_db(self.workspace, database = self.name + '.sqlite')
 
         # print(self.path.pprint())
         return st
