@@ -6,8 +6,8 @@ from src.expression.visitors import substitute, extend_summation, extend_distinc
 
 import random, logging
 from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from .constraint import Constraint, PlausibleChild
+# if TYPE_CHECKING:
+from .constraint import Constraint, PlausibleChild
 
 logger = logging.getLogger('src.parseval')
 
@@ -16,17 +16,58 @@ MAX_RETRY = 2
 MINIMIAL_GROUP_COUNT = 3
 MINIMIAL_GROUP_SIZE = 3
 
+
+
 def get_reference_predicate(plausible: PlausibleChild):
     '''
+        Given the plausible node in the constraint tree, we should get reference predicate and use it to derive new constraints so that we could append appropriate data to the instance.
         get reference predicate related to plausible node
         if branch type is PLAUSIBLE, return sibling.delta.not_()
         if branch type is positive:
             if constraint type in {Path, VALUE}, return delta
-            if constraint type in {SIZE}, return is_null, or duplicate
+            if constraint type in {SIZE}:
+                if operator key is project: we could return the projection directly
+                if operator key is aggregate: we should return the constraint that extend group count
+        if branch type is size:
+            if operator key is aggregate: we should extend group size of one group
+            if operator key is project: we should extend projections by adding duplication constraints
+        if branch type is null:
+            if operator key is aggregate and agg funs, we should add null values to a group
+            if operator key is project, we should add null values to the column
     '''
     constraint_type = None
     predicate = None
     tables = None
+    if plausible.branch_type in {BranchType.PLAUSIBLE}:
+        sibling = _find_sibling_constraint(plausible)
+        if not sibling:
+            raise ValueError("No sibling constraint found for PLAUSIBLE branch.")
+        predicate = random.choice(sibling.delta).not_()
+        constraint_type = sibling.constraint_type
+        tables = sibling.get_tables()
+    
+    elif plausible.branch_type == BranchType.POSITIVE:
+        parent_node: Constraint = plausible.parent
+        constraint_type = parent_node.constraint_type
+        tables = parent_node.get_tables()
+        if constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
+            predicate = _get_reference_predicate_from_filter(parent_node)
+        elif constraint_type in {PathConstraintType.SIZE}:
+            predicate = _get_reference_predicate_from_plausible_size(plausible)
+        else:
+            raise ValueError(f'cannot get reference predicate from plausible node : {plausible}')
+        
+    elif plausible.branch_type == BranchType.NULLABLE:
+        pred = plausible.parent.delta[-1]
+        variables = get_all_variables(pred)
+        v = variables.pop()
+        predicate = v.is_null()
+    elif plausible.branch_type == BranchType.SIZE:
+        predicate = _get_reference_predicate_from_plausible_size(plausible)
+
+    assert predicate is not None, f"should handle {plausible.branch_type} "
+    return predicate, constraint_type, tables
+
     if plausible.branch_type == BranchType.PLAUSIBLE:
         node = plausible.sibling()
         predicate = random.choice(node.delta).not_()
@@ -48,9 +89,31 @@ def get_reference_predicate(plausible: PlausibleChild):
                     '''we should increase group size '''
                     predicate = _get_reference_predicate_from_agg_func(parent_node)
             if parent_node.operator_key in {'project', 'sort'}:
-                predicate = _get_reference_predicate_from_project(parent_node)    
+                predicate = _get_reference_predicate_from_project(parent_node)
     assert predicate is not None, f"should handle {plausible.branch_type} "
     return predicate, constraint_type, tables
+
+
+def _find_sibling_constraint(plausible: PlausibleChild) -> Constraint | None:
+    """Helper to locate a sibling constraint node."""
+    for bit, child in plausible.parent.children.items():
+        if isinstance(child, Constraint):
+            return child
+    return None
+
+def _get_reference_predicate_from_plausible_size(plausible: PlausibleChild):
+    parent_node: Constraint = plausible.parent
+    if parent_node.operator_key in {'project'}:
+        predicate = _get_reference_predicate_from_project(parent_node)
+    elif parent_node.operator_key in {'sort'}:
+        predicate = _get_reference_predicate_from_project(parent_node)
+    elif parent_node.operator_key in {'aggregate'}:
+        predicate = None
+
+    # return predicate, constraint_type, tables
+
+def _get_reference_predicate_from_plausible_null(plausible: PlausibleChild):
+    ...
 
 def _get_reference_predicate_from_agg_func(node):
     '''we do not need to consider group count here. Instead
@@ -95,7 +158,7 @@ def _get_reference_predicate_from_agg_func(node):
 
 def _get_reference_predicate_from_project(node: Constraint):
     if node.sql_condition.key == 'column':
-        inputref = node.info['table'][0]
+        inputref = node.tbl_exprs[0]
         null_constraints = [variable.is_null() for variable in node.delta]
         if inputref.nullable and not any(null_constraints):
             predicate = null_constraints.pop()
@@ -114,6 +177,10 @@ def _get_reference_predicate_from_filter(node):
     assert node.constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}
     predicate = node.delta[-1]
     return predicate
+
+def _get_reference_predicate_from_join(plausible, node):
+    ...
+
 
 def _get_reference_predicate_from_having(node: Constraint):
 

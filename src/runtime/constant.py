@@ -20,26 +20,33 @@ class BranchType(Enum):
     """
 
     NEGATIVE = 0
-    POSITIVE = 1
-    STRAIGHT = 2
-    ROOT = 3
-    PLAUSIBLE = 4
+    POSITIVE = 1    
+    PLAUSIBLE = 2
+    RPLAUSIBLE = 3
+    ROOT = 4
     UNREACHABLE = 5
     NULLABLE = 6
-    UNIQUE = 7
-
+    SIZE = 7
     def __bool__(self):
-        return self in {BranchType.POSITIVE, BranchType.STRAIGHT}
+        return self in {BranchType.POSITIVE}
     
     def __and__(self, other):
         if not isinstance(other, BranchType):
             other = BranchType.from_value(other)
         if self == BranchType.ROOT:
             return other
-        elif self or other:
+        elif self.value  and other.value:
             return other
         else:
             return BranchType.NEGATIVE
+    
+    def __xor__(self, other):
+        if not isinstance(other, BranchType):
+            other = BranchType.from_value(other)
+        if self == BranchType.ROOT:
+            return other
+       
+        return BranchType.from_value(max(self.value, other.value))
     
     @classmethod
     def from_value(cls, value):
@@ -56,6 +63,8 @@ class BranchType(Enum):
         return self.name
     def __repr__(self):
         return self.name
+    
+
 class Action(Enum):    
     """Represents different actions that can be taken during AST processing.
        

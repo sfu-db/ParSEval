@@ -30,7 +30,7 @@ def negate_sql_condition(expr: exp.Condition) -> exp.Condition:
         return exp.GT( this=expr.left, expression=expr.right)
     if isinstance(expr, exp.Not):
         return expr.this
-    if isinstance(expr, ( exp.Column, exp.AggFunc)):
+    if isinstance(expr, (exp.Column, exp.AggFunc)):
         return expr
     return exp.Not(this=expr)
 
