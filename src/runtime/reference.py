@@ -16,172 +16,193 @@ MAX_RETRY = 2
 MINIMIAL_GROUP_COUNT = 3
 MINIMIAL_GROUP_SIZE = 3
 
-
-
 def get_reference_predicate(plausible: PlausibleChild):
-    '''
-        Given the plausible node in the constraint tree, we should get reference predicate and use it to derive new constraints so that we could append appropriate data to the instance.
-        get reference predicate related to plausible node
-        if branch type is PLAUSIBLE, return sibling.delta.not_()
-        if branch type is positive:
-            if constraint type in {Path, VALUE}, return delta
-            if constraint type in {SIZE}:
-                if operator key is project: we could return the projection directly
-                if operator key is aggregate: we should return the constraint that extend group count
-        if branch type is size:
-            if operator key is aggregate: we should extend group size of one group
-            if operator key is project: we should extend projections by adding duplication constraints
-        if branch type is null:
-            if operator key is aggregate and agg funs, we should add null values to a group
-            if operator key is project, we should add null values to the column
-    '''
-    constraint_type = None
-    predicate = None
-    tables = None
-    if plausible.branch_type in {BranchType.PLAUSIBLE}:
-        sibling = _find_sibling_constraint(plausible)
-        if not sibling:
-            raise ValueError("No sibling constraint found for PLAUSIBLE branch.")
-        predicate = random.choice(sibling.delta).not_()
-        constraint_type = sibling.constraint_type
-        tables = sibling.get_tables()
+    """
+        Given a plausible node in the constraint tree, return a reference predicate, its constraint type, and involved tables.
+        This predicate can be used to generate new data to cover unexplored branches.
+    """
+    branch_type = plausible.branch_type
+    if branch_type == BranchType.POSITIVE:
+        return _get_reference_predicate_from_positive(plausible)
+    elif branch_type == BranchType.PLAUSIBLE:
+        return _get_reference_predicate_from_plausible(plausible)
     
-    elif plausible.branch_type == BranchType.POSITIVE:
-        parent_node: Constraint = plausible.parent
-        constraint_type = parent_node.constraint_type
-        tables = parent_node.get_tables()
-        if constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
-            predicate = _get_reference_predicate_from_filter(parent_node)
-        elif constraint_type in {PathConstraintType.SIZE}:
-            predicate = _get_reference_predicate_from_plausible_size(plausible)
-        else:
-            raise ValueError(f'cannot get reference predicate from plausible node : {plausible}')
-        
-    elif plausible.branch_type == BranchType.NULLABLE:
-        pred = plausible.parent.delta[-1]
-        variables = get_all_variables(pred)
-        v = variables.pop()
-        predicate = v.is_null()
-    elif plausible.branch_type == BranchType.SIZE:
-        predicate = _get_reference_predicate_from_plausible_size(plausible)
+    elif branch_type == BranchType.NULLABLE:
+        return _get_reference_predicate_from_nullable(plausible)
+    elif branch_type == BranchType.SIZE:
+        return _get_reference_predicate_from_plausible_size(plausible)
+    else:
+        logger.error(f"Unsupported branch type: {branch_type}")
+        raise ValueError(f"Unsupported branch type: {branch_type}")
 
-    assert predicate is not None, f"should handle {plausible.branch_type} "
+def _get_reference_predicate_from_plausible(plausible: PlausibleChild):
+    """
+    For PLAUSIBLE branch, return the negation of a sibling's predicate.
+    """
+    sibling = _find_sibling_constraint(plausible)
+    if not sibling or not sibling.delta:
+        raise ValueError("No sibling constraint or empty delta found for PLAUSIBLE branch.")
+    # Pick a random predicate from sibling's delta and negate it
+    pred = random.choice(sibling.delta).not_()
+    constraint_type = sibling.constraint_type
+    tables = sibling.get_tables()    
+    return pred, constraint_type, tables
+
+def _get_reference_predicate_from_positive(plausible: PlausibleChild):
+    """
+        For POSITIVE branch, use parent's predicate or size logic.
+    """
+    parent_node: Constraint = plausible.parent
+    constraint_type = parent_node.constraint_type
+    tables = parent_node.get_tables()
+    if constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
+        pred = _get_reference_predicate_from_filter(parent_node)
+        logger.debug(f"POSITIVE: Using filter predicate {pred}")
+        return pred, constraint_type, tables
+    elif constraint_type == PathConstraintType.SIZE:
+        pred, _, _ = _get_reference_predicate_from_plausible_size(plausible)
+        logger.debug(f"POSITIVE: Using size predicate {pred}")
+        return pred, constraint_type, tables
+    else:
+        logger.error(f"Cannot get reference predicate from POSITIVE node: {plausible}")
+        raise ValueError(f"Cannot get reference predicate from POSITIVE node: {plausible}")
+
+def _get_reference_predicate_from_nullable(plausible: PlausibleChild):
+    """
+        For NULLABLE branch, generate a predicate that makes a variable NULL.
+    """
+    parent = plausible.parent
+    if not parent.delta:
+        logger.error("Parent delta is empty for NULLABLE branch.")
+        raise ValueError("Parent delta is empty for NULLABLE branch.")
+    pred = parent.delta[-1]
+    variables = list(get_all_variables(pred))
+    if not variables:
+        logger.error("No variables found in parent predicate for NULLABLE branch.")
+        raise ValueError("No variables found in parent predicate for NULLABLE branch.")
+    v = random.choice(variables)
+    predicate = v.is_null()
+    constraint_type = parent.constraint_type
+    tables = parent.get_tables()
+    logger.debug(f"NULLABLE: Using is_null predicate {predicate}")
     return predicate, constraint_type, tables
 
-    if plausible.branch_type == BranchType.PLAUSIBLE:
-        node = plausible.sibling()
-        predicate = random.choice(node.delta).not_()
-        constraint_type = node.constraint_type
-        tables = node.get_tables()
-
-    elif plausible.branch_type == BranchType.POSITIVE:
-        parent_node: Constraint = plausible.parent
-        constraint_type = parent_node.constraint_type
-        tables = parent_node.get_tables()
-        if parent_node.constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}:
-            predicate = _get_reference_predicate_from_filter(parent_node)
-        elif constraint_type in {PathConstraintType.SIZE}:
-            if parent_node.operator_key in {'aggregate'}:
-                if parent_node.taken:
-                    '''We should extend group count'''
-                    predicate = parent_node.delta[0]
-                else:
-                    '''we should increase group size '''
-                    predicate = _get_reference_predicate_from_agg_func(parent_node)
-            if parent_node.operator_key in {'project', 'sort'}:
-                predicate = _get_reference_predicate_from_project(parent_node)
-    assert predicate is not None, f"should handle {plausible.branch_type} "
-    return predicate, constraint_type, tables
-
+def _get_reference_predicate_from_plausible_size(plausible: PlausibleChild):
+    """
+    For SIZE branch, handle project, sort, and aggregate operators.
+    Returns (predicate, constraint_type, tables)
+    """
+    parent_node: Constraint = plausible.parent
+    constraint_type = parent_node.constraint_type
+    tables = parent_node.get_tables()
+    if parent_node.operator_key in {'project', 'sort'}:
+        pred = _get_reference_predicate_from_project(parent_node)
+        logger.debug(f"SIZE: Using project/sort predicate {pred}")
+        return pred, constraint_type, tables
+    elif parent_node.operator_key == 'aggregate':
+        pred = _get_reference_predicate_from_agg_func(parent_node)
+        logger.debug(f"SIZE: Using aggregate predicate {pred}")
+        return pred, constraint_type, tables
+    else:
+        logger.error(f"Unsupported operator_key for SIZE branch: {parent_node.operator_key}")
+        raise ValueError(f"Unsupported operator_key for SIZE branch: {parent_node.operator_key}")
 
 def _find_sibling_constraint(plausible: PlausibleChild) -> Constraint | None:
-    """Helper to locate a sibling constraint node."""
-    for bit, child in plausible.parent.children.items():
+    """
+    Helper to locate a sibling constraint node (not a PlausibleChild).
+    """
+    parent = plausible.parent
+    for bit, child in parent.children.items():
         if isinstance(child, Constraint):
             return child
     return None
 
-def _get_reference_predicate_from_plausible_size(plausible: PlausibleChild):
-    parent_node: Constraint = plausible.parent
-    if parent_node.operator_key in {'project'}:
-        predicate = _get_reference_predicate_from_project(parent_node)
-    elif parent_node.operator_key in {'sort'}:
-        predicate = _get_reference_predicate_from_project(parent_node)
-    elif parent_node.operator_key in {'aggregate'}:
-        predicate = None
+def _get_reference_predicate_from_filter(node: Constraint):
+    """
+    For VALUE or PATH constraints, return the last predicate in node.delta.
+    """
+    if not node.delta:
+        logger.error("No predicates in node.delta for filter.")
+        raise ValueError("No predicates in node.delta for filter.")
+    return node.delta[-1]
 
-    # return predicate, constraint_type, tables
+def _get_reference_predicate_from_project(node: Constraint):
+    """
+    For project/sort operators, handle nullability and uniqueness.
+    """
+    if not node.delta:
+        logger.error("No predicates in node.delta for project.")
+        raise ValueError("No predicates in node.delta for project.")
+    inputref = node.tbl_exprs[0] if node.tbl_exprs else None
+    null_constraints = [variable.is_null() for variable in node.delta]
+    if inputref and getattr(inputref, 'nullable', False) and not any(null_constraints):
+        # Add a NULL value if possible
+        predicate = random.choice([v for v in node.delta if not v.is_null()]).is_null()
+        logger.debug(f"PROJECT: Adding NULL value predicate {predicate}")
+        return predicate
+    elif inputref and not getattr(inputref, 'unique', True):
+        # Add a duplicate value if not unique
+        non_nulls = [d for d in node.delta if not d.is_null()]
+        if not non_nulls:
+            logger.error("No non-null values to duplicate in project.")
+            raise ValueError("No non-null values to duplicate in project.")
+        variable = random.choice(non_nulls)
+        predicate = variable == variable.value
+        logger.debug(f"PROJECT: Adding duplicate value predicate {predicate}")
+        return predicate
+    else:
+        logger.error(f"Referred column should be either nullable or not unique in project. inputref: {inputref}")
+        raise ValueError(f"Referred column should be either nullable or not unique in project. inputref: {inputref}")
 
-def _get_reference_predicate_from_plausible_null(plausible: PlausibleChild):
-    ...
-
-def _get_reference_predicate_from_agg_func(node):
-    '''we do not need to consider group count here. Instead
-        aggregate($0)
-        / 
-    SUM($4)
-        /
-    COUNT($5)'''
-    assert node.taken is False, f"Aggregate Func node should only in bit 0, current is {node.taken}"
-    assert node.sql_condition.key in {'count', 'sum', 'max', 'min', 'avg'}, f"Aggregate Func node should be one of count, sum, max, min, avg, current is {node.sql_condition.key}"
+def _get_reference_predicate_from_agg_func(node: Constraint):
+    """
+    For aggregate functions, handle group size, nulls, and duplicates.
+    """
+    if not hasattr(node, 'info') or 'group_stats' not in node.info or 'group_size' not in node.info:
+        logger.error("Aggregate node missing group_stats or group_size info.")
+        raise ValueError("Aggregate node missing group_stats or group_size info.")
     nullable, unique = False, False
-    for md in node.info['table']:
-        for depend in md.depends_on:
-            if depend.nullable:
+    for md in node.info.get('table', []):
+        for depend in getattr(md, 'depends_on', []):
+            if getattr(depend, 'nullable', False):
                 nullable = True
-            if depend.unique:
+            if getattr(depend, 'unique', False):
                 unique = True
+    # Try to add a duplicate if not unique
     if not unique:
         for group_index, _, has_duplicate in node.info['group_stats']:
             if not has_duplicate:
                 delta = node.delta[group_index]
                 variables = list(get_all_variables(delta))
+                if not variables:
+                    continue
                 variable = random.choice(variables)
-                # logger.info(f'group {group_index} has no unique values, select data: {variable == variable.value}')
-                return  variable == variable.value
-    if nullable: ## is there NULL in each group?
+                logger.debug(f"AGGREGATE: Adding duplicate value predicate {variable == variable.value}")
+                return variable == variable.value
+    # Try to add a NULL if nullable
+    if nullable:
         for group_index, has_null, _ in node.info['group_stats']:
             if not has_null:
                 delta = node.delta[group_index]
                 variables = list(get_all_variables(delta))
-                return random.choice(variables).is_null() #random.choice(variables).is_null()
-    
-    group_sizes = sorted(node.info['group_size'], key = lambda node: node[1])
-    '''if max size < thres, tehn max, if all groups have the same size, then random one '''
-    if group_sizes[-1][1] < MINIMIAL_GROUP_SIZE:
+                if not variables:
+                    continue
+                predicate = random.choice(variables).is_null()
+                logger.debug(f"AGGREGATE: Adding NULL value predicate {predicate}")
+                return predicate
+    # Try to increase group size
+    group_sizes = sorted(node.info['group_size'], key=lambda x: x[1])
+    if group_sizes and group_sizes[-1][1] < MINIMIAL_GROUP_SIZE:
         variable = node.delta[group_sizes[-1][0]]
-    else:
-        variable = random.choices(node.delta, weights= [-d[1] for d in node.info['group_size']])[0]
-    predicate = variable.is_null().not_()
-    return predicate
-
-
-def _get_reference_predicate_from_project(node: Constraint):
-    if node.sql_condition.key == 'column':
-        inputref = node.tbl_exprs[0]
-        null_constraints = [variable.is_null() for variable in node.delta]
-        if inputref.nullable and not any(null_constraints):
-            predicate = null_constraints.pop()
-        elif not inputref.unique:
-            if node.operator_key in {'sort'}:
-                variable = max(node.delta)
-            else:
-                variable = random.choice([d for d in node.delta if not d.is_null()])
-            predicate = variable == variable.value #variables[0] == variables[1]
-        else:
-            logger.info(node.sql_condition)
-            raise ValueError(f'refered column should be either nullable or unique')
-    return predicate
-
-def _get_reference_predicate_from_filter(node):
-    assert node.constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}
-    predicate = node.delta[-1]
-    return predicate
-
-def _get_reference_predicate_from_join(plausible, node):
-    ...
-
-
-def _get_reference_predicate_from_having(node: Constraint):
-
-    ...
+        predicate = variable.is_null().not_()
+        logger.debug(f"AGGREGATE: Increasing group size with predicate {predicate}")
+        return predicate
+    elif group_sizes:
+        # Weighted random choice to increase a group
+        weights = [-d[1] for d in node.info['group_size']]
+        variable = random.choices(node.delta, weights=weights)[0]
+        predicate = variable.is_null().not_()
+        logger.debug(f"AGGREGATE: Increasing group size (weighted) with predicate {predicate}")
+        return predicate
+    logger.error("Could not determine aggregate reference predicate.")
+    raise ValueError("Could not determine aggregate reference predicate.")

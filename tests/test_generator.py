@@ -96,14 +96,15 @@ class TestGenerator(unittest.TestCase):
         from src.runtime.generator import Generator
 
         with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
-            schema = conn.get_schema()
-        
+            schema = conn.get_schema()        
         # -- SQLite
         # SELECT schools.School from satscores JOIN schools on satscores.cds = schools.CDSCode where satscores.NumTstTakr > 500 and schools.Magnet = 1
-
         generator = Generator('tests/db', schema, "datasets/bird/plan/california_schools_7_gold.sql", name = 'test_spj')
         print(generator.plan)
-        result =generator.generate(max_iter= 2)
+        result =generator.generate(max_iter= 8)
+        from src.runtime.to_dot import display_constraints
+        # print(self.path.pprint())
+        print(display_constraints(generator.path.root_constraint))
         assert len(result.data) >= 3
     @unittest.skip('spj')
     def test_generate_spj_left_join_sort(self):

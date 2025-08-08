@@ -17,8 +17,9 @@ if TYPE_CHECKING:
 
 def adapt_constraint(instance, node: Constraint, new_symbols: Dict[str, List], primary_table, primary_tuple_id):
     new_constraint = None
-    if node.constraint_type in { PathConstraintType.VALUE, PathConstraintType.PATH}:
+    if node.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
         new_constraint = adapt_constraint_from_filter(instance, node, new_symbols= new_symbols, primary_table= primary_table, primary_tuple_id= primary_tuple_id)
+    
     if node.constraint_type in {PathConstraintType.SIZE}:
         if node.operator_key == 'aggregate':
             new_constraint = adapt_constraint_from_aggregate(instance, node, new_symbols= new_symbols, primary_table= primary_table, primary_tuple_id= primary_tuple_id)
@@ -38,7 +39,6 @@ def adapt_constraint_from_filter(instance, node: Constraint, new_symbols: Dict[s
         for predicate in node.delta:
             source_vars = get_all_variables(predicate)
             tuples_ = set(instance.symbol_to_tuple_id[v.this] for v in source_vars)
-            # logger.info(f"primary tuple id {primary_tuple_id} in {tuples_} : {primary_tuple_id in tuples_}")
             if primary_tuple_id in tuples_:
                 new_constraint = predicate
                 break

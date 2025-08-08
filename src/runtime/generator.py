@@ -102,7 +102,7 @@ class Generator:
             solver = Solver(target_vars)
             for label, constraints in self.constraints.items():
                 solver.append(constraints)
-                logger.info(f'label: {label} : {constraints}')
+                # logger.info(f'label: {label} : {constraints}')
             db_constraints = instance.get_db_constraints()
             solver.appendleft(db_constraints.pop('SIZE'))
             for label, constraints in db_constraints.items():
