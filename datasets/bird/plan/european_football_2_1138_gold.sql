@@ -1,0 +1,213 @@
+{
+  "relOp": "LogicalProject",
+  "project": [
+    {
+      "kind": "DIVIDE",
+      "operator": "/",
+      "type": "REAL",
+      "operands": [
+        {
+          "kind": "TIMES",
+          "operator": "*",
+          "type": "REAL",
+          "operands": [
+            {
+              "kind": "CAST",
+              "operator": "CAST",
+              "type": "REAL",
+              "operands": [
+                {
+                  "kind": "INPUT_REF",
+                  "index": 0,
+                  "name": "$0",
+                  "type": "BIGINT"
+                }
+              ]
+            },
+            {
+              "kind": "LITERAL",
+              "value": 100,
+              "type": "INTEGER",
+              "nullable": false,
+              "precision": 10
+            }
+          ]
+        },
+        {
+          "kind": "CASE",
+          "operator": "CASE",
+          "type": "BIGINT",
+          "operands": [
+            {
+              "kind": "EQUALS",
+              "operator": "=",
+              "type": "BOOLEAN",
+              "operands": [
+                {
+                  "kind": "INPUT_REF",
+                  "index": 1,
+                  "name": "$1",
+                  "type": "BIGINT"
+                },
+                {
+                  "kind": "LITERAL",
+                  "value": 0,
+                  "type": "BIGINT",
+                  "nullable": false,
+                  "precision": 19
+                }
+              ]
+            },
+            {
+              "kind": "LITERAL",
+              "value": "NULL",
+              "type": "BIGINT",
+              "nullable": true,
+              "precision": 19
+            },
+            {
+              "kind": "CAST",
+              "operator": "CAST",
+              "type": "BIGINT",
+              "operands": [
+                {
+                  "kind": "INPUT_REF",
+                  "index": 1,
+                  "name": "$1",
+                  "type": "BIGINT"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "id": "3",
+  "inputs": [
+    {
+      "relOp": "LogicalAggregate",
+      "keys": [],
+      "aggs": [
+        {
+          "operator": "COUNT",
+          "distinct": false,
+          "ignoreNulls": false,
+          "operands": [
+            {
+              "column": 0,
+              "type": "INTEGER"
+            }
+          ],
+          "type": "BIGINT",
+          "name": null
+        },
+        {
+          "operator": "COUNT",
+          "distinct": false,
+          "ignoreNulls": false,
+          "operands": [],
+          "type": "BIGINT",
+          "name": null
+        }
+      ],
+      "id": "2",
+      "inputs": [
+        {
+          "relOp": "LogicalProject",
+          "project": [
+            {
+              "kind": "CASE",
+              "operator": "CASE",
+              "type": "INTEGER",
+              "operands": [
+                {
+                  "kind": "AND",
+                  "operator": "AND",
+                  "type": "BOOLEAN",
+                  "operands": [
+                    {
+                      "kind": "GREATER_THAN",
+                      "operator": ">",
+                      "type": "BOOLEAN",
+                      "operands": [
+                        {
+                          "kind": "INPUT_REF",
+                          "index": 27,
+                          "name": "$27",
+                          "type": "INTEGER"
+                        },
+                        {
+                          "kind": "LITERAL",
+                          "value": 80,
+                          "type": "INTEGER",
+                          "nullable": false,
+                          "precision": 10
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "GREATER_THAN",
+                      "operator": ">",
+                      "type": "BOOLEAN",
+                      "operands": [
+                        {
+                          "kind": "INPUT_REF",
+                          "index": 26,
+                          "name": "$26",
+                          "type": "INTEGER"
+                        },
+                        {
+                          "kind": "LITERAL",
+                          "value": 80,
+                          "type": "INTEGER",
+                          "nullable": false,
+                          "precision": 10
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "CAST",
+                  "operator": "CAST",
+                  "type": "INTEGER",
+                  "operands": [
+                    {
+                      "kind": "INPUT_REF",
+                      "index": 0,
+                      "name": "$0",
+                      "type": "INTEGER"
+                    }
+                  ]
+                },
+                {
+                  "kind": "LITERAL",
+                  "value": "NULL",
+                  "type": "INTEGER",
+                  "nullable": true,
+                  "precision": 10
+                }
+              ]
+            },
+            {
+              "kind": "INPUT_REF",
+              "index": 0,
+              "name": "$0",
+              "type": "INTEGER"
+            }
+          ],
+          "id": "1",
+          "inputs": [
+            {
+              "relOp": "LogicalTableScan",
+              "table": "Player_Attributes",
+              "id": "0",
+              "inputs": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
