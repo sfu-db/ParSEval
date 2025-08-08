@@ -157,7 +157,7 @@ class Constraint:
             for bit, child in self.parent.children.items():
                 if child == self:
                     return bit
-        return self.tree.no_bit
+        return "0"
     
 
     def get_tables(self) -> List:

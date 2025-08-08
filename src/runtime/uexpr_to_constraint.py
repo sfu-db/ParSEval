@@ -465,12 +465,12 @@ class UExprToConstraint:
             affected_tables.update(n.get_tables())
         return affected_tables
     def _get_involved_nodes(self, plausible : PlausibleChild):
-        ''' get all nodes involved in the path to root
+        ''' 
+            get all nodes involved in the path to root
         '''
-        
         path = plausible.parent.get_path_to_root()[1:]
         if plausible.branch_type != BranchType.PLAUSIBLE:
-            path = path[:-1]        
+            path = path[:-1]
         return path
 
     def _handle_tuple_append(self, instance, plausible, pattern):
@@ -487,14 +487,29 @@ class UExprToConstraint:
 
         new_symbols = self._declare_new_symbols(instance, involved_tables)
 
+        logger.info(f'pattern : {pattern}, {plausible}, {plausible.parent.sql_condition}')
+        
         for node in self._get_involved_nodes(plausible):
+            # logger.info(node)
             constraint = adapt_constraint(instance, node, new_symbols, ref_table, ref_tuple_id)
+            # logger.info(constraint)
             if constraint is not None:
                 self.add(constraint, node.operator_key)
             constraint = None
 
-        # primary_predicate, primary_constraint_type, tables = get_reference_predicate(plausible)
+        if ref_constraint_type in {PathConstraintType.PATH, PathConstraintType.VALUE}:
+            new_constraint = self._derive_constraints(ref_predicate, instance, ref_vars, new_symbols, tables, extend= ref_constraint_type == PathConstraintType.PATH)
+        elif ref_constraint_type in {PathConstraintType.SIZE}:
+            logger.info(f'primary constraint : {ref_predicate}, primary vars: {ref_vars}, new_symbols: ')
+            new_constraint = self._derive_constraints(ref_predicate, instance, ref_vars, new_symbols, tables, extend= False)
+        else:
+            raise RuntimeError(f'cannot handle constraint type: {ref_constraint_type}')
 
+        if new_constraint is not None:
+            logger.info(f'new constraint for primary requirement: {new_constraint}')
+            self.add(new_constraint, 'primary')
+
+        # primary_predicate, primary_constraint_type, tables = get_reference_predicate(plausible)
         # primary_vars = get_all_variables(primary_predicate)
         # primary_var = random.choice(list(primary_vars))
         # primary_tuple_id = instance.symbol_to_tuple_id[primary_var.this]
@@ -502,7 +517,7 @@ class UExprToConstraint:
 
         # new_symbols = self._declare_new_symbols(instance, involved_tables)
         # for node in self._get_involved_nodes(plausible):
-            # constraint = adapt_constraint(instance, node, new_symbols, primary_table, primary_tuple_id)            
+            # constraint = adapt_constraint(instance, node, new_symbols, primary_table, primary_tuple_id)
         #     if constraint is not None:
         #         self.add(constraint, node.operator_key)
         #     constraint = None
@@ -529,17 +544,14 @@ class UExprToConstraint:
             for row in target_vars[tbl]:
                 new_symbol = row[col_index]
                 if new_symbol not in substitutions[tbl].values():
-                    substitutions[tbl][v] = new_symbol
-        
+                    substitutions[tbl][v] = new_symbol        
         new_constraint = predicate
-        
         for idx, tbl in enumerate(orders):
             mapping = substitutions[tbl]
             if extend:
                 new_constraint = extend_summation(new_constraint, mapping, extend = idx > 0)
             else:
-                new_constraint = substitute(new_constraint, mapping)
-        
+                new_constraint = substitute(new_constraint, mapping)        
         return new_constraint
         
 
