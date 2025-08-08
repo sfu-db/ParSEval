@@ -1,0 +1,128 @@
+{
+  "relOp": "LogicalAggregate",
+  "keys": [],
+  "aggs": [
+    {
+      "operator": "COUNT",
+      "distinct": false,
+      "ignoreNulls": false,
+      "operands": [],
+      "type": "BIGINT",
+      "name": "EXPR$0"
+    }
+  ],
+  "id": "7",
+  "inputs": [
+    {
+      "relOp": "LogicalProject",
+      "project": [
+        {
+          "kind": "INPUT_REF",
+          "index": 0,
+          "name": "$0",
+          "type": "INTEGER"
+        }
+      ],
+      "id": "6",
+      "inputs": [
+        {
+          "relOp": "LogicalFilter",
+          "condition": {
+            "kind": "EQUALS",
+            "operator": "=",
+            "type": "BOOLEAN",
+            "operands": [
+              {
+                "kind": "INPUT_REF",
+                "index": 13,
+                "name": "$13",
+                "type": "VARCHAR"
+              },
+              {
+                "kind": "LITERAL",
+                "value": "Prague",
+                "type": "VARCHAR",
+                "nullable": false,
+                "precision": -1
+              }
+            ]
+          },
+          "variableset": "[]",
+          "id": "5",
+          "inputs": [
+            {
+              "relOp": "LogicalJoin",
+              "joinType": "inner",
+              "condition": {
+                "kind": "EQUALS",
+                "operator": "=",
+                "type": "BOOLEAN",
+                "operands": [
+                  {
+                    "kind": "INPUT_REF",
+                    "index": 1,
+                    "name": "$1",
+                    "type": "INTEGER"
+                  },
+                  {
+                    "kind": "INPUT_REF",
+                    "index": 11,
+                    "name": "$11",
+                    "type": "INTEGER"
+                  }
+                ]
+              },
+              "id": "4",
+              "inputs": [
+                {
+                  "relOp": "LogicalJoin",
+                  "joinType": "inner",
+                  "condition": {
+                    "kind": "EQUALS",
+                    "operator": "=",
+                    "type": "BOOLEAN",
+                    "operands": [
+                      {
+                        "kind": "INPUT_REF",
+                        "index": 0,
+                        "name": "$0",
+                        "type": "INTEGER"
+                      },
+                      {
+                        "kind": "INPUT_REF",
+                        "index": 5,
+                        "name": "$5",
+                        "type": "INTEGER"
+                      }
+                    ]
+                  },
+                  "id": "2",
+                  "inputs": [
+                    {
+                      "relOp": "LogicalTableScan",
+                      "table": "account",
+                      "id": "0",
+                      "inputs": []
+                    },
+                    {
+                      "relOp": "LogicalTableScan",
+                      "table": "loan",
+                      "id": "1",
+                      "inputs": []
+                    }
+                  ]
+                },
+                {
+                  "relOp": "LogicalTableScan",
+                  "table": "district",
+                  "id": "3",
+                  "inputs": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
