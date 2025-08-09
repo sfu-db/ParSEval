@@ -163,6 +163,8 @@ cython_debug/
 
 # ./datasets
 # datasets
+
+wandb/
 logs
 results
 tests2
