@@ -1,0 +1,26 @@
+networks:
+  qrank_wandb_network:
+    external: true
+services:
+  parseval-dev:
+    build: 
+      context: .
+      dockerfile: ./docker/Dockerfile
+    image: parseval-python:3.11
+    container_name: parseval-dev
+    networks:
+      - qrank_wandb_network   
+    volumes:
+      - .:/workspace # Mount the full project (optional)
+      - ~/.ssh:/root/.ssh      # <-- Mount local SSH keys for git access
+      # - ./data:/app/data           # <-- Mount local ./data to container path
+    shm_size: 16g
+    environment:    
+      - PYTHONUNBUFFERED=1    
+      - WANDB_BASE_URL=http://wandb:8080
+      - WANDB_API_KEY=local-bb33e983b91ae3e4036542da6c1118410406f452
+
+    command: bash
+    stdin_open: true
+    tty: true
+    
