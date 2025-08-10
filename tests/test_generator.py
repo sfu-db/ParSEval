@@ -56,14 +56,13 @@ class TestGenerator(unittest.TestCase):
         register_default_generators()
         from src.instance.instance import Instance
         from src.runtime.generator import Generator
-
         with DBManager().get_connection("examples", "instance_size2.sqlite") as conn:
             schema = conn.get_schema()
 
         generator = Generator('tests/db', schema, "tests/plan/aggregate.txt", name = 'test_coverage')
         # generator = Generator('tests/db', schema, "datasets/bird/plan/california_schools_7_gold.sql", name = 'test_coverage')
         # instance = Instance.
-        # print(generator.plan)        
+        # print(generator.plan)
         result =generator.get_coverage(None)
         print(result)
         assert(len(result.data) == 3)

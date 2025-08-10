@@ -43,14 +43,13 @@ def render_edge(src, dst, node):
         edge_color = 'blue' if isinstance(edge_label, int) and edge_label > 0 else 'red'
         return pydot.Edge(src, dst, label = edge_label, color = edge_color)
     else:
-        colour = "red"
-        # if str(node.branch_type) == 'PLAUSIBLE':
-        #     colour = 'orange'
-        # elif str(node.branch_type) == 'POSITIVE':
-        #     colour = 'green'
-        # else:
-        #     colour = 'red'
-        return pydot.Edge(src, dst, style = 'dashed', dir = 'none', color = colour, label = f"bit: 1")
+        if str(node.branch_type) == 'PLAUSIBLE':
+            colour = 'orange'
+        elif str(node.branch_type) == 'POSITIVE':
+            colour = 'green'
+        else:
+            colour = 'red'
+        return pydot.Edge(src, dst, style = 'dashed', dir = 'none', color = colour, label = f"bit: {node.bit()}")
     
 def to_dot(node, graph, parent_node = None,
            counter = [0],
@@ -64,12 +63,12 @@ def to_dot(node, graph, parent_node = None,
     dot_node = pydot.Node(node_id)
 
     dot_node.obj_dict["attributes"]["label"] = '<<font face="lucida console">{}</font>>'.format(
-        clean_symbol(label.get(node.__class__.__name__, lambda x: str(x))(node))
+        clean_symbol(label[node.__class__.__name__](node))
     )
-    dot_node.obj_dict["attributes"]["shape"] = shape.get(node.__class__.__name__, lambda x: 'box')(node)
-    dot_node.obj_dict["attributes"]["color"] = color.get(node.__class__.__name__, lambda x: 'box')(node)
-    dot_node.obj_dict["attributes"]["fillcolor"] = color.get(node.__class__.__name__, lambda x: 'box')(node)
-    dot_node.obj_dict["attributes"]["fontcolor"] = label_color.get(node.__class__.__name__, lambda x: 'box')(node)
+    dot_node.obj_dict["attributes"]["shape"] = shape[node.__class__.__name__](node)
+    dot_node.obj_dict["attributes"]["color"] = color[node.__class__.__name__](node)
+    dot_node.obj_dict["attributes"]["fillcolor"] = color[node.__class__.__name__](node)
+    dot_node.obj_dict["attributes"]["fontcolor"] = label_color[node.__class__.__name__](node)
     graph.add_node(dot_node)
     
     if parent_node:
