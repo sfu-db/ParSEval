@@ -106,7 +106,6 @@ class Encoder:
                 tbl_exprs.append(inputref)
                 # infos.append({'table': [inputref]})
             elif isinstance(projection, exp.Literal):
-                # InputRef(name= projection.output_name, index= len(inputrefs), typ= )
                 raise NotImplementedError('Literal is not implemented in Project')
             elif isinstance(projection, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
                 inputref = InputRef(name= projection.name, 

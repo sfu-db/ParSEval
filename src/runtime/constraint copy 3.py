@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Optional, Dict, Union, Set, Any, Tuple
-from .constant import OperatorKey, OperatorId, PathConstraintType
+from .constant import *
 from sqlglot import exp
 
 from .helper import negate_sql_condition
@@ -14,8 +14,54 @@ MAX_RETRY = 2
 MINIMIAL_GROUP_COUNT = 3
 MINIMIAL_GROUP_SIZE = 3
 
-from .branch import Branch
+class PlausibleChild:
+    """
+    Represents possible behaviors of an operator in the constraint tree.
 
+    Attributes:
+        parent: The parent Constraint Node
+        branch_type: The type of branch(POSITIVE, NEGATIVE, NULLABLE, etc.)
+        tree: The constraint tree
+    """
+    def __init__(self, parent, branch_type: BranchType, tree):
+        self.parent = parent
+        self.branch_type = branch_type
+        self.tree = tree
+
+    def __str__(self):
+        return 'PlausibleChild[%s]' % (self.parent.pattern() + ':' + str(self.branch_type))
+    def __repr__(self):
+        return 'PlausibleChild[%s]' % (self.parent.pattern() + ':' + str(self.branch_type))
+
+    @property
+    def covered(self):
+        return len(self.parent.delta) or 0
+    
+    def bit(self):
+        if self.parent:
+            for bit, node in self.parent.children.items():
+                if node == self:
+                    return bit
+        return "0"
+
+    def is_covered(self):
+        if self.branch_type in {BranchType.POSITIVE}:
+            return len(self.parent.delta) >= BRANCH_HIT
+        
+        if self.branch_type in {BranchType.NULLABLE}:
+            null_values = [variable.is_null() for variable in self.parent.delta]
+            if self.parent.tbl_exprs[0].nullable and not any(null_values):
+                return False
+            return True
+        
+        if self.branch_type in {BranchType.SIZE}:
+            ...
+
+
+
+
+
+ 
 class Constraint:
     """
     Represents a node in the constraint tree for SQL logical plan execution path tracing.
@@ -70,7 +116,7 @@ class Constraint:
         
         self.tree = tree
         self.parent: Optional[Constraint] = parent
-        self.children: Dict[str, Constraint] = {}
+        self.children: Dict[str, Constraint] = {}  #   List[Constraint] = []
         self.operator_key = operator_key
         self.operator_i = operator_i
         self.delta:List[Expr] = delta or []
@@ -84,12 +130,30 @@ class Constraint:
         self.path = None
         self.tables = None
         
+
+    # def no(self):
+    #     return self.children.get(self.tree.no_bit, None)
+    
+    # def yes(self):
+    #     return self.children.get(self.tree.yes_bit, None)
+    
+    # def null_bit(self):
+    #     return self.children.get(self.tree.null_bit, None)
+
+    # def has_sibling(self):
+    #     return self.no() is not None and self.yes() is not None
+    
+    # def sibling(self) -> Constraint:
+    #     if self.bit() == self.tree.no_bit :
+    #         return self.parent.yes()
+    #     return self.parent.no()
+    
     def bit(self):
         if self.parent:
             for bit, child in self.parent.children.items():
                 if child == self:
                     return bit
-        return "1"
+        return "0"
     
 
     def get_tables(self) -> List:
@@ -107,89 +171,52 @@ class Constraint:
             all_tuples.update(t)
         return all_tuples
 
-    def upsert_branch_node(self, branch_type):
-        branch_type = Branch.from_value(branch_type, self, self.tree)
-        bit =  "1" if self.taken else "0"
+    def upsert_plausible_node(self, branch_type):
+        '''
+            update plausible node accordingly.
+            For filter and join, we should add two plausible nodes, one child, one sibling.
+            1. If current node has no sibling or sibling is a PlausibleChild, add plausible node to current node's parent node
+            2. if bit in current node's children, update branch type accordingly, else, add a PlausibleChild to current node
+        '''
+        branch_type = BranchType.from_value(branch_type)
+        bit =  "1" if self.taken else "0" 
         if bit not in self.children:
-            self.children[bit] = branch_type
+            plausible_child = PlausibleChild(self, branch_type, self.tree)
+            self.children[bit] = plausible_child
             self.tree.leaves.pop(self.pattern(), None)
-            self.tree.leaves[self.pattern()] = branch_type
-        
-        if self.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:
+            self.tree.leaves[self.pattern()] = plausible_child
+        elif isinstance(self.children[bit], Constraint):
+            self.children[bit].branch_type = branch_type
+
+        if self.constraint_type in {PathConstraintType.VALUE}:            
             sibling_bit = "0" if self.taken else "1"
-            if sibling_bit not in self.children or isinstance(self.children[sibling_bit], Branch):
-                plausible_child = Branch.from_value('plausible', self, self.tree)
+            if sibling_bit not in self.children or isinstance(self.children[sibling_bit], PlausibleChild):
+                plausible_child = PlausibleChild(self.parent, BranchType.PLAUSIBLE, self.tree)
                 self.parent.children[sibling_bit] = plausible_child
                 self.tree.leaves.pop(self.parent.pattern(), None)
                 self.tree.leaves[self.parent.pattern() + sibling_bit] = plausible_child
 
-        if self.operator_key .upper() in {"JOIN"}:
-            binary_bit = "2"
-            if binary_bit not in self.parent.children or isinstance(self.parent.children[binary_bit], Branch):
-                plausible_child = Branch.from_value('binary', self.parent, self.tree) 
-                self.parent.children[binary_bit] = plausible_child
-                self.tree.leaves.pop(self.parent.pattern(), None)
-                self.tree.leaves[self.parent.pattern() + binary_bit] = plausible_child
+        elif self.constraint_type in {PathConstraintType.PATH}:
+            sibling_bits = {"0", "1", "3"}
+            sibling_bits.remove(bit)
+            for sibling_bit in sibling_bits:
+                if sibling_bit not in self.children or isinstance(self.children[sibling_bit], PlausibleChild):
+                    sb_branch_type = BranchType.from_value(int(sibling_bit)) ^ BranchType.PLAUSIBLE
+                    # logger.info(f'sb_branch_type: {sb_branch_type}')
+                    plausible_child = PlausibleChild(self.parent, sb_branch_type, self.tree)
+                    self.parent.children[sibling_bit] = plausible_child
+                    self.tree.leaves.pop(self.parent.pattern(), None)
+                    self.tree.leaves[self.parent.pattern() + sibling_bit] = plausible_child
         
         elif self.constraint_type in {PathConstraintType.SIZE}:
-            bits = {'3': "multiplicity", '4': "nullable"}
-            for bit, bkey in bits.items():
-                if bit not in self.children:
-                    self.children[bit] = Branch.from_value(bkey, self, self.tree)
+            sibling_bits = {"6", "7"}
+            for sibling_bit in sibling_bits:
+                if sibling_bit not in self.children:
+                    sb_branch_type = BranchType.from_value(int(sibling_bit))
+                    plausible_child = PlausibleChild(self, sb_branch_type, self.tree)
+                    self.children[sibling_bit] = plausible_child
                     self.tree.leaves.pop(self.pattern(), None)
-                    self.tree.leaves[self.pattern() + bit] = self.children[bit]
-
-
-
-
-
-    # def upsert_plausible_node(self, branch_type):
-    #     '''
-    #         update plausible node accordingly.
-    #         For filter and join, we should add two plausible nodes, one child, one sibling.
-    #         1. If current node has no sibling or sibling is a PlausibleChild, add plausible node to current node's parent node
-    #         2. if bit in current node's children, update branch type accordingly, else, add a PlausibleChild to current node
-    #     '''
-    #     branch_type = BranchType.from_value(branch_type)
-    #     bit =  "1" if self.taken else "0" 
-    #     if bit not in self.children:
-    #         plausible_child = PlausibleChild(self, branch_type, self.tree)
-    #         self.children[bit] = plausible_child
-    #         self.tree.leaves.pop(self.pattern(), None)
-    #         self.tree.leaves[self.pattern()] = plausible_child
-    #     elif isinstance(self.children[bit], Constraint):
-    #         self.children[bit].branch_type = branch_type
-
-    #     if self.constraint_type in {PathConstraintType.VALUE}:            
-    #         sibling_bit = "0" if self.taken else "1"
-    #         if sibling_bit not in self.children or isinstance(self.children[sibling_bit], PlausibleChild):
-    #             plausible_child = PlausibleChild(self.parent, BranchType.PLAUSIBLE, self.tree)
-    #             self.parent.children[sibling_bit] = plausible_child
-    #             self.tree.leaves.pop(self.parent.pattern(), None)
-    #             self.tree.leaves[self.parent.pattern() + sibling_bit] = plausible_child
-
-    #     elif self.constraint_type in {PathConstraintType.PATH}:
-    #         sibling_bits = {"0", "1", "2"}
-    #         sibling_bits.remove(bit)
-    #         for sibling_bit in sibling_bits:
-    #             if sibling_bit not in self.children or isinstance(self.children[sibling_bit], Branch):
-
-    #                 sb_branch_type = BranchType.from_value(int(sibling_bit)) ^ BranchType.PLAUSIBLE
-    #                 # logger.info(f'sb_branch_type: {sb_branch_type}')
-    #                 plausible_child = PlausibleChild(self.parent, sb_branch_type, self.tree)
-    #                 self.parent.children[sibling_bit] = plausible_child
-    #                 self.tree.leaves.pop(self.parent.pattern(), None)
-    #                 self.tree.leaves[self.parent.pattern() + sibling_bit] = plausible_child
-        
-    #     elif self.constraint_type in {PathConstraintType.SIZE}:
-    #         sibling_bits = {"6", "7"}
-    #         for sibling_bit in sibling_bits:
-    #             if sibling_bit not in self.children:
-    #                 sb_branch_type = BranchType.from_value(int(sibling_bit))
-    #                 plausible_child = PlausibleChild(self, sb_branch_type, self.tree)
-    #                 self.children[sibling_bit] = plausible_child
-    #                 self.tree.leaves.pop(self.pattern(), None)
-    #                 self.tree.leaves[self.pattern() + sibling_bit] = plausible_child
+                    self.tree.leaves[self.pattern() + sibling_bit] = plausible_child
 
 
 
@@ -312,7 +339,7 @@ class Constraint:
                 tbl_exprs = tbl_exprs
             )
             self.children[self.__to_bit(taken)] = child_node
-            child_node.upsert_branch_node(branch)
+            child_node.upsert_plausible_node(branch)
         
         p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
         if child_node.constraint_type in {PathConstraintType.VALUE, PathConstraintType.PATH}:

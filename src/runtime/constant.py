@@ -1,5 +1,7 @@
 from enum import auto, Enum
 from typing import NewType
+from abc import ABC, abstractmethod
+
 
 PARSEVAL_NO_SOLUTIONS = 'No Solutions'
 PARSEVAL_GAVE_UP = 'Gave up'
@@ -8,6 +10,7 @@ PARSEVAL_SAT = 'sat'
 OperatorKey = NewType('OperatorKey', str)
 OperatorId = NewType('OperatorId', str)
 ConstraintId = NewType('ConstraintId', str)
+
 
 class BranchType(Enum):
     """Represents different types of branches in the AST.
