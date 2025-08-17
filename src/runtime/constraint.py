@@ -15,8 +15,217 @@ MINIMIAL_GROUP_COUNT = 3
 MINIMIAL_GROUP_SIZE = 3
 
 from .branch import Branch
+from abc import abstractmethod
 
-class Constraint:
+
+class _CoverageConstraint(type):
+    def __new__(cls, clsname, bases, attrs):
+        klass = super().__new__(cls, clsname, bases, attrs)
+        klass.key = clsname.lower()[:-10].capitalize()
+        klass.__doc__ = klass.__doc__ or ""
+        return klass
+
+class Constraint(metaclass = _CoverageConstraint):
+    key = "constraint"
+    def __init__(self, 
+                 tree, 
+                 parent: Optional[Constraint], 
+                 operator_key: OperatorKey,
+                 operator_i: OperatorId,
+                 delta: List = None,
+                 sql_condition: exp.Condition = None, 
+                 taken: Optional[bool] = None,
+                 tbl_exprs: Optional[List[Any]] = None,
+                 info: Optional[Dict[str, Any]] = None):
+        self.tree = tree
+        self.parent: Optional[Constraint] = parent
+        self.children: Dict[str, Constraint] = {}
+        self.operator_key = operator_key
+        self.operator_i = operator_i
+        self.delta:List[Expr] = delta or []
+        self.sql_condition = sql_condition
+        self.taken = taken
+        self.tbl_exprs = tbl_exprs or []
+        self.info = info or {}
+        self.tuples: List[List] = []
+        self._pattern = None
+        self.path = None
+        self.tables = None
+
+    @staticmethod
+    def from_operator(
+        operator_key: OperatorKey, 
+        tree, 
+        parent: Optional[Constraint], 
+        operator_i: OperatorId,
+        delta: List = None,
+        sql_condition: exp.Condition = None, 
+        taken: Optional[bool] = None,
+        tbl_exprs: Optional[List[Any]] = None,
+        info: Optional[Dict[str, Any]] = None):
+        klass = analyze_constraint_type(operator_key= operator_key, condition= sql_condition)
+        return klass(tree, parent, operator_key, operator_i, delta, sql_condition, taken, tbl_exprs, info)
+
+    def __repr__(self):
+        return str(self)
+    def __str__(self):
+        return f"Constraint({self.key}, {self.operator_i})"
+    
+    def __hash__(self):
+        return hash(f"Constraint({self.key}, {self.operator_i}, {self.sql_condition})")
+
+    def bit(self):
+        if self.parent:
+            for bit, child in self.parent.children.items():
+                if child == self:
+                    return bit
+        return ""
+    def get_path_to_root(self) -> List[Constraint]:
+        if self.path is not None:
+            return self.path
+        parent_path = []
+        if self.parent is not None:
+            parent_path = self.parent.get_path_to_root()
+        self.path = parent_path + [self]
+        return self.path
+
+    def pattern(self):
+        if self._pattern is not None:
+            return self._pattern
+        path = self.get_path_to_root()
+        self._pattern = ''.join(p.bit() for p in path[1:])
+        return self._pattern
+
+    def find_child(self, operator_key, operator_i, sql_condition):
+        for bit, child in self.children.items():
+            if isinstance(child, Constraint) and \
+            child.key.lower() == operator_key.lower() and \
+            child.operator_i == operator_i and \
+            child.sql_condition == sql_condition:
+                return child
+        return None
+    def __to_bit(self, taken: bool):
+        return {
+            True : '1',
+            False: '0'
+        }.get(taken)
+    
+    @abstractmethod
+    def add_child(self, operator_key, operator_i, sql_condition: exp.Condition, symbolic_expr, branch, tbl_exprs: List[Any], taken: bool, tuples, **kwargs):
+        # assert 
+        if not taken:
+            sql_condition = negate_sql_condition(sql_condition)
+        
+        child_node = self.find_child(operator_key, operator_i, sql_condition)
+        if child_node is None:
+            child_node = Constraint.from_operator(operator_key, tree= self.tree, parent= self, operator_i= operator_i, taken= taken, sql_condition= sql_condition, tbl_exprs= tbl_exprs)
+            self.children[self.__to_bit(taken)] = child_node
+            child_node.upsert_plausible_branch(branch)
+        
+        child_node.upadte_delta(symbolic_expr, tuples)
+
+        return child_node
+
+    @abstractmethod
+    def upadte_delta(self, symbolic_expr, tuples):
+        p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
+        p =  [symbolic_expr if self.taken else symbolic_expr.not_()]
+        self.delta.extend(p)
+        self.tuples.append(tuples)
+    @abstractmethod
+    def upsert_plausible_branch(self, branch_type):
+        raise NotImplementedError
+
+
+class PredicateConstraint(Constraint):
+    def upadte_delta(self, symbolic_expr, tuples):
+        p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
+        p =  [symbolic_expr if self.taken else symbolic_expr.not_()]
+        self.delta.extend(p)
+        self.tuples.append(tuples)
+    
+    def upsert_plausible_branch(self, branch_type):
+        branch_type = Branch.from_value(branch_type, self, self.tree)
+        bit =  "1" if self.taken else "0"
+        if bit not in self.children:
+            self.children[bit] = branch_type
+            self.tree.leaves.pop(self.pattern(), None)
+            self.tree.leaves[self.pattern()] = branch_type
+        elif isinstance(self.children[bit], Branch):
+            self.children[bit] = branch_type
+            self.tree.leaves.pop(self.pattern(), None)
+            self.tree.leaves[self.pattern()] = branch_type
+
+        sibling_bit = "0" if self.taken else "1"
+        if sibling_bit not in self.parent.children or isinstance(self.parent.children[sibling_bit], Branch):
+            plausible_child = Branch.from_value('plausible', self, self.tree)
+            self.parent.children[sibling_bit] = plausible_child
+            self.tree.leaves.pop(self.parent.pattern(), None)
+            self.tree.leaves[self.parent.pattern() + sibling_bit] = plausible_child
+
+class JoinConstraint(PredicateConstraint):
+    def upsert_plausible_branch(self, branch_type):
+        super().upsert_plausible_branch(branch_type)
+        binary_bit = "2"
+        if binary_bit not in self.parent.children or isinstance(self.parent.children[binary_bit], Branch):
+            plausible_child = Branch.from_value('binary', self.parent, self.tree) 
+            self.parent.children[binary_bit] = plausible_child
+            self.tree.leaves.pop(self.parent.pattern(), None)
+            self.tree.leaves[self.parent.pattern() + binary_bit] = plausible_child
+
+class ProjectConstraint(Constraint):
+    def upsert_plausible_branch(self, branch_type):
+        branch_type = Branch.from_value(branch_type, self, self.tree)
+        bit =  "1" if self.taken else "0"
+        if bit not in self.children:
+            self.children[bit] = branch_type
+            self.tree.leaves.pop(self.pattern(), None)
+            self.tree.leaves[self.pattern()] = branch_type
+        
+
+class GroupConstraint(Constraint):
+    ...
+
+class AggregateConstraint(Constraint):
+    ...
+
+CONSTRAINT_TYPES = {
+    ('filter', 'predicate'): PredicateConstraint,
+    ('join', 'predicate'): JoinConstraint,
+    ('project', 'column'): ProjectConstraint,
+    ('project', 'predicate'): PredicateConstraint,
+    ('aggregate', 'column'): GroupConstraint,
+    ('aggregate', 'aggfunc'):  AggregateConstraint
+}
+
+def analyze_constraint_type(operator_key, condition: exp.Condition):
+        '''
+            Analyze the type of constraint based on the condition.
+            Return
+                SIZE, VALUE, PATH
+        '''
+
+        constraint_type = None
+        if isinstance(condition, (exp.Count, exp.Exists, exp.Column, exp.Case, exp.AggFunc)):
+            constraint_type = 'aggfunc'
+        if isinstance(condition, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Like)):
+            if isinstance(condition.expression, exp.Literal):
+                constraint_type = 'predicate'
+            if isinstance(condition.this, exp.Column) and isinstance(condition.expression, exp.Column):
+                constraint_type = 'predicate'
+        elif condition.key == 'is_null':
+            constraint_type = 'predicate'
+        elif isinstance(condition, (exp.Div, exp.Mul, exp.Add, exp.Sub)):
+            constraint_type = 'column'
+        elif isinstance(condition, exp.Column):
+            constraint_type = 'column'
+        elif isinstance(condition, exp.Unary):
+            return analyze_constraint_type(operator_key, condition.this)
+        else:
+            raise ValueError(f'cannot parse constraint type {condition}')
+        return CONSTRAINT_TYPES[(operator_key, constraint_type)]
+
+class Constraint222:
     """
     Represents a node in the constraint tree for SQL logical plan execution path tracing.
 
@@ -67,7 +276,6 @@ class Constraint:
                  constraint_type: PathConstraintType = PathConstraintType.UNKNOWN,
                  tbl_exprs: Optional[List[Any]] = None,
                  info: Optional[Dict[str, Any]] = None):
-        
         self.tree = tree
         self.parent: Optional[Constraint] = parent
         self.children: Dict[str, Constraint] = {}
