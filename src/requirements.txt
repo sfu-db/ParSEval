@@ -1,0 +1,13 @@
+func_timeout==4.3.5
+matplotlib==3.10.5
+networkx==3.5
+numpy==1.24.4
+operators==1.0.1
+packaging==25.0
+pandas==2.0.3
+py4j==0.10.9.7
+pydot==3.0.4
+python_dateutil==2.9.0
+SQLAlchemy==2.0.32
+sqlglot==23.12.1
+z3_solver==4.13.0.0
