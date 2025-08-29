@@ -118,12 +118,10 @@ class Constraint(metaclass = _CoverageConstraint):
         
         child_node = self.find_child(operator_key, operator_i, sql_condition)
         if child_node is None:
-            child_node = Constraint.from_operator(operator_key, tree= self.tree, parent= self, operator_i= operator_i, taken= taken, sql_condition= sql_condition, tbl_exprs= tbl_exprs)
+            child_node = Constraint.from_operator(operator_key, tree = self.tree, parent= self, operator_i= operator_i, taken= taken, sql_condition= sql_condition, tbl_exprs= tbl_exprs)
             self.children[self.__to_bit(taken)] = child_node
             child_node.upsert_plausible_branch(branch)
-        
         child_node.upadte_delta(symbolic_expr, tuples)
-
         return child_node
 
     @abstractmethod
