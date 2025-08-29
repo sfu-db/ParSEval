@@ -12,7 +12,7 @@ OperatorKey = NewType('OperatorKey', str)
 OperatorId = NewType('OperatorId', str)
 ConstraintId = NewType('ConstraintId', str)
 
-
+from sqlglot.planner import Plan
 
 class _Branch(type):
     def __new__(cls, clsname, bases, attrs):
