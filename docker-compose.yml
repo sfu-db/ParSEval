@@ -11,14 +11,16 @@ services:
     networks:
       - qrank_wandb_network   
     volumes:
-      - .:/workspace # Mount the full project (optional)
-      - ~/.ssh:/root/.ssh      # <-- Mount local SSH keys for git access
+      - .:/workspace
+      - ~/.ssh:/home/devuser/.ssh:ro      # <-- Mount local SSH keys for git access
+      - $SSH_AUTH_SOCK:/ssh-agent 
       # - ./data:/app/data           # <-- Mount local ./data to container path
     shm_size: 16g
     environment:    
       - PYTHONUNBUFFERED=1    
       - WANDB_BASE_URL=http://wandb:8080
       - WANDB_API_KEY=local-bb33e983b91ae3e4036542da6c1118410406f452
+      - SSH_AUTH_SOCK=/ssh-agent
 
     command: bash
     stdin_open: true
