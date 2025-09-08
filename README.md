@@ -11,9 +11,9 @@ We are actively refactoring ParSeval to a pure Python implementation to provide 
 
 
 The new version of ParSEval provides the following features:
-1.	check_eq(schema, gold, pred, dialect, verify_first=False) – This function combines formal verification and test-case-based approaches for query equivalence evaluation. When verify_first=True, ParSEval will  prioritize formal verification when checking query pairs, while still benefiting from test-case-based evaluation as needed.
+1.	`check_eq(schema, gold, pred, dialect, verify_first=False)` – combines formal verification and test-case-based approaches for query equivalence evaluation. When verify_first=True, ParSEval prioritizes formal verification when checking query pairs, while still leveraging test-case-based evaluation when needed.
 
-2.	db_generate(schema, sql, dialect, **kwargs) – This function generates test database instances based on the input SQL.
+2.	`db_generate(schema, sql, dialect, **kwargs)` – generates test database instances based on the input SQL.
 
 Users can set verify_first=False to to use testcase based evaluation only.
 
