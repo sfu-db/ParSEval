@@ -396,9 +396,6 @@ class Generator:
             'if' : lambda x: self.evaluate_if(x, **kwargs) ,
             'cast': lambda x: cast(self.from_uexpr(x.this, **kwargs), from_type =  x.this.args.get('datatype'), to_type = x.args.get('to'))
         }
-
-       
-
         # STRFTIME
         return operations[expression.key](expression)
     

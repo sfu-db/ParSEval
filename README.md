@@ -19,8 +19,9 @@ Users can set verify_first=False to to use testcase based evaluation only.
 
 
 ## Future Plans
-- Pure Python Refactor – Completed soon: full transition from mixed implementations to a clean Python-only codebase.
-- NULL-related constraints
+- Pure Python Refactor – Completed soon: full transition from mixed implementations to a clean Python-only codebase (in progress)
+- NULL-related constraints (in progress)
+- Enhanced readability for generated values(maybe)
 
 
 ## File Structure
