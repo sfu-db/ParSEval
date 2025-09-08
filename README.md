@@ -3,11 +3,11 @@
 ParSEval considers the specific behaviors of each query operator and covers all possible execution branches of the logical query plan by adapting the notion of branch coverage to query plans.
 
 
-## Current Status & Upcoming Release
+## 🆕 Current Status & Upcoming Release
 
 We are actively refactoring ParSeval to a pure Python implementation to provide a cleaner, more user-friendly interface. The new version will include improved functions for query equivalence checking and database instance generation.
 
-> The current codebase may be messy during this transition. The new version will be released soon. We recommend waiting for it to reduce deployment and maintenance effort.
+> 📌 The current codebase may be messy during this transition. The new version will be released soon. We recommend waiting for it to reduce deployment and maintenance effort.
 
 
 The new version of ParSEval provides the following features:
