@@ -162,7 +162,7 @@ cython_debug/
 #.idea/
 
 # ./datasets
-# datasets
+datasets
 
 .devcontainer
 wandb/
