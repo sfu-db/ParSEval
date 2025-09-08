@@ -2,9 +2,13 @@
 
 ParSEval considers the specific behaviors of each query operator and covers all possible execution branches of the logical query plan by adapting the notion of branch coverage to query plans.
 
-> The current codebase may be a bit messy, as we are in the process of adapting the expression parser to pure Python. This will allow us to provide a clean, user-friendly, and easy-to-use interface. 
 
-> The new version of the code will be released soon. To reduce deployment and maintenance effort, I recommend using the new version once it is available.
+## Current Status & Upcoming Release
+
+We are actively refactoring ParSeval to a pure Python implementation to provide a cleaner, more user-friendly interface. The new version will include improved functions for query equivalence checking and database instance generation.
+
+> The current codebase may be messy during this transition. The new version will be released soon. We recommend waiting for it to reduce deployment and maintenance effort.
+
 
 The new version of ParSEval provides the following features:
 1.	check_eq(schema, gold, pred, dialect, verify_first=False) – This function combines formal verification and test-case-based approaches for query equivalence evaluation. When verify_first=True, ParSEval will  prioritize formal verification when checking query pairs, while still benefiting from test-case-based evaluation as needed.
@@ -13,6 +17,10 @@ The new version of ParSEval provides the following features:
 
 Users can set verify_first=False to to use testcase based evaluation only.
 
+
+## Future Plans
+- Pure Python Refactor – Completed soon: full transition from mixed implementations to a clean Python-only codebase.
+- NULL-related constraints
 
 
 ## File Structure
@@ -49,13 +57,7 @@ pip install -r requirements.txt
 
 Normally, one invoke the tool as 
 ```bash
-python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --offline
-```
-to generate test database instances for input query SQL1.
-
-To test the equivalence of two queries:
-```bash
-python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --pred SQL2
+python main2.py --strategy complete  --dataset bird --dialect sqlite --start 0 --end 100
 ```
 
 One can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
@@ -91,7 +93,6 @@ ValueGeneratorRegistry.register('int', int_generator)
 Commands needed can be found in the tests folder.
 
 
-### Planed features
-- NULL-related constraints
+
 
 
