@@ -1,0 +1,56 @@
+[
+    {
+        "type": "SCALAR",
+        "identifier": "STRFTIME",
+        "parameters": ["STRING", "STRING"],
+        "return_type": "STRING"
+      },
+      {
+        "type": "SCALAR",
+        "identifier": "UDATE",
+        "parameters": ["TIMESTAMP"],
+        "return_type": "DATE"
+      },
+      {
+        "type": "SCALAR",
+        "identifier": "DATETIME",
+        "parameters": ["STRING"],
+        "return_type": "DATE"
+      },
+      {
+        "type": "SCALAR",
+        "identifier": "INSTR",
+        "parameters": ["STRING", "STRING"],
+        "return_type": "INTEGER"
+      }, {
+        "type": "SCALAR",
+        "identifier": "JULIANDAY",
+        "parameters": ["DATE"],
+        "return_type": "INTEGER"
+      }, {
+        "type": "SCALAR",
+        "identifier": "LENGTH",
+        "parameters": ["STRING"],
+        "return_type": "INTEGER"
+      }, {
+        "type": "SCALAR",
+        "identifier": "NOW",
+        "parameters": [],
+        "return_type": "TIMESTAMP"
+      }, {
+        "type": "SCALAR",
+        "identifier": "SUBSTR",
+        "parameters": ["STRING", "INTEGER", "INTEGER"],
+        "return_type": "STRING"
+      }, {
+        "type": "SCALAR",
+        "identifier": "SUBSTR",
+        "parameters": ["STRING", "INTEGER"],
+        "return_type": "STRING"
+      },  {
+        "type": "SCALAR",
+        "identifier": "B",
+        "parameters": ["STRING", "INTEGER"],
+        "return_type": "STRING"
+      }
+]

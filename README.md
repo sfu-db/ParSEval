@@ -2,6 +2,19 @@
 
 ParSEval considers the specific behaviors of each query operator and covers all possible execution branches of the logical query plan by adapting the notion of branch coverage to query plans.
 
+> The current codebase may be a bit messy, as we are in the process of adapting the expression parser to pure Python. This will allow us to provide a clean, user-friendly, and easy-to-use interface. 
+
+> The new version of the code will be released soon. To reduce deployment and maintenance effort, I recommend using the new version once it is available.
+
+The new version of ParSEval provides the following features:
+1.	check_eq(schema, gold, pred, dialect, verify_first=False) – This function combines formal verification and test-case-based approaches for query equivalence evaluation. When verify_first=True, ParSEval will  prioritize formal verification when checking query pairs, while still benefiting from test-case-based evaluation as needed.
+
+2.	db_generate(schema, sql, dialect, **kwargs) – This function generates test database instances based on the input SQL.
+
+Users can set verify_first=False to to use testcase based evaluation only.
+
+
+
 ## File Structure
 
 The repo contains following supplemental materials:
