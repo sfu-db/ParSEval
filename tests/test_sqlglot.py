@@ -22,6 +22,14 @@ sql2 = """
     HAVING COUNT(*) > 1"""
 expr = parse_one(sql2, dialect="sqlite")
 
-print(repr(expr))
+# print(repr(expr))
 
-print(Plan(expr).root)
+# print(Plan(expr).root)
+
+
+import duckdb
+
+query = "SELECT a, SUM(b) FROM my_table GROUP BY a"
+con = duckdb.connect()
+logical_plan = con.explain(query, format='json')
+print(logical_plan)
