@@ -1,7 +1,7 @@
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 
-from .dtype import DATATYPE
+from .dtype import DataType
 
 
 @dataclass(frozen=True)
@@ -9,7 +9,7 @@ class Column:
     """Represents a column in the logical plan"""
 
     name: str
-    DATATYPE: DATATYPE
+    DataType: DataType
     nullable: bool = True
     unique: bool = False
     default_value: Optional[Any] = None
@@ -45,14 +45,14 @@ class Table: ...
 class Catalog:
     # function_name -> metadata
     functions: Dict[str, Dict[str, Any]] = {
-        "COUNT": {"is_aggregate": True, "return_type": DATATYPE.INT},
-        "SUM": {"is_aggregate": True, "return_type": DATATYPE.FLOAT},
-        "AVG": {"is_aggregate": True, "return_type": DATATYPE.FLOAT},
-        "MIN": {"is_aggregate": True, "return_type": DATATYPE.UNKNOWN},
-        "MAX": {"is_aggregate": True, "return_type": DATATYPE.UNKNOWN},
-        "UPPER": {"is_aggregate": False, "return_type": DATATYPE.TEXT},
-        "LOWER": {"is_aggregate": False, "return_type": DATATYPE.TEXT},
-        "LENGTH": {"is_aggregate": False, "return_type": DATATYPE.INT},
+        # "COUNT": {"is_aggregate": True, "return_type": DataType.INT},
+        # "SUM": {"is_aggregate": True, "return_type": DataType.FLOAT},
+        # "AVG": {"is_aggregate": True, "return_type": DataType.FLOAT},
+        # "MIN": {"is_aggregate": True, "return_type": DataType.UNKNOWN},
+        # "MAX": {"is_aggregate": True, "return_type": DataType.UNKNOWN},
+        # "UPPER": {"is_aggregate": False, "return_type": DataType.TEXT},
+        # "LOWER": {"is_aggregate": False, "return_type": DataType.TEXT},
+        # "LENGTH": {"is_aggregate": False, "return_type": DataType.INT},
     }
 
     def __init__(self, tables: Dict[str, Table] = None):
