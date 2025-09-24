@@ -3,18 +3,43 @@ from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-
+from functools import reduce
 from typing import TYPE_CHECKING, List, Dict, Callable, Union
-from .catalog import Catalog
+
+# from .catalog import Catalog
 
 if TYPE_CHECKING:
-    from .catalog import Schema, Column, ColumnRef
+    # from .catalog import Schema, Column, ColumnRef
     from sqlglot.expressions import DATA_TYPE
-    from .expression import TypedExpression, Condition  # Expression, Condition
+    from .expression import Expression, Condition
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Optional
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
+
+from .expression import (
+    Condition,
+    Binary,
+    Predicate,
+    Arithmetic,
+    ColumnRef,
+    Literal,
+    DataType,
+    AND,
+    OR,
+    NOT,
+    IS,
+    Count,
+    Max,
+    Min,
+    Avg,
+    Sum,
+    Star,
+    Schema,
+)
+
+# from sqlglot import exp
 
 
 class JoinType(Enum):
@@ -175,7 +200,7 @@ class LogicalProject(UnaryOperator):
     def __init__(
         self,
         input_operator: LogicalOperator,
-        expressions: List[TypedExpression],
+        expressions: List[Expression],
         aliases: Optional[List[str]] = None,
         operator_id: Optional[str] = None,
     ):
@@ -191,7 +216,7 @@ class LogicalProject(UnaryOperator):
         columns = []
         for expr, alias in zip(self.expressions, self.aliases):
             data_type = expr.evaluate_type(input_schema)
-            columns.append(Column(alias, data_type))
+            columns.append(ColumnRef(alias, data_type))
         return Schema(columns)
 
 
@@ -213,7 +238,7 @@ class LogicalFilter(UnaryOperator):
 class LogicalSort(UnaryOperator):
     def __init__(
         self,
-        sorts: List[TypedExpression],
+        sorts: List[Expression],
         dir: List,
         offset: int,
         limit: 1,
@@ -226,6 +251,9 @@ class LogicalSort(UnaryOperator):
         self.dir = dir
         self.offset = offset
         self.limit = limit
+
+    def schema(self):
+        return self.input.schema()
 
 
 class LogicalLimit(UnaryOperator):
@@ -349,47 +377,156 @@ class ExpressionRegistry:
     _registry: Dict[str, Callable] = {}
 
     @classmethod
-    def register(cls, expr_type: str):
+    def register(cls, expr_type: Union[str, Iterable[str]]):
         def decorator(func):
-            cls._registry[expr_type] = func
+            if isinstance(expr_type, str):
+                cls._registry[expr_type] = func
+            elif isinstance(expr_type, Iterable):
+                for et in expr_type:
+                    cls._registry[et] = func
+
             return func
 
         return decorator
 
     @classmethod
     def get_handler(cls, node_type: str) -> Callable:
-        return cls._registry.get(node_type, cls._fallback)
+        return cls._registry.get(node_type)
 
 
-# @ExpressionRegistry.register("glot")
-# def parse_glot_expr(factory, node: exp.Expression):
-#     return TypedExpression(
-#         glot_expr=node,
-#         type_=node.args.get("type"),
-#         nullable=True,
-#         metadata={"original_type": type(node).__name__},
-#     )
+PREDICATE_OPERATORS = {
+    "EQUALS": "=",
+    "NOT_EQUALS": "!=",
+    "GREATER_THAN": ">",
+    "LESS_THAN": "<",
+    "LESS_THAN_OR_EQUAL": "<=",
+    "GREATER_THAN_OR_EQUAL": ">=",
+    "LIKE": "Like",
+}
+
+
+@ExpressionRegistry.register("LITERAL")
+def parse_literal_expr(planner, **kwargs) -> Expression:
+    value = kwargs.pop("value")
+    dtype = kwargs.pop("type", "UNKNOWN")
+
+    datatype = DataType(
+        name=dtype,
+        nullable=kwargs.pop("nullable"),
+        precision=kwargs.pop("precision", None),
+    )
+    literal = Literal(value=value, datatype=datatype)
+    return literal
+
+
+@ExpressionRegistry.register("INPUT_REF")
+def parse_input_ref_expr(planner, **kwargs) -> Expression:
+    name = kwargs.pop("name")
+    index = kwargs.pop("index")
+    dtype = kwargs.pop("type", "UNKNOWN")
+
+    input_ref = ColumnRef(name=name, datatype=DataType(name=dtype), ref=index)
+    return input_ref
+
+
+@ExpressionRegistry.register(PREDICATE_OPERATORS.keys())
+def parse_predicate_expr(planner, **kwargs) -> Expression:
+    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
+    operator = kwargs.pop("kind", kwargs.pop("operator"))
+    op = reduce(
+        lambda x, y: Predicate(left=x, right=y, op=PREDICATE_OPERATORS[operator]),
+        expressions,
+    )
+    return op
+
+
+ARITHMETIC_OPERATORS = {"PLUS": "+", "MINUS": "-", "TIMES": "*", "DIVIDE": "/"}
+
+
+@ExpressionRegistry.register(ARITHMETIC_OPERATORS.keys())
+def parse_arithmetic_expr(planner, **kwargs) -> Expression:
+    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
+    operator = kwargs.pop("kind", kwargs.pop("operator"))
+    op = reduce(
+        lambda x, y: Arithmetic(left=x, right=y, op=ARITHMETIC_OPERATORS[operator]),
+        expressions,
+    )
+    return op
+
+
+CONNECTOR_OPERATORS = {"AND": AND, "OR": OR}
+
+
+@ExpressionRegistry.register(CONNECTOR_OPERATORS.keys())
+def parse_connector_expr(planner, **kwargs) -> Expression:
+    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
+    operator = kwargs.pop("kind", kwargs.pop("operator"))
+    op = reduce(
+        lambda x, y: ARITHMETIC_OPERATORS[operator](left=x, right=y),
+        expressions,
+    )
+    return op
+
+
+UNARY_OPERATORS = {"NOT": NOT, "IS": IS}
+
+
+@ExpressionRegistry.register(UNARY_OPERATORS.keys())
+def parse_unary_expr(planner, **kwargs) -> Expression:
+    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
+    operator = kwargs.pop("kind", kwargs.pop("operator"))
+    return UNARY_OPERATORS[operator](operand=expressions.pop())
+
+
+AGGFUNC_OPERATORS = {
+    "COUNT": Count,
+    "SUM": Sum,
+    "AVG": Avg,
+    "MAX": Max,
+    "MIN": Min,
+}
+
+
+@ExpressionRegistry.register(AGGFUNC_OPERATORS.keys())
+def parse_aggfunc_expr(planner, **kwargs) -> Expression:
+    func_name = kwargs.pop("operator")
+    distinct = kwargs.pop("distinct")
+    operands = kwargs.pop("operands")
+    operand = Star()
+    if operands:
+        operand = ColumnRef(
+            name=f"${operands[0]['column']}",
+            datatype=operands[0].get("type"),
+            ref=operands[0]["column"],
+        )
+
+    func = AGGFUNC_OPERATORS[func_name](
+        operand=operand,
+        distinct=distinct,
+        ignorenulls=kwargs.pop("ignorenulls"),
+        datatype=DataType(name=kwargs.pop("type")),
+    )
+    return func
 
 
 class Planner(PlannBuilder):
-    # REL_MAPPING = {
-    #     "LogicalTableScan": "scan",
-    #     "EnumerableTableScan": "scan",
-    #     "LogicalProject": "project",
-    #     "LogicalFilter": "filter",
-    #     "LogicalJoin": "join",
-    #     "LogicalAggregate": "aggregate",
-    #     "LogicalUnion": "union",
-    #     "LogicalIntersect": "intersect",
-    #     "LogicalMinus": "minus",
-    #     "LogicalSort": "sort",
-    #     "LogicalValues": "values",
-    #     "SCALAR_QUERY": "scalar",
-    # }
-
-    def __init__(self, step_registry: None, expr_registry: None):
+    def __init__(
+        self, step_registry: Optional[Any] = None, expr_registry: Optional[Any] = None
+    ):
         self.step_registry = step_registry or StepRegistry
         self.expr_registry = expr_registry or ExpressionRegistry
+
+    def explain2(self, schema: str, plan_path: str, dialect: str = "postgres"):
+        from sqlglot import parse_one, exp
+
+        if isinstance(schema, str):
+            schema = schema.split(";")
+        import json
+
+        with open(plan_path) as f:
+            plan = json.load(f)
+
+        return self.walk(plan)
 
     def explain(
         self, schema: str, sql: str, dialect: str = "postgres"
@@ -402,32 +539,29 @@ class Planner(PlannBuilder):
 
     def walk(self, node):
         RELOP = "relOp"
-        CONDITION = "condition"
-        AGG_FUNCS = {"COUNT", "SUM", "AVG", "MAX", "MIN"}
         fname = None
         if RELOP in node:
             """parse rel expression, i.e. LogicalProject, LogicalFilter, LogicalJoin, etc."""
             relOp = node.pop(RELOP)
             handler = self.step_registry.get_handler(relOp)
-            return handler(self, **node)
+            # return handler(self, **node)
         elif "kind" in node or "operator" in node:
             """parse rex expression, i.e. AND, OR, +, -, *, /, =, <>, >, <, >=, <=, etc."""
             kind_operator = node.get("kind", node.get("operator"))
-            if kind_operator in AGG_FUNCS:
-                fname = "aggfunc"
-            else:
-                fname = kind_operator
-        fn = self._handlers.get(fname)
-        return fn(self, node)
+            handler = self.expr_registry.get_handler(kind_operator)
 
-    def _convert_projection(self, **kwargs) -> LogicalProject:
-        input_op = self._convert(**kwargs)
-        expressions = [
-            self._convert(expr, self.catalog) for expr in kwargs.pop("expressions", [])
-        ]
-        aliases = kwargs.pop("aliases", None)
-        operator_id = kwargs.pop("id", None)
-        return LogicalProject(input_op, expressions, aliases, operator_id)
+        if handler is None:
+            print(f"Cannot find handler for node: {node}")
+        return handler(self, **node)
+
+    # def _convert_projection(self, **kwargs) -> LogicalProject:
+    #     input_op = self._convert(**kwargs)
+    #     expressions = [
+    #         self._convert(expr, self.catalog) for expr in kwargs.pop("expressions", [])
+    #     ]
+    #     aliases = kwargs.pop("aliases", None)
+    #     operator_id = kwargs.pop("id", None)
+    #     return LogicalProject(input_op, expressions, aliases, operator_id)
 
 
 @StepRegistry.register("LogicalTableScan")
@@ -443,27 +577,69 @@ def _convert_scan(planner: Planner, **kwargs) -> LogicalScan:
 
 
 @StepRegistry.register("LogicalFilter")
-def _convert_filter(planner: Planner, **kwargs) -> LogicalFilter: ...
+def _convert_filter(planner: Planner, **kwargs) -> LogicalFilter:
+    child = planner.walk(kwargs.pop("inputs")[0])
+    condition = planner.walk(kwargs.pop("condition"))
+    operator_id = kwargs.pop("id", None)
+    return LogicalFilter(child, condition, operator_id=operator_id)
 
 
 @StepRegistry.register("LogicalProject")
-def _convert_projection(planner: Planner, **kwargs) -> LogicalProject: ...
+def _convert_projection(planner: Planner, **kwargs) -> LogicalProject:
+    child = planner.walk(kwargs.pop("inputs")[0])
+    expressions = [planner.walk(proj) for proj in kwargs.pop("project", [])]
+    operator_id = kwargs.pop("id", None)
+    return LogicalProject(child, expressions, operator_id=operator_id)
 
 
-def _convert_join(planner: Planner, **kwargs) -> LogicalJoin: ...
+@StepRegistry.register("LogicalJoin")
+def _convert_join(planner: Planner, **kwargs) -> LogicalJoin:
+    children = [planner.walk(child) for child in kwargs.pop("inputs")]
+
+    condition = planner.walk(kwargs.pop("condition"))
+    join_type = kwargs.pop("joinType", "INNER").upper()
+    return LogicalJoin(
+        join_type=join_type,
+        condition=condition,
+        left=children[0],
+        right=children[1],
+        operator_id=kwargs.pop("id", None),
+    )
+
+    # parameters = {k: v for k, v in node.items() if k != "inputs"}
+
+    # return Join(this=deps[0], expression=deps[1], condition=condition, **parameters)
 
 
 def _convert_aggregate(planner: Planner, **kwargs) -> LogicalAggregate: ...
 
 
-def _convert_sort(planner: Planner, **kwargs) -> LogicalSort: ...
+@StepRegistry.register("LogicalSort")
+def _convert_sort(planner: Planner, **kwargs) -> LogicalSort:
+    this = planner.walk(kwargs.pop("inputs")[0])
+    sort = kwargs.pop("sort", [])
+    return LogicalSort(
+        sorts=[
+            ColumnRef(
+                name=s["column"],
+                ref=s["column"],
+                datatype=DataType.build(s["type"]),
+            )
+            for s in sort
+        ],
+        dir=kwargs.pop("dir", []),
+        offset=kwargs.pop("offset", 0),
+        limit=kwargs.pop("limit", 1),
+        input_operator=this,
+        operator_id=kwargs.pop("id", None),
+    )
 
 
 def _convert_union(planner: Planner, **kwargs) -> LogicalUnion: ...
 def _convert_values(planner: Planner, **kwargs) -> LogicalValues: ...
 
 
-def _parse_condition(planner: Planner, node: dict) -> TypedExpression: ...
+def _parse_condition(planner: Planner, node: dict) -> Expression: ...
 
 
 # =============================================================================
