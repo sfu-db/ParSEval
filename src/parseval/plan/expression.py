@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Dict, TYPE_CHECKING, List, Union, Tuple
+from typing import Any, Optional, Dict, TYPE_CHECKING, List, Union, Tuple, Callable, Set
 
 if TYPE_CHECKING:
     from ..dtype import DATATYPE
@@ -60,6 +60,53 @@ class Expression(ABC):
     def accept(self, visitor: "ExpressionVisitor"):
         return visitor.visit(self)
 
+    def with_children(self, new_children: Tuple["Expression", ...]) -> "Expression":
+        """
+        Rebuild this expression with a new set of children.
+        Subclasses should override this if they have custom constructor signatures.
+        """
+        if new_children == self.get_children():
+            return self
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement with_children()"
+        )
+
+    def find_all(self, target: "Expression") -> List["Expression"]:
+        """Find all instances of a target expression in the tree."""
+        matches = []
+        stack = [self]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, target):
+                matches.append(current)
+            children = current.get_children()
+            for child in children:
+                if isinstance(child, Expression):
+                    stack.append(child)
+        return matches
+
+    def transform(
+        self, func: Callable[["Expression"], Optional["Expression"]]
+    ) -> "Expression":
+        new_self = func(self)
+        if new_self is not None and new_self is not self:
+            return new_self
+
+        children = self.get_children()
+        if not children:
+            return self
+
+        for child in children:
+            if child is None:
+                print(f"Warning: {repr(self)} has None child")
+                raise ValueError(f"Expression has None child {self}")
+
+        new_children = tuple(child.transform(func) for child in children)
+        if new_children == children:
+            return self
+
+        return self.with_children(new_children)
+
     def predicates(self, include_nested: bool = False) -> List[Expression]:
         """Collect all boolean predicate symbols in the expression tree.
 
@@ -83,6 +130,48 @@ class Expression(ABC):
                 return
         for child in self.children():
             child._collect_predicates(results, include_nested, is_root=False)
+
+    def is_null(self):
+        """Check if this expression is an IS NULL predicate."""
+        return IS(self, "IS", Literal(value=None, datatype=self.datatype))
+
+    def negate(self) -> "Expression":
+        """Return the negation of this expression."""
+
+        if isinstance(self, NOT):
+            return self.operand
+        else:
+            neg_map = {
+                ">": "<=",
+                ">=": "<",
+                "<": ">=",
+                "<=": ">",
+                "=": "!=",
+                "!=": "=",
+            }
+            if self.op in neg_map:
+                return Predicate(
+                    left=self.left,
+                    op=neg_map[self.op],
+                    right=self.right,
+                    datatype=self.datatype,
+                    metadata=self.metadata.copy(),
+                )
+
+            return NOT(self)
+        # if isinstance(expr, EQ):
+        #     return NEQ(context=expr.context, this=expr.left, operand=expr.right)
+        # if isinstance(expr, NEQ):
+        #     return EQ(context=expr.context, this=expr.left, operand=expr.right)
+        # if isinstance(expr, GT):
+        #     return LTE(context=expr.context, this=expr.left, operand=expr.right)
+        # if isinstance(expr, GTE):
+        #     return LT(context=expr.context, this=expr.left, operand=expr.right)
+        # if isinstance(expr, LT):
+        #     return GTE(context=expr.context, this=expr.left, operand=expr.right)
+        # if isinstance(expr, LTE):
+        #     return GT(context=expr.context, this=expr.left, operand=expr.right)
+        # return Not(context=expr.context, this=expr)
 
     def __str__(self):
         return self.to_sql(None)
@@ -141,6 +230,9 @@ class Literal(Expression):
 
     def infer_type(self, schema_context: Schema) -> DataType:
         return self.datatype
+
+    def with_children(self, new_children):
+        return self
 
     def to_sql(self, dialect):
         if self.value is None:
@@ -207,6 +299,16 @@ class ColumnRef(Expression):
                 return col.datatype
         return DataType.build("UNKNOWN")
 
+    def with_children(self, new_children):
+        return self
+        # ColumnRef(
+        #     self.name,
+        #     table_alias=self.table_alias,
+        #     ref=self.ref,
+        #     datatype=self.datatype,
+        #     metadata=self.metadata.copy() ,
+        # )
+
     def to_sql(self, dialect):
         return self.name
 
@@ -218,13 +320,18 @@ class ColumnRef(Expression):
             return False
         return (
             self.name == other.name
-            and self.table_alias == other.table_alias
             and self.datatype == other.datatype
+            and self.metadata.get("table", None) == other.metadata.get("table", None)
         )
 
     def __hash__(self) -> int:
         return hash(
-            (self.__class__.__name__, self.name, self.table_alias, str(self.datatype))
+            (
+                self.__class__.__name__,
+                self.name,
+                self.metadata.get("table", None),
+                str(self.datatype),
+            )
         )
 
 
@@ -261,6 +368,9 @@ class Star(Expression):
 
     def get_children(self):
         return (self.table_ref,) if self.table_ref else ()
+
+    def with_children(self, new_children):
+        return self
 
     def infer_type(self, schema_context):
         raise ValueError("Star does not have a single data type")
@@ -305,6 +415,16 @@ class BinaryOp(Expression):
         # Default: use left type (subclasses can override)
         return left_type
 
+    def with_children(self, new_children):
+        left, right = new_children
+        return self.__class__(
+            left=left,
+            right=right,
+            op=self.op,
+            datatype=self.datatype,
+            metadata=self.metadata,
+        )
+
     def to_sql(self, dialect):
         left_sql = self.left.to_sql(dialect)
         right_sql = self.right.to_sql(dialect)
@@ -334,6 +454,12 @@ class UnaryOp(Expression):
     def get_children(self):
         return (self.operand,)
 
+    def with_children(self, new_children):
+        (operand,) = new_children
+        return self.__class__(
+            op=self.op, operand=operand, datatype=self.datatype, metadata=self.metadata
+        )
+
     def infer_type(self, schema_context):
         if self.datatype:
             return self.datatype
@@ -344,23 +470,38 @@ class UnaryOp(Expression):
         return f"({self.op} {operand_sql})"
 
 
+# class Predicate(Expression):
+#     """ Base class for boolean predicates."""
 class Predicate(BinaryOp):
     def infer_type(self, schema_context):
         return DataType.build("BOOLEAN")
 
+    def not_(self):
+        if isinstance(self, NOT):
+            return self.operand
+        return NOT(self)
 
-class AND(Predicate):
+
+class IS(Predicate):
+    def __init__(self, left, op, right, datatype=None, metadata=None):
+        super().__init__(left, op, right, datatype, metadata)
+
+    def infer_type(self, schema_context):
+        return DataType.build("BOOLEAN")
+
+
+class AND(BinaryOp):
     """Logical AND"""
 
-    def __init__(self, left: Expression, right: Expression, **kwargs):
-        super().__init__(left, "AND", right, **kwargs)
+    def __init__(self, left: Expression, right: Expression, datatype="bool", **kwargs):
+        super().__init__(left, "AND", right, datatype=datatype, **kwargs)
 
 
-class OR(Predicate):
+class OR(BinaryOp):
     """Logical OR"""
 
-    def __init__(self, left: Expression, right: Expression, **kwargs):
-        super().__init__(left, "OR", right, **kwargs)
+    def __init__(self, left: Expression, right: Expression, datatype="bool", **kwargs):
+        super().__init__(left, "OR", right, datatype=datatype, **kwargs)
 
 
 class NOT(UnaryOp):
@@ -405,10 +546,18 @@ class FunctionCall(Expression):
     def get_children(self):
         return tuple(self.args)
 
-    def infer_type(self, schema_context):
-        if self.datatype:
-            return self.datatype
-        raise ValueError("Cannot infer type for generic FunctionCall")
+    # def infer_type(self, schema_context):
+    #     if self.datatype:
+    #         return self.datatype
+    #     raise ValueError("Cannot infer type for generic FunctionCall")
+
+    def with_children(self, new_children):
+        return self.__class__(
+            # name=self.name,
+            args=list(new_children),
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
 
     def to_sql(self, dialect):
         args_sql = ", ".join(arg.to_sql(dialect) for arg in self.args)
@@ -427,6 +576,15 @@ class Cast(FunctionCall):
 
     def infer_type(self, schema_context):
         return self.to_type
+
+    def with_children(self, new_children):
+        operand = new_children[0]
+
+        return self.__class__(
+            operand=operand,
+            to_type=self.to_type,
+            metadata=self.metadata.copy(),
+        )
 
     def to_sql(self, dialect):
         return f"CAST({self.args[0].to_sql(dialect)} AS {self.to_type})"
@@ -456,7 +614,7 @@ class Case(FunctionCall):
     def get_children(self):
         children = []
         for when in self.whens:
-            children.extend([when.condition, when.result])
+            children.append(when)
         if self.default:
             children.append(self.default)
         return tuple(children)
@@ -468,6 +626,54 @@ class Case(FunctionCall):
             return self.default.infer_type(schema_context)
         return DataType.build("NULL")
 
+    def with_children(self, new_children):
+        default = new_children[-1]
+        whens = new_children[:-1]
+        # whens, default = new_children
+
+        return self.__class__(
+            whens=whens,
+            default=default,
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
+
+        expected_len = len(self.whens) * 2 + (1 if self.default else 0)
+        if len(new_children) != expected_len:
+            raise ValueError(
+                f"{self.__class__.__name__}: expected {expected_len} children, got {len(new_children)}"
+            )
+
+        i = 0
+        new_whens = []
+        for _ in self.whens:
+            cond = new_children[i]
+            result = new_children[i + 1]
+            new_whens.append((cond, result))
+            i += 2
+
+        new_default = new_children[-1] if self.default else None
+
+        print("new_whens:", new_whens)
+        print("old whens:", self.whens)
+
+        # Check if nothing has changed
+        if (
+            all(
+                c1 is c2 and r1 is r2
+                for (c1, r1), (c2, r2) in zip(self.whens, new_whens)
+            )
+            and self.default is new_default
+        ):
+            return self
+
+        return Case(
+            whens=new_whens,
+            default=new_default,
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
+
     def to_sql(self, dialect):
         when_sql = " ".join(
             f"WHEN {when.condition.to_sql(dialect)} THEN {when.true_expr.to_sql(dialect)}"
@@ -478,7 +684,7 @@ class Case(FunctionCall):
 
 
 class IF(FunctionCall):
-    __slots__ = "true_expr" "false_expr"
+    __slots__ = ("true_expr", "false_expr")
 
     def __init__(
         self, condition, true_expr, false_expr=None, datatype=None, metadata=None
@@ -494,25 +700,68 @@ class IF(FunctionCall):
         return self.args[0]
 
     def get_children(self):
-        return (self.args[0], self.true_expr, self.false_expr)
+        if self.false_expr:
+            return (self.condition, self.true_expr, self.false_expr)
+        return (self.condition, self.true_expr)
 
     def infer_type(self, schema_context):
         return self.true_expr.infer_type(schema_context)
 
+    def with_children(self, new_children: Tuple[Expression, ...]) -> "IF":
+        """
+        Create a new IF expression with replaced children.
+
+        Args:
+            new_children: A tuple of new child expressions in order:
+                          (condition, true_expr, false_expr)
+
+        Returns:
+            A new IF expression with updated children.
+        """
+        # Defensive validation
+        if len(new_children) not in (2, 3):
+            raise ValueError(f"IF expects 2 or 3 children, got {len(new_children)}")
+
+        condition = new_children[0]
+        true_expr = new_children[1]
+        false_expr = new_children[2] if len(new_children) == 3 else None
+        return self.__class__(
+            condition=condition,
+            true_expr=true_expr,
+            false_expr=false_expr,
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
+
     def to_sql(self, dialect):
-        return f"{self.name}({self.args[0].to_sql(dialect)}, {self.true_expr.to_sql(dialect)}, {self.false_expr.to_sql(dialect)})"
+        if self.false_expr:
+            return f"{self.name}({self.condition.to_sql(dialect)}, {self.true_expr.to_sql(dialect)}, {self.false_expr.to_sql(dialect)})"
+        return f"{self.name}({self.condition.to_sql(dialect)}, {self.true_expr.to_sql(dialect)}"
+
+    # f"{self.name}({self.args[0].to_sql(dialect)}, {self.true_expr.to_sql(dialect)}, {self.false_expr.to_sql(dialect)})"
 
 
 class When(IF): ...
 
 
 class AggFunc(FunctionCall):
-    __slots__ = ("distinct", "ignorenulls")
+    __slots__ = ("distinct", "ignore_nulls")
+    FUNCTION_RETURN_TYPE = {
+        "COUNT": lambda self, schema: DataType.build("INTEGER"),
+        "SUM": lambda self, schema: (
+            self.args[0].infer_type(schema)
+            if self.args[0].infer_type(schema).is_numeric()
+            else DataType.build("FLOAT")
+        ),
+        "AVG": lambda self, schema: DataType.build("FLOAT"),
+        "MIN": lambda self, schema: self.args[0].infer_type(schema),
+        "MAX": lambda self, schema: self.args[0].infer_type(schema),
+    }
 
     def __init__(
         self,
         name: str,
-        args: List[Expression],
+        args: Expression,
         distinct: bool = False,
         ignore_nulls: bool = False,
         datatype: Optional[Union[DATATYPE, DataType]] = None,
@@ -522,79 +771,35 @@ class AggFunc(FunctionCall):
         self.distinct = distinct
         self.ignore_nulls = ignore_nulls
 
+    def infer_type(self, schema_context):
+        fn_name = self.name.upper()
+        if fn_name in self.FUNCTION_RETURN_TYPE:
+            return self.FUNCTION_RETURN_TYPE[fn_name](self, schema_context)
+        raise ValueError(f"Cannot infer type for aggregate function {self.name}")
+
+    def with_children(self, new_children: Tuple[Expression, ...]) -> "AggFunc":
+        if len(new_children) != len(self.args):
+            raise ValueError(
+                f"{self.__class__.__name__}: expected {len(self.args)} args, got {len(new_children)}"
+            )
+        # If nothing changed, return self
+        if tuple(self.args) == new_children:
+            return self
+
+        return AggFunc(
+            name=self.name,
+            args=list(new_children),
+            distinct=self.distinct,
+            ignore_nulls=self.ignore_nulls,
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
+
     def to_sql(self, dialect) -> str:
         distinct_kw = "DISTINCT " if self.distinct else ""
+
         args_sql = ", ".join(arg.to_sql(dialect) for arg in self.args)
         return f"{self.name}({distinct_kw}{args_sql})"
-
-
-class Count(AggFunc):
-    def __init__(self, arg: Expression, distinct: bool = False, **kwargs):
-        super().__init__("COUNT", [arg], distinct, **kwargs)
-
-    def infer_type(self, schema_context):
-        return DataType.build("INTEGER")
-
-
-class Sum(AggFunc):
-    def __init__(
-        self,
-        arg,
-        distinct=False,
-        ignore_nulls=False,
-        datatype=None,
-        metadata=None,
-    ):
-        super().__init__("SUM", [arg], distinct, ignore_nulls, datatype, metadata)
-
-    def infer_type(self, schema_context):
-        arg_type = self.args[0].infer_type(schema_context)
-        return arg_type if arg_type.is_numeric() else DataType.build("FLOAT")
-
-
-class Avg(AggFunc):
-    def __init__(
-        self,
-        arg,
-        distinct=False,
-        ignore_nulls=False,
-        datatype=None,
-        metadata=None,
-    ):
-        super().__init__("AVG", [arg], distinct, ignore_nulls, datatype, metadata)
-
-    def infer_type(self, schema_context: Schema) -> DataType:
-        return DataType.build("FLOAT")
-
-
-class Max(AggFunc):
-    def __init__(
-        self,
-        arg,
-        distinct=False,
-        ignore_nulls=False,
-        datatype=None,
-        metadata=None,
-    ):
-        super().__init__("MAX", [arg], distinct, ignore_nulls, datatype, metadata)
-
-    def infer_type(self, schema_context: Schema) -> DataType:
-        return self.args[0].infer_type(schema_context)
-
-
-class Min(AggFunc):
-    def __init__(
-        self,
-        arg,
-        distinct=False,
-        ignore_nulls=False,
-        datatype=None,
-        metadata=None,
-    ):
-        super().__init__("MIN", [arg], distinct, ignore_nulls, datatype, metadata)
-
-    def infer_type(self, schema_context: Schema) -> DataType:
-        return self.args[0].infer_type(schema_context)
 
 
 class Subquery(Expression):
@@ -631,7 +836,13 @@ class Subquery(Expression):
         self.modifier = modifier
 
     def get_children(self):
-        return (self.query) if self.query else ()
+        # Support both single query node and iterable of nodes
+        if self.query is None:
+            return ()
+        elif isinstance(self.query, (list, tuple)):
+            return tuple(self.query)
+        else:
+            return (self.query,)
 
     def infer_type(self, schema_context: Schema) -> DataType:
         if self.datatype:
@@ -641,6 +852,25 @@ class Subquery(Expression):
             if schema and len(schema) > 0:
                 return schema[0].infer_type(schema_context)
         return DataType.build("UNKNOWN")
+
+    def with_children(self, new_children: Tuple["Expression", ...]) -> "Subquery":
+        """
+        Return a new Subquery instance with replaced child(ren).
+        """
+        if not new_children:
+            raise ValueError("Subquery must have at least one child expression")
+
+        # Rebuild query structure: single or list
+        new_query = new_children[0] if len(new_children) == 1 else list(new_children)
+
+        return Subquery(
+            query=new_query,
+            subquery_type=self.subquery_type,
+            correlated=self.correlated,
+            modifier=self.modifier,
+            datatype=self.datatype,
+            metadata=self.metadata.copy(),
+        )
 
     def to_sql(self, dialect) -> str:
         sql = [q.pprint() for q in self.query]
@@ -661,7 +891,7 @@ class Strftime(FunctionCall):
         return f"STRFTIME({self.args[0].to_sql(dialect)}, '{self._format}')"
 
     def get_children(self):
-        return (self.args[0],)
+        return tuple(self.args)
 
     def infer_type(self, schema_context):
         return DataType.build("VARCHAR")
@@ -672,30 +902,61 @@ class ABS(FunctionCall):
         super().__init__("ABS", [arg], datatype, metadata)
 
     def get_children(self):
-        return (self.args[0],)
+        return tuple(self.args)
 
     def infer_type(self, schema_context):
         return self.args[0].infer_type(schema_context)
+
+    def with_children(self, new_children):
+        return ABS(new_children[0], self.datatype, self.metadata.copy())
 
     def to_sql(self, dialect):
         return f"ABS({self.args[0].to_sql(dialect)})"
 
 
 class Table(Expression):
-    __slots__ = ("name", "schema", "constraints")
+    __slots__ = (
+        "name",
+        "schema",
+        "constraints",
+        "_columns",
+        "primary_key",
+        "foreign_key",
+    )
 
-    def __init__(self, name: str, schema: Schema, constraints: List = None):
+    def __init__(
+        self,
+        name: str,
+        schema: Schema,
+        constraints: Dict[str, Set[Any]] = None,
+        primary_key=None,
+        foreign_key=None,
+    ):
         super().__init__(None, None)
         self.name = name
         self.schema = schema
-        self.constraints = constraints or []
+        self.constraints = constraints or {}
+        self.primary_key = primary_key
+        self.foreign_key = foreign_key
+        self._columns = []
 
     @property
     def columns(self) -> List[ColumnRef]:
-        return self.schema.columns
+        if self._columns:
+            return self._columns
+        self._columns = []
+        for column in self.schema.columns:
+            nullable = self.nullable(column.name)
+            unique = self.is_unique(column.name)
+            column.metadata["table"] = self.name
+            column.metadata["unique"] = unique
+            column.datatype.nullable = nullable
+            self._columns.append(column)
+        return self._columns
 
-    def add_constraint(self, constraint):
-        self.constraints.append(constraint)
+    def add_constraint(self, column_name, constraint):
+        self.constraints.setdefault(column_name, set()).add(constraint)
+        # self.constraints[column_name].setdefault(set()).add(constraint)
 
     def get_children(self):
         return []
@@ -703,15 +964,33 @@ class Table(Expression):
     def infer_type(self, schema_context):
         return
 
+    def nullable(self, column_name):
+        from sqlglot import exp
+
+        if self.primary_key:
+            for column_name in self.primary_key.find_all(exp.Identifier):
+                if column_name.this.name == column_name:
+                    return False
+        for constraint in self.constraints.get(column_name, []):
+
+            if isinstance(constraint.kind, exp.NotNullColumnConstraint):
+                return constraint.kind.args.get("allow_null", False)
+                # return False
+
+        return True
+
     def is_unique(self, column_name):
-        for constraint in self.constraints:
+        for constraint in self.constraints.get(column_name, []):
             from sqlglot import exp
 
-            if constraint.this == column_name:
-                if isinstance(
-                    constraint.kind,
-                    (exp.UniqueColumnConstraint, exp.PrimaryKeyColumnConstraint),
-                ):
+            if isinstance(
+                constraint.kind,
+                (exp.UniqueColumnConstraint, exp.PrimaryKeyColumnConstraint),
+            ):
+                return True
+        if self.primary_key:
+            for column_name in self.primary_key.find_all(exp.Identifier):
+                if column_name.this.name == column_name:
                     return True
         return False
 

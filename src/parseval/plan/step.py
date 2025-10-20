@@ -13,7 +13,10 @@ import uuid
 
 # from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from .expression import ColumnRef
+
+# from .expression import ColumnRef
+
+import src.parseval.plan.expression as sql_exp
 
 
 class JoinType(Enum):
@@ -135,7 +138,7 @@ class LogicalScan(LeafOperator):
     ):
         super().__init__(operator_id)
         self.table_name = table_name
-        self.alias = alias or table_name
+        self.alias = alias or f"{table_name}_{self.id}"
         self._table_schema = None  # To be set from catalog or external source
 
     def schema(self, catalog: Catalog):
@@ -143,17 +146,24 @@ class LogicalScan(LeafOperator):
             return self._schema
         table = catalog.get_table(self.table_name)
         columns = []
-        for col in table.schema.columns:
+        for index, col in enumerate(table.schema.columns):
             # data_type=col.datatype,
             #     nullable=col.nullable,
             #     unique=col.unique,
             #     default_value=col.default_value,
-            new_col = ColumnRef(
-                name=col.name,
-                datatype=col.datatype,
-                table_alias=self.alias,
+            unique = table.is_unique(col.name)
+            nullable = table.nullable(col.name)
+            datatype = col.datatype
+            datatype.nullable = nullable
+            columns.append(
+                sql_exp.ColumnRef(
+                    name=col.name,
+                    datatype=datatype,
+                    ref=index,
+                    table_alias=self.alias,
+                    metadata={"table": self.table_name, "unique": unique},
+                )
             )
-            columns.append(new_col)
         self._schema = Schema(columns)
         return self._schema
 
@@ -220,8 +230,37 @@ class LogicalProject(UnaryOperator):
         input_schema = self.input.schema(catalog=catalog)
         columns = []
         for expr, alias in zip(self.expressions, self.aliases):
-            data_type = expr.infer_type(input_schema)
-            columns.append(ColumnRef(name=alias, datatype=data_type))
+
+            def resolve_schema(e):
+                if isinstance(e, sql_exp.ColumnRef) and e.ref is not None:
+                    return input_schema.columns[e.ref]
+                return None
+
+            new_expr = expr.transform(resolve_schema)
+            columns.append(new_expr)
+
+            # data_type = expr.infer_type(input_schema)
+            # if isinstance(expr, sql_exp.ColumnRef):
+            #     columns.append(input_schema.columns[expr.ref])
+            # elif isinstance(expr, sql_exp.BinaryOp):
+
+            #     def resolve_schema(e):
+            #         if isinstance(e, sql_exp.ColumnRef) and e.ref is not None:
+            #             return input_schema.columns[e.ref]
+            #         return None
+
+            #     new_expr = expr.transform(resolve_schema)
+            #     columns.append(new_expr)
+
+            # elif isinstance(expr, sql_exp.Case):
+            #     raise NotImplementedError(
+            #         f"Unsupported expression type in projection, {expr}"
+            #     )
+            # else:
+            #     raise NotImplementedError(
+            #         f"Unsupported expression type in projection, {expr}"
+            #     )
+
         self._schema = Schema(columns)
         return self._schema
 
@@ -246,6 +285,11 @@ class LogicalFilter(UnaryOperator):
         return f"LogicalFilter({self.condition})"
 
 
+class LogicalHaving(LogicalFilter):
+    def __str__(self):
+        return f"LogicalHaving({self.condition})"
+
+
 class LogicalSort(UnaryOperator):
     def __init__(
         self,
@@ -264,7 +308,7 @@ class LogicalSort(UnaryOperator):
         self.limit = limit
 
     def __str__(self):
-        return f"LogicalSort({', '.join(str(s) for s in self.sorts)}, dir={self.dir}, offset={self.offset}, limit={self.limit})"
+        return f"LogicalSort({', '.join([str(s) for s in self.sorts])}, dir={self.dir}, offset={self.offset}, limit={self.limit})"
 
 
 class LogicalLimit(UnaryOperator):
@@ -292,18 +336,26 @@ class LogicalAggregate(UnaryOperator):
         input_schema = self.input.schema(catalog)
         columns = []
 
-        for key_expr in self.keys:
-            key_type = key_expr.infer_type(input_schema)
-            key_name = str(key_expr)
-            if hasattr(key_expr, "name"):
-                key_name = key_expr.name
-            columns.append(ColumnRef(key_name, datatype=key_type))
-        # Add aggregate columns
-        for fidx, agg_expr in enumerate(self.aggs):
-            agg_type = agg_expr.infer_type(input_schema)
-            columns.append(ColumnRef(f"aggfunc${fidx}", datatype=agg_type))
+        for key in self.keys:
+            columns.append(input_schema.columns[key.ref])
+
+        def resolve_schema(e):
+            if isinstance(e, sql_exp.ColumnRef) and e.ref is not None:
+                return input_schema.columns[e.ref]
+            return None
+
+        for agg_expr in self.aggs:
+            agg = agg_expr.transform(resolve_schema)
+            columns.append(agg)
+
         self._schema = Schema(columns)
         return self._schema
+
+    def __str__(self):
+        keys = ", ".join([str(k) for k in self.keys])
+        agg_funcs = ", ".join([str(a) for a in self.aggs])
+
+        return f"LogicalAggregate(keys=[{keys}], aggs=[{agg_funcs})]"
 
 
 class LogicalJoin(BinaryOperator):
