@@ -48,6 +48,8 @@ class DataType:
     @classmethod
     def infer(cls, value: Any) -> "DataType":
         """Infer data type from a Python value"""
+        if value is None:
+            return cls("NULL")
         if isinstance(value, bool):
             return cls("BOOLEAN")
         elif isinstance(value, int):
@@ -61,6 +63,9 @@ class DataType:
         else:
             return cls("TEXT")
 
+    def is_integer(self) -> bool:
+        return exp.DataType.build(self.name).is_type(*exp.DataType.INTEGER_TYPES)
+
     def is_numeric(self) -> bool:
         return exp.DataType.build(self.name).is_type(*exp.DataType.NUMERIC_TYPES)
 
@@ -71,9 +76,9 @@ class DataType:
         """self.name.upper() == BOOLEAN"""
         return exp.DataType.build(self.name).is_type(exp.DataType.Type.BOOLEAN)
 
-    def is_date_time(self) -> bool:
+    def is_datetime(self) -> bool:
         """self.name.upper() in ["DATE", "TIME", "TIMESTAMP", "DATETIME"]"""
-        return exp.DataType.build(self.name).is_type(exp.DataType.TEMPORAL_TYPES)
+        return exp.DataType.build(self.name).is_type(*exp.DataType.TEMPORAL_TYPES)
 
     def can_cast_to(self, target_type: "DataType") -> bool:
         """Check if this type can be cast to target type"""

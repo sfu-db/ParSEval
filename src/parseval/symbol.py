@@ -1,8 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Iterable, List, Callable
-from dataclasses import dataclass
-from enum import Enum, auto
 from .dtype import DataType
 
 if TYPE_CHECKING:
@@ -25,6 +23,8 @@ _SQL_OP_MAP = {
     "AND": "AND",
     "OR": "OR",
     "NOT": "NOT",
+    "LIKE": "LIKE",
+    "IS": "IS",
 }
 
 
@@ -61,6 +61,19 @@ class Symbol(ABC):
         yield self
         for child in self.children():
             yield from child.iter()
+
+    def find_all(self, target: "Symbol") -> List["Symbol"]:
+        """Find all instances of a target expression in the tree."""
+        matches = []
+        stack = [self]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, target):
+                matches.append(current)
+            for child in current.children():
+                if isinstance(child, Symbol):
+                    stack.append(child)
+        return matches
 
     def predicates(self, include_nested: bool = False) -> List[Symbol]:
         """Collect all boolean predicate symbols in the expression tree.
@@ -175,12 +188,37 @@ class Symbol(ABC):
     def or_(self, other):
         return Or(self, _ensure_symbol(other))
 
+    def not_(self):
+        return Not(
+            operand=self, dtype="bool", concrete=not self.concrete, meta=self.meta
+        )
+
     # Use .eq() method instead
     def eq(self, other):
         return EQ(self, _ensure_symbol(other))
 
     def ne(self, other):
         return NE(self, _ensure_symbol(other))
+
+    def like(self, pattern: str) -> "Symbol":
+        """Create a LIKE comparison symbol."""
+        return LIKE(self, Const(pattern, dtype="string"))
+
+    def is_(self, other: Symbol) -> "Symbol":
+        """Create an IS comparison symbol."""
+        return IS(self, _ensure_symbol(other))
+
+    def refresh_concrete(self):
+        """Force refresh the value of `concrete` from bottom to top."""
+        for child in self.children():
+            child.refresh_concrete()  # Recursively refresh children
+        if isinstance(self, BinaryOp) or isinstance(self, UnaryOp):
+            self.concrete = self._eval()  # Recalculate concrete for operations
+        elif isinstance(self, And):
+            self.concrete = all(op.concrete for op in self.operands)
+        elif isinstance(self, Or):
+            self.concrete = any(op.concrete for op in self.operands)
+        # Add other cases as needed for specific Symbol types
 
 
 # ======================================================================================================
@@ -234,10 +272,13 @@ class BinaryOp(Symbol):
     __slots__ = ("left", "right", "op")
     OP_SYMBOL: str = ""
 
-    def __init__(self, left: Symbol, right: Symbol, dtype, concrete=None, meta=None):
+    def __init__(
+        self, left: Symbol, right: Symbol, dtype=None, concrete=None, meta=None
+    ):
         self.left = left
         self.right = right
         concrete = concrete or self._eval()
+        dtype = dtype or DataType.infer(concrete)
         super().__init__(dtype, concrete, meta)
 
     def canonical_key(self) -> Tuple:
@@ -262,8 +303,57 @@ class BinaryOp(Symbol):
             return self.left.concrete == self.right.concrete
         elif self.OP_SYMBOL == "!=":
             return self.left.concrete != self.right.concrete
+        elif self.OP_SYMBOL == "LIKE":
+            import re
+
+            pattern = self.right.concrete
+
+            def like_to_regex(pattern: str) -> re.Pattern:
+                regex = ""
+                for ch in pattern:
+                    if ch == "%":
+                        regex += ".*"
+                    elif ch == "_":
+                        regex += "."
+                    else:
+                        regex += re.escape(ch)
+                return re.compile(f"^{regex}$")
+
+            regex = like_to_regex(pattern)
+            return bool(regex.match(str(self.left.concrete)))
+        elif self.OP_SYMBOL == "/":
+            if (
+                isinstance(self.left.concrete, (int, float))
+                and isinstance(self.right.concrete, (int, float))
+                and self.right.concrete != 0
+            ):
+                return self.left.concrete / self.right.concrete
+            else:
+                return None
+
+        elif self.OP_SYMBOL == "IS":
+            return self.left.concrete is self.right.concrete
         else:
-            raise NotImplementedError(f"Unknown comparison operator: {self.OP_SYMBOL}")
+            try:
+
+                import operator
+
+                OPS = {
+                    ">": operator.gt,
+                    "<": operator.lt,
+                    ">=": operator.ge,
+                    "<=": operator.le,
+                    "+": operator.add,
+                    "-": operator.sub,
+                    "*": operator.mul,
+                    "/": operator.truediv,
+                }
+                return OPS[self.OP_SYMBOL](self.left.concrete, self.right.concrete)
+
+            except Exception as e:
+                raise NotImplementedError(
+                    f"Unknown comparison operator: {self.OP_SYMBOL}, {self.right.concrete} {e}"
+                )
 
 
 class Add(BinaryOp):
@@ -351,6 +441,14 @@ class EQ(Compare):
 
 class NE(Compare):
     OP_SYMBOL = _SQL_OP_MAP["NE"]
+
+
+class LIKE(Compare):
+    OP_SYMBOL = _SQL_OP_MAP["LIKE"]
+
+
+class IS(Compare):
+    OP_SYMBOL = _SQL_OP_MAP["IS"]
 
 
 class And(Symbol):

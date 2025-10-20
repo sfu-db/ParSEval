@@ -7,7 +7,7 @@ from .helper import normalize_name
 from .symbol import *
 from .faker import ValueGeneratorRegistry
 
-import random
+import random, logging
 
 
 def to_table(stmt: exp.Expression) -> Table:
@@ -24,14 +24,24 @@ def to_table(stmt: exp.Expression) -> Table:
     try:
         for expr in schema_obj.expressions:
             if isinstance(expr, exp.ColumnDef):
+                nullable = True
                 for constraint in expr.constraints[:]:
                     if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
                         table_components["primary_key"].add(expr.this)
                     elif isinstance(constraint.kind, exp.AutoIncrementColumnConstraint):
                         expr.constraints.remove(constraint)
+                    if isinstance(constraint.kind, exp.NotNullColumnConstraint):
+                        nullable = False
                 table_components["constraints"][expr.name].extend(expr.constraints)
+                datatype = str(expr.args.get("kind"))
+                datatype = DataType.build(datatype, nullable=nullable)
+
                 table_components["column_defs"].append(
-                    ColumnRef(name=expr.name, datatype=str(expr.args.get("kind")))
+                    ColumnRef(
+                        name=expr.name,
+                        datatype=datatype,
+                        table_alias=table_name,
+                    )
                 )
             elif isinstance(expr, exp.PrimaryKey):
                 table_components["primary_key"].update(
@@ -72,14 +82,17 @@ class Instance:
         for stmt_expr in ddls:
             schema_expr = stmt_expr.this
             table_name = schema_expr.this.name
-            column_defs, primary_key, constraints = [], set(), set()
+            column_defs, primary_key, foreign_key, constraints = [], None, None, {}
 
             for expr in schema_expr.expressions:
                 if isinstance(expr, exp.ColumnDef):
-                    for constraint in expr.constraints[:]:
-                        if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
-                            primary_key.add(expr.this.name)
-                    constraints.update(expr.constraints)
+                    # for constraint in expr.constraints[:]:
+                    #     if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+                    #         primary_key.add(expr.this.name)
+                    constraints.setdefault(expr.this.name, set()).update(
+                        expr.constraints
+                    )
+
                     column_defs.append(
                         ColumnRef(
                             name=expr.name,
@@ -89,24 +102,21 @@ class Instance:
                     )
 
                 elif isinstance(expr, exp.PrimaryKey):
-                    for item in expr.expressions:
-                        primary_key.add(item.this)
-                        constraints.add(
-                            exp.ColumnConstraint(
-                                this=item.this, kind=exp.PrimaryKeyColumnConstraint()
-                            )
-                        )
+                    primary_key = expr
 
                 elif isinstance(expr, exp.ForeignKey):
                     local_column = expr.expressions[0].this
                     ref_table = expr.args.get("reference").find(exp.Table).name
                     ref_column = expr.args.get("reference").this.expressions[0].this
                     foreign_keys[table_name][local_column] = (ref_table, ref_column)
+                    foreign_key = expr
 
             tables[table_name] = Table(
                 name=table_name,
                 schema=Schema(columns=column_defs),
-                constraints=list(constraints),
+                primary_key=primary_key,
+                foreign_key=foreign_key,
+                constraints=constraints,
             )
             if table_name not in dependency:
                 dependency[table_name] = 0
@@ -214,8 +224,9 @@ class Instance:
                 "%s_%s_%s_%s"
                 % (table_name, column_def.name, datatype.name, tuple_index)
             )
-            concrete = concretes.get(column_def.name, None)
-            if concrete is None:
+            if column_def.name in concretes:
+                concrete = concretes.get(column_def.name)
+            else:
                 concrete = self._assign_concrete_for_column(
                     table_name,
                     column_def.name,
@@ -258,3 +269,43 @@ class Instance:
 
         generator = ValueGeneratorRegistry.get_generator(datatype)
         return generator(is_unique=is_unique, existing_values=existing_values)
+
+    def to_db(
+        self, host_or_path, database=None, port=None, username=None, password=None
+    ):
+        database = database or self.name
+        database = database if database.endswith(".sqlite") else database + ".sqlite"
+        from src.parseval.db_manager import DBManager
+
+        mapped_data = []
+
+        with DBManager().get_connection(
+            host_or_path=host_or_path,
+            database=database,
+            port=port,
+            username=username,
+            password=password,
+            dialect=self.dialect,
+        ) as conn:
+            conn.create_tables(*self.ddls.split(";"))
+
+            for table_name in self.catalog.tables:
+                rows = self.get_rows(table_name)
+                columns = []
+
+                parameters = []
+                for column in self.catalog.get_table(table_name).columns:
+                    columns.append(f'"{column.name}"')
+                    parameters.append(f":{normalize_name(column.name)}")
+                mapped_data = []
+                for row in rows:
+                    data = {}
+                    for column_name, column_value in zip(columns, row.columns):
+                        data[normalize_name(column_name)] = column_value.concrete
+                    mapped_data.append(data)
+
+                column_list = ", ".join(columns)
+                stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
+
+                # logging.info(mapped_data)
+                conn.insert(stmt, mapped_data)
