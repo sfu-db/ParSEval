@@ -164,8 +164,15 @@ cython_debug/
 # ./datasets
 # datasets
 
-.devcontainer
-wandb/
+# .devcontainer
+
 logs
-results
-tests2
+datasets
+examples
+README-dev.md
+
+src/runtim/
+src/runtime/
+src/pipeline/
+src/engine/
+src/engine copy/
