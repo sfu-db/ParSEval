@@ -449,38 +449,6 @@ class LogicalPlanVisitor(ABC):
         for child in node.children:
             child.accept(self)
 
-    # @abstractmethod
-    # def visit_scan(self, node: LogicalScan) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_values(self, node: LogicalValues) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_projection(self, node: LogicalProject) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_filter(self, node: LogicalFilter) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_sort(self, node: LogicalSort) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_join(self, node: LogicalJoin) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_union(self, node: LogicalUnion) -> Any:
-    #     pass
-
-    # @abstractmethod
-    # def visit_aggregate(self, node: LogicalAggregate) -> Any:
-    #     pass
-
 
 class PrintVisitor(LogicalPlanVisitor):
     def __init__(self):
@@ -535,11 +503,16 @@ class ExpressionEncoder(ExpressionVisitor):
         "-": operator.sub,
         "*": operator.mul,
         "/": operator.truediv,
-        "LIKE": lambda left, right: left.like(right),
+        "Like": lambda left, right: left.like(right),
         "IS": lambda left, right: left.is_(right),
     }
 
-    def __init__(self, row: Row, ignore_nulls: bool = False):
+    def __init__(
+        self,
+        row: Row,
+        plan_encoder: Optional[PlanEncoder] = None,
+        ignore_nulls: bool = False,
+    ):
         super().__init__()
         self.row = row
         self.ref_conditions = []  ## the reference index style Expression
@@ -547,6 +520,7 @@ class ExpressionEncoder(ExpressionVisitor):
         self.smt_conditions = []  ## the smt expressions
         self._predicate_stack = []
         self.ignore_nulls = ignore_nulls
+        self.plan_encoder = plan_encoder
 
     @property
     def in_predicates(self):
@@ -626,6 +600,22 @@ class ExpressionEncoder(ExpressionVisitor):
     def visit_cast(self, expr):
         operand = expr.args[0].accept(self)
         return operand
+        concrete = operand.concrete if isinstance(expr.args[0], ColumnRef) else operand
+
+        if concrete is not None:
+            if expr.to_type.is_numeric():
+                concrete = int(concrete)
+            elif expr.to_type.is_datetime():
+                from datetime import datetime
+
+                concrete = datetime.strptime(concrete, "%Y-%m-%d")
+            else:
+                concrete = str(concrete)
+        if isinstance(expr.args[0], Literal):
+            return concrete
+        else:
+            operand.concrete = concrete
+            return operand
 
     def visit_case(self, expr):
         for when in expr.whens:
@@ -633,6 +623,17 @@ class ExpressionEncoder(ExpressionVisitor):
             if smt_expr:
                 return when.true_expr.accept(self)
         return expr.default.accept(self)
+
+    def visit_subquery(self, expr: Subquery):
+        for query in expr.query:
+
+            print(query.pprint())
+            res = query.accept(self.plan_encoder)
+
+            logging.info(f"Subquery result rows: {len(res.data)}, {res}")
+            return res.data[0][0]
+
+        # return super().visit(expr)
 
 
 def resolve_schema(expr, node, catalog):
@@ -653,9 +654,6 @@ def resolve_schema(expr, node, catalog):
             input_schema.extend(child.schema(catalog).columns)
         return input_schema[expr.ref]
     return None
-
-
-# new_expr = node.sql_condition.transform(resolve_schema)
 
 
 class PlanEncoder(LogicalPlanVisitor):
@@ -708,14 +706,15 @@ class PlanEncoder(LogicalPlanVisitor):
     @track_next
     def visit_project(self, node: LogicalProject):
         st = node.children[0].accept(self)
+        if st is None:
+            logging.error(f"Project child returned None: {node.children[0]}")
         out = []
         for row in st.data:
             data = []
             ref_conditions, sql_conditions = [], []
             smt_conditions = []
             for expr_idx, expr in enumerate(node.expressions):
-
-                encoder = ExpressionEncoder(row, ignore_nulls=True)
+                encoder = ExpressionEncoder(row, plan_encoder=self, ignore_nulls=True)
                 r = encoder.visit(expr)
                 data.append(r)
                 smt_conditions.extend(encoder.smt_conditions)
@@ -747,19 +746,28 @@ class PlanEncoder(LogicalPlanVisitor):
         st = node.children[0].accept(self)
         out = []
         for row in st.data:
-            encoder = ExpressionEncoder(row)
+            encoder = ExpressionEncoder(row, plan_encoder=self)
             try:
                 smt = encoder.visit(node.condition)
                 if smt:
                     out.append(row)
                 logging.info(encoder.smt_conditions)
+
                 takens = [b.concrete for b in encoder.smt_conditions]
                 sql_conditions = []
                 for cond in encoder.sql_conditions:
-                    new_cond = cond.transform(
-                        lambda e: resolve_schema(e, node, self.instance.catalog)
-                    )
-                    sql_conditions.append(new_cond)
+                    logging.info(f"Condition before schema resolve: {cond}")
+                    if cond.right and isinstance(cond.right, sql_exp.Subquery):
+                        logging.info(f"Subquery detected in condition: {cond}")
+                        sql_conditions.append(
+                            sql_exp.Predicate(cond.left, cond.op, sql_exp.Literal(5))
+                        )
+                        continue
+                    else:
+                        new_cond = cond.transform(
+                            lambda e: resolve_schema(e, node, self.instance.catalog)
+                        )
+                        sql_conditions.append(new_cond)
                 self.trace.which_path(
                     operator=node,
                     ref_conditions=encoder.sql_conditions,
@@ -785,7 +793,7 @@ class PlanEncoder(LogicalPlanVisitor):
                 row = Row(columns=lrow.columns + rrow.columns)
                 try:
                     encoder = ExpressionEncoder(row)
-                    smt = encoder.visit(node.condition)
+                    smt = encoder.visit(node.condition, plan_encoder=self)
                     if smt:
                         out.append(row)
                     takens = [b.concrete for b in encoder.smt_conditions]
@@ -907,25 +915,117 @@ class PlanEncoder(LogicalPlanVisitor):
                 groups[group_key] = []
             groups[group_key].append(row)
 
-        for agg_func in node.aggs:
-            self.log(f"Processing aggregate function: {agg_func}")
-            if isinstance(agg_func, AggFunc) and agg_func.name == "COUNT":
-                for group_key, rows in groups.items():
-                    count_value = len(rows)
-                    smt_conditions.append(count_value)
-                    new_columns = list(group_key) + [count_value]
-                    out.append(Row(columns=new_columns))
-            else:
-                raise NotImplementedError(
-                    f"Aggregate function {agg_func} not implemented yet."
-                )
-        self.trace.which_path(
-            operator=node,
-            sql_conditions=sql_conditions,
-            symbolic_exprs=smt_conditions,
-            takens=[True] * len(smt_conditions),
-            branch=True,
-            rows=[],
-        )
+        for group_key, rows in groups.items():
+            row = [] + list(group_key)
+            for agg_func in node.aggs:
+                self.log(f"Processing aggregate function: {agg_func}")
+                if not isinstance(agg_func, AggFunc):
+                    raise NotImplementedError(
+                        f"Aggregate function {agg_func} not implemented yet."
+                    )
+                if agg_func.name == "COUNT":
+                    from src.parseval.symbol import Const
 
+                    count_value = len(rows)
+                    smt_conditions.append(Const(count_value, dtype="INT"))
+                    row.append(Const(count_value, dtype="INT"))
+
+                elif agg_func.name == "SUM":
+                    sum_value = sum(
+                        row[agg_func.args[0].ref]
+                        for row in rows
+                        if row[agg_func.args[0].ref].concrete is not None
+                    )
+                    logging.info(f"SUM value: {sum_value}, {type(sum_value)}")
+                    smt_conditions.append(sum_value)
+                    row.append(sum_value)
+                else:
+                    raise NotImplementedError(
+                        f"Aggregate function {agg_func} not implemented yet."
+                    )
+            out.append(Row(columns=row))
+            self.trace.which_path(
+                operator=node,
+                ref_conditions=ref_conditions,
+                sql_conditions=sql_conditions,
+                symbolic_exprs=smt_conditions,
+                takens=[True] * len(ref_conditions),
+                branch=True,
+                rows=[Row(columns=row)],
+            )
+
+        # for agg_func in node.aggs:
+        #     self.log(f"Processing aggregate function: {agg_func}")
+        #     if not isinstance(agg_func, AggFunc):
+        #         raise NotImplementedError(
+        #             f"Aggregate function {agg_func} not implemented yet."
+        #         )
+        #     if agg_func.name == "COUNT":
+        #         for group_key, rows in groups.items():
+        #             count_value = len(rows)
+        #             smt_conditions.append(count_value)
+        #             new_columns = list(group_key) + [count_value]
+        #             out.append(Row(columns=new_columns))
+        #     elif agg_func.name == "SUM":
+        #         for group_key, rows in groups.items():
+        #             sum_value = sum(
+        #                 row[agg_func.args[0].ref]
+        #                 for row in rows
+        #                 if row[agg_func.args[0].ref].concrete is not None
+        #             )
+        #             smt_conditions.append(sum_value)
+        #             new_columns = list(group_key) + [sum_value]
+        #             out.append(Row(columns=new_columns))
+        #     else:
+        #         raise NotImplementedError(
+        #             f"Aggregate function {agg_func} not implemented yet."
+        #         )
+        # self.trace.which_path(
+        #     operator=node,
+        #     ref_conditions=ref_conditions,
+        #     sql_conditions=sql_conditions,
+        #     symbolic_exprs=smt_conditions,
+        #     takens=[True] * len(ref_conditions),
+        #     branch=True,
+        #     rows=out,
+        # )
+        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
+
+    @track_next
+    def visit_having(self, node: LogicalHaving):
+        st = node.children[0].accept(self)
+        out = []
+        for row in st.data:
+            encoder = ExpressionEncoder(row)
+            try:
+                smt = encoder.visit(node.condition)
+                if smt:
+                    out.append(row)
+                logging.info(encoder.smt_conditions)
+
+                takens = [b.concrete for b in encoder.smt_conditions]
+                sql_conditions = []
+                for cond in encoder.sql_conditions:
+                    new_cond = cond.transform(
+                        lambda e: resolve_schema(e, node, self.instance.catalog)
+                    )
+                    sql_conditions.append(new_cond)
+                self.trace.which_path(
+                    operator=node,
+                    ref_conditions=encoder.sql_conditions,
+                    sql_conditions=sql_conditions,
+                    symbolic_exprs=encoder.smt_conditions,
+                    takens=takens,
+                    branch=smt.concrete,
+                    rows=[row],
+                )
+            except Skipnulls:
+                logging.info(f"Skipping row with nulls: {row}")
+                continue
+        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
+
+    def visit_subquery(self, node: CorrelatedSubquery):
+        # st = node.children[0].accept(self)
+
+        st = node.subquery.accept(self)
         return st

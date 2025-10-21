@@ -389,7 +389,11 @@ class ValuePool:
             if op in {">", ">="}:
                 self.propagate_bounds(min_val=constraint.right.value)
             elif op in {"<", "<="}:
-                self.propagate_bounds(max_val=constraint.right.value)
+                # from dateutil import parser as date_parser
+                # parser
+                values = constraint.right.find_all(sql_exp.Literal)
+                value = datetime.strptime(values[0].value, "%Y-%m-%d")
+                self.propagate_bounds(max_val=value)
             elif op in {"=", "=="}:
                 self.local_values = {constraint.right.value}
                 self.min_val = self.max_val = constraint.right.value
@@ -410,7 +414,7 @@ class ValuePool:
                 self.local_values = {constraint.right.value}
             elif op in {"!=", "<>"}:
                 self.add_excluded(constraint.right.value)
-            elif op == "LIKE":
+            elif op.upper() == "LIKE":
                 raw_pattern = constraint.right.value
                 regex = like_to_pattern(raw_pattern)
                 self.local_values = {
@@ -419,7 +423,7 @@ class ValuePool:
                 self.choices = [v for v in self.choices if regex.match(str(v))]
                 self.pattern = raw_pattern
             else:
-                raise NotImplementedError
+                raise NotImplementedError(f"String op {op} not implemented")
         else:
             raise NotImplementedError
 
@@ -634,6 +638,7 @@ class SpeculativeSolver:
             self.var_to_columnref[var_name] = columnref
             self.column_alias_to_var[columnref.qualified_name] = var
             self.variables[var_name] = var
+            logging.info(columnref.qualified_name)
             self.pool_mgr.get_or_create_pool(
                 var_name, columnref.metadata["table"], columnref.name
             )
@@ -875,8 +880,9 @@ class SpeculativeSolver:
 
             casts = constraint.sql_expression.find_all(sql_exp.Cast)
             for cast in casts:
-                var_name = cast.args[0].qualified_name
-                self.pool_mgr.get_pool(var_name).datatype = cast.to_type
+                if isinstance(cast.args[0], sql_exp.ColumnRef):
+                    var_name = cast.args[0].qualified_name
+                    self.pool_mgr.get_pool(var_name).datatype = cast.to_type
             if len(constraint.variables) == 1:
                 for var in constraint.variables:
                     pool = self.pool_mgr.get_pool(var.name)

@@ -145,13 +145,17 @@ class Generator:
                             solver.add_constraint(predicate, variables={var})
 
                 for cast in constraint.find_all(sql_exp.Cast):
-                    solver.cast_valuepool_datatype(cast)
+                    if isinstance(cast.args[0], sql_exp.ColumnRef):
+                        solver.cast_valuepool_datatype(cast)
+
+                if constraint.find_all(sql_exp.AggFunc):
+                    # skip constraints with aggregation functions
+                    continue
 
                 if isinstance(constraint, sql_exp.Predicate):
                     solver.add_constraint(constraint, variables=variables)
 
         # logging.info(solver.variables)
-
         # return {}
 
         assignment = solver.solve()
