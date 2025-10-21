@@ -135,7 +135,8 @@ class _Constraint:
         if self._pattern is not None:
             return self._pattern
         bits = [node.bit() for node in path[2:]]
-        return "".join(bits)
+        self._pattern = "".join(bits)
+        return self._pattern
 
         # self._pattern = self.parent.pattern()
         return self._pattern
@@ -197,14 +198,6 @@ class PlausibleBranch(_Constraint):
                 if self.branch and bit == "1"
                 else PlausibleType.NEGATIVE
             )
-
-    def pattern(self):
-        # if self._pattern is not None:
-        #     return self._pattern
-        self._pattern = self.parent.pattern() + self.bit()
-        return self._pattern
-
-        # return super().pattern()
 
     def update_mark(self):
         if self.parent is None:
@@ -395,11 +388,8 @@ class Constraint(_Constraint):
             logging.info(
                 f"child pattern to add: {child_pattern}, bit: {bit_str}, parent pattern: {self.pattern()}"
             )
-            for node in plausible.get_path_to_root():
-                logging.info(f"  node in path: {node}, bit: {node.bit()}")
+
             self.tree.leaves[child_pattern] = plausible
-            logging.info(f"child pattern: {child_pattern}")
-            # self.tree.leaves[plausible.pattern()] = plausible
 
 
 class UExprToConstraint:
@@ -456,9 +446,9 @@ class UExprToConstraint:
         branch: Union[bool, str],
         **kwargs,
     ):
-        assert len(ref_conditions) == len(
-            sql_conditions
-        ), "Conditions length mismatch in uexpr to constraint"
+        # assert len(ref_conditions) == len(
+        #     sql_conditions
+        # ), "Conditions length mismatch in uexpr to constraint"
         for positive_node, bit in self.positive_nodes[self.prev_operator]:
             # Skip nodes that don't have relevant tuples (for non-root nodes)
             # if node.operator_key != "ROOT" and not node.get_all_tuples().intersection(
@@ -495,14 +485,8 @@ class UExprToConstraint:
                 raise ValueError("Expected PlausibleBranch in leaves")
                 continue
             leaf.update_mark()
-            logging.info(f"Leaf pattern: {pattern}, type: {leaf.pattern()}")
-
         for pattern, leaf in self.leaves.items():
-            if (
-                leaf.branch
-                and leaf.plausible_type == PlausibleType.UNEXPLORED
-                and pattern.endswith("1")
-            ):
+            if leaf.branch and leaf.plausible_type == PlausibleType.UNEXPLORED:
                 logging.info(
                     f"Selecting unexplored positive leaf: ========================= {pattern}"
                 )

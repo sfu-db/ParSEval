@@ -238,29 +238,6 @@ class LogicalProject(UnaryOperator):
 
             new_expr = expr.transform(resolve_schema)
             columns.append(new_expr)
-
-            # data_type = expr.infer_type(input_schema)
-            # if isinstance(expr, sql_exp.ColumnRef):
-            #     columns.append(input_schema.columns[expr.ref])
-            # elif isinstance(expr, sql_exp.BinaryOp):
-
-            #     def resolve_schema(e):
-            #         if isinstance(e, sql_exp.ColumnRef) and e.ref is not None:
-            #             return input_schema.columns[e.ref]
-            #         return None
-
-            #     new_expr = expr.transform(resolve_schema)
-            #     columns.append(new_expr)
-
-            # elif isinstance(expr, sql_exp.Case):
-            #     raise NotImplementedError(
-            #         f"Unsupported expression type in projection, {expr}"
-            #     )
-            # else:
-            #     raise NotImplementedError(
-            #         f"Unsupported expression type in projection, {expr}"
-            #     )
-
         self._schema = Schema(columns)
         return self._schema
 

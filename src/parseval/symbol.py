@@ -208,17 +208,17 @@ class Symbol(ABC):
         """Create an IS comparison symbol."""
         return IS(self, _ensure_symbol(other))
 
-    def refresh_concrete(self):
-        """Force refresh the value of `concrete` from bottom to top."""
-        for child in self.children():
-            child.refresh_concrete()  # Recursively refresh children
-        if isinstance(self, BinaryOp) or isinstance(self, UnaryOp):
-            self.concrete = self._eval()  # Recalculate concrete for operations
-        elif isinstance(self, And):
-            self.concrete = all(op.concrete for op in self.operands)
-        elif isinstance(self, Or):
-            self.concrete = any(op.concrete for op in self.operands)
-        # Add other cases as needed for specific Symbol types
+    # def refresh_concrete(self):
+    #     """Force refresh the value of `concrete` from bottom to top."""
+    #     for child in self.children():
+    #         child.refresh_concrete()  # Recursively refresh children
+    #     if isinstance(self, BinaryOp) or isinstance(self, UnaryOp):
+    #         self.concrete = self._eval()  # Recalculate concrete for operations
+    #     elif isinstance(self, And):
+    #         self.concrete = all(op.concrete for op in self.operands)
+    #     elif isinstance(self, Or):
+    #         self.concrete = any(op.concrete for op in self.operands)
+    #     # Add other cases as needed for specific Symbol types
 
 
 # ======================================================================================================
@@ -294,6 +294,10 @@ class BinaryOp(Symbol):
         if self.OP_SYMBOL == "<":
             return self.left.concrete < self.right.concrete
         elif self.OP_SYMBOL == "<=":
+            print(
+                f"Evaluating LE: {self.left.concrete} ({type(self.left.concrete)}) <= {self.right.concrete}({type(self.right.concrete)})"
+            )
+
             return self.left.concrete <= self.right.concrete
         elif self.OP_SYMBOL == ">":
             return self.left.concrete > self.right.concrete
