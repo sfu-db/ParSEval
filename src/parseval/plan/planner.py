@@ -656,6 +656,9 @@ def resolve_schema(expr, node, catalog):
     return None
 
 
+from sqlglot import exp
+
+
 class PlanEncoder(LogicalPlanVisitor):
     def __init__(
         self, instance: Instance, trace: UExprToConstraint, verbose: bool = True
