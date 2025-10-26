@@ -1,10 +1,11 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
+from src.parseval.plan.rex import Expression
 from typing import Dict, Optional, Any
 import z3, operator
+from sqlglot import exp as sqlglot_exp
 from sqlglot.expressions import DataType
-from src.parseval import symbol as sym
 
 z3.set_option(html_mode=False)
 z3.set_option(rational_to_decimal=True)
@@ -15,31 +16,30 @@ z3.set_option(max_args=100)
 
 class SMTEncoder:
     SYMBOLIC_EVAL_REGISTRY = {
-        "eq": operator.eq,
-        "neq": operator.ne,
+        "eq": lambda left, right: left.eq(right),
+        "neq": lambda left, right: left.ne(right),
         "gt": operator.gt,
         "lt": operator.lt,
         "lte": operator.le,
         "gte": operator.ge,
         "like": lambda left, right: left.like(right),
+        "and": lambda left, right: left.and_(right),
+        "or": lambda left, right: left.or_(right),
         "add": operator.add,
         "sub": operator.sub,
         "mul": operator.mul,
         "div": operator.truediv,
-        "and": lambda left, right: z3.And(left, right),
-        "or": lambda left, right: z3.Or(left, right),
     }
 
     def __init__(
         self,
-        # variables: Optional[Dict[str, z3.ExprRef]] = None,
-        # symbols: Optional[Dict[str, z3.ExprRef]] = None,
+        variables: Optional[Dict[str, z3.ExprRef]] = None,
+        symbols: Optional[Dict[str, z3.ExprRef]] = None,
     ):
-        pass
-        # self.var_cache: Dict[str, Any] = variables if variables is not None else {}
-        # self.symbol_cache: Dict[str, z3.ExprRef] = (
-        #     symbols if symbols is not None else {}
-        # )
+        self.var_cache: Dict[str, Any] = variables if variables is not None else {}
+        self.symbol_cache: Dict[str, z3.ExprRef] = (
+            symbols if symbols is not None else {}
+        )
 
     def visit(self, expr, parent_stack=None, context=None):
         if expr is None:
@@ -51,31 +51,34 @@ class SMTEncoder:
         return result
 
     def generic_visit(self, expr, parent_stack, context):
-        if isinstance(expr, sym.Binary):
+        if isinstance(expr, sqlglot_exp.Predicate):
+            return self.visit_predicate(expr, parent_stack, context)
+        elif isinstance(expr, sqlglot_exp.Binary):
             return self.visit_binary(expr, parent_stack, context)
         raise NotImplementedError(f"No visit_{expr.key} method defined")
 
-    def visit_variable(self, expr, parent_stack=None, context=None):
-        if expr.name in context.get("variables", {}):
-            return context["variables"][expr.name]
+    def visit_columnref(self, expr, parent_stack=None, context=None):
+        if expr.this in self.symbol_cache:
+            return self.symbol_cache[expr.this]
 
         # Create Z3 variable based on type
         if expr.dtype.is_type(*DataType.INTEGER_TYPES):
-            z3_var = z3.Int(expr.name)
+            z3_var = z3.Int(expr.this)
         elif expr.dtype.is_type(*DataType.REAL_TYPES):
-            z3_var = z3.Real(expr.name)
+            z3_var = z3.Real(expr.this)
         elif expr.dtype.is_type("BOOLEAN"):
-            z3_var = z3.Bool(expr.name)
+            z3_var = z3.Bool(expr.this)
         elif expr.dtype.is_type(*DataType.TEXT_TYPES):
-            z3_var = z3.String(expr.name)
+            z3_var = z3.String(expr.this)
         elif expr.dtype.is_type(*DataType.TEMPORAL_TYPES):
-            z3_var = z3.String(expr.name)  # Use String for temporal types
+            z3_var = z3.String(expr.this)  # Use String for temporal types
         else:
             raise TypeError(f"Unsupported type for Z3: {expr.dtype}")
-        context.setdefault("variables", {})[expr.name] = z3_var
+        self.symbol_cache[expr.this] = z3_var
+        self.var_cache[expr.this] = expr
         return z3_var
 
-    def visit_const(self, expr: sym.Const, parent_stack=None, context=None):
+    def visit_literal(self, expr: sqlglot_exp.Literal, parent_stack=None, context=None):
         value = expr.this
         if expr.is_int:
             return int(value)
@@ -99,21 +102,31 @@ class SMTEncoder:
         else:
             return value
 
-    def visit_binary(self, expr: sym.Binary, parent_stack, context):
+    def visit_predicate(self, expr: sqlglot_exp.Predicate, parent_stack, context):
         left = self.visit(
-            expr.left, parent_stack=parent_stack + [expr], context=context
+            expr.this, parent_stack=parent_stack + [expr], context=context
         )
         right = self.visit(
-            expr.right, parent_stack=parent_stack + [expr], context=context
+            expr.expression, parent_stack=parent_stack + [expr], context=context
         )
         smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
         return smt_expr
 
-    def visit_not(self, expr: sym.Not, parent_stack=None, context=None):
-        this = self.visit(
-            expr.operand, parent_stack=parent_stack + [expr], context=context
+    def visit_binary(self, expr: sqlglot_exp.Binary, parent_stack, context):
+        left = self.visit(
+            expr.this, parent_stack=parent_stack + [expr], context=context
         )
-        return z3.Not(this)
+        right = self.visit(
+            expr.expression, parent_stack=parent_stack + [expr], context=context
+        )
+        smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
+        return smt_expr
+
+    def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
+        this = self.visit(
+            expr.this, parent_stack=parent_stack + [expr], context=context
+        )
+        return this.not_()
 
     def visit_subquery(self, expr, parent_stack, context):
         sub_ctx = {
@@ -130,7 +143,7 @@ class SMTEncoder:
         # context["smt_constraints"].extend(sub_ctx["smt_constraints"])
         return expr
 
-    # def visit_subquery(self, expr: Subquery):
+    # def visit_subquery(self, expr: sqlglot_exp.Subquery):
     #     for query in expr.query:
 
     #         print(query.pprint())
@@ -141,35 +154,24 @@ class SMTEncoder:
 
 
 class SMTSolver:
+    if TYPE_CHECKING:
+        from src.parseval.instance import Instance
 
     def __init__(
         self,
-        ctx=None,
+        context=None,
         timeout: int = 3000,
         debug=True,
     ):
-        self.solver = z3.Solver(ctx=ctx)
+        self.solver = z3.Solver(ctx=context)
         self.solver.set("timeout", timeout)
 
         self.variables = {}
-        self.smt_constraints = []
+        self.constraints = []
 
-    def check(self):
-        self.before_solve()
-        result = self.solver.check(*self.smt_constraints)
-        result = self.after_solve(self.solver.model() if result == z3.sat else None)
-        return result
+    def check(self): ...
 
-    def before_solve(self):
-        context = {}
-        for constraint in self.constraints:
-            smt_constraint = SMTEncoder().visit(constraint, context=context)
-            self.smt_constraints.append(smt_constraint)
-
-        for _, variable in context.get("variables", {}).items():
-            if variable.sort().name() == "String":
-                self.smt_constraints.append(self.ensure_printable(variable))
-        return context
+    def before_solve(self): ...
 
     def after_solve(self, model: z3.ModelRef): ...
 

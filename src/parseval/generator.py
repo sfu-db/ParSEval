@@ -5,7 +5,6 @@ from src.parseval.plan.planner import Planner, PlanEncoder
 from src.parseval.instance import Instance
 from src.parseval.uexpr import UExprToConstraint
 import src.parseval.plan.expression as sql_exp
-import src.parseval.symbol as sym
 import logging
 from src.parseval.solver.solver import CSPConstraint, SpeculativeSolver
 
@@ -90,24 +89,31 @@ class Generator:
                 break
                 return tracer
             pattern = plausible.pattern()
-            logging.info(plausible.pattern())
-            tracer._append_tuple(instance, plausible=plausible)
-            concretes = self.generate_smt_constriants(instance)
-            if not concretes:
-                plausible.mark_infeasible()
-            else:
-                plausible.mark_covered()
-            for table_name in instance.catalog.tables.keys():
-                if table_name in concretes:
-                    instance.create_row(table_name, concretes[table_name])
-                    logging.info(
-                        f"create row for table {table_name}: {concretes[table_name]}"
-                    )
+            logging.info(f"plausible.pattern(): {pattern} == {plausible.pattern()}")
+            tracer._decalre_smt_constraints(plausible)
 
-            if index < max_iter - 1:
-                tracer.reset()
-                self.reset()
-            # break
+            for label, constraints in self.constraints.items():
+                logging.info(f"Constraints for {label}:")
+                for constraint in constraints:
+                    logging.info(f"  {str(constraint)}")
+
+            # tracer._append_tuple(instance, plausible=plausible)
+            # concretes = self.generate_smt_constriants(instance)
+            # if not concretes:
+            #     plausible.mark_infeasible()
+            # else:
+            #     plausible.mark_covered()
+            # for table_name in instance.catalog.tables.keys():
+            #     if table_name in concretes:
+            #         instance.create_row(table_name, concretes[table_name])
+            #         logging.info(
+            #             f"create row for table {table_name}: {concretes[table_name]}"
+            #         )
+
+            # if index < max_iter - 1:
+            #     tracer.reset()
+            #     self.reset()
+            break
         instance.to_db("tests/db")
 
         return tracer

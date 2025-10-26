@@ -1,510 +1,45 @@
 from __future__ import annotations
+from abc import abstractmethod
+from functools import reduce, wraps
+from sqlglot import exp as sqlglot_exp
+from sqlglot import generator
+from src.parseval.dtype import DataType
+from typing import TYPE_CHECKING, List, Optional, Dict, Any
+from src.parseval.symbol import Row
+from .rex import *
 import operator, logging
 
-from abc import ABC, abstractmethod
-from functools import reduce
-from typing import TYPE_CHECKING, List, Dict, Callable, Union
-from collections.abc import Iterable
-
-from .step import *
-from .expression import *
-from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
-    from src.parseval.instance import Instance
+    from parseval.instance import Instance
     from src.parseval.uexpr import UExprToConstraint
 
+from abc import ABC
 
-# =========================================================================
-# Plan Builder
-# =========================================================================
 
-
-class PlannBuilder(ABC):
-    TRANSFORM_MAPPING = {}
-
-    def __init__(
-        self,
-        step_registry: Optional[StepRegistry] = None,
-        expression_registry: Optional[ExpressionRegistry] = None,
-    ):
-        self._handlers: Dict[str, Callable] = {}
-        self.step_registry = step_registry or StepRegistry
-        self.expr_registry = expression_registry or ExpressionRegistry
-
-    def register_handler(self, operator: str, handler: callable):
-        """Register a custom handler for a specific operator."""
-        self._handlers[operator.lower()] = handler
-
-    @abstractmethod
-    def explain(
-        self, schema: str, sql: str, dialect: str = "postgres"
-    ) -> LogicalOperator:
-        pass
-
-
-# =========================================================================
-# Apache Calcite JSON to Logical Plan Conversion
-# =========================================================================
-
-
-class StepRegistry:
-    _registry: Dict[str, Callable] = {}
-    _fallback: Callable | None = None
-
-    @classmethod
-    def register(cls, node_type: str):
-        def decorator(func: Callable):
-            cls._registry[node_type] = func
-            return func
-
-        return decorator
-
-    @classmethod
-    def set_fallback(cls, func: Callable):
-        cls._fallback = func
-        return func
-
-    @classmethod
-    def get_handler(cls, node_type: str) -> Callable:
-        return cls._registry.get(node_type, cls._fallback)
-
-
-class ExpressionRegistry:
-    _registry: Dict[str, Callable] = {
-        "LITERAL": lambda planner, **kwargs: Literal(
-            value=kwargs.pop("value"),
-            datatype=DataType.build(
-                kwargs.pop("type", "UNKNOWN"),
-                kwargs.pop("nullable"),
-                kwargs.pop("precision", None),
-            ),
-        ),
-        "INPUT_REF": lambda planner, **kwargs: ColumnRef(
-            name=kwargs.pop("name"),
-            datatype=DataType(name=kwargs.pop("type", "UNKNOWN")),
-            ref=kwargs.pop("index"),
-        ),
-    }
-
-    @classmethod
-    def register(cls, expr_type: Union[str, Iterable[str]]):
-        def decorator(func):
-            if isinstance(expr_type, str):
-                cls._registry[expr_type] = func
-            elif isinstance(expr_type, Iterable):
-                for et in expr_type:
-                    cls._registry[et] = func
-            return func
-
-        return decorator
-
-    @classmethod
-    def get_handler(cls, node_type: str) -> Callable:
-        return cls._registry.get(node_type)
-
-
-PREDICATE_OPERATORS = {
-    "EQUALS": "=",
-    "NOT_EQUALS": "!=",
-    "GREATER_THAN": ">",
-    "LESS_THAN": "<",
-    "LESS_THAN_OR_EQUAL": "<=",
-    "GREATER_THAN_OR_EQUAL": ">=",
-    "LIKE": "Like",
-}
-
-
-@ExpressionRegistry.register(PREDICATE_OPERATORS.keys())
-def default_predicate_handler(planner, **kwargs) -> Expression:
-    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
-    op = kwargs.pop("kind", kwargs.pop("operator"))
-    op = reduce(
-        lambda x, y: Predicate(left=x, right=y, op=PREDICATE_OPERATORS[op]),
-        expressions,
-    )
-    return op
-
-
-@ExpressionRegistry.register({"IS", "IS_NULL"})
-def default_is_handler(planner, **kwargs) -> Expression:
-    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
-    op = kwargs.pop("kind", kwargs.pop("operator"))
-
-    if op == "IS_NULL":
-        datatype = expressions[0].datatype
-        right = Literal(value=None, datatype=datatype)
-
-    else:
-        raise ValueError(f"Unsupported IS operator: {op}")
-    return IS(left=expressions.pop(), op="IS", right=right)
-
-
-ARITHMETIC_OPERATORS = {"PLUS": "+", "MINUS": "-", "TIMES": "*", "DIVIDE": "/"}
-
-
-@ExpressionRegistry.register(ARITHMETIC_OPERATORS.keys())
-def default_binary_handler(planner, **kwargs) -> Expression:
-    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
-    op = kwargs.pop("kind", kwargs.pop("operator"))
-    op = reduce(
-        lambda x, y: BinaryOp(left=x, right=y, op=ARITHMETIC_OPERATORS[op]),
-        expressions,
-    )
-    return op
-
-
-CONNECTOR_OPERATORS = {"AND": AND, "OR": OR}
-
-
-@ExpressionRegistry.register(CONNECTOR_OPERATORS.keys())
-def default_connector_handler(planner, **kwargs) -> Expression:
-    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
-    operator = kwargs.pop("kind", kwargs.pop("operator"))
-    op = reduce(
-        lambda x, y: CONNECTOR_OPERATORS[operator](left=x, right=y),
-        expressions,
-    )
-    return op
-
-
-UNARY_OPERATORS = {"NOT": NOT, "IS": IS}
-
-
-@ExpressionRegistry.register(UNARY_OPERATORS.keys())
-def default_unary_handler(planner, **kwargs) -> Expression:
-    expressions = [planner.walk(operand) for operand in kwargs.get("operands", [])]
-    operator = kwargs.pop("kind", kwargs.pop("operator"))
-    return UNARY_OPERATORS[operator](operand=expressions.pop())
-
-
-AGGFUNC_OPERATORS = {
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MAX",
-    "MIN",
-}
-
-
-@ExpressionRegistry.register(AGGFUNC_OPERATORS)
-def default_aggfunc_expr(planner, **kwargs) -> Expression:
-    func_name = kwargs.pop("operator")
-    distinct = kwargs.pop("distinct")
-    operands = kwargs.pop("operands")
-    operands = [
-        ColumnRef(
-            name=f"${operand['column']}",
-            datatype=operand.get("type"),
-            ref=operand["column"],
-        )
-        for operand in operands
-    ]
-    if not operands:
-        operands.append(Star())
-
-        # operand = ColumnRef(
-        #     name=f"${operands[0]['column']}",
-        #     datatype=operands[0].get("type"),
-        #     ref=operands[0]["column"],
-        # )
-    func = AggFunc(
-        name=func_name,
-        args=operands,
-        distinct=distinct,
-        ignore_nulls=kwargs.pop("ignoreNulls"),
-        datatype=DataType(name=kwargs.pop("type")),
-    )
-
-    # func = AGGFUNC_OPERATORS[func_name](
-    #     arg=operand,
-    #     distinct=distinct,
-    #     ignore_nulls=kwargs.pop("ignoreNulls"),
-    #     datatype=DataType(name=kwargs.pop("type")),
-    # )
-    return func
-
-
-@ExpressionRegistry.register("CASE")
-def default_case_handler(planner, **kwargs) -> Expression:
-    operands = kwargs.pop("operands")
-    default = planner.walk(operands.pop())
-    whens = []
-    for index in range(0, len(operands), 2):
-        when = planner.walk(operands[index])
-        then = planner.walk(operands[index + 1])
-        whens.append(When(condition=when, true_expr=then))
-    # if len(whens) == 1:
-    #     cond = whens[0].condition
-    #     true_expr = whens[0].true_expr
-    #     if (
-    #         isinstance(cond, BinaryOp)
-    #         and cond.op == "="
-    #         and isinstance(cond.right, Literal)
-    #         and cond.right.value == 0
-    #         and isinstance(default, ColumnRef)
-    #     ):
-    #         return default
-    #         # return Predicate(left=cond.left, right=true_expr, op="=")
-
-    case = Case(whens=whens, default=default)
-    return case
-
-
-@ExpressionRegistry.register("CAST")
-def default_cast_handler(planner, **kwargs) -> Expression:
-    operands = kwargs.pop("operands")
-    input_operator = planner.walk(operands.pop())
-    return Cast(operand=input_operator, to_type=DataType.build(kwargs.pop("type")))
-
-
-@ExpressionRegistry.register("OTHER_FUNCTION")
-def parse_other_function(planner, **kwargs) -> Expression:
-    operator = kwargs.pop("operator").upper()
-    operands = kwargs.pop("operands")
-
-    if operator == "STRFTIME":
-        _format = planner.walk(operands.pop())
-        operand = planner.walk(operands.pop())
-        return Strftime(args=[operand, _format], datatype=kwargs.pop("type"))
-    elif operator == "ABS":
-        operand = planner.walk(operands.pop())
-        return ABS(arg=operand, datatype=kwargs.pop("type"))
-
-    handler = ExpressionRegistry.get_handler(operator)
-    if handler:
-        return handler(planner, **kwargs)
-    else:
-        raise ValueError(f"Unsupported function: {operator}, {kwargs}")
-
-
-# Strftime
-@ExpressionRegistry.register("SCALAR_QUERY")
-def default_subquery_handler(planner, **kwargs) -> Expression:
-    query = [planner.walk(q) for q in kwargs.pop("query")]
-
-    subquery_type = kwargs.pop("operator")[1:].lower()  # remove leading '$'
-
-    return Subquery(query=query, subquery_type=subquery_type, correlated=False)
-
-    # return Cast(expr=input_operator, to_type=DataType.build(kwargs.pop("type")))
-
-
-# =========================================================================
-# Logical Plan Steps
-# ========================================================================
-
-
-@StepRegistry.register("LogicalTableScan")
-def _convert_scan(planner: Planner, **kwargs) -> LogicalScan:
-    table_name = kwargs.pop("table")
-    operator_id = kwargs.pop("id", None)
-    op = LogicalScan(table_name, operator_id=operator_id)
-    catalog = kwargs.pop("catalog", None)
-    if catalog:
-        schema = catalog.get_table(table_name)
-        op._table_schema = schema
-    return op
-
-
-@StepRegistry.register("LogicalFilter")
-def _convert_filter(planner: Planner, **kwargs) -> LogicalFilter:
-    child = planner.walk(kwargs.pop("inputs")[0])
-    condition = planner.walk(kwargs.pop("condition"))
-    operator_id = kwargs.pop("id", None)
-    if isinstance(child, LogicalAggregate):
-        return LogicalHaving(child, condition, operator_id=operator_id)
-    return LogicalFilter(child, condition, operator_id=operator_id)
-
-
-@StepRegistry.register("LogicalProject")
-def _convert_projection(planner: Planner, **kwargs) -> LogicalProject:
-    child = planner.walk(kwargs.pop("inputs")[0])
-    expressions = [planner.walk(proj) for proj in kwargs.pop("project", [])]
-    operator_id = kwargs.pop("id", None)
-    return LogicalProject(child, expressions, operator_id=operator_id)
-
-
-@StepRegistry.register("LogicalJoin")
-def _convert_join(planner: Planner, **kwargs) -> LogicalJoin:
-    children = [planner.walk(child) for child in kwargs.pop("inputs")]
-
-    condition = planner.walk(kwargs.pop("condition"))
-    join_type = kwargs.pop("joinType", "INNER").upper()
-    return LogicalJoin(
-        join_type=join_type,
-        condition=condition,
-        left=children[0],
-        right=children[1],
-        operator_id=kwargs.pop("id", None),
-    )
-
-
-@StepRegistry.register("LogicalAggregate")
-def _convert_aggregate(planner: Planner, **kwargs) -> LogicalAggregate:
-    children = [planner.walk(child) for child in kwargs.pop("inputs")]
-    groupby = []
-    for gid, key in enumerate(kwargs.pop("keys")):
-        groupby.append(
-            ColumnRef(name=f"${gid}", ref=key.get("column"), datatype=key.get("type"))
-        )
-    agg_funcs = [planner.walk(func_def) for func_def in kwargs.pop("aggs")]
-    return LogicalAggregate(keys=groupby, aggs=agg_funcs, input_operator=children[0])
-
-
-@StepRegistry.register("LogicalSort")
-def _convert_sort(planner: Planner, **kwargs) -> LogicalSort:
-    this = planner.walk(kwargs.pop("inputs")[0])
-    sort = kwargs.pop("sort", [])
-    return LogicalSort(
-        sorts=[
-            ColumnRef(
-                name=str(s["column"]),
-                ref=s["column"],
-                datatype=DataType.build(s["type"]),
-            )
-            for s in sort
-        ],
-        dir=kwargs.pop("dir", []),
-        offset=kwargs.pop("offset", 0),
-        limit=kwargs.pop("limit", 1),
-        input_operator=this,
-        operator_id=kwargs.pop("id", None),
-    )
-
-
-def _convert_union(planner: Planner, **kwargs) -> LogicalUnion: ...
-def _convert_values(planner: Planner, **kwargs) -> LogicalValues: ...
-
-
-def _parse_condition(planner: Planner, node: dict) -> Expression: ...
-
-
-# =========================================================================
-# Planner
-# = ========================================================================
-
-
-class Planner(PlannBuilder):
-    def __init__(self, step_registry=None, expression_registry=None):
-        super().__init__(step_registry, expression_registry)
-
-    def explain2(self, schema: str, plan_path: str, dialect: str = "postgres"):
-        if isinstance(schema, str):
-            schema = schema.split(";")
-        import json
-
-        with open(plan_path) as f:
-            plan = json.load(f)
-
-        return self.walk(plan)
-
-    def explain(
-        self, schema: str, sql: str, dialect: str = "postgres"
-    ) -> LogicalOperator:
-        if isinstance(schema, str):
-            schema = schema.split(";")
-        root = self.walk(sql)
-        root.set("dialect", self)
-        return root
-
-    def walk(self, node):
-        RELOP = "relOp"
-        fname = None
-        if RELOP in node:
-            """parse rel expression, i.e. LogicalProject, LogicalFilter, LogicalJoin, etc."""
-            relOp = node.pop(RELOP)
-            handler = self.step_registry.get_handler(relOp)
-            # return handler(self, **node)
-        elif "kind" in node or "operator" in node:
-            """parse rex expression, i.e. AND, OR, +, -, *, /, =, <>, >, <, >=, <=, etc."""
-            kind_operator = node.get("kind", node.get("operator"))
-
-            handler = self.expr_registry.get_handler(kind_operator)
-
-        else:
-            raise ValueError(f"Cannot find relOp or kind/operator in node: {node}")
-
-        if handler is None:
-            raise KeyError(
-                f"Cannot find handler for node: {node}, currently can handle {self.expr_registry._registry.keys()}"
-            )
-        return handler(self, **node)
-
-
-# =============================================================================
-# VISITOR PATTERN
-# =============================================================================
-
-
-class LogicalPlanVisitor(ABC):
-    """Abstract visitor for traversing logical plans"""
-
-    def visit(self, node: LogicalOperator):
-        method_name = f"visit_{node.operator_type.lower()}"
-        visitor = getattr(self, method_name, self.generic_visit)
-        return visitor(node)
-
-    def generic_visit(self, node: LogicalOperator):
-        for child in node.children:
-            child.accept(self)
-
-
-class PrintVisitor(LogicalPlanVisitor):
-    def __init__(self):
-        super().__init__()
-        self.indent = 0
-
-    def generic_visit(self, node):
-        line = "  " * self.indent + str(node) + "\n"
-
-        self.indent += 1
-        for child in node.children:
-            line += child.accept(self)
-        self.indent -= 1
-        return line
-
-
-@dataclass
-class SymbolTable:
-    data: List
-    tbl_exprs: List[ColumnRef] = field(default_factory=list, repr=False)
-
-
-from src.parseval.symbol import Row
-import functools
+from dataclasses import dataclass, field
+from contextlib import contextmanager
 
 
 class Skipnulls(Exception):
     pass
 
 
-def track_next(func):
-    @functools.wraps(func)
-    def wrapper(self, expr, *args, **kwargs):
-        result = func(self, expr, *args, **kwargs)
-        self.trace.advance(expr)
-        return result
-
-    return wrapper
-
-
-from contextlib import contextmanager
-
-
-class ExpressionEncoder(ExpressionVisitor):
-    SYMBOLIC_EVAL_REGISTRY = {}
-    OPS = {
-        ">": operator.gt,
-        "<": operator.lt,
-        ">=": operator.ge,
-        "<=": operator.le,
-        "+": operator.add,
-        "-": operator.sub,
-        "*": operator.mul,
-        "/": operator.truediv,
-        "Like": lambda left, right: left.like(right),
-        "IS": lambda left, right: left.is_(right),
+class ExpressionEncoder:
+    SYMBOLIC_EVAL_REGISTRY = {
+        "eq": lambda left, right: left.eq(right),
+        "neq": lambda left, right: left.ne(right),
+        "gt": operator.gt,
+        "lt": operator.lt,
+        "lte": operator.le,
+        "gte": operator.ge,
+        "like": lambda left, right: left.like(right),
+        "and": lambda left, right: left.and_(right),
+        "or": lambda left, right: left.or_(right),
+        "add": operator.add,
+        "sub": operator.sub,
+        "mul": operator.mul,
+        "div": operator.truediv,
     }
 
     def __init__(
@@ -515,91 +50,126 @@ class ExpressionEncoder(ExpressionVisitor):
     ):
         super().__init__()
         self.row = row
-        self.ref_conditions = []  ## the reference index style Expression
-        self.sql_conditions = []  ## the resolved schema style Expression
-        self.smt_conditions = []  ## the smt expressions
-        self._predicate_stack = []
         self.ignore_nulls = ignore_nulls
         self.plan_encoder = plan_encoder
 
-    @property
-    def in_predicates(self):
-        return bool(self._predicate_stack)
+    def in_predicates(self, context):
+        return bool(context.get("_predicate_stack", []))
 
     @contextmanager
-    def predicate_scope(self):
-        self._predicate_stack.append(True)
+    def predicate_scope(self, context):
+        stack = context.setdefault("_predicate_stack", [])
+        stack.append(True)
         try:
 
             def track(expr, smt_expr):
-                # result = expr.accept(self)
-                # result = func(expr)
-                self.sql_conditions.append(expr)
-                self.smt_conditions.append(smt_expr)
+                context.setdefault("ref_conditions", []).append(expr)
+                context.setdefault("smt_conditions", []).append(smt_expr)
+
                 return smt_expr
 
             yield track
         finally:
-            self._predicate_stack.pop()
+            stack.pop()
 
-    def visit_columnref(self, expr: ColumnRef):
+    def visit(self, expr, parent_stack=None, context=None):
+        if expr is None:
+            return None
+        parent_stack = parent_stack or []
+        context = context if context is not None else {}
+        handler = getattr(self, f"visit_{expr.key}", self.generic_visit)
+        result = handler(expr, parent_stack, context)
+        return result
 
-        if not self.in_predicates:
-            self.sql_conditions.append(expr)
-            self.smt_conditions.append(self.row[expr.ref])
-        return self.row[expr.ref]
+    def generic_visit(self, expr, parent_stack, context):
+        if isinstance(expr, sqlglot_exp.Predicate):
+            return self.visit_predicate(expr, parent_stack, context)
+        elif isinstance(expr, sqlglot_exp.Binary):
+            return self.visit_binary(expr, parent_stack, context)
+        raise NotImplementedError(f"No visit_{expr.key} method defined")
 
-    def visit_literal(self, expr: Literal):
-        return expr.value
+    def visit_columnref(self, expr: ColumnRef, parent_stack=None, context=None):
+        smt_expr = self.row[expr.ref]
+        if not self.in_predicates(context=context):
+            context.setdefault("ref_conditions", []).append(expr)
+            context.setdefault("smt_conditions", []).append(smt_expr)
+        return smt_expr
 
-    def visit_predicate(self, expr: Predicate):
-        with self.predicate_scope() as track:
-            left = expr.left.accept(self)
-            right = expr.right.accept(self)
+    def visit_literal(self, expr: sqlglot_exp.Literal, parent_stack=None, context=None):
+        value = expr.this
+        if expr.is_int:
+            return int(value)
+        elif expr.is_number:
+            return float(value)
+        elif expr.is_string:
+            return str(value)
+        elif expr.is_date or expr.is_time or expr.is_timestamp:
+            from datetime import datetime
+
+            try:
+                return datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                # fallback for timestamp formats
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        return datetime.strptime(value, fmt)
+                    except ValueError:
+                        continue
+                return value  # leave as string if unparseable
+        else:
+            return value
+
+    def visit_predicate(self, expr: sqlglot_exp.Predicate, parent_stack, context):
+        with self.predicate_scope(context=context) as track:
+            left = self.visit(
+                expr.this, parent_stack=parent_stack + [expr], context=context
+            )
+            right = self.visit(
+                expr.expression, parent_stack=parent_stack + [expr], context=context
+            )
             if not self.ignore_nulls and left.concrete is None:
                 raise Skipnulls()
-            if expr.op == "=":
-                smt_expr = left.eq(right)
-            elif expr.op == "!=":
-                smt_expr = left.ne(right)
-            else:
-                smt_expr = self.OPS[expr.op](left, right)
+            smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
+            res = track(expr, smt_expr)
+            return res
+
+    def visit_is_null(self, expr: Is_Null, parent_stack=None, context=None):
+        with self.predicate_scope(context=context) as track:
+            this = self.visit(
+                expr.this, parent_stack=parent_stack + [expr], context=context
+            )
+            smt_expr = this.is_(None)
             return track(expr, smt_expr)
 
-    def visit_is(self, expr: IS):
-        with self.predicate_scope() as track:
-            left = expr.left.accept(self)
-            right = expr.right.accept(self)
-            return track(expr, left.is_(right))
+    def visit_binary(self, expr: sqlglot_exp.Binary, parent_stack, context):
+        left = self.visit(
+            expr.this, parent_stack=parent_stack + [expr], context=context
+        )
+        right = self.visit(
+            expr.expression, parent_stack=parent_stack + [expr], context=context
+        )
+        smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
+        return smt_expr
 
+    # def visit_is(self, expr: IS):
+    #     with self.predicate_scope() as track:
+    #         left = expr.left.accept(self)
+    #         right = expr.right.accept(self)
+    #         return track(expr, left.is_(right))
     # from sqlglot.executor import env
 
-    def visit_binaryop(self, expr: BinaryOp):
-        left = expr.left.accept(self)
-        right = expr.right.accept(self)
-        try:
-            res = self.OPS[expr.op](left, right)
-        except Exception:
-            res.conrete = None
-        return res
+    def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
+        this = self.visit(
+            expr.this, parent_stack=parent_stack + [expr], context=context
+        )
+        return this.not_()
 
-    def visit_and(self, expr):
-        left = expr.left.accept(self)
-        right = expr.right.accept(self)
-        return left.and_(right)
+    def visit_cast(self, expr, parent_stack=None, context=None):
+        inner = self.visit(expr.this, parent_stack + [expr], context)
+        to_type = expr.to
+        # type_name = str(target_type).upper() if target_type else None
+        return inner
 
-    def visit_or(self, expr):
-        left = expr.left.accept(self)
-        right = expr.right.accept(self)
-        return left.or_(right)
-
-    def visit_not(self, expr):
-        operand = expr.operand.accept(self)
-        return operand.not_()
-
-    def visit_cast(self, expr):
-        operand = expr.args[0].accept(self)
-        return operand
         concrete = operand.concrete if isinstance(expr.args[0], ColumnRef) else operand
 
         if concrete is not None:
@@ -617,46 +187,204 @@ class ExpressionEncoder(ExpressionVisitor):
             operand.concrete = concrete
             return operand
 
-    def visit_case(self, expr):
-        for when in expr.whens:
-            smt_expr = when.condition.accept(self)
+    def visit_case(self, expr: sqlglot_exp.Case, parent_stack=None, context=None):
+        for when in expr.ifs:
+            smt_expr = self.visit(when.this, parent_stack + [expr], context)
             if smt_expr:
-                return when.true_expr.accept(self)
-        return expr.default.accept(self)
+                return self.visit(when.true, parent_stack + [expr], context)
+        return self.visit(expr.default, parent_stack + [expr], context)
 
-    def visit_subquery(self, expr: Subquery):
-        for query in expr.query:
+    def visit_subquery(self, expr, parent_stack, context):
+        sub_ctx = {
+            "ref_conditions": [],
+            "sql_conditions": [],
+            "smt_conditions": [],
+            "parent": expr,
+        }
+        for child in expr.expressions:
+            self.visit(child, parent_stack + [expr], sub_ctx)
+        # Merge subquery predicates into main context
+        # context["predicates"].extend(sub_ctx["predicates"])
+        # context["columns"].extend(sub_ctx["columns"])
+        # context["smt_constraints"].extend(sub_ctx["smt_constraints"])
+        return expr
 
-            print(query.pprint())
-            res = query.accept(self.plan_encoder)
+    # def visit_subquery(self, expr: sqlglot_exp.Subquery):
+    #     for query in expr.query:
 
-            logging.info(f"Subquery result rows: {len(res.data)}, {res}")
-            return res.data[0][0]
+    #         print(query.pprint())
+    #         res = query.accept(self.plan_encoder)
 
-        # return super().visit(expr)
-
-
-def resolve_schema(expr, node, catalog):
-    """
-    Resolve a ColumnRef expression to its corresponding schema entry.
-
-    Args:
-        expr (sql_exp.Expression): The expression to check.
-        node: The current query plan node containing child nodes.
-        catalog: The database catalog used to retrieve schema info.
-
-    Returns:
-        The resolved schema column if applicable, otherwise None.
-    """
-    if isinstance(expr, sql_exp.ColumnRef) and expr.ref is not None:
-        input_schema = []
-        for child in node.children:
-            input_schema.extend(child.schema(catalog).columns)
-        return input_schema[expr.ref]
-    return None
+    #         logging.info(f"Subquery result rows: {len(res.data)}, {res}")
+    #         return res.data[0][0]
 
 
-from sqlglot import exp
+class LogicalPlanVisitor(ABC):
+    """Abstract visitor for traversing logical plans"""
+
+    def visit(self, expr: LogicalOperator, parent_stack=None, context=None):
+        if expr is None:
+            return
+        parent_stack = parent_stack or []
+        context = context or {}
+        handler = getattr(
+            self, f"visit_{expr.operator_type.lower()}", self.generic_visit
+        )
+        return handler(expr, parent_stack, context)
+
+    def generic_visit(self, expr, parent_stack, context):
+        raise NotImplementedError(
+            f"No visit_{expr.operator_type.lower()} method defined"
+        )
+
+
+class UExprEncoder(LogicalPlanVisitor):
+    def __init__(
+        self, instance: Instance, trace: UExprToConstraint, verbose: bool = True
+    ):
+        super().__init__()
+        self.instance = instance
+        self.trace = trace
+        self.context = {}
+        self.verbose = verbose
+
+    def visit_logicalscan(self, expr: LogicalScan, parent_stack=None, context=None):
+        ref_conditions, sql_conditions = [], []
+        for columnref in expr.schema(catalog=self.instance.catalog).columns:
+            unique = columnref.args.get("unique", False)
+            if unique:
+                ref_conditions.append(
+                    ColumnRef(
+                        this=sqlglot_exp.to_identifier("$" + str(columnref.ref)),
+                        table=expr.table_name,
+                        ref=columnref.ref,
+                        datatype=columnref.datatype,
+                    )
+                )
+                sql_conditions.append(columnref)
+
+        expr.set("sql_conditions", sql_conditions)
+        expr.set("ref_conditions", ref_conditions)
+
+        self.trace.which_path(
+            operator=expr,
+            ref_conditions=ref_conditions,
+            sql_conditions=sql_conditions,
+            takens=[True] * len(sql_conditions),
+            branch=True,
+            rows=[],
+        )
+
+    def visit_logicalproject(
+        self, expr: LogicalProject, parent_stack=None, context=None
+    ):
+        input_schema = expr.this.schema(catalog=self.instance.catalog)
+        ref_conditions, sql_conditions = [], []
+        for proj in expr.expressions:
+            if isinstance(proj, ColumnRef):
+                sql_conditions.append(input_schema.columns[proj.ref])
+                ref_conditions.append(proj)
+            elif isinstance(proj, sqlglot_exp.Case):
+                for when in proj.ifs:
+                    for predicate in when.condition.find_all(sqlglot_exp.Predicate):
+                        sql_conditions.append(
+                            predicate.transform(resolve_schema, input_schema)
+                        )
+                        ref_conditions.append(predicate)
+                    sql_conditions.append(
+                        when.true.transform(resolve_schema, input_schema)
+                    )
+                    ref_conditions.append(when.true)
+                    break
+            else:
+
+                sql_conditions.append(proj.transform(resolve_schema, input_schema))
+                ref_conditions.append(proj)
+        self.trace.which_path(
+            expr,
+            ref_conditions=ref_conditions,
+            sql_conditions=sql_conditions,
+            takens=[True] * len(sql_conditions),
+            branch=True,
+        )
+
+    def visit_logicalfilter(self, expr: LogicalFilter, parent_stack=None, context=None):
+        input_schema = expr.schema(catalog=self.instance.catalog)
+        ref_conditions, sql_conditions = [], []
+        takens = []
+        for predicate in expr.condition.find_all(sqlglot_exp.Predicate):
+            sql_conditions.append(predicate.transform(resolve_schema, input_schema))
+
+            if isinstance(predicate.parent, sqlglot_exp.Not):
+                takens.append(False)
+            else:
+                takens.append(True)
+            ref_conditions.append(predicate)
+
+        self.trace.which_path(
+            expr,
+            ref_conditions=ref_conditions,
+            sql_conditions=sql_conditions,
+            takens=takens,
+            branch=True,
+        )
+
+    def visit_logicaljoin(self, expr: LogicalJoin, parent_stack=None, context=None):
+        self.visit_logicalfilter(expr, parent_stack, context)
+
+    def visit_logicalsort(self, expr: LogicalSort, parent_stack=None, context=None):
+        input_schema = expr.this.schema(catalog=self.instance.catalog)
+        ref_conditions = expr.sorts
+
+        sql_conditions = [
+            cond.transform(resolve_schema, input_schema) for cond in ref_conditions
+        ]
+        self.trace.which_path(
+            expr,
+            ref_conditions=ref_conditions,
+            sql_conditions=sql_conditions,
+            takens=[True] * len(sql_conditions),
+            branch=True,
+        )
+
+    def visit_logicalaggregate(
+        self, expr: LogicalAggregate, parent_stack=None, context=None
+    ):
+        input_schema = expr.this.schema(catalog=self.instance.catalog)
+        ref_conditions, sql_conditions = [], []
+        for key in expr.keys:
+            ref_conditions.append(key)
+            sql_conditions.append(key.transform(resolve_schema, input_schema))
+
+        for func in expr.aggs:
+            ref_conditions.append(func)
+            sql_conditions.append(func.transform(resolve_schema, input_schema))
+        self.trace.which_path(
+            expr,
+            ref_conditions=ref_conditions,
+            sql_conditions=sql_conditions,
+            takens=[True] * len(sql_conditions),
+            branch=True,
+        )
+
+    def visit_having(self, expr, parent_stack=None, context=None):
+        return self.visit_logicalfilter(expr, parent_stack, context)
+
+
+@dataclass
+class SymbolTable:
+    data: List
+    tbl_exprs: List[ColumnRef] = field(default_factory=list, repr=False)
+
+
+def track_next(func):
+    @wraps(func)
+    def wrapper(self, expr, *args, **kwargs):
+        result = func(self, expr, *args, **kwargs)
+        self.trace.advance(expr)
+        return result
+
+    return wrapper
 
 
 class PlanEncoder(LogicalPlanVisitor):
@@ -665,74 +393,62 @@ class PlanEncoder(LogicalPlanVisitor):
     ):
         super().__init__()
         self.instance = instance
-        self.trace: UExprToConstraint = trace
-        self.context = {}
+        self.trace = trace
         self.verbose = verbose
 
-    def log(self, message):
-        if self.verbose:
-            logging.info(message)
-
     @track_next
-    def visit_scan(self, node: LogicalScan):
-        rows = self.instance.get_rows(node.table_name)
-        self.log(f"Scan table: {node.table_name}, rows: {len(rows)}")
-        table = self.instance.catalog.get_table(node.table_name)
+    def visit_scan(self, expr: LogicalScan, parent_stack, context):
+        rows = self.instance.get_rows(expr.table_name)
+        input_schema = expr.schema(catalog=self.instance.catalog)
+        sql_conditions, ref_conditions = [], []
+        for columnref in input_schema.columns:
+            unique = columnref.args.get("unique", False)
+            if unique:
+                ref_conditions.append(
+                    ColumnRef(
+                        this=sqlglot_exp.to_identifier("$" + str(columnref.ref)),
+                        table=expr.table_name,
+                        ref=columnref.ref,
+                        datatype=columnref.datatype,
+                    )
+                )
+                sql_conditions.append(columnref)
         for row in rows:
-            ref_conditions, sql_conditions, symbolic_exprs = [], [], []
-            for index, column in enumerate(table.columns):
-                unique = column.metadata["unique"]
-                if unique:
-                    ref_conditions.append(
-                        sql_exp.ColumnRef(
-                            name="$" + str(index),
-                            ref=index,
-                            datatype=column.datatype,
-                            metadata={**column.metadata},
-                        )
-                    )
-                    new_expr = node.schema(catalog=self.instance.catalog).columns[index]
-                    sql_conditions.append(new_expr)
-                    symbolic_exprs.append(row[column.ref])
-
-            self.trace.which_path(
-                node,
-                ref_conditions=ref_conditions,
-                sql_conditions=sql_conditions,
-                symbolic_exprs=symbolic_exprs,
-                takens=[True] * len(symbolic_exprs),
-                branch=True,
-                rows=[row],
-            )
-        return SymbolTable(data=rows)
+            symbolic_exprs = [row[columnref.ref] for columnref in sql_conditions]
+            if symbolic_exprs:
+                self.trace.which_path(
+                    expr,
+                    ref_conditions=ref_conditions,
+                    sql_conditions=sql_conditions,
+                    symbolic_exprs=symbolic_exprs,
+                    takens=[True] * len(symbolic_exprs),
+                    branch=True,
+                    rows=[row],
+                )
+        return rows
 
     @track_next
-    def visit_project(self, node: LogicalProject):
-        st = node.children[0].accept(self)
-        if st is None:
-            logging.error(f"Project child returned None: {node.children[0]}")
+    def visit_project(self, node: LogicalProject, parent_stack, context):
+        input_data = self.visit(node.this, parent_stack + [node], context)
+        input_schema = node.this.schema(catalog=self.instance.catalog)
         out = []
-        for row in st.data:
+        for row in input_data:
             data = []
-            ref_conditions, sql_conditions = [], []
-            smt_conditions = []
-            for expr_idx, expr in enumerate(node.expressions):
-                encoder = ExpressionEncoder(row, plan_encoder=self, ignore_nulls=True)
-                r = encoder.visit(expr)
-                data.append(r)
-                smt_conditions.extend(encoder.smt_conditions)
-                ref_conditions.extend(encoder.sql_conditions)
-                for cond in encoder.sql_conditions:
-                    new_expr = cond.transform(
-                        lambda e: resolve_schema(e, node, self.instance.catalog)
-                    )
-                    sql_conditions.append(new_expr)
+            ref_conditions, sql_conditions, smt_conditions = [], [], []
+            for proj in node.expressions:
+                context = {}
+                encoder = ExpressionEncoder(row, plan_encoder=self, ignore_nulls=False)
+                data.append(encoder.visit(proj, context=context))
+                smt_conditions.extend(context.get("smt_conditions", []))
+                ref_conditions.extend(context.get("ref_conditions", []))
+                for cond in context.get("ref_conditions", []):
+                    sql_conditions.append(cond.transform(resolve_schema, input_schema))
 
             self.trace.which_path(
                 operator=node,
-                ref_conditions=ref_conditions,
+                ref_conditions=context.get("ref_conditions", []),
                 sql_conditions=sql_conditions,
-                symbolic_exprs=smt_conditions,
+                symbolic_exprs=context.get("smt_conditions", []),
                 takens=[
                     True if isinstance(sql, ColumnRef) else smt.concrete
                     for smt, sql in zip(smt_conditions, sql_conditions)
@@ -740,42 +456,34 @@ class PlanEncoder(LogicalPlanVisitor):
                 branch=True,
                 rows=[row],
             )
-            out.append(Row(columns=data))
-
-        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
+            out.append(Row(*data))
+        return out
 
     @track_next
-    def visit_filter(self, node: LogicalFilter):
-        st = node.children[0].accept(self)
+    def visit_filter(self, node: LogicalFilter, parent_stack, context):
+        input_schema = node.this.schema(catalog=self.instance.catalog)
+        input_data = self.visit(node.this, parent_stack + [node], context)
         out = []
-        for row in st.data:
+
+        for row in input_data:
             encoder = ExpressionEncoder(row, plan_encoder=self)
             try:
-                smt = encoder.visit(node.condition)
+                context = {}
+                smt = encoder.visit(node.condition, context=context)
                 if smt:
                     out.append(row)
-                logging.info(encoder.smt_conditions)
-
-                takens = [b.concrete for b in encoder.smt_conditions]
-                sql_conditions = []
-                for cond in encoder.sql_conditions:
-                    logging.info(f"Condition before schema resolve: {cond}")
-                    if cond.right and isinstance(cond.right, sql_exp.Subquery):
-                        logging.info(f"Subquery detected in condition: {cond}")
-                        sql_conditions.append(
-                            sql_exp.Predicate(cond.left, cond.op, sql_exp.Literal(5))
-                        )
-                        continue
-                    else:
-                        new_cond = cond.transform(
-                            lambda e: resolve_schema(e, node, self.instance.catalog)
-                        )
-                        sql_conditions.append(new_cond)
+                smt_conditions = context.get("smt_conditions", [])
+                ref_conditions = context.get("ref_conditions", [])
+                sql_conditions = [
+                    cond.transform(resolve_schema, input_schema)
+                    for cond in ref_conditions
+                ]
+                takens = [b.concrete for b in smt_conditions]
                 self.trace.which_path(
                     operator=node,
-                    ref_conditions=encoder.sql_conditions,
+                    ref_conditions=ref_conditions,
                     sql_conditions=sql_conditions,
-                    symbolic_exprs=encoder.smt_conditions,
+                    symbolic_exprs=smt_conditions,
                     takens=takens,
                     branch=smt.concrete,
                     rows=[row],
@@ -783,51 +491,49 @@ class PlanEncoder(LogicalPlanVisitor):
             except Skipnulls:
                 logging.info(f"Skipping row with nulls: {row}")
                 continue
-        # self.trace.advance(node)
-        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
+        return out
 
     @track_next
-    def visit_join(self, node: LogicalJoin):
-        left_st = node.children[0].accept(self)
-        right_st = node.children[1].accept(self)
+    def visit_join(self, node: LogicalJoin, parent_stack, context):
+        left_input = self.visit(node.left, parent_stack + [node], context)
+        right_input = self.visit(node.right, parent_stack + [node], context)
+        input_schema = node.schema(catalog=self.instance.catalog)
         out = []
-        for lrow in left_st.data:
-            for rrow in right_st.data:
-                row = Row(columns=lrow.columns + rrow.columns)
+        for lrow in left_input:
+            for rrow in right_input:
+                row = lrow + rrow
                 try:
-                    encoder = ExpressionEncoder(row)
-                    smt = encoder.visit(node.condition, plan_encoder=self)
+                    local_ctx = {}
+                    encoder = ExpressionEncoder(row, plan_encoder=self)
+                    smt = encoder.visit(node.condition, context=local_ctx)
+                    logging.info(f"Join condition SMT result: {smt.concrete} for row:")
                     if smt:
                         out.append(row)
-                    takens = [b.concrete for b in encoder.smt_conditions]
+                    ref_conditions = local_ctx.get("ref_conditions", [])
+                    smt_conditions = local_ctx.get("smt_conditions", [])
+                    takens = [bool(b) for b in smt_conditions]
                     sql_conditions = [
-                        cond.transform(
-                            lambda e: resolve_schema(e, node, self.instance.catalog)
-                        )
-                        for cond in encoder.sql_conditions
+                        cond.transform(resolve_schema, input_schema)
+                        for cond in ref_conditions
                     ]
                     self.trace.which_path(
                         operator=node,
-                        ref_conditions=encoder.sql_conditions,
+                        ref_conditions=ref_conditions,
                         sql_conditions=sql_conditions,
-                        symbolic_exprs=encoder.smt_conditions,
+                        symbolic_exprs=smt_conditions,
                         takens=takens,
                         branch=smt.concrete,
                         rows=[row],
                     )
                 except Skipnulls:
+                    logging.info(f"Skipping row with nulls: {row}")
                     pass
-        return SymbolTable(data=out, tbl_exprs=left_st.tbl_exprs + right_st.tbl_exprs)
+        return out
 
     @track_next
-    def visit_sort(self, node: LogicalSort):
-        """
-        We just choose the max and min rows based on the sort order
-        """
-
-        st = node.children[0].accept(self)
-        out = []
-        self.log(f"Sort input rows: {len(st.data)}")
+    def visit_sort(self, node: LogicalSort, parent_stack, context):
+        input_data = self.visit(node.this, parent_stack + [node], context)
+        input_schema = node.this.schema(catalog=self.instance.catalog)
 
         def sorted_pure(iterable, key=None, reverse=False):
             filtered = [
@@ -867,18 +573,17 @@ class PlanEncoder(LogicalPlanVisitor):
             return merge_sort(list(filtered)) + null_values
 
         data = sorted_pure(
-            st.data,
+            input_data,
             key=lambda row: tuple(row[column.ref - 1] for column in node.sorts),
-            reverse=("DESCENDING" in node.dir),
+            reverse=("DESCENDING" in node.dirs),
         )
         ref_conditions = node.sorts
         sql_conditions = [
-            cond.transform(lambda e: resolve_schema(e, node, self.instance.catalog))
-            for cond in ref_conditions
+            cond.transform(resolve_schema, input_schema) for cond in ref_conditions
         ]
-        smt_conditions = [row[column.ref - 1] for row in data for column in node.sorts]
 
         for row in data:
+            smt_conditions = [row[column.ref - 1] for column in node.sorts]
             self.trace.which_path(
                 operator=node,
                 ref_conditions=ref_conditions,
@@ -889,64 +594,53 @@ class PlanEncoder(LogicalPlanVisitor):
                 rows=[row],
             )
 
-        return SymbolTable(data=data[: node.limit], tbl_exprs=st.tbl_exprs)
+        return data
 
     @track_next
-    def visit_aggregate(self, node: LogicalAggregate):
-        st = node.children[0].accept(self)
-        self.log(f"Aggregate input rows: {len(st.data)}")
+    def visit_aggregate(self, node: LogicalAggregate, parent_stack, context):
+        input_data = self.visit(node.this, parent_stack + [node], context)
+        input_schema = node.this.schema(catalog=self.instance.catalog)
+        from collections import defaultdict
 
         ### implement group by
         ref_conditions, sql_conditions, smt_conditions = [], [], []
-        for key in node.keys:
+        for key in node.keys + node.aggs:
             ref_conditions.append(key)
-            sql_conditions.append(
-                key.transform(lambda e: resolve_schema(e, node, self.instance.catalog))
-            )
-
-        for func in node.aggs:
-            ref_conditions.append(func)
-            sql_conditions.append(
-                func.transform(lambda e: resolve_schema(e, node, self.instance.catalog))
-            )
+            sql_conditions.append(key.transform(resolve_schema, input_schema))
 
         out = []
-        groups = {}
-        for row in st.data:
+        groups = defaultdict(list)
+        for row in input_data:
             group_key = tuple(row[expr.ref] for expr in node.keys)
-            if group_key not in groups:
-                groups[group_key] = []
             groups[group_key].append(row)
 
         for group_key, rows in groups.items():
             row = [] + list(group_key)
             for agg_func in node.aggs:
-                self.log(f"Processing aggregate function: {agg_func}")
-                if not isinstance(agg_func, AggFunc):
+                if not isinstance(agg_func, sqlglot_exp.AggFunc):
                     raise NotImplementedError(
                         f"Aggregate function {agg_func} not implemented yet."
                     )
-                if agg_func.name == "COUNT":
+                if agg_func.key == "count":
                     from src.parseval.symbol import Const
 
                     count_value = len(rows)
                     smt_conditions.append(Const(count_value, dtype="INT"))
                     row.append(Const(count_value, dtype="INT"))
 
-                elif agg_func.name == "SUM":
+                elif agg_func.key == "sum":
                     sum_value = sum(
                         row[agg_func.args[0].ref]
                         for row in rows
                         if row[agg_func.args[0].ref].concrete is not None
                     )
-                    logging.info(f"SUM value: {sum_value}, {type(sum_value)}")
                     smt_conditions.append(sum_value)
                     row.append(sum_value)
                 else:
                     raise NotImplementedError(
                         f"Aggregate function {agg_func} not implemented yet."
                     )
-            out.append(Row(columns=row))
+            out.append(Row(row))
             self.trace.which_path(
                 operator=node,
                 ref_conditions=ref_conditions,
@@ -954,81 +648,6 @@ class PlanEncoder(LogicalPlanVisitor):
                 symbolic_exprs=smt_conditions,
                 takens=[True] * len(ref_conditions),
                 branch=True,
-                rows=[Row(columns=row)],
+                rows=[Row(row)],
             )
-
-        # for agg_func in node.aggs:
-        #     self.log(f"Processing aggregate function: {agg_func}")
-        #     if not isinstance(agg_func, AggFunc):
-        #         raise NotImplementedError(
-        #             f"Aggregate function {agg_func} not implemented yet."
-        #         )
-        #     if agg_func.name == "COUNT":
-        #         for group_key, rows in groups.items():
-        #             count_value = len(rows)
-        #             smt_conditions.append(count_value)
-        #             new_columns = list(group_key) + [count_value]
-        #             out.append(Row(columns=new_columns))
-        #     elif agg_func.name == "SUM":
-        #         for group_key, rows in groups.items():
-        #             sum_value = sum(
-        #                 row[agg_func.args[0].ref]
-        #                 for row in rows
-        #                 if row[agg_func.args[0].ref].concrete is not None
-        #             )
-        #             smt_conditions.append(sum_value)
-        #             new_columns = list(group_key) + [sum_value]
-        #             out.append(Row(columns=new_columns))
-        #     else:
-        #         raise NotImplementedError(
-        #             f"Aggregate function {agg_func} not implemented yet."
-        #         )
-        # self.trace.which_path(
-        #     operator=node,
-        #     ref_conditions=ref_conditions,
-        #     sql_conditions=sql_conditions,
-        #     symbolic_exprs=smt_conditions,
-        #     takens=[True] * len(ref_conditions),
-        #     branch=True,
-        #     rows=out,
-        # )
-        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
-
-    @track_next
-    def visit_having(self, node: LogicalHaving):
-        st = node.children[0].accept(self)
-        out = []
-        for row in st.data:
-            encoder = ExpressionEncoder(row)
-            try:
-                smt = encoder.visit(node.condition)
-                if smt:
-                    out.append(row)
-                logging.info(encoder.smt_conditions)
-
-                takens = [b.concrete for b in encoder.smt_conditions]
-                sql_conditions = []
-                for cond in encoder.sql_conditions:
-                    new_cond = cond.transform(
-                        lambda e: resolve_schema(e, node, self.instance.catalog)
-                    )
-                    sql_conditions.append(new_cond)
-                self.trace.which_path(
-                    operator=node,
-                    ref_conditions=encoder.sql_conditions,
-                    sql_conditions=sql_conditions,
-                    symbolic_exprs=encoder.smt_conditions,
-                    takens=takens,
-                    branch=smt.concrete,
-                    rows=[row],
-                )
-            except Skipnulls:
-                logging.info(f"Skipping row with nulls: {row}")
-                continue
-        return SymbolTable(data=out, tbl_exprs=st.tbl_exprs)
-
-    def visit_subquery(self, node: CorrelatedSubquery):
-        # st = node.children[0].accept(self)
-
-        st = node.subquery.accept(self)
-        return st
+        return out
