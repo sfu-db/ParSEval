@@ -1,10 +1,9 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Iterable, List, Callable
-from .dtype import DataType
+from src.parseval.dtype import DataType
+from typing import Any, List, Optional, Dict, TYPE_CHECKING, Iterable, Union, Tuple
 
 if TYPE_CHECKING:
-    from .dtype import DATATYPE
+    from src.parseval.dtype import DATATYPE
 
 _SQL_OP_MAP = {
     "ADD": "+",
@@ -24,85 +23,89 @@ _SQL_OP_MAP = {
     "OR": "OR",
     "NOT": "NOT",
     "LIKE": "LIKE",
-    "IS": "IS",
+    "IS": "=",
 }
 
 
-class Symbol(ABC):
-    __slots__ = ("dtype", "concrete", "meta", "_hash")
+class _Symbol(type):
+    def __new__(cls, clsname, bases, attrs):
+        klass = super().__new__(cls, clsname, bases, attrs)
+        # When an Expression class is created, its key is automatically set to be
+        # the lowercase version of the class' name.
+        klass.key = clsname.lower()
 
-    def __init__(
-        self,
-        dtype: DATATYPE,
+        # This is so that docstrings are not inherited in pdoc
+        klass.__doc__ = klass.__doc__ or ""
+
+        return klass
+
+
+class Symbol(metaclass=_Symbol):
+    """
+    Represents an atomic symbolic expression with a data type.
+    """
+
+    key = "symbol"
+    __slots__: Tuple[str, ...] = ("args", "dtype", "_concrete", "metadata")
+
+    def __new__(
+        cls,
+        *args: Tuple[Any, ...],
+        dtype: DATATYPE = None,
         concrete: Any = None,
-        meta: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
+        obj = super().__new__(cls)
+        object.__setattr__(obj, "args", tuple(args))
+        object.__setattr__(obj, "dtype", DataType.build(dtype) if dtype else None)
+        object.__setattr__(obj, "_concrete", concrete)
+        object.__setattr__(obj, "metadata", {})
+        obj.metadata.update(kwargs)
+        return obj
 
-        self.dtype = DataType.build(dtype)
-        self.concrete = concrete
-        self.meta = meta or {}
-        self._hash = None
+    @property
+    def datatype(self):
+        return self.dtype
 
-    @abstractmethod
-    def children(self) -> Tuple[Symbol, ...]:
-        """Return child symbols."""
-        pass
+    @property
+    def concrete(self):
+        return self._concrete
 
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.dtype, self.children())
-
-    def __hash__(self):
-        if self._hash is None:
-            self._hash = hash(self.canonical_key())
-        return self._hash
+    def __bool__(self):
+        if self.concrete is not None:
+            return bool(self.concrete)
+        return False
 
     def iter(self) -> Iterable[Symbol]:
         """Depth-first traversal of the symbol tree."""
         yield self
-        for child in self.children():
-            yield from child.iter()
+        for arg in self.args:
+            if isinstance(arg, Symbol):
+                yield from arg.iter()
 
-    def find_all(self, target: "Symbol") -> List["Symbol"]:
-        """Find all instances of a target expression in the tree."""
-        matches = []
-        stack = [self]
-        while stack:
-            current = stack.pop()
-            if isinstance(current, target):
-                matches.append(current)
-            for child in current.children():
-                if isinstance(child, Symbol):
-                    stack.append(child)
-        return matches
+    def __setattr__(self, name, value):
+        if name != "concrete":
+            raise AttributeError(f"{self.__class__.__name__} is immutable")
+        object.__setattr__(self, "_concrete", value)
 
-    def predicates(self, include_nested: bool = False) -> List[Symbol]:
-        """Collect all boolean predicate symbols in the expression tree.
+    def is_number(self):
+        return self.dtype.is_type(DataType.NUMERIC_TYPES)
 
-        Args:
-            include_nested (bool): If True, include nested predicates within other predicates.
-                                   If False, only include top-level predicates.
+    def is_datetime(self):
+        return self.dtype.is_type(*DataType.TEMPORAL_TYPES)
 
-        Returns:
-            List[Symbol]: List of predicate symbols.
-        """
-        results: List[Symbol] = []
-        self._collect_predicates(results, include_nested, is_root=True)
-        return results
+    def __str__(self):
+        return f"{self.key.capitalize()}({', '.join(map(str, self.args))})"
 
-    def _collect_predicates(
-        self, results: List[Symbol], include_nested: bool, is_root: bool = False
-    ):
-        if self.dtype.is_boolean() and isinstance(self, Compare):
-            results.append(self)
-            if not include_nested and not is_root:
-                return
-        for child in self.children():
-            child._collect_predicates(results, include_nested, is_root=False)
+    def __repr__(self) -> str:
+        return f"{self.key}({', '.join(map(str, self.args))}:{self.dtype})"
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, Symbol):
             return False
-        return self.canonical_key() == other.canonical_key()
+        if self is other:
+            return True
+        return type(self) == type(other) and self.args == other.args
 
     def __add__(self, other):
         return Add(self, _ensure_symbol(other))
@@ -133,18 +136,6 @@ class Symbol(ABC):
 
     def __rfloordiv__(self, other):
         return FloorDiv(_ensure_symbol(other), self)
-
-    # def __mod__(self, other):
-    #     return Mod(self, _ensure_symbol(other))
-
-    # def __rmod__(self, other):
-    #     return Mod(_ensure_symbol(other), self)
-
-    # def __pow__(self, other):
-    #     return Pow(self, _ensure_symbol(other))
-
-    # def __rpow__(self, other):
-    #     return Pow(_ensure_symbol(other), self)
 
     def __neg__(self):
         return Neg(self)
@@ -183,166 +174,70 @@ class Symbol(ABC):
         return Not(self)
 
     def and_(self, other):
-        return And(self, _ensure_symbol(other))
+        return And(self, _ensure_symbol(other), dtype="bool")
 
     def or_(self, other):
-        return Or(self, _ensure_symbol(other))
+        return Or(self, _ensure_symbol(other), dtype="bool")
 
     def not_(self):
         return Not(
-            operand=self, dtype="bool", concrete=not self.concrete, meta=self.meta
+            self, dtype="bool", concrete=not self.concrete, metadata=self.metadata
         )
 
-    # Use .eq() method instead
     def eq(self, other):
-        return EQ(self, _ensure_symbol(other))
+        return EQ(self, _ensure_symbol(other), dtype="bool")
 
     def ne(self, other):
-        return NE(self, _ensure_symbol(other))
+        return NE(self, _ensure_symbol(other), dtype="bool")
 
     def like(self, pattern: str) -> "Symbol":
         """Create a LIKE comparison symbol."""
-        return LIKE(self, Const(pattern, dtype="string"))
+        return LIKE(self, Const(pattern, dtype="string"), dtype="bool")
 
     def is_(self, other: Symbol) -> "Symbol":
         """Create an IS comparison symbol."""
-        return IS(self, _ensure_symbol(other))
-
-    # def refresh_concrete(self):
-    #     """Force refresh the value of `concrete` from bottom to top."""
-    #     for child in self.children():
-    #         child.refresh_concrete()  # Recursively refresh children
-    #     if isinstance(self, BinaryOp) or isinstance(self, UnaryOp):
-    #         self.concrete = self._eval()  # Recalculate concrete for operations
-    #     elif isinstance(self, And):
-    #         self.concrete = all(op.concrete for op in self.operands)
-    #     elif isinstance(self, Or):
-    #         self.concrete = any(op.concrete for op in self.operands)
-    #     # Add other cases as needed for specific Symbol types
+        return IS(self, _ensure_symbol(other), dtype="bool")
 
 
-# ======================================================================================================
-# Leaf Nodes
-# =====================================================================================================
+class Variable(Symbol):
+    """
+    Represents a symbolic variable with additional attributes.
+    """
 
+    @property
+    def name(self) -> str:
+        return self.args[0]
 
-class Var(Symbol):
-    __slots__ = ("name",)
-
-    def __init__(self, name, dtype, concrete=None, meta=None):
-        super().__init__(dtype, concrete, meta)
-        self.name = name
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.name, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return ()
-
-    def __str__(self):
-        return str(self.concrete)
-
-    def __repr__(self) -> str:
-        return f"Var({self.name})"
+    @property
+    def concrete(self):
+        return self._concrete
 
 
 class Const(Symbol):
-
-    def __init__(
-        self, value: Any, dtype: DATATYPE, meta: Optional[Dict[str, Any]] = None
-    ):
-        super().__init__(dtype, concrete=value, meta=meta)
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.concrete, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return ()
-
-    def __repr__(self) -> str:
-        return f"Const({self.concrete})"
+    @property
+    def value(self) -> Any:
+        return self.args[0]
 
 
-# ============================================================================
-# Binary Operations Base
-# ============================================================================
+class Binary(Symbol):
 
+    @property
+    def left(self) -> Symbol:
+        return self.args[0]
 
-class BinaryOp(Symbol):
-    __slots__ = ("left", "right", "op")
-    OP_SYMBOL: str = ""
+    @property
+    def right(self) -> Symbol:
+        return self.args[1]
 
-    def __init__(
-        self, left: Symbol, right: Symbol, dtype=None, concrete=None, meta=None
-    ):
-        self.left = left
-        self.right = right
-        concrete = concrete or self._eval()
-        dtype = dtype or DataType.infer(concrete)
-        super().__init__(dtype, concrete, meta)
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__.__name__, self.left, self.right, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return (self.left, self.right)
-
-    def __repr__(self) -> str:
-        return f"{self.OP_SYMBOL}({repr(self.left)}, {repr(self.right)})"
-
-    def _eval(self):
-        if self.OP_SYMBOL == "<":
-            return self.left.concrete < self.right.concrete
-        elif self.OP_SYMBOL == "<=":
-            print(
-                f"Evaluating LE: {self.left.concrete} ({type(self.left.concrete)}) <= {self.right.concrete}({type(self.right.concrete)})"
-            )
-
-            return self.left.concrete <= self.right.concrete
-        elif self.OP_SYMBOL == ">":
-            return self.left.concrete > self.right.concrete
-        elif self.OP_SYMBOL == ">=":
-            return self.left.concrete >= self.right.concrete
-        elif self.OP_SYMBOL == "=":
-            return self.left.concrete == self.right.concrete
-        elif self.OP_SYMBOL == "!=":
-            return self.left.concrete != self.right.concrete
-        elif self.OP_SYMBOL == "LIKE":
-            import re
-
-            pattern = self.right.concrete
-
-            def like_to_regex(pattern: str) -> re.Pattern:
-                regex = ""
-                for ch in pattern:
-                    if ch == "%":
-                        regex += ".*"
-                    elif ch == "_":
-                        regex += "."
-                    else:
-                        regex += re.escape(ch)
-                return re.compile(f"^{regex}$")
-
-            regex = like_to_regex(pattern)
-            return bool(regex.match(str(self.left.concrete)))
-        elif self.OP_SYMBOL == "/":
-            if (
-                isinstance(self.left.concrete, (int, float))
-                and isinstance(self.right.concrete, (int, float))
-                and self.right.concrete != 0
-            ):
-                return self.left.concrete / self.right.concrete
-            else:
-                return None
-
-        elif self.OP_SYMBOL == "IS":
-            return self.left.concrete is self.right.concrete
-        else:
+    @property
+    def concrete(self):
+        if self._concrete is None:
             try:
-
                 import operator
 
                 OPS = {
+                    "=": operator.eq,
+                    "!=": operator.ne,
                     ">": operator.gt,
                     "<": operator.lt,
                     ">=": operator.ge,
@@ -352,195 +247,121 @@ class BinaryOp(Symbol):
                     "*": operator.mul,
                     "/": operator.truediv,
                 }
-                return OPS[self.OP_SYMBOL](self.left.concrete, self.right.concrete)
+                self.concrete = OPS[_SQL_OP_MAP[self.key.upper()]](
+                    self.left.concrete, self.right.concrete
+                )
 
             except Exception as e:
                 raise NotImplementedError(
-                    f"Unknown comparison operator: {self.OP_SYMBOL}, {self.right.concrete} {e}"
+                    f"Unknown comparison operator: {self.key.upper()}, {self.right.concrete} {e}"
                 )
 
-
-class Add(BinaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["ADD"]
+        return self._concrete
 
 
-class Sub(BinaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["SUB"]
+class Add(Binary):
+    pass
 
 
-class Mul(BinaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["MUL"]
+class Sub(Binary):
+    pass
 
 
-class Div(BinaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["DIV"]
+class Mul(Binary):
+    pass
 
 
-class FloorDiv(BinaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["FLOORDIV"]
+class Div(Binary):
+    pass
 
 
-class UnaryOp(Symbol):
-    __slots__ = "operand"
-    OP_SYMBOL: str = ""
-
-    def __init__(self, operand: Symbol, dtype, concrete=None, meta=None):
-        super().__init__(dtype, concrete, meta)
-        self.operand = operand
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.operand, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return (self.operand,)
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.operand})"
+class FloorDiv(Binary):
+    pass
 
 
-class Neg(UnaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["SUB"]
+class Unary(Symbol):
+    @property
+    def operand(self) -> Symbol:
+        return self.args[0]
 
 
-class Not(UnaryOp):
-    OP_SYMBOL = _SQL_OP_MAP["NOT"]
+class Neg(Unary):
+    pass
 
 
-class Cast(UnaryOp):
-    OP_SYMBOL = "CAST"
+class Not(Unary):
+    pass
 
 
-# ============================================================================
-# Comparison Operations
-# ============================================================================
-class Compare(BinaryOp):
-    def __init__(self, left, right, dtype="bool", concrete=None, meta=None):
-        super().__init__(left, right, dtype, concrete, meta)
-
-    def __bool__(self):
-        if self.concrete is None:
-            self.concrete = self._eval()
-        return self.concrete
+class Compare(Binary):
+    pass
 
 
 class LT(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["LT"]
+    pass
 
 
 class LE(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["LE"]
+    pass
 
 
 class GT(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["GT"]
+    pass
 
 
 class GE(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["GE"]
+    pass
 
 
 class EQ(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["EQ"]
+    pass
 
 
 class NE(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["NE"]
+    pass
 
 
 class LIKE(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["LIKE"]
+    pass
 
 
 class IS(Compare):
-    OP_SYMBOL = _SQL_OP_MAP["IS"]
+    pass
 
 
-class And(Symbol):
-    __slots__ = ("operands",)
-
-    def __init__(self, *operands: Symbol, concrete: Optional[bool] = None, meta=None):
-        concrete = all(op.concrete for op in operands)
-        super().__init__("bool", concrete=concrete, meta=meta)
-        self.operands = operands
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.operands, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return self.operands
-
-    def __repr__(self) -> str:
-        return f"And({', '.join(repr(op) for op in self.operands)})"
-
-    def __bool__(self):
-        if self.concrete is None:
-            self.concrete = all(op.concrete for op in self.operands)
-        return self.concrete
+class IS_NULL(Unary):
+    pass
 
 
-class Or(Symbol):
-    __slots__ = ("operands",)
-
-    def __init__(self, *operands: Symbol, concrete: Optional[bool] = None, meta=None):
-        concrete = any(op.concrete for op in operands)
-        super().__init__("bool", concrete=concrete, meta=meta)
-        self.operands = operands
-
-    def canonical_key(self) -> Tuple:
-        return (self.__class__, self.operands, self.dtype)
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return self.operands
-
-    def __repr__(self) -> str:
-        return f"Or({', '.join(repr(op) for op in self.operands)})"
-
-    def __bool__(self):
-        if self.concrete is None:
-            self.concrete = all(op.concrete for op in self.operands)
-        return self.concrete
+class And(Binary):
+    pass
 
 
-class FunctionDef(Symbol):
-    __slots__ = ("name", "args")
-    OP_SYMBOL = "FUNC"
+class Or(Binary):
+    pass
 
-    def __init__(self, name, args, return_type, concrete=None, meta=None):
-        super().__init__(return_type, concrete, meta)
-        self.name = name
-        self.args = args
+
+class Function(Symbol): ...
 
 
 class Row(Symbol):
-    __slots__ = ("columns",)
-
-    def __init__(self, columns: List[Symbol]):
-        super().__init__("row", None, None)
-        self.columns = columns
-
-    def children(self) -> Tuple[Symbol, ...]:
-        return tuple(self.columns)
-
     def __iter__(self):
-        return iter(self.columns)
+        return iter(self.args)
 
-    def __getitem__(self, idx):
-        return self.columns[idx]
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return Row(*self.args[index])
+        return self.args[index]  # return single Symbol
 
-    def __repr__(self) -> str:
-        return f"Row({', '.join(repr(op) for op in self.columns)})"
+    def __add__(self, other):
+        if not isinstance(other, Row):
+            raise TypeError(f"Cannot add Row with {type(other)}")
+        new_columns = self.args + other.args
+        new_metadata = {**self.metadata, **other.metadata}
+        return Row(*new_columns, metadata=new_metadata)
 
-
-class FunctionRegistry:
-    _registry: Dict[str, FunctionDef] = {}
-
-    @classmethod
-    def register(cls, f: FunctionDef):
-        cls._registry[f.name] = f
-
-    @classmethod
-    def get(cls, name: str) -> Optional[FunctionDef]:
-        return cls._registry.get(name)
+    def __len__(self):
+        return len(self.args)
 
 
 def _ensure_symbol(value: Any) -> Symbol:
@@ -549,3 +370,42 @@ def _ensure_symbol(value: Any) -> Symbol:
         return value
 
     return Const(value, dtype=DataType.infer(value))
+
+
+# class DateAdd(Function):
+#     """
+#     Represents the addition of a time interval to a date.
+#     """
+
+#     nargs = 2
+
+#     @classmethod
+#     def eval(cls, date, interval):
+#         # Evaluation logic can be added here if needed
+#         pass
+
+
+# class DateSub(Function):
+#     """
+#     Represents the subtraction of a time interval from a date.
+#     """
+
+#     nargs = 2
+
+#     @classmethod
+#     def eval(cls, date, interval):
+#         # Evaluation logic can be added here if needed
+#         pass
+
+
+# class Extract(Function):
+#     """
+#     Represents the extraction of a specific part from a date.
+#     """
+
+#     nargs = 2
+
+#     @classmethod
+#     def eval(cls, part, date):
+#         # Evaluation logic can be added here if needed
+#         pass

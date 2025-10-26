@@ -588,7 +588,7 @@ class ColumnDomainPool:
 class CSPConstraint:
     def __init__(
         self,
-        variables: List[sym.Var],
+        variables: List[sym.Variable],
         sql_expression: Optional[sql_exp.Expression] = None,
     ):
         self.variables = variables
