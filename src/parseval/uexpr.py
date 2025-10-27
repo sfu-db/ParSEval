@@ -488,9 +488,9 @@ class UExprToConstraint:
         if isinstance(node.sql_condition, sql_exp.ColumnRef):
             if not node.sql_condition.args.get("unique", False) and node.symbolic_exprs:
                 value = random.choice(node.symbolic_exprs["1"])
-                from sqlglot import parse_one
+                from sqlglot.expressions import convert
 
-                literal = parse_one(value.concrete, into=sql_exp.sqlglot_exp.Literal)
+                literal = convert(value.concrete)
                 literal.set("datatype", node.sql_condition.datatype)
                 constraint = sql_exp.sqlglot_exp.EQ(
                     this=node.sql_condition, expression=literal
@@ -508,7 +508,7 @@ class UExprToConstraint:
             null_constraint = sql_exp.Is_Null(this=node.sql_condition)
             self.declare(node.operator.operator_type, null_constraint)
 
-    def _decalre_smt_constraints(self, plausible: PlausibleBranch):
+    def _declare_smt_constraints(self, plausible: PlausibleBranch):
         """
         declare SMT constraints for the plausible branch
         """
@@ -522,7 +522,7 @@ class UExprToConstraint:
                 self._declare_null_constraints(node)
             elif str(bit) == "0":
 
-                if isinstance(node.sql_condition, sql_exp.Predicate):
+                if isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
                     pos_constraint = sql_exp.negate_predicate(
                         node.sql_condition
                     )  # node.sql_condition.negate()

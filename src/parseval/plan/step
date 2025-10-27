@@ -6,17 +6,15 @@ from functools import reduce
 from typing import TYPE_CHECKING, List, Dict, Callable, Union, Any, Optional, Optional
 
 if TYPE_CHECKING:
-    from .expression import Expression, Condition, Schema, Catalog
+    from .rex import Expression, Catalog
     from .planner import LogicalPlanVisitor
-from .expression import Schema
+from .rex import Schema, ColumnRef
 import uuid
 
 # from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
 # from .expression import ColumnRef
-
-import src.parseval.plan.expression as sql_exp
 
 
 class JoinType(Enum):
@@ -156,7 +154,7 @@ class LogicalScan(LeafOperator):
             datatype = col.datatype
             datatype.nullable = nullable
             columns.append(
-                sql_exp.ColumnRef(
+                ColumnRef(
                     name=col.name,
                     datatype=datatype,
                     ref=index,

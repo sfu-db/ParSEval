@@ -506,7 +506,7 @@ class PlanEncoder(LogicalPlanVisitor):
                     local_ctx = {}
                     encoder = ExpressionEncoder(row, plan_encoder=self)
                     smt = encoder.visit(node.condition, context=local_ctx)
-                    logging.info(f"Join condition SMT result: {smt.concrete} for row:")
+
                     if smt:
                         out.append(row)
                     ref_conditions = local_ctx.get("ref_conditions", [])

@@ -69,6 +69,7 @@ class Symbol(metaclass=_Symbol):
 
     @property
     def concrete(self):
+
         return self._concrete
 
     def __bool__(self):
@@ -76,12 +77,67 @@ class Symbol(metaclass=_Symbol):
             return bool(self.concrete)
         return False
 
-    def iter(self) -> Iterable[Symbol]:
+    def evaluate(self, mapping: Dict):
+        if self in mapping:
+            return mapping[self]
+        evaluated_args = tuple(
+            arg.evaluate(mapping) if isinstance(arg, Symbol) else arg
+            for arg in getattr(self, "args", ())
+        )
+        if hasattr(self, "_eval_concrete"):
+            return self._eval_concrete(*evaluated_args)
+
+        if evaluated_args:
+            return type(self)(*evaluated_args)
+        return self
+
+    def subs(self, mapping: Dict):
+        if self in mapping:
+            return mapping[self]
+        substituted_args = tuple(
+            arg.subs(mapping) if isinstance(arg, Symbol) else arg
+            for arg in getattr(self, "args", ())
+        )
+        return self.__class__(*substituted_args, dtype=self.dtype, **self.metadata)
+
+    def find_any(self, targets: Tuple[Symbol]) -> Optional[Symbol]:
+        """Find any instance of target expressions in the tree."""
+        stack = [self]
+        target_types = tuple(targets)
+        while stack:
+            current = stack.pop()
+            if isinstance(current, target_types):
+                return current
+
+            for child in current.args:
+                if isinstance(child, Symbol):
+                    stack.append(child)
+        return None
+
+    def find_all(self, target: "Symbol") -> List["Symbol"]:
+        """Find all instances of a target expression in the tree."""
+        matches = []
+        stack = [self]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, target):
+                matches.append(current)
+
+            for child in current.args:
+                if isinstance(child, Symbol):
+                    stack.append(child)
+        return matches
+
+    def iter(self, visited=None) -> Iterable[Symbol]:
         """Depth-first traversal of the symbol tree."""
+        if visited is None:
+            visited = set()
+        if id(self) in visited:
+            return
         yield self
         for arg in self.args:
             if isinstance(arg, Symbol):
-                yield from arg.iter()
+                yield from arg.iter(visited)
 
     def __setattr__(self, name, value):
         if name != "concrete":
@@ -106,6 +162,9 @@ class Symbol(metaclass=_Symbol):
         if self is other:
             return True
         return type(self) == type(other) and self.args == other.args
+
+    def __hash__(self):
+        return hash((self.key, tuple(self.args)))
 
     def __add__(self, other):
         return Add(self, _ensure_symbol(other))
@@ -218,8 +277,19 @@ class Const(Symbol):
     def value(self) -> Any:
         return self.args[0]
 
+    @property
+    def concrete(self):
+        return self._concrete if self._concrete is not None else self.value
 
-class Binary(Symbol):
+
+class Condition(Symbol):
+    pass
+
+
+class Arithmetic(Condition): ...
+
+
+class Binary(Condition):
 
     @property
     def left(self) -> Symbol:
@@ -232,50 +302,51 @@ class Binary(Symbol):
     @property
     def concrete(self):
         if self._concrete is None:
-            try:
-                import operator
-
-                OPS = {
-                    "=": operator.eq,
-                    "!=": operator.ne,
-                    ">": operator.gt,
-                    "<": operator.lt,
-                    ">=": operator.ge,
-                    "<=": operator.le,
-                    "+": operator.add,
-                    "-": operator.sub,
-                    "*": operator.mul,
-                    "/": operator.truediv,
-                }
-                self.concrete = OPS[_SQL_OP_MAP[self.key.upper()]](
-                    self.left.concrete, self.right.concrete
-                )
-
-            except Exception as e:
-                raise NotImplementedError(
-                    f"Unknown comparison operator: {self.key.upper()}, {self.right.concrete} {e}"
-                )
-
+            self.concrete = self._eval_concrete(self.left.concrete, self.right.concrete)
         return self._concrete
 
+    def _eval_concrete(self, left_value, right_value):
+        try:
+            import operator
 
-class Add(Binary):
+            OPS = {
+                "=": operator.eq,
+                "!=": operator.ne,
+                ">": operator.gt,
+                "<": operator.lt,
+                ">=": operator.ge,
+                "<=": operator.le,
+                "+": operator.add,
+                "-": operator.sub,
+                "*": operator.mul,
+                "/": operator.truediv,
+            }
+            concrete = OPS[_SQL_OP_MAP[self.key.upper()]](left_value, right_value)
+            return concrete
+
+        except Exception as e:
+            raise NotImplementedError(
+                f"Unknown comparison operator: {self.key.upper()}, {self.right.concrete} {e}"
+            )
+
+
+class Add(Binary, Arithmetic):
     pass
 
 
-class Sub(Binary):
+class Sub(Binary, Arithmetic):
     pass
 
 
-class Mul(Binary):
+class Mul(Binary, Arithmetic):
     pass
 
 
-class Div(Binary):
+class Div(Binary, Arithmetic):
     pass
 
 
-class FloorDiv(Binary):
+class FloorDiv(Binary, Arithmetic):
     pass
 
 
@@ -339,6 +410,26 @@ class And(Binary):
 
 class Or(Binary):
     pass
+
+
+class Quantifier(Symbol):
+    @property
+    def var(self) -> Tuple[Symbol, ...]:
+        v = self.args[0]
+        return v if isinstance(v, tuple) else (v,)
+
+    @property
+    def body(self) -> Tuple[Symbol, ...]:
+        return self.args[1]
+
+
+class ForAll(Quantifier): ...
+
+
+class Exists(Quantifier): ...
+
+
+class Distinct(Condition): ...
 
 
 class Function(Symbol): ...
