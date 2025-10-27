@@ -1,6 +1,7 @@
 import pydot
 from typing import Callable, Dict, TYPE_CHECKING
-from .plan.step import LogicalOperator
+
+from .plan.rex import LogicalOperator
 from .uexpr import Constraint, PlausibleBranch
 from enum import Enum
 import logging

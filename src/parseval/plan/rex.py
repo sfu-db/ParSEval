@@ -36,7 +36,7 @@ class ColumnRef(sqlglot_exp.Expression):
 
     @property
     def table(self) -> str:
-        return self.text("table", None)
+        return self.text("table")
 
     @property
     def datatype(self) -> DATATYPE:

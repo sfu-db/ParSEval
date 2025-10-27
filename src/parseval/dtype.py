@@ -56,8 +56,8 @@ class DataType(exp.DataType):
     @classmethod
     def build(
         cls,
-        dtype: DATA_TYPE,
-        dialect: DialectType = None,
+        dtype,
+        dialect=None,
         udt: bool = False,
         copy: bool = True,
         **kwargs,
@@ -81,23 +81,8 @@ class DataType(exp.DataType):
         if isinstance(dtype, str):
             if dtype.upper() == "UNKNOWN":
                 return DataType(this=DataType.Type.UNKNOWN, **kwargs)
-
-            # DataType(this = )
-
             t = parse_one(dtype, into=exp.DataType)
-
             return DataType(this=t.this)
-
-            try:
-                data_type_exp = parse_one(
-                    dtype, read=dialect, into=DataType, error_level=ErrorLevel.IGNORE
-                )
-            except ParseError:
-                if udt:
-                    return DataType(
-                        this=DataType.Type.USERDEFINED, kind=dtype, **kwargs
-                    )
-                raise
         elif isinstance(dtype, DataType.Type):
             data_type_exp = DataType(this=dtype)
         elif isinstance(dtype, DataType):

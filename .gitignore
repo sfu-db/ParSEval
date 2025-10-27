@@ -176,3 +176,12 @@ src/runtime/
 src/pipeline/
 src/engine/
 src/engine copy/
+src/context/
+src/exprs/
+src/solver/
+src/symbols/
+src/uexpr/
+src/expr/
+src/instance/
+src/expression/
+src/parseval/solver/

@@ -7,6 +7,8 @@ from .helper import normalize_name
 from .symbol import *
 from .faker import ValueGeneratorRegistry
 
+from src.parseval.smt.domain import ColumnDomainPool, DomainSpec
+
 import random, logging
 
 
@@ -25,6 +27,8 @@ class Instance:
         self.tuple_id_to_symbols = {}
         self.pk_fk_symbols = {}
 
+        self.column_domain = ColumnDomainPool()
+
     def _build_catalog(self, ddls, dialect):
         ddls = parse(ddls, dialect=dialect)
 
@@ -37,13 +41,9 @@ class Instance:
 
             for expr in schema_expr.expressions:
                 if isinstance(expr, exp.ColumnDef):
-                    # for constraint in expr.constraints[:]:
-                    #     if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
-                    #         primary_key.add(expr.this.name)
                     constraints.setdefault(expr.this.name, set()).update(
                         expr.constraints
                     )
-
                     column_defs.append(
                         ColumnRef(
                             this=exp.to_identifier(expr.name),
@@ -138,13 +138,15 @@ class Instance:
                 for idx, val in enumerate(existing_values)
                 if not (table.is_unique(local_col) and val.concrete in used_values)
             ]
+            logging.info(
+                f"available values for {ref_table_name}.{ref_col_name}: {available_values}"
+            )
             if available_values:
                 idx, chosen_value = random.choice(available_values)
                 values[local_col] = chosen_value
             else:
                 ref_values = {}
                 ref_position = self._create_row(ref_table_name, ref_values)
-
                 ref_value = self.get_column_data(ref_table_name, ref_col_name)[
                     ref_position
                 ]
@@ -256,9 +258,10 @@ class Instance:
                     for column_name, column_value in zip(columns, row.args):
                         data[normalize_name(column_name)] = column_value.concrete
                     mapped_data.append(data)
+                if mapped_data:
 
-                column_list = ", ".join(columns)
-                stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
+                    column_list = ", ".join(columns)
+                    stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
 
-                # logging.info(mapped_data)
-                conn.insert(stmt, mapped_data)
+                    # logging.info(mapped_data)
+                    conn.insert(stmt, mapped_data)

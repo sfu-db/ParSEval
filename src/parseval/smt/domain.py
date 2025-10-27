@@ -9,46 +9,17 @@ from collections import deque
 import string, re
 from datetime import datetime, timedelta
 from ..dtype import DataType, DATATYPE
-import src.parseval.plan.expression as sql_exp
-import src.parseval.symbol as sym
-from .evaluator import Evaluator
+from src.parseval.plan import rex
+
 from src.parseval.helper import like_to_pattern
 
-if TYPE_CHECKING:
-    from src.parseval.plan.expression import ColumnRef
-    from src.parseval.instance import Instance
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ValueAssignment:
-    column: str
-    alias: str
-    value: Any
-    data_type: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class SolverResult:
-    status: str
-    assignments: List[ValueAssignment] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class InConsistency(Exception):
     def __init__(self, message: str, variables: str | None = None):
         super().__init__(message)
         self.variables = variables
-
-
-class SAT(Exception):
-    pass
-
-
-class UNSAT(Exception):
-    pass
 
 
 class UnionFind:
@@ -155,6 +126,8 @@ class DomainSpec:
     min_val: Any = None
     max_val: Any = None
     choices: List[Any] = field(default_factory=list)
+    length: Optional[int] = None
+    pattern: Optional[str] = None
     unique: bool = False
     nullable: bool = False
     default: Any = None
@@ -369,7 +342,7 @@ class ValuePool:
                     variables=[self.alias],
                 )
 
-    def apply_constraints(self, constraint: sql_exp.Expression):
+    def apply_constraints(self, constraint: rex.Expression):
         op = constraint.op
 
         if self.datatype.is_numeric():
@@ -391,7 +364,7 @@ class ValuePool:
             elif op in {"<", "<="}:
                 # from dateutil import parser as date_parser
                 # parser
-                values = constraint.right.find_all(sql_exp.Literal)
+                values = constraint.right.find_all(rex.sqlglot_exp.Literal)
                 value = datetime.strptime(values[0].value, "%Y-%m-%d")
                 self.propagate_bounds(max_val=value)
             elif op in {"=", "=="}:
@@ -486,7 +459,7 @@ class ColumnDomainPool:
             self._domains[key] = domain
         return self._domains[key]
 
-    def link_equality(self, pool_a: ValuePool, pool_b: ValuePool):
+    def add_equality(self, pool_a: ValuePool, pool_b: ValuePool):
         assert isinstance(pool_a, ValuePool) and isinstance(pool_b, ValuePool)
 
         alias = f"{pool_a.alias}|{pool_b.alias}"
@@ -531,15 +504,9 @@ class ColumnDomainPool:
         if any(c is False for c in conflicts):
             return False
         self._pools[alias] = merged
-
         return True
 
-        # shared_values = pool_a.get_domain_values() | pool_b.get_domain_values()
-        # for pool in [pool_a, pool_a]:
-        #     for value in shared_values:
-        #         pool.add_local_value(value, propagate=False)
-
-    def add_conflicts(self, pool_a: ValuePool, pool_b: ValuePool):
+    def add_inequality(self, pool_a: ValuePool, pool_b: ValuePool):
         assert isinstance(pool_a, ValuePool) and isinstance(pool_b, ValuePool)
         return self.union_find.add_inequality(pool_a.alias, pool_b.alias)
 
@@ -559,7 +526,6 @@ class ColumnDomainPool:
         domain = self._domains.get(qualified_name)
         if not domain:
             raise KeyError(f"No DomainSpec registered for {qualified_name}")
-
         pool = ValuePool(alias, domain=domain)
         self._pools[key] = pool
         logger.debug(f"Created ValuePool for alias={alias}, domain={qualified_name}")
@@ -576,319 +542,8 @@ class ColumnDomainPool:
         """Expand a column's domain with more generated values."""
         pool = self.get_pool(alias)
         pool.expand_domain(additional_samples=additional_samples)
-        # for _ in range(additional_samples):
-        #     pool.add_local_value(None)
 
     def __repr__(self):
         return (
             f"<ColumnDomainPool {len(self._pools)} pools, {len(self._domains)} domains>"
         )
-
-
-class CSPConstraint:
-    def __init__(
-        self,
-        variables: List[sym.Variable],
-        sql_expression: Optional[sql_exp.Expression] = None,
-    ):
-        self.variables = variables
-        # self.check = check
-        self.sql_expression = sql_expression
-
-    def is_satisfied(
-        self, assignment: Dict[str, Any], context: Dict[str, Any] = None
-    ) -> bool:
-        if not self.sql_expression:
-            return True
-        context = {}
-        for var_name in assignment:
-            for var in self.variables:
-                if var.name == var_name:
-                    var.concrete = assignment[var_name]
-                    context[var.name] = var
-
-        evaluator = Evaluator(context=context)
-        result = evaluator.visit(self.sql_expression)
-        # logger.info(
-        #     f"Evaluating {self.sql_expression} with assignment {assignment} = {result.concrete}"
-        # )
-        return bool(result.concrete) if result else False
-
-    def propagate(self):
-        pass
-
-
-class SpeculativeSolver:
-    def __init__(self, ColumnDomainPool: ColumnDomainPool):
-        self.pool_mgr = ColumnDomainPool
-        self.variables: Dict[str, sym.Var] = {}
-        self.constraints: List[CSPConstraint] = []
-        self.var_to_columnref: Dict[Any, ColumnRef] = {}
-        self.column_alias_to_var: Dict[str, sym.Var] = {}
-        self.pair_to_constraints: Dict[Tuple[str, str], List[CSPConstraint]] = {}
-
-    def add_constraint(self, constraint: sql_exp.Expression, variables: List[sym.Var]):
-        cons = CSPConstraint(variables=variables, sql_expression=constraint)
-        self.constraints.append(cons)
-
-    def add_variable(self, var_name, columnref: sql_exp.ColumnRef):
-        var_name = var_name
-        if var_name not in self.variables:
-            var = sym.Var(name=var_name, dtype=columnref.datatype)
-            self.var_to_columnref[var_name] = columnref
-            self.column_alias_to_var[columnref.qualified_name] = var
-            self.variables[var_name] = var
-            logging.info(columnref.qualified_name)
-            self.pool_mgr.get_or_create_pool(
-                var_name, columnref.metadata["table"], columnref.name
-            )
-        return self.variables[
-            var_name
-        ]  # self.column_alias_to_var[columnref.qualified_name]
-
-    def cast_valuepool_datatype(self, cast: sql_exp.Cast):
-        alias = cast.args[0].qualified_name
-        var = self.column_alias_to_var.get(alias)
-        pool = self.pool_mgr.get_pool(var.name)
-        if pool:
-            pool.datatype = cast.to_type
-
-    def solve(self, max_attempts=2) -> Optional[Dict[str, Any]]:
-        """
-        AC-3 + Backtracking to find a consistent assignment of values to variables.
-        """
-
-        for _ in range(max_attempts):
-            try:
-                self._initialize_domain()
-                if not self.propagate():
-                    logger.warning("No solution found during propagation")
-                    return False
-                logger.info("Propagation complete, starting backtracking search")
-                assignment = {}
-                result = self._backtrack(assignment)
-                if result:
-                    break
-            except InConsistency as e:
-                logger.warning(f"Inconsistency detected: {e}")
-                return SolverResult(status="UNSAT")
-        status = "SAT" if result else "UNSAT"
-        return SolverResult(status=status, assignments=result)
-
-    def _domain_size(self, var_name: str) -> int:
-        pool_i = self.pool_mgr.get_pool(var_name)
-        return len(pool_i.get_domain_values())
-
-    def _is_consistent(self, var_name, value, assignment: Dict[str, Any]) -> bool:
-        """Check if assigning value to var is consistent with constraints."""
-        assignment[var_name] = value
-        consistent = True
-
-        for constraint in self.constraints:
-            # Get variable names in this constraint
-            constraint_vars = [v.name for v in constraint.variables]
-            if var_name not in constraint_vars:
-                continue
-            # If all variables in constraint are assigned, check it
-            if all(v in assignment for v in constraint_vars):
-                if not constraint.is_satisfied(assignment):
-                    consistent = False
-        del assignment[var_name]
-        return consistent
-
-    def _backtrack(self, assignment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if len(assignment) == len(self.variables):
-            return assignment
-        unassigned = [v for v in self.variables if v not in assignment]
-        var_name = min(unassigned, key=lambda v: self._domain_size(v))
-
-        value_pool = self.pool_mgr.get_pool(var_name)
-        domain_values = list(value_pool.get_domain_values())
-        if not domain_values:
-            return
-        for value in domain_values:
-            if not self._is_consistent(var_name, value, assignment):
-                continue
-            saved_state = {
-                v_name: {
-                    "local_values": self.pool_mgr.get_pool(v_name).local_values.copy(),
-                    "excluded": self.pool_mgr.get_pool(v_name).local_excluded.copy(),
-                }
-                for v_name in self.variables
-                if v_name not in assignment
-            }
-            assignment[var_name] = value
-            if self._forward_check(var_name, value, assignment):
-                result = self._backtrack(assignment)
-                if result:
-                    return result
-            for v_name in self.variables:
-                if v_name not in assignment:
-                    pool_v = self.pool_mgr.get_pool(v_name)
-                    pool_v.local_values = saved_state[v_name]["local_values"]
-                    pool_v.local_excluded = saved_state[v_name]["excluded"]
-            del assignment[var_name]
-        return None
-
-    def _forward_check(
-        self, var_name: str, value: Any, assignment: Dict[str, Any]
-    ) -> bool:
-        """
-        Forward checking: check if assigning var=value makes any future variable's domain empty.
-        """
-        for constraint in self.constraints:
-            constraint_var_names = [v.name for v in constraint.variables]
-            if var_name not in constraint_var_names:
-                continue
-            unassigned_vars = [
-                v
-                for v in constraint.variables
-                if v.name not in assignment and v.name != var_name
-            ]
-
-            for other_var in unassigned_vars:
-                has_valid_value = False
-                pool_other = self.pool_mgr.get_pool(other_var.name)
-                domain_values = list(pool_other.get_domain_values())
-                values_to_exclude = []
-                for v in domain_values:
-                    test_assignment = assignment.copy()
-                    test_assignment[other_var.name] = v
-                    test_assignment[var_name] = value
-                    can_evaluate = all(
-                        v in test_assignment for v in constraint_var_names
-                    )
-                    if can_evaluate:
-                        if not constraint.is_satisfied(test_assignment):
-                            values_to_exclude.append(v)
-
-                for val in values_to_exclude:
-                    pool_other.add_excluded(val)
-                remaining = list(pool_other.get_domain_values())
-                if not remaining:
-                    return False
-        return True
-
-    def _initialize_arcs(self) -> List[Tuple[str, str, CSPConstraint]]:
-        arcs = []
-
-        for constraint in self.constraints:
-            # logger.info(
-            #     f"Processing constraint: {constraint.sql_expression}, type={type(constraint.sql_expression)}, {constraint.sql_expression.op}"
-            # )
-            if len(constraint.variables) > 1:
-                names = [v.name for v in constraint.variables]
-                logger.info(f"name: {names}")
-                for i in range(len(names)):
-                    for j in range(len(names)):
-                        if i == j:
-                            continue
-                        self.pair_to_constraints.setdefault(
-                            (names[i], names[j]), []
-                        ).append(constraint)
-                        self.pair_to_constraints.setdefault(
-                            (names[j], names[i]), []
-                        ).append(constraint)
-                        arcs.append((names[i], names[j], constraint))
-                        arcs.append((names[j], names[i], constraint))
-        return arcs
-
-    def propagate(self) -> bool:
-        queue = deque(self._initialize_arcs())
-
-        while queue:
-            xi, xj, constraint = queue.popleft()
-            revised = self._revise(xi, xj, constraint)
-            if revised:
-                ### check if domain becomes empty
-                pool_i = self.pool_mgr.get_pool(xi)
-                logger.info(self._domain_size(xi))
-                if not pool_i.get_domain_values():
-                    return False
-
-                for (a, b), constraints in self.pair_to_constraints.items():
-                    if b == xi and a != xj:
-                        for c in constraints:
-                            queue.append((a, b, c))
-
-        return True
-
-    def _revise(self, xi: str, xj: str, constraint: CSPConstraint) -> bool:
-        """
-        Remove values from domain(xi) that have no supporting value in domain(xj).
-        Returns True if domain(xi) was revised.
-        """
-        pool_i = self.pool_mgr.get_pool(xi)
-        pool_j = self.pool_mgr.get_pool(xj)
-
-        removed_any = False
-        pool_i_values = pool_i.get_domain_values()
-        pool_j_values = pool_j.get_domain_values()
-
-        for vi in pool_i_values:
-            has_support = False
-            other_vars = [
-                v.name for v in constraint.variables if v.name not in (xi, xj)
-            ]
-
-            for vj in pool_j_values:
-                assignment = {xi: vi, xj: vj}
-                if not other_vars:
-                    sat = constraint.is_satisfied(assignment)
-                    if sat is True:
-                        has_support = True
-                        break
-                else:
-                    logger.info(f"other vars: {other_vars}")
-                    logger.warning("Skipping multi-variable constraint support for now")
-                    raise NotImplementedError
-
-            if not has_support:
-                pool_i.add_excluded(vi)
-                logger.info(
-                    f"adding excluded value {vi} to pool {xi}, domain size: {len(pool_i.get_domain_values())}"
-                )
-                removed_any = True
-
-        return removed_any
-
-    def _initialize_domain(self):
-
-        for constraint in self.constraints:
-            if constraint.sql_expression.op == "=" and len(constraint.variables) == 2:
-                pools = [self.pool_mgr.get_pool(v.name) for v in constraint.variables]
-                if not self.pool_mgr.link_equality(pools[0], pools[1]):
-                    raise InConsistency(
-                        "Inconsistent constraints detected.",
-                        variables=[constraint.variables],
-                    )
-
-            elif (
-                constraint.sql_expression.op in {"!=", "<>"}
-                and len(constraint.variables) == 2
-            ):
-                pools = [self.pool_mgr.get_pool(v.name) for v in constraint.variables]
-                if not self.pool_mgr.add_conflicts(pools[0], pools[1]):
-                    raise InConsistency(
-                        "Inconsistent constraints detected.",
-                        variables=[constraint.variables],
-                    )
-
-            else:
-                # logger.info("non-equality constraint, skipping linking")
-                pass
-
-            casts = constraint.sql_expression.find_all(sql_exp.Cast)
-            for cast in casts:
-                if isinstance(cast.args[0], sql_exp.ColumnRef):
-                    var_name = cast.args[0].qualified_name
-                    self.pool_mgr.get_pool(var_name).datatype = cast.to_type
-            if len(constraint.variables) == 1:
-                for var in constraint.variables:
-                    pool = self.pool_mgr.get_pool(var.name)
-                    pool.apply_constraints(constraint.sql_expression)
-
-        for var_name, var in self.variables.items():
-            pool = self.pool_mgr.get_pool(var_name)
-            pool.expand_domain(additional_samples=30)
-            logger.info(f"initialize value pool for {var_name}: {pool}")
