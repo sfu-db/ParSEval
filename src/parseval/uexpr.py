@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, TYPE_CHECKING, Union, Optional, Any, Dict
+from src.parseval.symbol import Variable
 
 if TYPE_CHECKING:
     from .plan.rex import Expression as Expression
@@ -137,7 +138,11 @@ def check_cover_duplicate(current_label, constraint: Constraint) -> bool:
         if constraint.sql_condition.args.get("unique", False):
             return PlausibleType.INFEASIBLE
         else:
-            values = [v.concrete for v in constraint.symbolic_exprs["1"]]
+            values = [
+                v.concrete
+                for v in constraint.symbolic_exprs["1"]
+                if v.concrete is not None
+            ]
             if len(values) != len(set(values)):
                 return PlausibleType.COVERED
     return current_label
@@ -145,15 +150,22 @@ def check_cover_duplicate(current_label, constraint: Constraint) -> bool:
 
 def check_cover_null(current_label, constraint: Constraint) -> bool:
     """Check if the constraint covers null values."""
-    if (
-        constraint.sql_condition.datatype
-        and constraint.sql_condition.datatype.nullable is False
-    ):
+    columnrefs = list(constraint.sql_condition.find_all(sql_exp.ColumnRef))
+
+    if all([columnref.datatype.nullable is False for columnref in columnrefs]):
         return PlausibleType.INFEASIBLE
-    else:
-        values = [v for v in constraint.symbolic_exprs["1"] if v.concrete is None]
-        if values:
-            return PlausibleType.COVERED
+
+    for columnref in columnrefs:
+        if columnref.datatype.nullable is False:
+            continue
+        else:
+            values = []
+            for smt in constraint.symbolic_exprs["1"]:
+                for var in smt.find_all(Variable):
+                    values.append(var.concrete is None)
+            if values and any(values):
+                return PlausibleType.COVERED
+
     return current_label
 
 
@@ -394,11 +406,6 @@ class UExprToConstraint:
         """move the current path forward by one step"""
         if operator.operator_id in self.positive_nodes:
             self.prev_operator = operator.operator_id
-        for pattern in self.leaves:
-            leaf = self.leaves[pattern]
-            if not isinstance(leaf, PlausibleBranch):
-                continue
-            leaf.update_mark()
 
     def reset(self):
         self.prev_operator = "ROOT"
@@ -450,6 +457,11 @@ class UExprToConstraint:
 
             if branch and (node, b) not in self.positive_nodes[operator.operator_id]:
                 self.positive_nodes[operator.operator_id].add((node, b))
+        for pattern in self.leaves:
+            leaf = self.leaves[pattern]
+            if not isinstance(leaf, PlausibleBranch):
+                continue
+            leaf.update_mark()
 
     def next_path(self):
         for pattern in self.leaves:
@@ -459,9 +471,8 @@ class UExprToConstraint:
             leaf.update_mark()
         for pattern, leaf in self.leaves.items():
             if leaf.branch and leaf.plausible_type == PlausibleType.UNEXPLORED:
-                logging.info(
-                    f"Selecting unexplored positive leaf: ========================= {pattern}"
-                )
+                if leaf.parent.operator.operator_type == "Join":
+                    continue
                 return leaf
 
         leaves = dict(
@@ -480,21 +491,24 @@ class UExprToConstraint:
 
             if leaf.plausible_type == PlausibleType.UNEXPLORED:
                 leaf.mark_pending()
-                assert pattern == leaf.pattern(), f"{pattern} vs {leaf.pattern()}"
                 return leaf
         return None
 
     def _declare_duplicate_constraints(self, node):
         if isinstance(node.sql_condition, sql_exp.ColumnRef):
             if not node.sql_condition.args.get("unique", False) and node.symbolic_exprs:
+
                 value = random.choice(node.symbolic_exprs["1"])
                 from sqlglot.expressions import convert
 
-                literal = convert(value.concrete)
-                literal.set("datatype", node.sql_condition.datatype)
-                constraint = sql_exp.sqlglot_exp.EQ(
-                    this=node.sql_condition, expression=literal
-                )
+                if value.concrete is None:
+                    constraint = sql_exp.Is_Null(this=node.sql_condition)
+                else:
+                    literal = convert(value.concrete)
+                    literal.set("datatype", node.sql_condition.datatype)
+                    constraint = sql_exp.sqlglot_exp.EQ(
+                        this=node.sql_condition, expression=literal
+                    )
 
                 self.declare(node.operator.operator_type, constraint)
 
@@ -521,63 +535,60 @@ class UExprToConstraint:
             elif str(bit) == "3":
                 self._declare_null_constraints(node)
             elif str(bit) == "0":
-
-                if isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
-                    pos_constraint = sql_exp.negate_predicate(
-                        node.sql_condition
-                    )  # node.sql_condition.negate()
+                if node.operator.operator_type == "aggregate":
+                    self._declare_smt_group_constraints(plausible, node)
+                elif isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
+                    pos_constraint = sql_exp.negate_predicate(node.sql_condition)
                     self.declare(node.operator.operator_type, pos_constraint)
+
             else:
-                self.declare(node.operator.operator_type, node.sql_condition)
+                if node.operator.operator_type == "aggregate":
+                    self._declare_smt_group_constraints(plausible, node)
+                else:
+                    self.declare(node.operator.operator_type, node.sql_condition)
 
-    def _append_tuple(self, instance: Instance, plausible: PlausibleBranch):
+    def _declare_smt_join_constraints(self, plausible: PlausibleBranch):
         """
-        insert a new tuple into the instance
-        Declare new symbols.
-        we do not need to change all existing concrete values, hence, we just need to call a solver to solve constraints to derive concrete values for new symbols.
+        declare SMT constraints for the plausible branch
         """
-        # involved_tables = self._get_involved_tables_path(plausible)
-
         path = plausible.get_path_to_root()
-
-        if plausible.pattern().endswith("4"):
-            logging.info(plausible.pattern())
 
         ### we first process constraints in the path to root
         for bit, node in zip(plausible.pattern(), path[1:]):
-            if plausible.pattern().endswith("4"):
-                logging.info("==== Processing constraint node ====")
-                logging.info(f"bit: {bit}, node: {node.sql_condition}")
-            if str(bit) == "4":
-                if isinstance(node.sql_condition, sql_exp.ColumnRef):
-                    if (
-                        not node.sql_condition.metadata.get("unique", False)
-                        and node.symbolic_exprs
-                    ):
-                        value = random.choice(node.symbolic_exprs["1"])
-                        dup_constraint = sql_exp.Predicate(
-                            node.sql_condition,
-                            "=",
-                            sql_exp.Literal(
-                                value=value.concrete,
-                                datatype=node.sql_condition.datatype,
-                            ),
-                        )
-                        logging.info(
-                            f"Handling duplicate constraint: {node.sql_condition}, {str(dup_constraint)}"
-                        )
-                        self.declare(node.operator.operator_type, dup_constraint)
-            elif str(bit) == "3":
-                null_constraint = node.sql_condition.is_null()
-                logging.info(
-                    f"Handling null constraint: {node.sql_condition}, {type(node.sql_condition)}, {null_constraint}"
-                )
-                self.declare(node.operator.operator_type, null_constraint)
-            elif str(bit) == "0":
-                if isinstance(node.sql_condition, sql_exp.Predicate):
-                    pos_constraint = node.sql_condition.negate()
+            if str(bit) == "0":
+                if isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
+                    pos_constraint = sql_exp.negate_predicate(node.sql_condition)
                     self.declare(node.operator.operator_type, pos_constraint)
             else:
                 self.declare(node.operator.operator_type, node.sql_condition)
 
-        ## Then process the constraint node itself
+    def _declare_smt_group_constraints(self, plausible: PlausibleBranch, node):
+        bit = str(plausible.bit())
+        if bit == "0":
+            """declare SMT constraints for group count"""
+            if node.symbolic_exprs.get("1"):
+                for value in node.symbolic_exprs["1"]:
+                    from sqlglot.expressions import convert
+
+                    literal = convert(value.concrete)
+                    literal.set("datatype", node.sql_condition.datatype)
+                    constraint = sql_exp.sqlglot_exp.NE(
+                        this=node.sql_condition, expression=literal
+                    )
+                    self.declare(node.operator.operator_type, constraint)
+        elif bit == "1":
+            """declare SMT constraints for group size"""
+            if node.symbolic_exprs.get("1"):
+                for value in node.symbolic_exprs["1"]:
+                    from sqlglot.expressions import convert
+
+                    literal = convert(value.concrete)
+                    literal.set("datatype", node.sql_condition.datatype)
+                    constraint = sql_exp.sqlglot_exp.EQ(
+                        this=node.sql_condition, expression=literal
+                    )
+                    self.declare(node.operator.operator_type, constraint)
+        else:
+            raise NotImplementedError(
+                f"Group by plausible branch bit {bit} not implement yet."
+            )

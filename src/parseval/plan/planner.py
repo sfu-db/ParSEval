@@ -27,19 +27,19 @@ class Skipnulls(Exception):
 
 class ExpressionEncoder:
     SYMBOLIC_EVAL_REGISTRY = {
-        "eq": lambda left, right: left.eq(right),
-        "neq": lambda left, right: left.ne(right),
-        "gt": operator.gt,
-        "lt": operator.lt,
-        "lte": operator.le,
-        "gte": operator.ge,
-        "like": lambda left, right: left.like(right),
-        "and": lambda left, right: left.and_(right),
-        "or": lambda left, right: left.or_(right),
-        "add": operator.add,
-        "sub": operator.sub,
-        "mul": operator.mul,
-        "div": operator.truediv,
+        "eq": lambda *args: args[0].eq(args[1]),
+        "neq": lambda *args: args[0].ne(args[1]),
+        "gt": lambda *args: args[0] > args[1],
+        "lt": lambda *args: args[0] < args[1],
+        "lte": lambda *args: args[0] >= args[1],
+        "gte": lambda *args: args[0] <= args[1],
+        "like": lambda *args: args[0].like(args[1]),
+        "and": lambda *args: args[0].and_(args[1]),
+        "or": lambda *args: args[0].or_(args[1]),
+        "add": lambda *args: args[0] + args[1],
+        "sub": lambda *args: args[0] - args[1],
+        "mul": lambda *args: args[0] * args[1],
+        "div": lambda *args: args[0] // args[1],
     }
 
     def __init__(
@@ -479,6 +479,7 @@ class PlanEncoder(LogicalPlanVisitor):
                     for cond in ref_conditions
                 ]
                 takens = [b.concrete for b in smt_conditions]
+                # logging.info(f"SQL condition: {sql_conditions}, takens: {takens}")
                 self.trace.which_path(
                     operator=node,
                     ref_conditions=ref_conditions,
@@ -636,6 +637,14 @@ class PlanEncoder(LogicalPlanVisitor):
                     )
                     smt_conditions.append(sum_value)
                     row.append(sum_value)
+                elif agg_func.key == "min":
+                    min_value = min(
+                        row[agg_func.this.ref]
+                        for row in rows
+                        if row[agg_func.this.ref].concrete is not None
+                    )
+                    smt_conditions.append(min_value)
+                    row.append(min_value)
                 else:
                     raise NotImplementedError(
                         f"Aggregate function {agg_func} not implemented yet."

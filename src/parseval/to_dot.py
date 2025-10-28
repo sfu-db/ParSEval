@@ -181,7 +181,6 @@ def uexpr_to_dot(
     elif isinstance(node, PlausibleBranch):
         label = node.plausible_type.value
         label += f": {node.pattern()}"
-        # label += f"\nhit: {len(node.parent.delta[str(node.bit())])}"
     dot_node.obj_dict["attributes"]["label"] = label
     for key, value in node_style(node).items():
         dot_node.obj_dict["attributes"][key] = value
