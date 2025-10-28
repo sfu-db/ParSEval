@@ -4,8 +4,15 @@ from typing import List, Tuple, Set, Union
 from .db_manager import DBManager
 
 
-def instantiate_db(schema, sql, dialect, **kwargs):
+def instantiate_db(workspace, schema, sql, dialect, **kwargs):
     """generates test database instances based on the input SQL."""
+    max_iter = kwargs.pop("max_iter", 30)
+    threshold = kwargs.pop("threshold", 1)
+    generator = Generator(schema=schema, query=sql, name=kwargs.get("name", "default"))
+    instance = generator.generate(max_iter=max_iter, threshold=threshold)
+    instance.to_db(host_or_path=workspace)
+
+    return workspace
 
 
 def compare_df(result1: List[Tuple], result2: List[Tuple], order_matters: bool) -> bool:
