@@ -64,6 +64,11 @@ class Is_Null(sqlglot_exp.Unary, sqlglot_exp.Predicate):
         return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
 
 
+class Is_Not_Null(sqlglot_exp.Unary, sqlglot_exp.Predicate):
+    def sql(self, dialect=None, **opts):
+        return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
+
+
 class FunctionCall(sqlglot_exp.Func):
     arg_types = {"this": True, "expressions": True}
 
@@ -789,5 +794,10 @@ def negate_predicate(expr) -> "Expression":
     """Return the negation of this expression."""
 
     from sqlglot.optimizer.simplify import simplify
+
+    if expr.key == "is_null":
+        return Is_Not_Null(this=expr.this)
+    elif expr.key == "is_not_null":
+        return Is_Null(this=expr.this)
 
     return simplify(expr.not_())

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Set, Tuple, Optional, TYPE_CHECKING
 from .domain import UnionFind, ColumnDomainPool, ValuePool, DomainSpec, InConsistency
 from .adapter import SolverAdapter, SolverResult, ValueAssignment
 from .smt_solver import SMTSolver
-from src.parseval.symbol import Variable, Symbol, Condition
+from src.parseval.symbol import Variable, Symbol, Condition, IS_NULL
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,6 @@ class Solver:
 
     def add_constraint(self, constraint: Condition):
         vars_ = list(constraint.find_all(Variable))
-        logging.info(f"finding vars : {vars_}")
         self.constraints.append(constraint)
         self.variables.update({v.name: v for v in vars_})
         for v in vars_:
@@ -49,7 +48,7 @@ class Solver:
 
     def select_adapter(self, cluster: List[Condition], context) -> SolverAdapter:
         # For simplicity, we use SpeculativeSolver for all clusters
-        return SMTSolver("smt_solver")
+        return SMTSolver
 
     def solve(self) -> SolverResult:
 
@@ -59,8 +58,24 @@ class Solver:
         for cluster in self.clusters():
             constraints = []
             for var_name in cluster:
-                constraints.extend(self.var_to_constraints.get(var_name, set()))
+                for constraint in self.var_to_constraints.get(var_name, set()):
+                    if isinstance(constraint, IS_NULL):
+                        assignments.append(
+                            ValueAssignment(
+                                column=var_name, value=None, alias=None, data_type=None
+                            )
+                        )
+                        logging.info(
+                            f"Assigning NULL to {var_name} due to IS NULL constraint"
+                        )
+                        # context.setdefault("models", {})[
+                        #     var_name
+                        # ] = None  # .update(model)
+
+                    else:
+                        constraints.append(constraint)
             adapter = self.select_adapter(constraints, context)
+            adapter = adapter(str(cluster))
             solve_result = adapter.solve(
                 variables=cluster, constraints=constraints, context=context
             )

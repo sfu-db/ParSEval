@@ -35,7 +35,6 @@ class SMTSolver(SolverAdapter):
         "OR": lambda a, b: z3.Or(a, b),
         "NOT": lambda a: z3.Not(a),
         "LIKE": "LIKE",
-        "IS": lambda a, b: a == b,
     }
 
     def __init__(self, name: str):
@@ -49,7 +48,9 @@ class SMTSolver(SolverAdapter):
     def solve(
         self, variables: List[Variable], constraints: List[Condition], context=None
     ):
+
         context = context if context is not None else {}
+        context["variable_to_z3"] = {}
         ctx = context.get("z3_ctx", None)
         z3_constraints = []
         for constraint in constraints:
@@ -58,26 +59,52 @@ class SMTSolver(SolverAdapter):
         solver = z3.Solver(ctx=ctx)
         solver.add(*z3_constraints)
 
-        logging.info("Z3 Solver Constraints:")
-        logging.info(solver.assertions())
-
         solver.add(*context.get("safe_divisions", []))
         solver.add(*context.get("str_format", []))
         solver.add(*context.get("datetime_format", []))
+
+        for var_name, z3var in context.get("variable_to_z3", {}).items():
+            if var_name in context.get("models", {}):
+                solver.add(z3var == context["models"][var_name])
+
+        sexpr = solver.sexpr()
+
         status = solver.check()
         assignments = []
+
+        # logging.info(solver.sexpr())
+
         if status == z3.sat:
             model = solver.model()
-            for d in model.decls():
+            for var_name, z3var in context.get("variable_to_z3", {}).items():
+
                 assignments.append(
                     ValueAssignment(
-                        column=d.name(),
+                        column=var_name,
                         alias="",
-                        value=self._to_concrete(d, model[d], context),
+                        value=self._to_concrete(z3var, model.evaluate(z3var), context),
                         data_type="",
                         metadata={},
                     )
                 )
+            # for d in model.decls():
+            #     assignments.append(
+            #         ValueAssignment(
+            #             column=d.name(),
+            #             alias="",
+            #             value=self._to_concrete(d, model[d], context),
+            #             data_type="",
+            #             metadata={},
+            #         )
+            #     )
+        # else:
+        #     logging.info(solver.sexpr())
+
+        with open("tests/db/smt_debug.smt2", "a") as f:
+            f.write(sexpr + "\n")
+            f.write(str(status) + "\n")
+            f.write(str(assignments) + "\n")
+            f.write("\n\n")
 
         return SolverResult(status=str(status), assignments=assignments)
 
@@ -98,7 +125,6 @@ class SMTSolver(SolverAdapter):
             elif condition.datatype.is_type(*DataType.REAL_TYPES):
                 return z3.RealVal(condition.value, ctx=ctx)
             if condition.dtype.is_type(*DataType.TEXT_TYPES):
-                logging.info(f"Creating StringVal for constant: {condition.value}")
                 return z3.StringVal(str(condition.value), ctx=ctx)
             elif condition.datatype.is_type(*DataType.TEMPORAL_TYPES):
                 for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
@@ -135,7 +161,12 @@ class SMTSolver(SolverAdapter):
                     arg_z3 = arg  # constant
                     raise ValueError("DISTINCT only supports Symbol arguments")
                 args.append(arg_z3)
-            return z3.Distinct(*args)
+            from functools import reduce
+
+            cons = []
+            for i in range(1, len(args)):
+                cons.append(args[0] != args[i])
+            return z3.And(cons)  # z3.Distinct(*args)
         else:
             raise NotImplementedError(
                 f"{repr(condition)} not supported in SMT conversion"
@@ -164,12 +195,14 @@ class SMTSolver(SolverAdapter):
         elif dtype.is_type(*DataType.TEXT_TYPES):
             z3var = z3.String(variable.name, ctx=ctx)
             self._ensure_str_printable(z3var, context)
-            return self._ensure_str_length(z3var, dtype.length or 1, context)
+            return self._ensure_str_length(z3var, dtype.length or 0, context)
         elif dtype.is_type(*DataType.TEMPORAL_TYPES):
             z3var = z3.Int(variable.name, ctx=ctx)
             return self._ensure_dt_format(z3var, context)
         else:
             raise RuntimeError(f"Unsupported data type: {dtype}")
+
+    # def _ensure_str_no_leading_whitespace(self, s, context) -> z3.BoolRef:
 
     def _ensure_str_printable(self, s, context) -> z3.BoolRef:
         ascii_printable = z3.Range(chr(32), chr(126))
@@ -180,7 +213,12 @@ class SMTSolver(SolverAdapter):
 
     def _ensure_str_length(self, s, length: int, context) -> z3.BoolRef:
         if isinstance(s.sort(), z3.SeqSortRef):
+            # z3.Or(z3.Or(z3.Length(s) == 0, z3.SubString(s, 0, 1) != z3.StringVal(" ")))
+
             context.setdefault("str_format", []).append(z3.Length(s) > length)
+            context.setdefault("str_format", []).append(
+                z3.SubString(s, 0, 1) != z3.StringVal(" ")
+            )
         return s
 
     def _ensure_dt_format(self, s, context) -> z3.BoolRef:
