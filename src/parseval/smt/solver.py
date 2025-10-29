@@ -59,7 +59,8 @@ class Solver:
             constraints = []
             for var_name in cluster:
                 for constraint in self.var_to_constraints.get(var_name, set()):
-                    if isinstance(constraint, IS_NULL):
+                    if constraint.find_all(IS_NULL):
+                        logger.info(f'{constraint}')
                         assignments.append(
                             ValueAssignment(
                                 column=var_name, value=None, alias=None, data_type=None
@@ -68,10 +69,7 @@ class Solver:
                         logging.info(
                             f"Assigning NULL to {var_name} due to IS NULL constraint"
                         )
-                        # context.setdefault("models", {})[
-                        #     var_name
-                        # ] = None  # .update(model)
-
+                   
                     else:
                         constraints.append(constraint)
             adapter = self.select_adapter(constraints, context)

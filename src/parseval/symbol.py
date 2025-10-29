@@ -91,6 +91,38 @@ class Symbol(metaclass=_Symbol):
             return type(self)(*evaluated_args)
         return self
 
+    def _eval_concrete(self, *args):
+        try:
+            OPS = {
+                "eq": lambda *args: args[0] == args[1],
+                "neq": lambda *args: args[0] != args[1],
+                "gt": lambda *args: args[0] > args[1],
+                "lt": lambda *args: args[0] < args[1],
+                "lte": lambda *args: args[0] >= args[1],
+                "gte": lambda *args: args[0] <= args[1],
+                "like": lambda *args: args[0].like(args[1]),
+                "and": lambda *args: args[0].and_(args[1]),
+                "or": lambda *args: args[0].or_(args[1]),
+                "add": lambda *args: args[0] + args[1],
+                "sub": lambda *args: args[0] - args[1],
+                "mul": lambda *args: args[0] * args[1],
+                "div": lambda *args: args[0] // args[1],
+                "floordiv": lambda *args: args[0] // args[1],
+                "AND": lambda *args: args[0] and args[1],
+                "OR": lambda *args: args[0] or args[1],
+                "NOT": lambda *args: not args[0],
+                "NEG": lambda *args: -args[0],
+            }
+            concrete = OPS[self.key.lower()](*args)
+            return concrete
+        except KeyError:
+            raise NotImplementedError(
+                f"Unknown operator: {self.key.upper()}, {self.right.concrete} {e}"
+            )
+
+        except Exception as e:
+            return None
+
     def subs(self, mapping: Dict):
         if self in mapping:
             return mapping[self]
@@ -251,7 +283,9 @@ class Symbol(metaclass=_Symbol):
 
     def like(self, pattern: str) -> "Symbol":
         """Create a LIKE comparison symbol."""
-        return LIKE(self, Const(pattern, dtype="string"), dtype="bool")
+        pattern = _ensure_symbol(pattern)
+        
+        return LIKE(self, pattern, dtype="bool")
 
     def is_(self, other: Symbol) -> "Symbol":
         """Create an IS comparison symbol."""
@@ -307,32 +341,6 @@ class Binary(Condition):
             self.concrete = self._eval_concrete(self.left.concrete, self.right.concrete)
         return self._concrete
 
-    def _eval_concrete(self, left_value, right_value):
-        try:
-            import operator
-
-            OPS = {
-                "=": operator.eq,
-                "!=": operator.ne,
-                ">": operator.gt,
-                "<": operator.lt,
-                ">=": operator.ge,
-                "<=": operator.le,
-                "+": operator.add,
-                "-": operator.sub,
-                "*": operator.mul,
-                "/": operator.truediv,
-                "AND": lambda left, right: left and right,
-                "OR": lambda left, right: left or right,
-            }
-            concrete = OPS[_SQL_OP_MAP[self.key.upper()]](left_value, right_value)
-            return concrete
-
-        except Exception as e:
-            raise NotImplementedError(
-                f"Unknown comparison operator: {self.key.upper()}, {self.right.concrete} {e}"
-            )
-
 
 class Add(Binary, Arithmetic):
     pass
@@ -358,20 +366,6 @@ class Unary(Symbol):
     @property
     def operand(self) -> Symbol:
         return self.args[0]
-
-    def _eval_concrete(self, *operand_value):
-        try:
-            OPS = {
-                "NOT": lambda x: not x,
-                "NEG": lambda x: -x,
-            }
-            concrete = OPS[_SQL_OP_MAP[self.key.upper()]](operand_value)
-            return concrete
-
-        except Exception as e:
-            raise NotImplementedError(
-                f"Unknown unary operator: {self.key.upper()}, {self.operand.concrete} {e}"
-            )
 
 
 class Neg(Unary):

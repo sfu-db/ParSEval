@@ -61,6 +61,9 @@ def get_domainpool(instance: Instance) -> ColumnDomainPool:
     return pool
 
 
+def coerce_datatype(): ...
+
+
 class ExprEncoder(ExpressionEncoder):
     def __init__(self):
         super().__init__(None, None, True)
@@ -178,7 +181,7 @@ class Generator:
                             column_name=cast.this.name,
                         )
                         if pool:
-                            pool.datatype = cast.to_type
+                            pool.datatype = cast.to
 
         ### step 2: declare variables
 
@@ -190,6 +193,8 @@ class Generator:
         for label, constraints in self.constraints.items():
             for constraint in constraints:
                 columnrefs = set(constraint.find_all(rex.ColumnRef))
+                if not columnrefs:
+                    continue
                 for columnref in columnrefs:
                     var_name = f"{columnref.qualified_name}"
                     if var_name not in var_to_columnref:
@@ -237,6 +242,8 @@ class Generator:
                     condition = ExprEncoder().visit(
                         constraint, context={**columnref_to_var}
                     )
+                    # if condition is not None:
+                    logging.info(f"Encoded constraint: {condition}")
                     solver.add_constraint(condition)
 
         return solver, var_to_columnref, columnref_to_var

@@ -15,6 +15,42 @@ SECONDS_PER_DAY = 86400
 SECONDS_PER_MONTH = 30 * SECONDS_PER_DAY  # approximate month
 SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY  # approximate year
 
+def like_to_z3(var, pattern: str):
+    """
+    Convert SQL LIKE pattern to Z3 regex constraint using native Z3 regex constructors.
+    
+    % -> any sequence of characters (ReStar)
+    _ -> any single character (ReRange)
+    Other characters -> literal character (Re)
+    """
+    """
+    Convert a SQL LIKE pattern to Z3 constraints in a way that
+    allows Z3 to generate realistic Python strings.
+    """
+    parts = []
+    constraints = []
+    pattern = pattern.as_string()
+
+    for i, ch in enumerate(pattern):
+        if ch == "_":
+            c = z3.String(f"char_{i}")
+            constraints.append(z3.Length(c) == 1)
+            parts.append(c)
+        elif ch == "%":
+            tail = z3.String(f"percent_{i}")
+            constraints.append(z3.Length(tail) >= 1)
+            parts.append(tail)
+        else:
+            parts.append(z3.StringVal(ch))
+    expr = parts[0]
+    for p in parts[1:]:
+        expr = z3.Concat(expr, p)
+
+    # The LIKE constraint is var == expr AND all length constraints
+    constraints.append(var == expr)
+    return z3.And(*constraints)  # <- combine into a single Z3 expression
+
+
 
 class SMTSolver(SolverAdapter):
     _SQL_OP_MAP = {
@@ -22,7 +58,7 @@ class SMTSolver(SolverAdapter):
         "SUB": lambda a, b: a - b,
         "MUL": lambda a, b: a * b,
         "DIV": lambda a, b: a / b,
-        "FLOORDIV": lambda a, b: a // b,
+        "FLOORDIV": lambda a, b: a / b,
         "MOD": lambda a, b: a % b,
         "POW": lambda a, b: a**b,
         "EQ": lambda a, b: a == b,
@@ -34,7 +70,7 @@ class SMTSolver(SolverAdapter):
         "AND": lambda a, b: z3.And(a, b),
         "OR": lambda a, b: z3.Or(a, b),
         "NOT": lambda a: z3.Not(a),
-        "LIKE": "LIKE",
+        "LIKE": lambda a, b: like_to_z3(a, b),
     }
 
     def __init__(self, name: str):
@@ -48,17 +84,18 @@ class SMTSolver(SolverAdapter):
     def solve(
         self, variables: List[Variable], constraints: List[Condition], context=None
     ):
-
         context = context if context is not None else {}
         context["variable_to_z3"] = {}
         ctx = context.get("z3_ctx", None)
         z3_constraints = []
         for constraint in constraints:
+            if any([c.concrete is None for c in constraint.find_all(Const)]):
+                continue
             z3_constraint = self._to_z3_constraint(constraint, ctx=ctx, context=context)
             z3_constraints.append(z3_constraint)
+
         solver = z3.Solver(ctx=ctx)
         solver.add(*z3_constraints)
-
         solver.add(*context.get("safe_divisions", []))
         solver.add(*context.get("str_format", []))
         solver.add(*context.get("datetime_format", []))
@@ -71,9 +108,6 @@ class SMTSolver(SolverAdapter):
 
         status = solver.check()
         assignments = []
-
-        # logging.info(solver.sexpr())
-
         if status == z3.sat:
             model = solver.model()
             for var_name, z3var in context.get("variable_to_z3", {}).items():
@@ -87,19 +121,6 @@ class SMTSolver(SolverAdapter):
                         metadata={},
                     )
                 )
-            # for d in model.decls():
-            #     assignments.append(
-            #         ValueAssignment(
-            #             column=d.name(),
-            #             alias="",
-            #             value=self._to_concrete(d, model[d], context),
-            #             data_type="",
-            #             metadata={},
-            #         )
-            #     )
-        # else:
-        #     logging.info(solver.sexpr())
-
         with open("tests/db/smt_debug.smt2", "a") as f:
             f.write(sexpr + "\n")
             f.write(str(status) + "\n")
@@ -115,7 +136,6 @@ class SMTSolver(SolverAdapter):
                 z3var = self._declare_sort(condition, context=context, ctx=ctx)
                 context.setdefault("variable_to_z3", {})[condition.name] = z3var
                 context.setdefault("z3_to_variable", {})[str(z3var)] = condition
-
             return context["variable_to_z3"][condition.name]
         if isinstance(condition, Const):
             if condition.dtype.is_type(DataType.Type.BOOLEAN):
@@ -130,12 +150,13 @@ class SMTSolver(SolverAdapter):
                 for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
                     try:
                         dt_value = datetime.strptime(condition.value, fmt)
-                        return int(dt_value.timestamp())
+                        return z3.IntVal(int(dt_value.timestamp()))
                     except ValueError:
                         continue
                 raise ValueError(f"Invalid date format: {condition.value}")
 
         if condition.key.upper() in self._SQL_OP_MAP:
+
             op = self._SQL_OP_MAP[condition.key.upper()]
             args = []
             for arg in condition.args:
@@ -147,6 +168,11 @@ class SMTSolver(SolverAdapter):
             if condition.key.upper() in {"DIV", "FLOORDIV"}:
                 safe_div_constraint = self._ensure_safe_div(args[1])
                 context.setdefault("safe_divisions", []).append(safe_div_constraint)
+            # logging.info(f"Applying operation {condition} on args {args}")
+
+            if condition.key.upper() == "LIKE":
+                for arg in args:
+                    logging.info(f"{type(arg)} -> {arg}")
 
             if callable(op):
                 return op(*args)
@@ -237,11 +263,9 @@ class SMTSolver(SolverAdapter):
         variable = z3_to_variable[str(decl)]
         if variable.datatype.is_type(*DataType.TEMPORAL_TYPES):
             from datetime import datetime
-
             ts = z3val.as_long()
             concrete = datetime.fromtimestamp(ts)
-        elif variable.datatype.is_type(*DataType.TEXT_TYPES):
-            concrete = z3val.as_string()
+        
         elif variable.datatype.is_type(DataType.Type.BOOLEAN):
             concrete = bool(z3val)
         elif variable.datatype.is_type(*DataType.INTEGER_TYPES):
@@ -250,6 +274,8 @@ class SMTSolver(SolverAdapter):
             concrete = z3val.as_decimal(prec=32)
             concrete = concrete[:-1] if concrete.endswith("?") else concrete
             concrete = float(concrete)
+        elif variable.datatype.is_type(*DataType.TEXT_TYPES):
+            concrete = z3val.as_string()
         else:
             raise RuntimeError(f"Cannot interpret {z3val}")
         return concrete
