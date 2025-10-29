@@ -9,8 +9,8 @@ from collections import deque
 import string, re
 from datetime import datetime, timedelta
 from ..dtype import DataType, DATATYPE
-from src.parseval.plan import rex
 
+from src.parseval import symbol as sym
 from src.parseval.helper import like_to_pattern
 
 logger = logging.getLogger(__name__)
@@ -342,50 +342,48 @@ class ValuePool:
                     variables=[self.alias],
                 )
 
-    def apply_constraints(self, constraint: rex.Expression):
-        op = constraint.op
+    def apply_constraints(self, constraint: sym.Condition):
+        op = constraint.key
 
-        if self.datatype.is_numeric():
-            if op in {">", ">="}:
+        if self.datatype.is_type(*DataType.NUMERIC_TYPES):
+            if op in {"gt", "ge"}:
                 self.propagate_bounds(min_val=constraint.right.value)
-            elif op in {"<", "<="}:
+            elif op in {"lt", "le"}:
                 self.propagate_bounds(max_val=constraint.right.value)
-            elif op in {"=", "==", "IS"}:
+            elif op in {"eq", "IS"}:
                 self.local_values = {constraint.right.value}
                 self.choices.append(constraint.right.value)
                 self.min_val = self.max_val = constraint.right.value
-            elif op in {"!=", "<>"}:
+            elif op in {"ne"}:
                 self.add_excluded(constraint.right.value)
             else:
                 raise NotImplementedError(f"Numeric op {op} not implemented")
-        elif self.datatype.is_datetime():
-            if op in {">", ">="}:
+        elif self.datatype.is_type(*DataType.TEMPORAL_TYPES):
+            if op in {"gt", "ge"}:
                 self.propagate_bounds(min_val=constraint.right.value)
-            elif op in {"<", "<="}:
-                # from dateutil import parser as date_parser
-                # parser
-                values = constraint.right.find_all(rex.sqlglot_exp.Literal)
+            elif op in {"lt", "le"}:
+                values = constraint.right.find_all(sym.Const)
                 value = datetime.strptime(values[0].value, "%Y-%m-%d")
                 self.propagate_bounds(max_val=value)
-            elif op in {"=", "=="}:
+            elif op in {"=", "eq"}:
                 self.local_values = {constraint.right.value}
                 self.min_val = self.max_val = constraint.right.value
-            elif op in {"!=", "<>"}:
+            elif op in {"!=", "ne"}:
                 self.add_excluded(constraint.right.value)
             else:
                 raise NotImplementedError(f"Datetime op {op} not implemented")
-        elif self.datatype.is_boolean():
-            if op in {"=", "=="}:
+        elif self.datatype.is_type(DataType.Type.BOOLEAN):
+            if op in {"eq", "=="}:
                 self.local_values = {constraint.right.value}
-            elif op in {"!=", "<>"}:
+            elif op in {"ne", "<>"}:
                 self.add_excluded(constraint.right.value)
             else:
                 raise NotImplementedError(f"Boolean op {op} not implemented")
-        elif self.datatype.is_string():
-            if op in {"=", "==", "IS"}:
+        elif self.datatype.is_type(*DataType.TEXT_TYPES):
+            if op in {"=", "eq", "IS"}:
                 self.choices.append(constraint.right.value)
                 self.local_values = {constraint.right.value}
-            elif op in {"!=", "<>"}:
+            elif op in {"ne", "<>"}:
                 self.add_excluded(constraint.right.value)
             elif op.upper() == "LIKE":
                 raw_pattern = constraint.right.value

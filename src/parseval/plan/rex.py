@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import abstractmethod
 from functools import reduce
-from sqlglot import exp as sqlglot_exp
+from sqlglot import exp as sqlglot_exp, expressions
 from sqlglot import generator
 from src.parseval.dtype import DataType
 from typing import TYPE_CHECKING, List, Optional, Dict, Any
@@ -405,7 +405,7 @@ class LogicalAggregate(UnaryOperator):
     def __repr__(self):
         keys = ", ".join([str(k) for k in self.keys])
         agg_funcs = ", ".join([str(a) for a in self.aggs])
-        return f"{self.operator_type}(keys=[{keys}], aggs=[{agg_funcs})]"
+        return f"{self.operator_type}(keys=[{keys}], aggs=[{agg_funcs}]"
 
     def schema(self, catalog):
         if "_schema" in self.args:
@@ -541,6 +541,9 @@ class Planner:
             this=self.walk(kwargs["operands"].pop()),
             datatype=DataType.build(kwargs.pop("type")),
         ),
+        "IS_NULL": lambda self, **kwargs: Is_Null(
+            this=self.walk(kwargs.pop("operands").pop())
+        ),
         #     "INSTR": lambda args: sqlglot_exp.InStr(
         #         this=args[0], substring=args[1], start=args[2] if len(args) == 3 else None
         #     ),
@@ -640,7 +643,7 @@ class Planner:
                 )
             )
         agg_funcs = [self.walk(func_def) for func_def in kwargs.pop("aggs")]
-        return LogicalAggregate(this=child, keys=groupby, aggs=agg_funcs)
+        return LogicalAggregate(this=child, expressions=groupby, aggs=agg_funcs)
 
     def on_union(self, **kwargs):
         pass
@@ -689,7 +692,7 @@ BINARY_OPERATORS = {
 
 UNARY_OPERATORS = {
     "NOT": sqlglot_exp.Not,
-    "IS_NULL": Is_Null,
+    # "IS_NULL": Is_Null,
 }
 AGG_FUNCS = {
     "COUNT": sqlglot_exp.Count,
@@ -743,8 +746,8 @@ for kind, op_class in BINARY_OPERATORS.items():
 
 for kind, op_class in UNARY_OPERATORS.items():
     Planner.EXPRESSION_HANDLERS[kind] = (
-        lambda self, op_class=op_class, **kwargs: op_class(
-            this=self.walk(kwargs.pop("operands").pop())
+        lambda self, op_class=op_class, **kwargs: negate_predicate(
+            self.walk(kwargs.pop("operands").pop())
         )
     )
 
@@ -777,6 +780,7 @@ Planner.EXPRESSION_HANDLERS["CASE"] = parse_case
 for klass in [
     ColumnRef,
     Is_Null,
+    Is_Not_Null,
     LogicalOperator,
     LogicalAggregate,
     LogicalJoin,

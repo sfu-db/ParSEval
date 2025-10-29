@@ -1,8 +1,10 @@
 from __future__ import annotations
 from abc import abstractmethod
 from functools import reduce, wraps
+from sys import flags
 from sqlglot import exp as sqlglot_exp
 from sqlglot import generator
+from sqlglot.helper import is_type
 from src.parseval.dtype import DataType
 from typing import TYPE_CHECKING, List, Optional, Dict, Any
 from src.parseval.symbol import Row
@@ -96,28 +98,29 @@ class ExpressionEncoder:
         return smt_expr
 
     def visit_literal(self, expr: sqlglot_exp.Literal, parent_stack=None, context=None):
+        from src.parseval.symbol import Const
         value = expr.this
-        if expr.is_int:
-            return int(value)
-        elif expr.is_number:
-            return float(value)
-        elif expr.is_string:
-            return str(value)
-        elif expr.is_date or expr.is_time or expr.is_timestamp:
-            from datetime import datetime
-
-            try:
-                return datetime.strptime(value, "%Y-%m-%d")
-            except ValueError:
-                # fallback for timestamp formats
+        datatype = expr.args.get('datatype')
+        try:
+            if datatype.is_type(*DataType.INTEGER_TYPES):
+                value = int(value)
+            elif datatype.is_type(*DataType.REAL_TYPES):
+                value = float(value)
+            elif datatype.is_type(DataType.Type.BOOLEAN):
+                value = bool(value)
+            elif datatype.is_type(*DataType.TEMPORAL_TYPES):
+                from datetime import datetime
                 for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
                     try:
-                        return datetime.strptime(value, fmt)
+                        value = datetime.strptime(value, fmt)
                     except ValueError:
                         continue
-                return value  # leave as string if unparseable
-        else:
-            return value
+            elif datatype.is_type(*DataType.TEXT_TYPES):
+                value = str(value)
+        except Exception as e:
+            logging.info(f'Failed to convert {repr(expr)} to const in datatype {datatype}, {e}')
+            value = value            
+        return Const(value, dtype= datatype)
 
     def visit_predicate(self, expr: sqlglot_exp.Predicate, parent_stack, context):
         with self.predicate_scope(context=context) as track:
@@ -127,11 +130,16 @@ class ExpressionEncoder:
             right = self.visit(
                 expr.expression, parent_stack=parent_stack + [expr], context=context
             )
-            if not self.ignore_nulls and left.concrete is None:
-                raise Skipnulls()
-            smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
-            res = track(expr, smt_expr)
-            return res
+            
+            try:
+                smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
+                return track(expr, smt_expr)
+            except Exception as e:
+                if not self.ignore_nulls and left.concrete is None:
+                    raise Skipnulls()
+                
+            
+            return None
 
     def visit_is_null(self, expr: Is_Null, parent_stack=None, context=None):
         with self.predicate_scope(context=context) as track:
@@ -139,6 +147,16 @@ class ExpressionEncoder:
                 expr.this, parent_stack=parent_stack + [expr], context=context
             )
             smt_expr = this.is_(None)
+            return track(expr, smt_expr)
+
+    def visit_is_not_null(self, expr, parent_stack=None, context=None):
+
+        with self.predicate_scope(context=context) as track:
+            this = self.visit(
+                expr.this, parent_stack=parent_stack + [expr], context=context
+            )
+            smt_expr = this.is_(None).not_()
+            # smt_expr = this.is_not(None)
             return track(expr, smt_expr)
 
     def visit_binary(self, expr: sqlglot_exp.Binary, parent_stack, context):
@@ -151,12 +169,6 @@ class ExpressionEncoder:
         smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
         return smt_expr
 
-    # def visit_is(self, expr: IS):
-    #     with self.predicate_scope() as track:
-    #         left = expr.left.accept(self)
-    #         right = expr.right.accept(self)
-    #         return track(expr, left.is_(right))
-    # from sqlglot.executor import env
 
     def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
         this = self.visit(
@@ -167,8 +179,15 @@ class ExpressionEncoder:
     def visit_cast(self, expr, parent_stack=None, context=None):
         inner = self.visit(expr.this, parent_stack + [expr], context)
         to_type = expr.to
-        # type_name = str(target_type).upper() if target_type else None
-        return inner
+        if to_type.is_type(DataType.Type.DATE, DataType.Type.DATE32):
+            from datetime import datetime
+            inner.concrete = datetime.strptime(inner.concrete, "%Y-%m-%d")
+        elif to_type.is_type(DataType.Type.DATETIME, DataType.Type.DATETIME64):
+            from datetime import datetime
+            inner.concrete = datetime.strptime(inner.concrete, "%Y-%m-%dT%H:%M:%S")
+
+        args = (a for a in inner.args)
+        return inner.__class__(*args, dtype = expr.to, **inner.metadata)
 
         concrete = operand.concrete if isinstance(expr.args[0], ColumnRef) else operand
 
@@ -188,11 +207,11 @@ class ExpressionEncoder:
             return operand
 
     def visit_case(self, expr: sqlglot_exp.Case, parent_stack=None, context=None):
-        for when in expr.ifs:
+        for when in expr.args.get("ifs"):
             smt_expr = self.visit(when.this, parent_stack + [expr], context)
             if smt_expr:
-                return self.visit(when.true, parent_stack + [expr], context)
-        return self.visit(expr.default, parent_stack + [expr], context)
+                return self.visit(when.args.get("true"), parent_stack + [expr], context)
+        return self.visit(expr.args.get("default"), parent_stack + [expr], context)
 
     def visit_subquery(self, expr, parent_stack, context):
         sub_ctx = {
@@ -371,12 +390,6 @@ class UExprEncoder(LogicalPlanVisitor):
         return self.visit_logicalfilter(expr, parent_stack, context)
 
 
-@dataclass
-class SymbolTable:
-    data: List
-    tbl_exprs: List[ColumnRef] = field(default_factory=list, repr=False)
-
-
 def track_next(func):
     @wraps(func)
     def wrapper(self, expr, *args, **kwargs):
@@ -478,8 +491,7 @@ class PlanEncoder(LogicalPlanVisitor):
                     cond.transform(resolve_schema, input_schema)
                     for cond in ref_conditions
                 ]
-                takens = [b.concrete for b in smt_conditions]
-                # logging.info(f"SQL condition: {sql_conditions}, takens: {takens}")
+                takens = [True if b.concrete else False for b in smt_conditions]
                 self.trace.which_path(
                     operator=node,
                     ref_conditions=ref_conditions,
@@ -660,3 +672,37 @@ class PlanEncoder(LogicalPlanVisitor):
                 rows=[Row(row)],
             )
         return out
+
+    def visit_having(self, node: LogicalHaving, parent_stack, context):
+        input_data = self.visit(node.this, parent_stack + [node], context)
+        input_schema = node.this.schema(catalog=self.instance.catalog)        
+        out = []
+        for row in input_data:
+            encoder = ExpressionEncoder(row, plan_encoder=self)
+            try:
+                context = {}
+                smt = encoder.visit(node.condition, context=context)
+                if smt:
+                    out.append(row)
+                smt_conditions = context.get("smt_conditions", [])
+                ref_conditions = context.get("ref_conditions", [])
+                sql_conditions = [
+                    cond.transform(resolve_schema, input_schema)
+                    for cond in ref_conditions
+                ]
+                takens = [True if b.concrete else False for b in smt_conditions]
+                self.trace.which_path(
+                    operator=node,
+                    ref_conditions=ref_conditions,
+                    sql_conditions=sql_conditions,
+                    symbolic_exprs=smt_conditions,
+                    takens=takens,
+                    branch=smt.concrete,
+                    rows=[row],
+                )
+            except Skipnulls:
+                logging.info(f"Skipping row with nulls: {row}")
+                continue
+        return out
+        
+        
