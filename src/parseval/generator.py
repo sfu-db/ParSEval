@@ -142,7 +142,8 @@ class Generator:
                         columnref.name
                     ] = assignment.value
                 if concretes:
-                    plausible.mark_covered()
+                    # plausible.mark_covered()
+                    plausible.update_mark()
                     logging.info(concretes)
                     for table_name in instance.catalog.tables:
                         if table_name in concretes:
@@ -243,7 +244,8 @@ class Generator:
                         constraint, context={**columnref_to_var}
                     )
                     # if condition is not None:
-                    logging.info(f"Encoded constraint: {condition}")
+                    # logging.info(f"Encoded constraint: {repr(condition)}")
+                    # logging.info(f"From original: {constraint}")
                     solver.add_constraint(condition)
 
         return solver, var_to_columnref, columnref_to_var

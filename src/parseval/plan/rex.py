@@ -505,15 +505,6 @@ def resolve_schema(expr, input_schema: Schema):
 
 class Planner:
     EXPRESSION_HANDLERS = {
-        # "LITERAL": lambda planner, **kwargs: sqlglot_exp.Literal(
-        #     this=kwargs.pop("value"),
-        #     is_string=isinstance(kwargs.pop("value"), str),
-        #     datatype=DataType.build(
-        #         dtype=kwargs.pop("type", "UNKNOWN"),
-        #         nullable=kwargs.pop("nullable"),
-        #         precision=kwargs.pop("precision", None),
-        #     ),
-        # ),
         "INPUT_REF": lambda planner, **kwargs: ColumnRef(
             this=sqlglot_exp.to_identifier(kwargs.pop("name")),
             datatype=DataType(this=kwargs.pop("type", "UNKNOWN")),
@@ -571,15 +562,15 @@ class Planner:
     def __init__(self, expression_registry=None):
         self.expr_registry = expression_registry
         self.dispatches = {
-            "relOp": lambda self, node: self.TRANSFORM_MAPPING[node.pop("relOp")](
+            "relOp": lambda self, node: self.TRANSFORM_MAPPING[node["relOp"]](
                 self, **node
             ),
-            "kind": lambda self, node: self.EXPRESSION_HANDLERS[node.pop("kind")](
+            "kind": lambda self, node: self.EXPRESSION_HANDLERS[node["kind"]](
                 self, **node
             ),
-            "operator": lambda self, node: self.EXPRESSION_HANDLERS[
-                node.pop("operator")
-            ](self, **node),
+            "operator": lambda self, node: self.EXPRESSION_HANDLERS[node["operator"]](
+                self, **node
+            ),
         }
 
     def explain2(self, schema: str, plan_path: str, dialect: str = "postgres"):
@@ -594,10 +585,11 @@ class Planner:
 
     def walk(self, node):
         for key, func in self.dispatches.items():
-            if key in node and (
-                node.get(key).upper() in self.EXPRESSION_HANDLERS
-                or node.get(key) in self.TRANSFORM_MAPPING
-            ):
+            # and (
+            #     node.get(key).upper() in self.EXPRESSION_HANDLERS
+            #     or node.get(key) in self.TRANSFORM_MAPPING
+            # )
+            if key in node:
                 return func(self, node)
         raise ValueError(f"Cannot find relOp or kind/operator in node: {node}")
 
@@ -642,15 +634,18 @@ class Planner:
                     datatype=DataType.build(key.get("type")),
                 )
             )
-        agg_funcs = [self.walk(func_def) for func_def in kwargs.pop("aggs")]
+
+        aggs = kwargs.pop("aggs", [])
+        agg_funcs = [self.walk(func_def) for func_def in aggs]
+
         return LogicalAggregate(this=child, expressions=groupby, aggs=agg_funcs)
 
     def on_union(self, **kwargs):
         pass
 
     def on_sort(self, **kwargs):
-        this = self.walk(kwargs.pop("inputs")[0])
-        sort = kwargs.pop("sort", [])
+        this = self.walk(kwargs["inputs"][0])
+        sort = kwargs.get("sort", [])
         return LogicalSort(
             this=this,
             expressions=[
@@ -676,12 +671,6 @@ BINARY_OPERATORS = {
     "LESS_THAN_OR_EQUAL": sqlglot_exp.LTE,
     "GREATER_THAN_OR_EQUAL": sqlglot_exp.GTE,
     "LIKE": sqlglot_exp.Like,
-    "AND": sqlglot_exp.And,
-    "OR": sqlglot_exp.Or,
-    "PLUS": sqlglot_exp.Add,
-    "MINUS": sqlglot_exp.Sub,
-    "TIMES": sqlglot_exp.Mul,
-    "DIVIDE": sqlglot_exp.Div,
     "AND": sqlglot_exp.And,
     "OR": sqlglot_exp.Or,
     "PLUS": sqlglot_exp.Add,
@@ -720,19 +709,23 @@ def parse_literal(self, **kwargs):
 
 
 for func_name, func_class in AGG_FUNCS.items():
-    Planner.EXPRESSION_HANDLERS[func_name] = lambda self, **kwargs: func_class(
-        this=(
-            ColumnRef(
-                this=sqlglot_exp.to_identifier(f'${kwargs["operands"][0]["column"]}'),
-                type=DataType.build(kwargs["operands"][0].get("type")),
-                ref=kwargs["operands"][0]["column"],
-            )
-            if kwargs.get("operands")
-            else sqlglot_exp.Star()
-        ),
-        distinct=kwargs.get("distinct", False),
-        ignorenulls=kwargs.get("ignorenulls", False),
-        datatype=DataType.build(kwargs.get("type")),
+    Planner.EXPRESSION_HANDLERS[func_name] = (
+        lambda self, func_class=func_class, **kwargs: func_class(
+            this=(
+                ColumnRef(
+                    this=sqlglot_exp.to_identifier(
+                        f'${kwargs["operands"][0]["column"]}'
+                    ),
+                    type=DataType.build(kwargs["operands"][0].get("type")),
+                    ref=kwargs["operands"][0]["column"],
+                )
+                if kwargs.get("operands")
+                else sqlglot_exp.Star()
+            ),
+            distinct=kwargs.get("distinct", False),
+            ignorenulls=kwargs.get("ignorenulls", False),
+            datatype=DataType.build(kwargs.get("type")),
+        )
     )
 
 

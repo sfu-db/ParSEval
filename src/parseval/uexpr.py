@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, TYPE_CHECKING, Union, Optional, Any, Dict
 from src.parseval.symbol import Variable
+from .helper import group_by_concrete
 
 if TYPE_CHECKING:
     from .plan.rex import Expression as Expression
@@ -19,6 +20,32 @@ from collections import defaultdict
 
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Union, Set, Any, Tuple
+
+
+class PlausibleBit(IntEnum):
+    """Bits representing different plausible branches."""
+
+    FALSE = 0  # e.g., if condition is false
+    TRUE = 1  # e.g., if condition is true
+    JOIN = 2  # e.g., threr exist tuple in right table cannot join with left table
+    NULL = 3  # e.g., column is null
+    DUPLICATE = 4  # e.g., duplicate values exist
+    MAX = 5  # e.g., number of max value
+    MIN = 6  # e.g., number of  min value
+    GROUP_COUNT = 7  # e.g., number of groups
+    GROUP_SIZE = 8  # e.g., size of groups(count of rows in each group)
+
+    @classmethod
+    def from_int(cls, value: Union[int, str, bool, PlausibleBit]) -> "PlausibleBit":
+        if isinstance(value, PlausibleBit):
+            return value
+        return cls(int(value))
+
+    def __str__(self):
+        return str(self.value)
+
+
+PBit = PlausibleBit
 
 
 class PlausibleType(Enum):
@@ -40,8 +67,8 @@ class ConstraintConfig:
     """
 
     should_negate: bool = True
-    # Possible bits for branches (e.g., 0, 1 for if/else, 2 for join, 3 for null, 4 for duplicate, 5 for max/min)
-    plausible_bits: Tuple[int, ...] = (0, 1)
+    # Possible bits for branches (e.g., 0, 1 for if/else, 2 for join, 3 for null, 4 for duplicate, 5 for max, 6 for min)
+    plausible_bits: Tuple[int, ...] = (PBit.FALSE, PBit.TRUE)
 
     @classmethod
     def for_predicate(cls) -> ConstraintConfig:
@@ -50,38 +77,50 @@ class ConstraintConfig:
         Bits: 0=false, 1=true
         """
         return cls(
-            plausible_bits=(0, 1),
+            plausible_bits=(PBit.FALSE, PBit.TRUE),
         )
 
     @classmethod
     def for_join(cls) -> ConstraintConfig:
-        return cls(plausible_bits=(0, 1, 2))
+        return cls(plausible_bits=(PBit.FALSE, PBit.TRUE, PBit.JOIN))
 
     @classmethod
     def for_project(cls) -> ConstraintConfig:
         return cls(
-            plausible_bits=(1, 3, 4),
+            plausible_bits=(
+                PBit.TRUE,
+                PBit.NULL,
+                PBit.DUPLICATE,
+            ),
             should_negate=False,
         )
 
     @classmethod
     def for_sort(cls) -> ConstraintConfig:
         return cls(
-            plausible_bits=(1,),
+            plausible_bits=(PBit.TRUE, PBit.MAX, PBit.MIN),
             should_negate=False,
         )
 
     @classmethod
     def for_groupby(cls) -> ConstraintConfig:
         return cls(
-            plausible_bits=(1, 3, 4),
+            plausible_bits=(
+                PBit.TRUE,
+                PBit.GROUP_COUNT,
+                PBit.GROUP_SIZE,
+            ),
             should_negate=False,
         )
 
     @classmethod
     def for_aggregate(cls) -> ConstraintConfig:
         return cls(
-            plausible_bits=(1, 3, 4),
+            plausible_bits=(
+                PBit.TRUE,
+                PBit.NULL,
+                PBit.DUPLICATE,
+            ),
             should_negate=False,
         )
 
@@ -102,16 +141,16 @@ class _Constraint:
         self._pattern = None
         self._hash = None
 
-    def bit(self):
+    def bit(self) -> PlausibleBit:
         if self.parent is not None:
             for k, v in self.parent.children.items():
                 if v is self:
                     return k
-        return ""
 
     def hit(self):
         if self.parent is not None and self.parent.operator != "ROOT":
-            return len(self.parent.symbolic_exprs[self.bit()])
+            bit = self.bit()
+            return len(self.parent.symbolic_exprs[bit])
         return 0
 
     def get_path_to_root(self) -> List[Constraint]:
@@ -128,28 +167,42 @@ class _Constraint:
         if self._pattern is not None:
             return self._pattern
         bits = [node.bit() for node in path[2:]]
-        self._pattern = "".join(bits)
+        self._pattern = tuple(bits)
         return self._pattern
 
 
-def check_cover_duplicate(current_label, constraint: Constraint) -> bool:
+def check_cover_duplicate(current_plausible) -> bool:
     """Check if the constraint covers duplicate values."""
+    bit = current_plausible.bit()
+    current_label = current_plausible.plausible_type
+    constraint: Constraint = current_plausible.parent
+
     if isinstance(constraint.sql_condition, sql_exp.ColumnRef):
         if constraint.sql_condition.args.get("unique", False):
             return PlausibleType.INFEASIBLE
+        elif constraint.symbolic_exprs[bit]:
+            return PlausibleType.COVERED
         else:
-            values = [
-                v.concrete
-                for v in constraint.symbolic_exprs["1"]
-                if v.concrete is not None
-            ]
-            if len(values) != len(set(values)):
+            indices = defaultdict(list)
+            for i, v in enumerate(constraint.symbolic_exprs[PBit.TRUE]):
+                if v.concrete is not None:
+                    indices[v.concrete].append(i)
+            duplicates = {v: idxs for v, idxs in indices.items() if len(idxs) > 1}
+            if duplicates:
+                for v, idxs in duplicates.items():
+                    for idx in idxs:
+                        smt = constraint.symbolic_exprs[PBit.TRUE][idx]
+                        constraint.symbolic_exprs[bit].append(smt)
                 return PlausibleType.COVERED
     return current_label
 
 
-def check_cover_null(current_label, constraint: Constraint) -> bool:
+def check_cover_null(current_plausible) -> bool:
     """Check if the constraint covers null values."""
+    bit = current_plausible.bit()
+    label = current_plausible.plausible_type
+
+    constraint: Constraint = current_plausible.parent
     columnrefs = list(constraint.sql_condition.find_all(sql_exp.ColumnRef))
 
     if all([columnref.datatype.nullable is False for columnref in columnrefs]):
@@ -158,15 +211,28 @@ def check_cover_null(current_label, constraint: Constraint) -> bool:
     for columnref in columnrefs:
         if columnref.datatype.nullable is False:
             continue
+        elif constraint.symbolic_exprs[bit]:
+            return PlausibleType.COVERED
         else:
-            values = []
-            for smt in constraint.symbolic_exprs["1"]:
+            for index, smt in enumerate(constraint.symbolic_exprs[PBit.TRUE]):
                 for var in smt.find_all(Variable):
-                    values.append(var.concrete is None)
-            if values and any(values):
-                return PlausibleType.COVERED
+                    if var.concrete is None:
+                        constraint.symbolic_exprs[bit].append(smt)
+                        label = PlausibleType.COVERED
+                        break
 
-    return current_label
+    return label
+
+
+def check_cardinality(current_plausible) -> bool:
+    """Check if the constraint covers cardinality conditions."""
+    bit = current_plausible.bit()
+    label = current_plausible.plausible_type
+    constraint: Constraint = current_plausible.parent
+    values = group_by_concrete(constraint.symbolic_exprs[PBit.TRUE])
+    if len(values) > 1:
+        return PlausibleType.COVERED
+    return label
 
 
 class PlausibleBranch(_Constraint):
@@ -178,11 +244,15 @@ class PlausibleBranch(_Constraint):
     """
 
     LABEL_STRATEGIES = {
-        "4": check_cover_duplicate,
-        "3": check_cover_null,
-        "0": lambda current_label, parent: (
-            PlausibleType.COVERED if parent.symbolic_exprs["0"] else current_label
+        PBit.DUPLICATE: check_cover_duplicate,
+        PBit.NULL: check_cover_null,
+        PBit.FALSE: lambda self: (
+            PlausibleType.COVERED
+            if self.parent.symbolic_exprs[PBit.FALSE]
+            else self.plausible_type
         ),
+        PBit.MAX: check_cardinality,
+        PBit.MIN: check_cardinality,
     }
 
     def __init__(
@@ -202,6 +272,7 @@ class PlausibleBranch(_Constraint):
         self.plausible_type = plausible_type or PlausibleType.UNEXPLORED
 
     def mark_pending(self):
+        self.attempts += 1
         self.plausible_type = PlausibleType.PENDING
 
     def mark_infeasible(self):
@@ -218,10 +289,10 @@ class PlausibleBranch(_Constraint):
 
     def mark_positive_negative(self):
         bit = self.bit()
-        if self.parent.delta[str(bit)]:
+        if self.parent.delta[bit]:
             self.plausible_type = (
                 PlausibleType.POSITIVE
-                if self.branch and bit == "1"
+                if self.branch and bit == PBit.TRUE
                 else PlausibleType.COVERED
             )
 
@@ -231,7 +302,7 @@ class PlausibleBranch(_Constraint):
         bit = self.bit()
         for bit, strategy in self.LABEL_STRATEGIES.items():
             if bit == self.bit():
-                self.plausible_type = strategy(self.plausible_type, self.parent)
+                self.plausible_type = strategy(self)
 
     def __str__(self):
         return (
@@ -291,7 +362,7 @@ class Constraint(_Constraint):
         if isinstance(sql_condition, sql_exp.sqlglot_exp.Predicate):
             return self.CONSTRAINT_CONFIGS["predicate"]
         elif operator.operator_type == "Sort":
-            return ConstraintConfig(should_negate=False, plausible_bits=(1,))
+            return ConstraintConfig.for_sort()
         elif isinstance(sql_condition, sql_exp.ColumnRef):
             return self.CONSTRAINT_CONFIGS["project"]
 
@@ -300,7 +371,10 @@ class Constraint(_Constraint):
         if operator.operator_type == "Project":
             return self.CONSTRAINT_CONFIGS["project"]
         if operator.operator_type == "Aggregate":
-            return self.CONSTRAINT_CONFIGS["aggregate"]
+            if isinstance(sql_condition, tuple(sql_exp.AGG_FUNCS.values())):
+                return self.CONSTRAINT_CONFIGS["aggregate"]
+
+            return self.CONSTRAINT_CONFIGS["groupby"]
 
         raise ValueError(
             f"Cannot infer config for operator type: {operator.operator_type}"
@@ -337,10 +411,11 @@ class Constraint(_Constraint):
         operator: LogicalOperator,
         ref_condition: Expression,
         sql_condition: Expression,
-        bit: str,
+        bit: PlausibleBit,
         branch: bool,
     ):
-        child_node = self.children.get(str(bit), None)
+
+        child_node = self.children.get(bit, None)
         if child_node is None or isinstance(child_node, PlausibleBranch):
             child_node = Constraint(
                 tree=self.tree,
@@ -350,20 +425,20 @@ class Constraint(_Constraint):
                 operator=operator,
                 branch=branch,
             )
-            self.children[str(bit)] = child_node
+            self.children[bit] = child_node
             child_node._create_plausible_siblings()
         return child_node
 
-    def update_delta(self, bit, symbolic_expr: Union[List[Symbol], Symbol], rows):
+    def update_delta(
+        self, bit: PlausibleBit, symbolic_expr: Union[List[Symbol], Symbol], rows
+    ):
         p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
-        self.symbolic_exprs[str(bit)].extend(p)
-        self.delta[str(bit)].append(rows)
-        if isinstance(self.children[str(bit)], PlausibleBranch):
-            self.children[str(bit)].mark_positive_negative()
+        self.symbolic_exprs[bit].extend(p)
+        self.delta[bit].append(rows)
 
     def _create_plausible_siblings(self):
         for bit in self.config.plausible_bits:
-            bit_str = str(bit)
+            bit_str = bit
             if bit_str in self.children:
                 continue
             plausible_type = None
@@ -374,14 +449,10 @@ class Constraint(_Constraint):
                 plausible_type=plausible_type,
             )
             self.children[bit_str] = plausible
-            # parent_pattern = self.pattern()
-            # if parent_pattern in self.tree.leaves:
-            #     del self.tree.leaves[parent_pattern]
             child_pattern = self.pattern()
             if child_pattern in self.tree.leaves:
                 del self.tree.leaves[child_pattern]
             child_pattern = plausible.pattern()  # cached pattern for child
-
             self.tree.leaves[child_pattern] = plausible
 
 
@@ -397,7 +468,9 @@ class UExprToConstraint:
         self.root_constraint = Constraint(self, None, None)
         ## we use this positive_path to cache all positive paths' constraints.
         self.positive_nodes: Dict[str, Set[Constraint]] = defaultdict(set)
-        self.positive_nodes["ROOT"].add((self.root_constraint, "1"))  # (Node, bit)
+        self.positive_nodes["ROOT"].add(
+            (self.root_constraint, PBit.TRUE)
+        )  # (Node, bit)
         self.prev_operator: Optional[LogicalOperator] = "ROOT"
         self.declare = declare
         self.threshold = threshold
@@ -439,7 +512,7 @@ class UExprToConstraint:
             # ):
             #     continue
             node = positive_node
-            b = str(bit)
+            b = bit
             for index, (ref_condition, sql_condition) in enumerate(
                 zip(ref_conditions, sql_conditions)
             ):
@@ -452,7 +525,7 @@ class UExprToConstraint:
                 )
                 taken = takens[index]
                 smt_expr = symbolic_exprs[index] if index < len(symbolic_exprs) else []
-                b = str(int(taken))
+                b = PlausibleBit.from_int(taken)
                 node.update_delta(b, smt_expr, rows)
 
             if branch and (node, b) not in self.positive_nodes[operator.operator_id]:
@@ -464,11 +537,6 @@ class UExprToConstraint:
             leaf.update_mark()
 
     def next_path(self):
-        for pattern in self.leaves:
-            leaf = self.leaves[pattern]
-            if not isinstance(leaf, PlausibleBranch):
-                raise ValueError("Expected PlausibleBranch in leaves")
-            leaf.update_mark()
         for pattern, leaf in self.leaves.items():
             if leaf.branch and leaf.plausible_type == PlausibleType.UNEXPLORED:
                 if leaf.parent.operator.operator_type == "Join":
@@ -486,7 +554,7 @@ class UExprToConstraint:
                 PlausibleType.COVERED,
             }:
                 continue
-            if pattern.endswith("2"):
+            if pattern[-1] == PBit.JOIN:
                 continue
 
             if leaf.plausible_type == PlausibleType.UNEXPLORED:
@@ -494,22 +562,50 @@ class UExprToConstraint:
                 return leaf
         return None
 
+    def _declare_smt_constraints(self, plausible: PlausibleBranch):
+        """
+        declare SMT constraints for the plausible branch
+        """
+        path = plausible.get_path_to_root()
+        # path = reversed(path[1:])
+
+        # ### we first process constraints in the path to root
+        # for bit, node in zip(plausible.pattern(), path):
+        #     ...
+
+        for bit, node in zip(plausible.pattern(), path[1:]):
+            logging.info(f"Declaring SMT for bit {bit} at node {node.sql_condition}")
+            if bit is PBit.DUPLICATE:
+                self._declare_duplicate_constraints(node)
+            elif bit is PBit.NULL:
+                self._declare_null_constraints(node)
+            elif bit is PBit.FALSE:
+                if node.operator.operator_type == "aggregate":
+                    self._declare_smt_group_constraints(plausible, node)
+                elif isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
+                    pos_constraint = sql_exp.negate_predicate(node.sql_condition)
+                    self.declare(node.operator.operator_type, pos_constraint)
+            else:
+                if node.operator.operator_type == "aggregate":
+                    self._declare_smt_group_constraints(plausible, node)
+                else:
+                    self.declare(node.operator.operator_type, node.sql_condition)
+
     def _declare_duplicate_constraints(self, node):
         if isinstance(node.sql_condition, sql_exp.ColumnRef):
             if not node.sql_condition.args.get("unique", False) and node.symbolic_exprs:
+                constraint = node.sql_condition
+                value_counts = group_by_concrete(node.symbolic_exprs[PBit.TRUE])
+                if value_counts:
+                    from sqlglot.expressions import convert
 
-                value = random.choice(node.symbolic_exprs["1"])
-                from sqlglot.expressions import convert
-
-                if value.concrete is None:
-                    constraint = sql_exp.Is_Null(this=node.sql_condition)
-                else:
+                    values = sorted(value_counts.items(), key=lambda x: -len(x[1]))
+                    value = values[0][1][0]
                     literal = convert(value.concrete)
                     literal.set("datatype", node.sql_condition.datatype)
                     constraint = sql_exp.sqlglot_exp.EQ(
                         this=node.sql_condition, expression=literal
                     )
-
                 self.declare(node.operator.operator_type, constraint)
 
     def _declare_null_constraints(self, node):
@@ -522,31 +618,6 @@ class UExprToConstraint:
             null_constraint = sql_exp.Is_Null(this=node.sql_condition)
             self.declare(node.operator.operator_type, null_constraint)
 
-    def _declare_smt_constraints(self, plausible: PlausibleBranch):
-        """
-        declare SMT constraints for the plausible branch
-        """
-        path = plausible.get_path_to_root()
-
-        ### we first process constraints in the path to root
-        for bit, node in zip(plausible.pattern(), path[1:]):
-            if str(bit) == "4":
-                self._declare_duplicate_constraints(node)
-            elif str(bit) == "3":
-                self._declare_null_constraints(node)
-            elif str(bit) == "0":
-                if node.operator.operator_type == "aggregate":
-                    self._declare_smt_group_constraints(plausible, node)
-                elif isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
-                    pos_constraint = sql_exp.negate_predicate(node.sql_condition)
-                    self.declare(node.operator.operator_type, pos_constraint)
-
-            else:
-                if node.operator.operator_type == "aggregate":
-                    self._declare_smt_group_constraints(plausible, node)
-                else:
-                    self.declare(node.operator.operator_type, node.sql_condition)
-
     def _declare_smt_join_constraints(self, plausible: PlausibleBranch):
         """
         declare SMT constraints for the plausible branch
@@ -555,7 +626,7 @@ class UExprToConstraint:
 
         ### we first process constraints in the path to root
         for bit, node in zip(plausible.pattern(), path[1:]):
-            if str(bit) == "0":
+            if bit == PBit.FALSE:
                 if isinstance(node.sql_condition, sql_exp.sqlglot_exp.Predicate):
                     pos_constraint = sql_exp.negate_predicate(node.sql_condition)
                     self.declare(node.operator.operator_type, pos_constraint)
@@ -564,10 +635,10 @@ class UExprToConstraint:
 
     def _declare_smt_group_constraints(self, plausible: PlausibleBranch, node):
         bit = str(plausible.bit())
-        if bit == "0":
+        if bit == PBit.GROUP_COUNT:
             """declare SMT constraints for group count"""
-            if node.symbolic_exprs.get("1"):
-                for value in node.symbolic_exprs["1"]:
+            if node.symbolic_exprs.get(PBit.TRUE):
+                for value in node.symbolic_exprs[PBit.TRUE]:
                     from sqlglot.expressions import convert
 
                     literal = convert(value.concrete)
@@ -576,10 +647,10 @@ class UExprToConstraint:
                         this=node.sql_condition, expression=literal
                     )
                     self.declare(node.operator.operator_type, constraint)
-        elif bit == "1":
+        elif bit == PBit.TRUE:
             """declare SMT constraints for group size"""
-            if node.symbolic_exprs.get("1"):
-                for value in node.symbolic_exprs["1"]:
+            if node.symbolic_exprs.get(PBit.TRUE):
+                for value in node.symbolic_exprs[PBit.TRUE]:
                     from sqlglot.expressions import convert
 
                     literal = convert(value.concrete)

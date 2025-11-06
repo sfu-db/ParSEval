@@ -1,30 +1,11 @@
 from __future__ import annotations
 from src.parseval.dtype import DataType
 from typing import Any, List, Optional, Dict, TYPE_CHECKING, Iterable, Union, Tuple
+import logging
+import fnmatch
 
 if TYPE_CHECKING:
     from src.parseval.dtype import DATATYPE
-
-_SQL_OP_MAP = {
-    "ADD": "+",
-    "SUB": "-",
-    "MUL": "*",
-    "DIV": "/",
-    "FLOORDIV": "//",
-    "MOD": "%",
-    "POW": "^",
-    "EQ": "=",
-    "NE": "!=",
-    "LT": "<",
-    "LE": "<=",
-    "GT": ">",
-    "GE": ">=",
-    "AND": "AND",
-    "OR": "OR",
-    "NOT": "NOT",
-    "LIKE": "LIKE",
-    "IS": "=",
-}
 
 
 class _Symbol(type):
@@ -69,7 +50,11 @@ class Symbol(metaclass=_Symbol):
 
     @property
     def concrete(self):
-
+        mappings = {arg: arg.concrete for arg in self.args if isinstance(arg, Symbol)}
+        if self._concrete is None and mappings:
+            res = self.evaluate(mappings)
+            logging.info(f"Evaluated {self} to concrete value: {res}")
+            self.concrete = self.evaluate(mappings)
         return self._concrete
 
     def __bool__(self):
@@ -98,21 +83,24 @@ class Symbol(metaclass=_Symbol):
                 "neq": lambda *args: args[0] != args[1],
                 "gt": lambda *args: args[0] > args[1],
                 "lt": lambda *args: args[0] < args[1],
-                "lte": lambda *args: args[0] >= args[1],
-                "gte": lambda *args: args[0] <= args[1],
-                "like": lambda *args: args[0].like(args[1]),
+                "le": lambda *args: args[0] >= args[1],
+                "ge": lambda *args: args[0] <= args[1],
+                "like": lambda *args: fnmatch.fnmatch(
+                    args[0], args[1].replace("%", "*").replace("_", "?")
+                ),
                 "and": lambda *args: args[0].and_(args[1]),
                 "or": lambda *args: args[0].or_(args[1]),
                 "add": lambda *args: args[0] + args[1],
                 "sub": lambda *args: args[0] - args[1],
                 "mul": lambda *args: args[0] * args[1],
-                "div": lambda *args: args[0] // args[1],
-                "floordiv": lambda *args: args[0] // args[1],
+                "div": lambda *args: args[0] / args[1],
+                "floordiv": lambda *args: args[0] / args[1],
                 "AND": lambda *args: args[0] and args[1],
                 "OR": lambda *args: args[0] or args[1],
                 "NOT": lambda *args: not args[0],
                 "NEG": lambda *args: -args[0],
             }
+
             concrete = OPS[self.key.lower()](*args)
             return concrete
         except KeyError:
@@ -283,8 +271,13 @@ class Symbol(metaclass=_Symbol):
 
     def like(self, pattern: str) -> "Symbol":
         """Create a LIKE comparison symbol."""
+        logging.info(f"pattern type: {type(pattern)}, pattern: {pattern}")
+
         pattern = _ensure_symbol(pattern)
-        
+        r = LIKE(self, pattern, dtype="bool")
+
+        logging.info(r.concrete)
+
         return LIKE(self, pattern, dtype="bool")
 
     def is_(self, other: Symbol) -> "Symbol":
@@ -302,10 +295,6 @@ class Variable(Symbol):
     @property
     def name(self) -> str:
         return self.args[0]
-
-    @property
-    def concrete(self):
-        return self._concrete
 
 
 class Const(Symbol):

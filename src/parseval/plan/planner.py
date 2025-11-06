@@ -42,6 +42,7 @@ class ExpressionEncoder:
         "sub": lambda *args: args[0] - args[1],
         "mul": lambda *args: args[0] * args[1],
         "div": lambda *args: args[0] // args[1],
+        "floordiv": lambda *args: args[0] // args[1],
     }
 
     def __init__(
@@ -99,8 +100,9 @@ class ExpressionEncoder:
 
     def visit_literal(self, expr: sqlglot_exp.Literal, parent_stack=None, context=None):
         from src.parseval.symbol import Const
+
         value = expr.this
-        datatype = expr.args.get('datatype')
+        datatype = expr.args.get("datatype")
         try:
             if datatype.is_type(*DataType.INTEGER_TYPES):
                 value = int(value)
@@ -110,6 +112,7 @@ class ExpressionEncoder:
                 value = bool(value)
             elif datatype.is_type(*DataType.TEMPORAL_TYPES):
                 from datetime import datetime
+
                 for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
                     try:
                         value = datetime.strptime(value, fmt)
@@ -118,9 +121,8 @@ class ExpressionEncoder:
             elif datatype.is_type(*DataType.TEXT_TYPES):
                 value = str(value)
         except Exception as e:
-            logging.info(f'Failed to convert {repr(expr)} to const in datatype {datatype}, {e}')
-            value = value            
-        return Const(value, dtype= datatype)
+            value = None
+        return Const(value, dtype=datatype)
 
     def visit_predicate(self, expr: sqlglot_exp.Predicate, parent_stack, context):
         with self.predicate_scope(context=context) as track:
@@ -130,15 +132,14 @@ class ExpressionEncoder:
             right = self.visit(
                 expr.expression, parent_stack=parent_stack + [expr], context=context
             )
-            
+
             try:
                 smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
                 return track(expr, smt_expr)
             except Exception as e:
                 if not self.ignore_nulls and left.concrete is None:
                     raise Skipnulls()
-                
-            
+
             return None
 
     def visit_is_null(self, expr: Is_Null, parent_stack=None, context=None):
@@ -169,7 +170,6 @@ class ExpressionEncoder:
         smt_expr = self.SYMBOLIC_EVAL_REGISTRY[expr.key](left, right)
         return smt_expr
 
-
     def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
         this = self.visit(
             expr.this, parent_stack=parent_stack + [expr], context=context
@@ -181,13 +181,21 @@ class ExpressionEncoder:
         to_type = expr.to
         if to_type.is_type(DataType.Type.DATE, DataType.Type.DATE32):
             from datetime import datetime
+
             inner.concrete = datetime.strptime(inner.concrete, "%Y-%m-%d")
         elif to_type.is_type(DataType.Type.DATETIME, DataType.Type.DATETIME64):
             from datetime import datetime
-            inner.concrete = datetime.strptime(inner.concrete, "%Y-%m-%dT%H:%M:%S")
 
-        args = (a for a in inner.args)
-        return inner.__class__(*args, dtype = expr.to, **inner.metadata)
+            inner.concrete = datetime.strptime(inner.concrete, "%Y-%m-%dT%H:%M:%S")
+        try:
+            args = (a for a in inner.args)
+        except Exception as e:
+            logging.info(f"Error in cast args: {inner}, {e}")
+            logging.info(expr)
+            raise e
+        return inner.__class__(
+            *args, dtype=expr.to, concrete=inner.concrete, **inner.metadata
+        )
 
         concrete = operand.concrete if isinstance(expr.args[0], ColumnRef) else operand
 
@@ -211,6 +219,7 @@ class ExpressionEncoder:
             smt_expr = self.visit(when.this, parent_stack + [expr], context)
             if smt_expr:
                 return self.visit(when.args.get("true"), parent_stack + [expr], context)
+
         return self.visit(expr.args.get("default"), parent_stack + [expr], context)
 
     def visit_subquery(self, expr, parent_stack, context):
@@ -371,6 +380,7 @@ class UExprEncoder(LogicalPlanVisitor):
     ):
         input_schema = expr.this.schema(catalog=self.instance.catalog)
         ref_conditions, sql_conditions = [], []
+
         for key in expr.keys:
             ref_conditions.append(key)
             sql_conditions.append(key.transform(resolve_schema, input_schema))
@@ -459,9 +469,9 @@ class PlanEncoder(LogicalPlanVisitor):
 
             self.trace.which_path(
                 operator=node,
-                ref_conditions=context.get("ref_conditions", []),
+                ref_conditions=ref_conditions,
                 sql_conditions=sql_conditions,
-                symbolic_exprs=context.get("smt_conditions", []),
+                symbolic_exprs=smt_conditions,
                 takens=[
                     True if isinstance(sql, ColumnRef) else smt.concrete
                     for smt, sql in zip(smt_conditions, sql_conditions)
@@ -483,7 +493,7 @@ class PlanEncoder(LogicalPlanVisitor):
             try:
                 context = {}
                 smt = encoder.visit(node.condition, context=context)
-                if smt:
+                if smt.concrete:
                     out.append(row)
                 smt_conditions = context.get("smt_conditions", [])
                 ref_conditions = context.get("ref_conditions", [])
@@ -615,6 +625,10 @@ class PlanEncoder(LogicalPlanVisitor):
         input_schema = node.this.schema(catalog=self.instance.catalog)
         from collections import defaultdict
 
+        logging.info(
+            f"Aggregate keys: {node.keys}, aggs: {node.aggs} with {len(input_data)}"
+        )
+
         ### implement group by
         ref_conditions, sql_conditions, smt_conditions = [], [], []
         for key in node.keys + node.aggs:
@@ -629,7 +643,7 @@ class PlanEncoder(LogicalPlanVisitor):
 
         for group_key, rows in groups.items():
             row = [] + list(group_key)
-            for agg_func in node.aggs:
+            for func_index, agg_func in enumerate(node.aggs):
                 if not isinstance(agg_func, sqlglot_exp.AggFunc):
                     raise NotImplementedError(
                         f"Aggregate function {agg_func} not implemented yet."
@@ -643,25 +657,32 @@ class PlanEncoder(LogicalPlanVisitor):
 
                 elif agg_func.key == "sum":
                     sum_value = sum(
-                        row[agg_func.args[0].ref]
-                        for row in rows
-                        if row[agg_func.args[0].ref].concrete is not None
-                    )
-                    smt_conditions.append(sum_value)
-                    row.append(sum_value)
-                elif agg_func.key == "min":
-                    min_value = min(
                         row[agg_func.this.ref]
                         for row in rows
                         if row[agg_func.this.ref].concrete is not None
                     )
+                    if isinstance(sum_value, int):
+                        sum_value = Const(sum_value, dtype="INT")
+                    smt_conditions.append(sum_value)
+                    row.append(sum_value)
+                elif agg_func.key == "min":
+                    ref = (
+                        func_index + len(node.keys)
+                        if isinstance(agg_func.this, sqlglot_exp.Star)
+                        else agg_func.this.ref
+                    )
+
+                    min_value = min(
+                        row[ref] for row in rows if row[ref].concrete is not None
+                    )
+                    logging.info(f"Min aggregate on ref {ref}: {min_value}")
                     smt_conditions.append(min_value)
                     row.append(min_value)
                 else:
                     raise NotImplementedError(
                         f"Aggregate function {agg_func} not implemented yet."
                     )
-            out.append(Row(row))
+            out.append(Row(*row))
             self.trace.which_path(
                 operator=node,
                 ref_conditions=ref_conditions,
@@ -669,23 +690,23 @@ class PlanEncoder(LogicalPlanVisitor):
                 symbolic_exprs=smt_conditions,
                 takens=[True] * len(ref_conditions),
                 branch=True,
-                rows=[Row(row)],
+                rows=[Row(*row)],
             )
         return out
 
     def visit_having(self, node: LogicalHaving, parent_stack, context):
         input_data = self.visit(node.this, parent_stack + [node], context)
-        input_schema = node.this.schema(catalog=self.instance.catalog)        
+        input_schema = node.this.schema(catalog=self.instance.catalog)
         out = []
         for row in input_data:
-            encoder = ExpressionEncoder(row, plan_encoder=self)
+            encoder = ExpressionEncoder(row, plan_encoder=self, ignore_nulls=True)
             try:
-                context = {}
-                smt = encoder.visit(node.condition, context=context)
+                local_context = {}
+                smt = encoder.visit(node.condition, context=local_context)
                 if smt:
                     out.append(row)
-                smt_conditions = context.get("smt_conditions", [])
-                ref_conditions = context.get("ref_conditions", [])
+                smt_conditions = local_context.get("smt_conditions", [])
+                ref_conditions = local_context.get("ref_conditions", [])
                 sql_conditions = [
                     cond.transform(resolve_schema, input_schema)
                     for cond in ref_conditions
@@ -704,5 +725,3 @@ class PlanEncoder(LogicalPlanVisitor):
                 logging.info(f"Skipping row with nulls: {row}")
                 continue
         return out
-        
-        
