@@ -1,5 +1,5 @@
 import pydot
-from typing import Callable, Dict, TYPE_CHECKING
+from typing import Callable, Dict, TYPE_CHECKING, Iterable
 
 from .plan.rex import LogicalOperator
 from .uexpr import Constraint, PlausibleBranch
@@ -111,6 +111,12 @@ def _get_default_node_styles(node):
     return style
 
 
+def to_string(value):
+    if isinstance(value, Iterable):
+        return "".join(str(v) for v in value)
+    return str(value)
+
+
 def _get_default_edge_styles(edge_type):
     styles = {
         0: {"color": "#DC3545", "label": "FALSE", "style": "solid", "fontsize": "12"},
@@ -135,6 +141,8 @@ def _get_default_edge_styles(edge_type):
         },  # Orange for NULL
         # Teal for DUPLICATE
         4: {"color": "#20C997", "label": "DUP", "style": "dotted", "fontsize": "12"},
+        5: {"color": "#20C997", "label": "MAX", "style": "dotted", "fontsize": "12"},
+        6: {"color": "#20C997", "label": "MIN", "style": "dotted", "fontsize": "12"},
     }
     return styles.get(edge_type)
 
@@ -173,14 +181,15 @@ def uexpr_to_dot(
         condition_to_use = (
             node.ref_condition if use_ref_condition_flag else node.sql_condition
         )
+
         label = (
-            f"{node.operator.operator_type}({ str(condition_to_use)}) \n {node.pattern()}"
+            f"{node.operator.operator_type}({ str(condition_to_use)}) \n {to_string(node.pattern())}"
             if condition_to_use
             else "ROOT"
         )
     elif isinstance(node, PlausibleBranch):
         label = node.plausible_type.value
-        label += f": {node.pattern()}"
+        label += f": {to_string(node.pattern())}"
     dot_node.obj_dict["attributes"]["label"] = label
     for key, value in node_style(node).items():
         dot_node.obj_dict["attributes"][key] = value

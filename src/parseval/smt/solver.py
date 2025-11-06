@@ -39,11 +39,6 @@ class Solver:
         """
         Yield clusters of variable names  based on constraint variables connectivity.
         """
-        # for varnames in self.uf.groups():
-        #     for var_name in varnames:
-        #         yield from self.var_to_constraints.get(var_name, set())
-        # for constraint in self.var_to_constraints.get(var_name, set()):
-        #     yield constraint
         return self.uf.groups()
 
     def select_adapter(self, cluster: List[Condition], context) -> SolverAdapter:
@@ -60,16 +55,21 @@ class Solver:
             for var_name in cluster:
                 for constraint in self.var_to_constraints.get(var_name, set()):
                     if constraint.find_all(IS_NULL):
-                        logger.info(f'{constraint}')
-                        assignments.append(
-                            ValueAssignment(
-                                column=var_name, value=None, alias=None, data_type=None
+                        if constraint.key == "not":
+                            ...
+                        else:
+                            assignments.append(
+                                ValueAssignment(
+                                    column=var_name,
+                                    value=None,
+                                    alias=None,
+                                    data_type=None,
+                                )
                             )
-                        )
-                        logging.info(
-                            f"Assigning NULL to {var_name} due to IS NULL constraint"
-                        )
-                   
+                            logging.info(
+                                f"Assigning NULL to {var_name} due to IS NULL constraint"
+                            )
+
                     else:
                         constraints.append(constraint)
             adapter = self.select_adapter(constraints, context)
@@ -77,6 +77,7 @@ class Solver:
             solve_result = adapter.solve(
                 variables=cluster, constraints=constraints, context=context
             )
+            # logger.info(f"solve {cluster} with constraints: {constraints}")
             model = {}
             status = solve_result.status
             if status != "sat":
