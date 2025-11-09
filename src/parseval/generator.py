@@ -82,10 +82,8 @@ class Generator:
 
     def __init__(self, schema, query, dialect="sqlite", name="default"):
         self.schema = schema
-        # self.query = query
         self.dialect = dialect
         self.name = name
-        ## label -> List[Constraint], track constraints for each operator
         self.constraints: Dict[str, List[rex.Expression]] = defaultdict(list)
 
         planner = Planner()
