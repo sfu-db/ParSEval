@@ -95,8 +95,7 @@ def disprove_queries(schema, gold, pred, dialect, **kwargs):
     gold, pred = remove_limit(gold, pred)
 
     for label, query in zip(["gold", "pred"], [gold, pred]):
-        plan_path = f"datasets/bird/plan/california_schools_6_gold.sql"
-        generator = Generator(schema=schema, query=plan_path, name=label)
+        generator = Generator(schema=schema, query=query, name=label)
         instance = generator.generate(max_iter=max_iter, threshold=threshold)
 
         instance.to_db(host_or_path=workspace)
