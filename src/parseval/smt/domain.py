@@ -404,7 +404,7 @@ class ValuePool:
         self.local_excluded.add(v)
 
     def propagate_bounds(self, min_val=None, max_val=None):
-        if self.datatype.is_numeric():
+        if self.datatype.is_type(*DataType.NUMERIC_TYPES):
             if min_val is not None:
                 self.min_val = max(self.min_val or min_val, min_val)
             if max_val is not None:
@@ -415,7 +415,7 @@ class ValuePool:
                 if (self.min_val is None or v >= self.min_val)
                 and (self.max_val is None or v <= self.max_val)
             }
-        elif self.datatype.is_datetime():
+        elif self.datatype.is_type(*DataType.TEMPORAL_TYPES):
             if min_val is not None:
                 self.min_val = max(self.min_val, min_val) if self.min_val else min_val
             if max_val is not None:

@@ -15,10 +15,113 @@ SECONDS_PER_DAY = 86400
 SECONDS_PER_MONTH = 30 * SECONDS_PER_DAY  # approximate month
 SECONDS_PER_YEAR = 365 * SECONDS_PER_DAY  # approximate year
 
+
+SECONDS_IN_MINUTE = 60  # z3.IntVal(60)
+SECONDS_IN_HOUR = 3600  # z3.IntVal(3600)
+SECONDS_IN_DAY = 86400  # z3.IntVal(86400)
+
+# Days in months (non-leap year)
+DAYS_IN_MONTH = [
+    31,
+    28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+]
+
+
+# Leap year check (Z3 expression)
+def is_leap_year(year):
+    return z3.Or(z3.And(year % 4 == 0, year % 100 != 0), year % 400 == 0)
+
+
+def month_length(month, year):
+
+    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return z3.If(z3.And(month == 2, is_leap_year(year)), 29, days_in_month[month - 1])
+
+
+def symbolic_ymd_hms(t):
+    # Hour, minute, second
+    second = t % SECONDS_IN_MINUTE
+    minute = (t / SECONDS_IN_MINUTE) % 60
+    hour = (t / SECONDS_IN_HOUR) % 24
+
+    # Days since epoch
+    days_since_epoch = t / SECONDS_IN_DAY
+
+    year = 1970 + (days_since_epoch / 365)  # Z3 expression
+    month = (days_since_epoch % 365) / 30 + 1  # very rough
+    day = (days_since_epoch % 365) % 30 + 1
+
+    # cum_days = [0]
+    # for i in range(12):
+    #     cum_days.append(cum_days[-1] + DAYS_IN_MONTH[i])
+
+    # feb_days = z3.If(is_leap_year(year), 29, 28)
+    # cum_days[2] = cum_days[1] + feb_days
+    # for i in range(3, 13):
+    #     cum_days[i] = cum_days[i - 1] + DAYS_IN_MONTH[i - 1]
+
+    # Build constraints for month/day using day_of_year
+    # Z3 solver can handle this efficiently
+    return year, month, day, hour, minute, second
+
+
+def strftime_to_z3(*args):
+    """
+    Convert STRFTIME(format, timestamp) to Z3 constraints.
+
+    Supported format specifiers:
+    %Y - year (4 digits)
+    %m - month (01-12)
+    %d - day (01-31)
+    %H - hour (00-23)
+    %M - minute (00-59)
+    %S - second (00-59)
+
+    This function approximates the conversion by constraining the timestamp
+    to be within reasonable ranges based on the format.
+    """
+
+    timestamp = args[1]
+    format_str = args[2].as_string()
+
+    year, month, day, hour, minute, second = symbolic_ymd_hms(timestamp)
+
+    constraints = []
+    if "%Y" in format_str:
+        # Year range: 1970 to 2100
+        constraints.append(z3.IntToStr(year))
+    if "%m" in format_str:
+        # Month range: 1 to 12
+        constraints.append(z3.IntToStr(month))
+    if "%d" in format_str:
+        # Day range: 1 to 31
+        constraints.append(z3.IntToStr(day))
+    if "%H" in format_str:
+        # Hour range: 0 to 23
+        constraints.append(z3.IntToStr(hour))
+    if "%M" in format_str:
+        # Minute range: 0 to 59
+        constraints.append(z3.IntToStr(minute))
+    if "%S" in format_str:
+        # Second range: 0 to 59
+        constraints.append(z3.IntToStr(second))
+    return z3.Concat(*constraints) if len(constraints) > 1 else constraints.pop()
+
+
 def like_to_z3(var, pattern: str):
     """
     Convert SQL LIKE pattern to Z3 regex constraint using native Z3 regex constructors.
-    
+
     % -> any sequence of characters (ReStar)
     _ -> any single character (ReRange)
     Other characters -> literal character (Re)
@@ -51,6 +154,9 @@ def like_to_z3(var, pattern: str):
     return z3.And(*constraints)  # <- combine into a single Z3 expression
 
 
+def debug_gt(a, b):
+    return a > b  # z3.StrToInt(b)
+
 
 class SMTSolver(SolverAdapter):
     _SQL_OP_MAP = {
@@ -62,15 +168,16 @@ class SMTSolver(SolverAdapter):
         "MOD": lambda a, b: a % b,
         "POW": lambda a, b: a**b,
         "EQ": lambda a, b: a == b,
-        "NE": lambda a, b: a != b,
+        "NEQ": lambda a, b: a != b,
         "LT": lambda a, b: a < b,
         "LE": lambda a, b: a <= b,
-        "GT": lambda a, b: a > b,
+        "GT": lambda a, b: debug_gt(a, b),
         "GE": lambda a, b: a >= b,
         "AND": lambda a, b: z3.And(a, b),
         "OR": lambda a, b: z3.Or(a, b),
         "NOT": lambda a: z3.Not(a),
         "LIKE": lambda a, b: like_to_z3(a, b),
+        "STRFTIME": lambda *args: strftime_to_z3(*args),
     }
 
     def __init__(self, name: str):
@@ -168,12 +275,6 @@ class SMTSolver(SolverAdapter):
             if condition.key.upper() in {"DIV", "FLOORDIV"}:
                 safe_div_constraint = self._ensure_safe_div(args[1])
                 context.setdefault("safe_divisions", []).append(safe_div_constraint)
-            # logging.info(f"Applying operation {condition} on args {args}")
-
-            if condition.key.upper() == "LIKE":
-                for arg in args:
-                    logging.info(f"{type(arg)} -> {arg}")
-
             if callable(op):
                 return op(*args)
             else:
@@ -251,6 +352,9 @@ class SMTSolver(SolverAdapter):
         context.setdefault("datetime_format", []).append(
             s > datetime(1970, 1, 1, 0, 0, 0).timestamp()
         )
+        context.setdefault("datetime_format", []).append(
+            s < datetime(2030, 1, 1, 0, 0, 0).timestamp()
+        )
         return s
 
     def _ensure_safe_div(self, denominator) -> z3.BoolRef:
@@ -263,9 +367,10 @@ class SMTSolver(SolverAdapter):
         variable = z3_to_variable[str(decl)]
         if variable.datatype.is_type(*DataType.TEMPORAL_TYPES):
             from datetime import datetime
+
             ts = z3val.as_long()
             concrete = datetime.fromtimestamp(ts)
-        
+
         elif variable.datatype.is_type(DataType.Type.BOOLEAN):
             concrete = bool(z3val)
         elif variable.datatype.is_type(*DataType.INTEGER_TYPES):

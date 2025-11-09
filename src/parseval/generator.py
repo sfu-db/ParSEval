@@ -89,7 +89,7 @@ class Generator:
         self.constraints: Dict[str, List[rex.Expression]] = defaultdict(list)
 
         planner = Planner()
-        self.query = planner.explain2(schema, query)
+        self.query = planner.explain(schema, query)
 
     def add_constraint(
         self, label, constraints: Union[rex.Expression, List[rex.Expression]]

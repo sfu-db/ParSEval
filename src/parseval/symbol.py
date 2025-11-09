@@ -1,11 +1,26 @@
 from __future__ import annotations
 from src.parseval.dtype import DataType
-from typing import Any, List, Optional, Dict, TYPE_CHECKING, Iterable, Union, Tuple
+from typing import (
+    Any,
+    List,
+    Optional,
+    Dict,
+    TYPE_CHECKING,
+    Iterable,
+    Tuple,
+    Callable,
+)
 import logging
 import fnmatch
 
 if TYPE_CHECKING:
     from src.parseval.dtype import DATATYPE
+
+
+class NullValueError(Exception):
+    """Raised when a SQL NULL value is used in an invalid context."""
+
+    pass
 
 
 class _Symbol(type):
@@ -26,8 +41,31 @@ class Symbol(metaclass=_Symbol):
     Represents an atomic symbolic expression with a data type.
     """
 
+    OPS = {
+        "eq": lambda *args: args[0] == args[1],
+        "neq": lambda *args: args[0] != args[1],
+        "gt": lambda *args: args[0] > args[1],
+        "lt": lambda *args: args[0] < args[1],
+        "le": lambda *args: args[0] >= args[1],
+        "ge": lambda *args: args[0] <= args[1],
+        "like": lambda *args: fnmatch.fnmatch(
+            args[0], args[1].replace("%", "*").replace("_", "?")
+        ),
+        "add": lambda *args: args[0] + args[1],
+        "sub": lambda *args: args[0] - args[1],
+        "mul": lambda *args: args[0] * args[1],
+        "div": lambda *args: args[0] / args[1],
+        "floordiv": lambda *args: args[0] / args[1],
+        "and": lambda *args: args[0] and args[1],
+        "or": lambda *args: args[0] or args[1],
+        "not": lambda *args: not args[0],
+        "neg": lambda *args: -args[0],
+        "is_null": lambda *args: args[0] is None,
+        "ite": lambda *args: args[1] if args[0] else args[2],
+    }
+
     key = "symbol"
-    __slots__: Tuple[str, ...] = ("args", "dtype", "_concrete", "metadata")
+    __slots__: Tuple[str, ...] = ("args", "dtype", "_concrete", "parent", "metadata")
 
     def __new__(
         cls,
@@ -42,6 +80,9 @@ class Symbol(metaclass=_Symbol):
         object.__setattr__(obj, "_concrete", concrete)
         object.__setattr__(obj, "metadata", {})
         obj.metadata.update(kwargs)
+        for arg in args:
+            if isinstance(arg, Symbol):
+                object.__setattr__(arg, "parent", obj)
         return obj
 
     @property
@@ -52,15 +93,15 @@ class Symbol(metaclass=_Symbol):
     def concrete(self):
         mappings = {arg: arg.concrete for arg in self.args if isinstance(arg, Symbol)}
         if self._concrete is None and mappings:
-            res = self.evaluate(mappings)
-            logging.info(f"Evaluated {self} to concrete value: {res}")
             self.concrete = self.evaluate(mappings)
         return self._concrete
 
     def __bool__(self):
         if self.concrete is not None:
             return bool(self.concrete)
-        return False
+        raise NullValueError(
+            f"Cannot convert symbolic expression {self} to bool without concrete value."
+        )
 
     def evaluate(self, mapping: Dict):
         if self in mapping:
@@ -69,45 +110,13 @@ class Symbol(metaclass=_Symbol):
             arg.evaluate(mapping) if isinstance(arg, Symbol) else arg
             for arg in getattr(self, "args", ())
         )
-        if hasattr(self, "_eval_concrete"):
-            return self._eval_concrete(*evaluated_args)
-
-        if evaluated_args:
-            return type(self)(*evaluated_args)
-        return self
+        return self._eval_concrete(*evaluated_args)
 
     def _eval_concrete(self, *args):
         try:
-            OPS = {
-                "eq": lambda *args: args[0] == args[1],
-                "neq": lambda *args: args[0] != args[1],
-                "gt": lambda *args: args[0] > args[1],
-                "lt": lambda *args: args[0] < args[1],
-                "le": lambda *args: args[0] >= args[1],
-                "ge": lambda *args: args[0] <= args[1],
-                "like": lambda *args: fnmatch.fnmatch(
-                    args[0], args[1].replace("%", "*").replace("_", "?")
-                ),
-                "and": lambda *args: args[0].and_(args[1]),
-                "or": lambda *args: args[0].or_(args[1]),
-                "add": lambda *args: args[0] + args[1],
-                "sub": lambda *args: args[0] - args[1],
-                "mul": lambda *args: args[0] * args[1],
-                "div": lambda *args: args[0] / args[1],
-                "floordiv": lambda *args: args[0] / args[1],
-                "AND": lambda *args: args[0] and args[1],
-                "OR": lambda *args: args[0] or args[1],
-                "NOT": lambda *args: not args[0],
-                "NEG": lambda *args: -args[0],
-            }
-
-            concrete = OPS[self.key.lower()](*args)
-            return concrete
-        except KeyError:
-            raise NotImplementedError(
-                f"Unknown operator: {self.key.upper()}, {self.right.concrete} {e}"
-            )
-
+            return self.OPS[self.key.lower()](*args)
+        except KeyError as e:
+            raise NotImplementedError(f"Unknown operator: {self.key.upper()},  {e}")
         except Exception as e:
             return None
 
@@ -267,17 +276,11 @@ class Symbol(metaclass=_Symbol):
         return EQ(self, _ensure_symbol(other), dtype="bool")
 
     def ne(self, other):
-        return NE(self, _ensure_symbol(other), dtype="bool")
+        return NEQ(self, _ensure_symbol(other), dtype="bool")
 
     def like(self, pattern: str) -> "Symbol":
         """Create a LIKE comparison symbol."""
-        logging.info(f"pattern type: {type(pattern)}, pattern: {pattern}")
-
         pattern = _ensure_symbol(pattern)
-        r = LIKE(self, pattern, dtype="bool")
-
-        logging.info(r.concrete)
-
         return LIKE(self, pattern, dtype="bool")
 
     def is_(self, other: Symbol) -> "Symbol":
@@ -389,7 +392,7 @@ class EQ(Compare):
     pass
 
 
-class NE(Compare):
+class NEQ(Compare):
     pass
 
 
@@ -413,6 +416,32 @@ class Or(Binary):
     pass
 
 
+class ITE(Symbol):
+    @property
+    def condition(self) -> Symbol:
+        return self.args[0]
+
+    @property
+    def true_branch(self) -> Symbol:
+        return self.args[1]
+
+    @property
+    def false_branch(self) -> Symbol:
+        return self.args[2]
+
+
+class Group(Symbol):
+    @property
+    def name(self) -> Any:
+        return self.args[0]
+
+    def __iter__(self):
+        return iter(self.args[1:])
+
+    def __getitem__(self, index):
+        return self.args[1:][index]
+
+
 class Quantifier(Symbol):
     @property
     def var(self) -> Tuple[Symbol, ...]:
@@ -433,7 +462,14 @@ class Exists(Quantifier): ...
 class Distinct(Condition): ...
 
 
-class Function(Symbol): ...
+class Function(Symbol):
+    @property
+    def name(self):
+        return self.args[0]
+
+    @property
+    def operands(self):
+        return self.args[1:]
 
 
 class Row(Symbol):
@@ -462,6 +498,35 @@ def _ensure_symbol(value: Any) -> Symbol:
         return value
 
     return Const(value, dtype=DataType.infer(value))
+
+
+class Strftime(Function):
+    """
+    Represents the strftime function for formatting dates.
+    """
+
+    def _eval_concrete(self, *args):
+        from datetime import datetime
+
+        logging.info(args)
+
+        _, date_arg, format_arg = args
+
+        for arg in self.parent.args:
+            if isinstance(arg, Symbol) and arg is not self:
+                arg.metadata["format"] = format_arg
+        try:
+            return date_arg.strftime(format_arg)
+        except Exception as e:
+            return None
+
+    @property
+    def operand(self):
+        return self.args[1]
+
+    @property
+    def fmt(self):
+        return self.args[2]
 
 
 # class DateAdd(Function):
@@ -501,3 +566,79 @@ def _ensure_symbol(value: Any) -> Symbol:
 #     def eval(cls, part, date):
 #         # Evaluation logic can be added here if needed
 #         pass
+
+
+class SymbolicRegistry:
+    """Default implementation of SymbolicEncoder."""
+
+    VALID_CATEGORIES = {"BRANCH", "OPAQUE"}
+
+    DEFAULT_BRANCH_EXPRESSIONS: Dict[str, Callable] = {
+        "eq": lambda *args: args[0].eq(args[1]),
+        "neq": lambda *args: args[0].ne(args[1]),
+        "gt": lambda *args: args[0] > args[1],
+        "lt": lambda *args: args[0] < args[1],
+        "lte": lambda *args: args[0] >= args[1],
+        "gte": lambda *args: args[0] <= args[1],
+        "like": lambda *args: args[0].like(args[1]),
+        "is_": lambda *args: args[0].is_(args[1]),
+        "is_null": lambda *args: args[0].is_(None),
+        "is_not_null": lambda *args: args[0].is_(None).not_(),
+    }
+
+    DEFAULT_OPAQUE_EXPRESSIONS: Dict[str, Callable] = {
+        "and": lambda *args: args[0].and_(args[1]),
+        "or": lambda *args: args[0].or_(args[1]),
+        "add": lambda *args: args[0] + args[1],
+        "sub": lambda *args: args[0] - args[1],
+        "mul": lambda *args: args[0] * args[1],
+        "div": lambda *args: args[0] // args[1],
+        "floordiv": lambda *args: args[0] // args[1],
+        "strftime": lambda *args: Strftime(
+            "strftime", args[0], args[1], dtype=args[2] if len(args) > 2 else "STRING"
+        ),
+    }
+
+    def __init__(
+        self,
+        branch_handlers: Optional[Dict[str, Callable]] = None,
+        opaque_handlers: Optional[Dict[str, Callable]] = None,
+    ):
+        super().__init__()
+        self.branch_handlers: Dict[str, Callable] = dict(
+            self.DEFAULT_BRANCH_EXPRESSIONS
+        )
+        self.opaque_handlers: Dict[str, Callable] = dict(
+            self.DEFAULT_OPAQUE_EXPRESSIONS
+        )
+        self.register_handlers(branch=branch_handlers, opaque=opaque_handlers)
+
+    def register_handlers(
+        self,
+        branch: Optional[Dict[str, Callable]] = None,
+        opaque: Optional[Dict[str, Callable]] = None,
+    ):
+        """Register or update handler mappings after initialization."""
+        if branch:
+            self.branch_handlers.update(branch)
+        if opaque:
+            self.opaque_handlers.update(opaque)
+
+    def get_handlers(self, name):
+        if name.lower() in self.branch_handlers:
+            return self.branch_handlers[name.lower()]
+        elif name.lower() in self.opaque_handlers:
+            return self.opaque_handlers[name.lower()]
+        else:
+            raise KeyError(f"Unknown symbolic function: {name}")
+
+    def has_handler(self, name: str) -> bool:
+        return (
+            name.lower() in self.branch_handlers or name.lower() in self.opaque_handlers
+        )
+
+    def is_branch(self, name: str) -> bool:
+        return name.lower() in self.branch_handlers
+
+    def is_opaque(self, name: str) -> bool:
+        return name.lower() in self.opaque_handlers

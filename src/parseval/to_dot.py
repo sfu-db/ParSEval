@@ -143,6 +143,18 @@ def _get_default_edge_styles(edge_type):
         4: {"color": "#20C997", "label": "DUP", "style": "dotted", "fontsize": "12"},
         5: {"color": "#20C997", "label": "MAX", "style": "dotted", "fontsize": "12"},
         6: {"color": "#20C997", "label": "MIN", "style": "dotted", "fontsize": "12"},
+        7: {
+            "color": "#20C997",
+            "label": "GROUP_COUNT",
+            "style": "dotted",
+            "fontsize": "12",
+        },
+        8: {
+            "color": "#20C997",
+            "label": "GROUP_SIZE",
+            "style": "dotted",
+            "fontsize": "12",
+        },
     }
     return styles.get(edge_type)
 
