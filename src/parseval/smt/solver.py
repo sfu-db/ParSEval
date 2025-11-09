@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Set, Tuple, Optional, TYPE_CHECKING
 from .domain import UnionFind, ColumnDomainPool, ValuePool, DomainSpec, InConsistency
 from .adapter import SolverAdapter, SolverResult, ValueAssignment
 from .smt_solver import SMTSolver
-from src.parseval.symbol import Variable, Symbol, Condition, IS_NULL
+from src.parseval.symbol import Variable, Symbol, Condition, IS_NULL, EQ, NEQ
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,11 @@ class Solver:
         self.uf.find(variable.name)
 
     def add_constraint(self, constraint: Condition):
+        if not isinstance(constraint, Symbol):
+            raise NotImplementedError(
+                "Function constraints are not supported in this solver."
+            )
+
         vars_ = list(constraint.find_all(Variable))
         self.constraints.append(constraint)
         self.variables.update({v.name: v for v in vars_})
@@ -41,6 +46,38 @@ class Solver:
         """
         return self.uf.groups()
 
+    def _assert_inconsistency(self):
+        for constraint in self.constraints:
+            if (
+                isinstance(constraint, EQ)
+                and isinstance(constraint.left, Variable)
+                and isinstance(constraint.right, Variable)
+            ):
+                pools = [
+                    self.pool_mgr.get_pool(var.name)
+                    for var in [constraint.left, constraint.right]
+                ]
+
+                if not self.pool_mgr.add_equality(pools[0], pools[1]):
+                    raise InConsistency(
+                        "Inconsistent constraints detected.",
+                        variables=[constraint.left, constraint.right],
+                    )
+            if (
+                isinstance(constraint, NEQ)
+                and isinstance(constraint.left, Variable)
+                and isinstance(constraint.right, Variable)
+            ):
+                pools = [
+                    self.pool_mgr.get_pool(var.name)
+                    for var in [constraint.left, constraint.right]
+                ]
+                if not self.pool_mgr.add_inequality(pools[0], pools[1]):
+                    raise InConsistency(
+                        "Inconsistent constraints detected.",
+                        variables=[constraint.left, constraint.right],
+                    )
+
     def select_adapter(self, cluster: List[Condition], context) -> SolverAdapter:
         # For simplicity, we use SpeculativeSolver for all clusters
         return SMTSolver
@@ -50,6 +87,11 @@ class Solver:
         context = {}
         status = "sat"
         assignments = []
+        try:
+            self._assert_inconsistency()
+        except InConsistency as e:
+            return SolverResult(status="unsat", assignments=[])
+
         for cluster in self.clusters():
             constraints = []
             for var_name in cluster:

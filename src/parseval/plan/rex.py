@@ -326,7 +326,9 @@ class LogicalProject(UnaryOperator):
         input_schema = self.this.schema(catalog=catalog)
         columns = []
         for expr in self.expressions:
-            new_expr = expr.transform(resolve_schema, input_schema=input_schema)
+            new_expr = expr.transform(
+                resolve_schema, input_schema=input_schema, catalog=catalog
+            )
             columns.append(new_expr)
         scm = Schema(expressions=columns)
         self.set("_schema", scm)
@@ -416,7 +418,9 @@ class LogicalAggregate(UnaryOperator):
         for key in self.keys:
             columns.append(input_schema.columns[key.ref])
         for agg_expr in self.aggs:
-            agg = agg_expr.transform(resolve_schema, input_schema=input_schema)
+            agg = agg_expr.transform(
+                resolve_schema, input_schema=input_schema, catalog=catalog
+            )
             columns.append(agg)
 
         scm = Schema(expressions=columns)
@@ -487,7 +491,26 @@ class LogicalDifference(LogicalUnion):
     pass
 
 
-def resolve_schema(expr, input_schema: Schema):
+class LogicalCorrelate(UnaryOperator):
+    arg_types = {
+        "this": True,
+        "expressions": False,
+        "query": True,
+        "correlated": False,
+        "operator_id": True,
+    }
+
+    def query(self) -> LogicalOperator:
+        return self.this
+
+    def __repr__(self) -> str:
+        return f"{self.operator_type}(, id={self.operator_id[:8]})"
+
+    def schema(self, catalog):
+        return self.this.schema(catalog)
+
+
+def resolve_schema(expr, input_schema: Schema, catalog):
     """
     Resolve a ColumnRef expression to its corresponding schema entry.
 
@@ -500,6 +523,9 @@ def resolve_schema(expr, input_schema: Schema):
     """
     if isinstance(expr, ColumnRef):
         return input_schema.columns[expr.ref]
+    if isinstance(expr, LogicalCorrelate):
+        sub_schema = expr.this.schema(catalog)
+        return sub_schema.columns[0]
     return expr
 
 
@@ -573,6 +599,20 @@ class Planner:
             ),
         }
 
+    def explain(self, schema: str, sql: str, dialect: str = "sqlite"):
+        from src.parseval.calcite import get_logical_plan
+        import json
+
+        res = get_logical_plan(ddls=schema, queries=[sql], dialect=dialect)
+
+        src = json.loads(res)[0]
+
+        if src["state"] != "SUCCESS":
+            raise ValueError(f"Failed to get logical plan: {res['error']}")
+
+        src = json.loads(src["plan"])
+        return self.walk(src)
+
     def explain2(self, schema: str, plan_path: str, dialect: str = "postgres"):
         if isinstance(schema, str):
             schema = schema.split(";")
@@ -585,11 +625,11 @@ class Planner:
 
     def walk(self, node):
         for key, func in self.dispatches.items():
-            # and (
-            #     node.get(key).upper() in self.EXPRESSION_HANDLERS
-            #     or node.get(key) in self.TRANSFORM_MAPPING
-            # )
-            if key in node:
+
+            if key in node and (
+                node.get(key).upper() in self.EXPRESSION_HANDLERS
+                or node.get(key) in self.TRANSFORM_MAPPING
+            ):
                 return func(self, node)
         raise ValueError(f"Cannot find relOp or kind/operator in node: {node}")
 
@@ -763,7 +803,7 @@ def parse_scalary_query(self, **kwargs) -> Expression:
 
     subquery_type = kwargs.pop("operator")[1:].lower()
 
-    return sqlglot_exp.Subquery(this=query[0], type=subquery_type, correlated=False)
+    return LogicalCorrelate(this=query[0], type=subquery_type, correlated=False)
 
 
 Planner.EXPRESSION_HANDLERS["SCALAR_QUERY"] = parse_scalary_query
@@ -781,6 +821,7 @@ for klass in [
     LogicalProject,
     LogicalScan,
     LogicalSort,
+    LogicalCorrelate,
 ]:
     generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
         dialect=self.dialect
