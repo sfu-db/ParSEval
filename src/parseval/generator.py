@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
 from collections import defaultdict
-from src.parseval.plan.planner import PlanEncoder, Planner, ExpressionEncoder
+
+# from src.parseval.plan.planner import PlanEncoder, Planner, ExpressionEncoder
+from src.parseval.plan.plan import PlanEncoder, Planner, ExpressionEncoder
 from src.parseval.plan import rex
 
 from src.parseval.instance import Instance
@@ -61,12 +63,9 @@ def get_domainpool(instance: Instance) -> ColumnDomainPool:
     return pool
 
 
-def coerce_datatype(): ...
-
-
 class ExprEncoder(ExpressionEncoder):
-    def __init__(self):
-        super().__init__(None, None, True)
+    def __init__(self, row=None, ignore_nulls=False, symbolic_registry=None):
+        super().__init__(row, ignore_nulls, symbolic_registry)
 
     def visit_columnref(self, expr, parent_stack=None, context=None):
         smt_expr = context[expr]
@@ -104,7 +103,6 @@ class Generator:
         for table_name in instance.catalog.tables:
             instance.create_row(table_name, {})
         tracer = UExprToConstraint(declare=self.add_constraint, threshold=threshold)
-        self.query.schema(instance.catalog)
         for index in range(max_iter):
             encoder = PlanEncoder(instance=instance, trace=tracer)
             encoder.visit(self.query)
@@ -141,7 +139,7 @@ class Generator:
                     ] = assignment.value
                 if concretes:
                     # plausible.mark_covered()
-                    plausible.update_mark()
+                    # plausible.update_mark()
                     logging.info(concretes)
                     for table_name in instance.catalog.tables:
                         if table_name in concretes:
@@ -157,7 +155,7 @@ class Generator:
         self.reset()
         encoder = PlanEncoder(instance=instance, trace=tracer)
         encoder.visit(self.query)
-        display_uexpr(tracer.root_constraint, use_ref_condition_flag=False).write(
+        display_uexpr(tracer.root_constraint).write(
             "tests/db/dot_coverage" + instance.name + ".png", format="png"
         )
         return instance
@@ -196,6 +194,7 @@ class Generator:
                     continue
                 for columnref in columnrefs:
                     var_name = f"{columnref.qualified_name}"
+                    logging.info(f"Declaring variable: {var_name}")
                     if var_name not in var_to_columnref:
                         domain = column_pool.get_or_create_pool(
                             var_name,

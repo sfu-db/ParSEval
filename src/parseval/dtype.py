@@ -1,9 +1,25 @@
 from __future__ import annotations
 from typing import Any, Optional, Union
-from sqlglot import exp
+from sqlglot.expressions import DataType as sqlglot_datatype
 
 
-class DataType(exp.DataType):
+class DataType(sqlglot_datatype):
+    """
+    Represents a data type in the logical plan, extending the `DataType` class from `sqlglot`.
+
+    This class provides additional properties and methods to handle attributes such as
+    precision, scale, length, nullability, and default values for the data type.
+
+    Attributes:
+        arg_types (dict): A dictionary defining the argument types for the data type.
+            - "this": The main data type (e.g., INT, VARCHAR).
+            - "precision": The precision of the data type (e.g., for DECIMAL types).
+            - "scale": The scale of the data type (e.g., for DECIMAL types).
+            - "length": The length of the data type (e.g., for VARCHAR types).
+            - "nullable": Whether the data type allows NULL values.
+            - "default": The default value for the data type.
+    """
+
     arg_types = {
         "this": True,
         "precision": False,
@@ -15,23 +31,53 @@ class DataType(exp.DataType):
 
     @property
     def precision(self) -> Optional[int]:
+        """
+        Get the precision of the data type.
+
+        Precision is typically used for numeric types like DECIMAL to specify
+        the total number of digits.
+
+        Returns:
+            Optional[int]: The precision of the data type, or None if not specified.
+        """
         return self.args.get("precision")
 
     @property
     def scale(self) -> Optional[int]:
+        """
+        Get the scale of the data type.
+
+        Scale is typically used for numeric types like DECIMAL to specify
+        the number of digits after the decimal point.
+
+        Returns:
+            Optional[int]: The scale of the data type, or None if not specified.
+        """
         return self.args.get("scale")
 
     @property
     def length(self) -> Optional[int]:
+        """
+        Get the length of the data type.
+
+        Length is typically used for string types like VARCHAR to specify
+        the maximum number of characters.
+
+        Returns:
+            Optional[int]: The length of the data type, or None if not specified.
+        """
         return self.args.get("length")
 
     @property
     def nullable(self) -> Optional[bool]:
-        return self.args.get("nullable")
+        """
+        Get whether the data type allows NULL values.
 
-    @nullable.setter
-    def nullable(self, value: bool):
-        self.set("nullable", value)
+        Returns:
+            Optional[bool]: True if the data type is nullable, False if not,
+            or None if not specified.
+        """
+        return self.args.get("nullable")
 
     @property
     def default(self) -> Optional[Any]:
@@ -81,8 +127,8 @@ class DataType(exp.DataType):
         if isinstance(dtype, str):
             if dtype.upper() == "UNKNOWN":
                 return DataType(this=DataType.Type.UNKNOWN, **kwargs)
-            t = parse_one(dtype, into=exp.DataType)
-            return DataType(this=t.this)
+            t = parse_one(dtype, into=sqlglot_datatype, dialect=dialect)
+            return DataType(**{**t.args, **kwargs})
         elif isinstance(dtype, DataType.Type):
             data_type_exp = DataType(this=dtype)
         elif isinstance(dtype, DataType):
@@ -95,104 +141,4 @@ class DataType(exp.DataType):
         return DataType(**{**data_type_exp.args, **kwargs})
 
 
-# class DataType:
-#     """Enhanced data type for ParSEval"""
-
-#     __slots__ = ("name", "precision", "scale", "length", "nullable", "default")
-
-#     def __init__(
-#         self,
-#         name: str,
-#         precision: Optional[int] = None,
-#         scale: Optional[int] = None,
-#         length: Optional[int] = None,
-#         nullable: Optional[bool] = None,
-#         default: Optional[Any] = None,
-#     ):
-#         self.name = name
-#         self.precision = precision
-#         self.scale = scale
-#         self.length = length
-#         self.nullable = nullable
-#         self.default = default
-
-#     @classmethod
-#     def build(
-#         cls,
-#         name: str,
-#         precision: Optional[int] = None,
-#         scale: Optional[int] = None,
-#         length: Optional[int] = None,
-#         nullable: Optional[bool] = None,
-#         default: Optional[Any] = None,
-#     ) -> "DataType":
-#         if isinstance(name, DataType):
-#             return name
-#         return cls(
-#             name=name,
-#             precision=precision,
-#             scale=scale,
-#             length=length,
-#             nullable=nullable,
-#             default=default,
-#         )
-
-#     @classmethod
-#     def infer(cls, value: Any) -> "DataType":
-#         """Infer data type from a Python value"""
-#         if value is None:
-#             return cls("NULL")
-#         if isinstance(value, bool):
-#             return cls("BOOLEAN")
-#         elif isinstance(value, int):
-#             return cls("INT")
-#         elif isinstance(value, float):
-#             return cls("FLOAT")
-#         elif isinstance(value, str):
-#             return cls("TEXT", length=len(value))
-#         elif value is None:
-#             return cls("NULL")
-#         else:
-#             return cls("TEXT")
-
-#     def is_integer(self) -> bool:
-#         return exp.DataType.build(self.name).is_type(*exp.DataType.INTEGER_TYPES)
-
-#     def is_numeric(self) -> bool:
-#         return exp.DataType.build(self.name).is_type(*exp.DataType.NUMERIC_TYPES)
-
-#     def is_string(self) -> bool:
-#         return exp.DataType.build(self.name).is_type(*exp.DataType.TEXT_TYPES)
-
-#     def is_boolean(self) -> bool:
-#         """self.name.upper() == BOOLEAN"""
-#         return exp.DataType.build(self.name).is_type(exp.DataType.Type.BOOLEAN)
-
-#     def is_datetime(self) -> bool:
-#         """self.name.upper() in ["DATE", "TIME", "TIMESTAMP", "DATETIME"]"""
-#         return exp.DataType.build(self.name).is_type(*exp.DataType.TEMPORAL_TYPES)
-
-#     def can_cast_to(self, target_type: "DataType") -> bool:
-#         """Check if this type can be cast to target type"""
-#         if self == target_type:
-#             return True
-
-#         # Numeric types can generally be cast to other numeric types
-#         if self.is_numeric() and target_type.is_numeric():
-#             return True
-
-#         # String types can be cast to most other types
-#         if self.is_string():
-#             return True
-
-#         # Most types can be cast to string
-#         if target_type.is_string():
-#             return True
-
-#         return False
-
-#     def __str__(self):
-#         return self.name
-
-
-DATATYPE = Union[str, DataType]
+DATATYPE = Union[str, "DataType"]

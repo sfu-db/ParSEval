@@ -178,11 +178,12 @@ def uexpr_to_dot(
     node,
     graph,
     parent_node=None,
-    counter=[0],
+    counter=None,
     node_style: Callable = _get_default_node_styles,
     edge_style: Callable = _get_default_edge_styles,
-    use_ref_condition_flag=False,
 ):
+    if counter is None:
+        counter = [0]
     node_id = f"node{counter[0]}"
     counter[0] += 1
     dot_node = pydot.Node(node_id)
@@ -190,13 +191,9 @@ def uexpr_to_dot(
     label = node.__class__.__name__
 
     if isinstance(node, Constraint):
-        condition_to_use = (
-            node.ref_condition if use_ref_condition_flag else node.sql_condition
-        )
-
         label = (
-            f"{node.operator.operator_type}({ str(condition_to_use)}) \n {to_string(node.pattern())}"
-            if condition_to_use
+            f"{node.operator.operator_type}({ str(node.sql_condition)}) \n {to_string(node.pattern())}"
+            if node.sql_condition
             else "ROOT"
         )
     elif isinstance(node, PlausibleBranch):
@@ -220,14 +217,13 @@ def uexpr_to_dot(
                 counter,
                 node_style,
                 edge_style,
-                use_ref_condition_flag=use_ref_condition_flag,
             )
 
 
-def display_uexpr(root_constraint, use_ref_condition_flag=False):
+def display_uexpr(root_constraint):
     """"""
     dot_graph = pydot.Dot()
     # uexpr_to_dot(root_constraint, dot_graph)
     for bit, child in root_constraint.children.items():
-        uexpr_to_dot(child, dot_graph, use_ref_condition_flag=use_ref_condition_flag)
+        uexpr_to_dot(child, dot_graph)
     return dot_graph
