@@ -5,17 +5,14 @@ from sqlglot import exp as sqlglot_exp
 from src.parseval.dtype import DataType
 from typing import TYPE_CHECKING, List, Optional, Dict, Any
 from src.parseval.symbol import Row, Group, SymbolicRegistry, Const, NullValueError
-
 from .rex import *
 import logging
-
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
     from src.parseval.uexpr import UExprToConstraint
 
 from abc import ABC
-from dataclasses import dataclass, field
 from contextlib import contextmanager
 
 

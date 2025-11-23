@@ -1,62 +1,45 @@
 from __future__ import annotations
-from sqlalchemy import __version__ as SQLALCHEMY_VERSION
+
 from sqlalchemy.schema import CreateTable
-from packaging.version import Version
-
-from sqlalchemy import create_engine, text, Connection, MetaData, Engine, URL
-
+from sqlalchemy import create_engine, text, MetaData, Engine, URL
 from threading import Lock
-from typing import List, Tuple, Any, Dict, Union, Literal, overload, Optional, NewType
+from typing import (
+    List,
+    Tuple,
+    Any,
+    Dict,
+    Union,
+    Literal,
+    overload,
+    Optional,
+    Callable,
+)
 from collections import defaultdict
 import random, logging, os
 from sqlglot import parse_one, exp, parse
 from sqlglot.schema import MappingSchema
-
-logger = logging.getLogger(f"src.db_manager")
-
-from threading import Lock
-
-
-def singleton(cls):
-    instance = {}
-    _lock: Lock = Lock()
-
-    def _singleton(*args, **kwargs):
-        with _lock:
-            if cls not in instance:
-                instance[cls] = cls(*args, **kwargs)
-            return instance[cls]
-
-    return _singleton
-
-
-class singletonMeta(type):
-    """
-    This is a thread-safe implementation of Singleton.
-    """
-
-    _instances = {}
-    _lock: Lock = Lock()
-
-    def __call__(cls, *args, **kwargs):
-        with cls._lock:
-            if cls not in cls._instances:
-                instance = super().__call__(*args, **kwargs)
-                cls._instances[cls] = instance
-        return cls._instances[cls]
+from contextlib import contextmanager
+import time
+import atexit
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeout,
+)
+from .singleton import singletonMeta
 
 
 class Connect:
-    def __init__(self, connection: Connection):
-        self.conn: Connection = connection
+    def __init__(self, engine: Engine, executor, logger=None):
+        self.engine = engine
+        self.executor = executor
+        self.logger = logger or logging.getLogger(f"parseval.db_manager.connect")
         self._metadata = None
 
     @property
     def metadata(self):
         if self._metadata is None:
-            engine = self.conn.engine
             self._metadata = MetaData()
-            self.metadata.reflect(bind=engine)
+            self.metadata.reflect(bind=self.engine)
         return self._metadata
 
     def __enter__(self):
@@ -66,7 +49,9 @@ class Connect:
         self.close()
 
     def close(self):
-        self.conn.close()
+        self.logger.debug(
+            f"closed connection {self.engine.url.render_as_string(hide_password=True)}"
+        )
 
     @overload
     def execute(
@@ -74,8 +59,8 @@ class Connect:
         stmt: str,
         parameters: Optional[Any] = ...,
         fetch: None = ...,
-        commit: bool = ...,
         with_column_name: bool = ...,
+        timeout: int = ...,
     ) -> None: ...
 
     @overload
@@ -84,8 +69,8 @@ class Connect:
         stmt: str,
         parameters: Optional[Any] = ...,
         fetch: Union[Literal["all", "one", "1", "random"], int] = ...,
-        commit: bool = ...,
         with_column_name: bool = ...,
+        timeout: int = ...,
     ) -> List[Tuple[Any]]: ...
 
     def execute(
@@ -93,17 +78,53 @@ class Connect:
         stmt,
         parameters: Optional[Any] = None,
         fetch: Optional[Union[Literal["all", "one", "1", "random"], int]] = "all",
-        commit: bool = False,
         with_column_name: bool = False,
+        timeout: int = 20,
     ):
-        r = self.conn.execute(text(stmt), parameters=parameters)
+        """
+        Execute a SQL statement with optional fetch and commit.
+
+        Args:
+            stmt: SQL query string.
+            parameters: Optional query parameters.
+            fetch: 'all', 'one', integer, or 'random' (default: 'all').
+            commit: Whether to commit the transaction (for DML queries).
+            with_column_name: Whether to include column names in the result.
+        """
         results = None
-        if fetch:
-            results = self._fetch_query_results(
-                r, fetch=fetch, with_column_name=with_column_name
-            )
-        if commit:
-            self.conn.commit()
+        try:
+            raw_conn = None
+            conn_result = None
+            with self.engine.begin() as conn:
+                statement = text(stmt)
+                if "sqlite" in str(self.engine.url):
+                    start_time = time.time()
+                    raw_conn = conn.connection.dbapi_connection
+
+                    def progress_handler():
+                        if time.time() - start_time > timeout:
+                            return 1
+                        return 0
+
+                    raw_conn.set_progress_handler(progress_handler, 1000)
+                self.logger.debug(f"start to execute statement: {stmt[:100]}")
+                conn_result = conn.execute(statement, parameters=parameters)
+                if fetch and conn_result is not None:
+                    self.logger.debug(f"fetching results for statement: {stmt[:100]}")
+                    results = self._fetch_query_results(
+                        conn_result, fetch=fetch, with_column_name=with_column_name
+                    )
+        finally:
+            if raw_conn is not None:
+                try:
+                    raw_conn.set_progress_handler(None, 0)
+                except:
+                    ...
+            if conn_result is not None:
+                try:
+                    conn_result.close()
+                except Exception as e:
+                    ...
         return results
 
     def _fetch_query_results(
@@ -112,28 +133,29 @@ class Connect:
         fetch: Optional[Union[Literal["all", "one", "1", "random"], int]],
         with_column_name,
     ):
-        results_sizes = {
-            "all": lambda cur: cur.fetchall(),
-            "one": lambda cur: cur.fetchone(),
-            "1": lambda cur: cur.fetchone(),
-            "random": lambda cur: random.choice([] + cur.fetchmany(20)),
-            None: lambda cur: None,
-        }
-        results = None
-        if fetch in results_sizes:
-            results = results_sizes.get(fetch)(cursor_result)
+        if cursor_result is None:
+            return None
+
+        if fetch == "random":
+            rows = cursor_result.fetchmany(20)
+            results = [random.choice(rows)] if rows else []
+        elif fetch == "all":
+            results = cursor_result.fetchall()
+        elif fetch in {"one", 1, "1"}:
+            results = cursor_result.fetchone()
         elif isinstance(fetch, int):
             results = cursor_result.fetchmany(fetch)
-        column_names = []
-        if results:
-            records = []
-            column_names = tuple(cursor_result.keys())
-            for row in results:
-                records.append(tuple(row))
-            results = records
-        if with_column_name and column_names:
-            results.insert(0, tuple(column_names))
-        return results
+        else:
+            results = []
+
+        if not results:
+            return []
+        # Convert to tuples
+        records = [tuple(row) for row in results]
+        # Include column names if requested
+        if with_column_name and hasattr(cursor_result, "keys"):
+            records.insert(0, tuple(cursor_result.keys()))
+        return records
 
     def create_tables(self, *ddls):
         for ddl in ddls:
@@ -146,7 +168,7 @@ class Connect:
         """
         INSERT data into tables accordingly.
         """
-        self.execute(stmt, parameters=data, commit=True, fetch=None)
+        self.execute(stmt, parameters=data, fetch=None)
 
     def get_schema(self) -> str:
         """
@@ -190,7 +212,7 @@ class Connect:
         schema = self.get_schema()
         inserts = []
         for table_name, table in self.metadata.tables.items():
-            rows = self.conn.execute(table.select())
+            rows = self._conn.execute(table.select())
             values = []
             for row in rows.fetchall():
                 values.append(row._asdict())
@@ -211,7 +233,7 @@ class DBManager(metaclass=singletonMeta):
         records = conn.execute(stmt, fetch = 'all')
     """
 
-    CONNECTION_STR_MAPPING: Dict[str, URL] = {
+    CONNECTION_STR_MAPPING: Dict[str, Callable] = {
         "sqlite": lambda host_or_path, port, username, password, database: URL.create(
             "sqlite", database=os.path.join(host_or_path, database)
         ),
@@ -225,43 +247,63 @@ class DBManager(metaclass=singletonMeta):
         ),
     }
 
-    def __init__(self, **kwargs):
-        self.engines: Dict[str, Dict[str, Engine]] = defaultdict(dict)
+    def __init__(self, logger=None, base_pool_size=10, max_pool_size=30, **kwargs):
+        self.logger = logger or logging.getLogger(f"parseval.db_manager")
+        self.engines: Dict[str, Dict[URL, Engine]] = defaultdict(dict)
         self.lock = Lock()
-        self.set_options("MAX_CHECKOUTS", kwargs.get("max_checkouts", 100))
+        self.set_options("max_workers", kwargs.get("max_workers", 10))
+        self.pools: dict[URL, ThreadPoolExecutor] = {}
+        self.base_pool_size = base_pool_size
+        self.max_pool_size = max_pool_size
+        self.last_used = defaultdict(float)
+
+        atexit.register(self._shutdown_dbmanager)
 
     def set_options(self, key, value):
         setattr(self, key, value)
 
+    def get_pool(self, conn_str: URL) -> ThreadPoolExecutor:
+        """Get or create thread pool for this database URI."""
+        with self.lock:
+            if conn_str not in self.pools:
+                pool = ThreadPoolExecutor(
+                    max_workers=self.base_pool_size, thread_name_prefix="db_conn_"
+                )
+                self.pools[conn_str] = pool
+            self.last_used[conn_str] = time.time()
+            return self.pools[conn_str]
+
     def _assert_engine(
         self,
         conn_str: URL,
-        pool_size=20,
-        max_overflow=10,
+        pool_size=150,
+        max_overflow=100,
         pool_timeout=15,
         pool_recycle=60,
+        connect_timeout=5,
         **kwargs,
     ) -> Engine:
         host_or_path = conn_str.host or conn_str.database
         with self.lock:
-            if conn_str in self.engines[host_or_path]:
-                return self.engines[host_or_path][conn_str]
-
-            if self._get_checkouts(host_or_path) > self.MAX_CHECKOUTS:
-                self._clean_unused_engine(host_or_path)
-
             if conn_str not in self.engines[host_or_path]:
-                engine = create_engine(
-                    conn_str,
+                params = dict(
                     pool_size=pool_size,
                     max_overflow=max_overflow,
                     pool_timeout=pool_timeout,
                     pool_recycle=pool_recycle,
+                    pool_pre_ping=True,
+                    connect_args={
+                        "timeout": connect_timeout,
+                        "check_same_thread": False,
+                    },
                 )
+                engine = create_engine(conn_str, **params)
                 self.engines[host_or_path][conn_str] = engine
-                logger.debug(f"create new connection for {conn_str}")
-            return self.engines[host_or_path][conn_str]
 
+        self.last_used[conn_str] = time.time()
+        return self.engines[host_or_path][conn_str]
+
+    @contextmanager
     def get_connection(
         self,
         host_or_path,
@@ -270,12 +312,13 @@ class DBManager(metaclass=singletonMeta):
         username=None,
         password=None,
         dialect="sqlite",
-        pool_size=20,
-        max_overflow=10,
+        pool_size=5,
+        max_overflow=5,
         pool_timeout=15,
-        pool_recycle=60,
+        pool_recycle=25,
+        connect_timeout=5,
         **kwargs,
-    ) -> Connect:
+    ):
         conn_str = self.CONNECTION_STR_MAPPING[dialect](
             host_or_path,
             database=database,
@@ -283,10 +326,22 @@ class DBManager(metaclass=singletonMeta):
             username=username,
             password=password,
         )
+
         engine = self._assert_engine(
-            conn_str, pool_size, max_overflow, pool_timeout, pool_recycle, **kwargs
+            conn_str,
+            pool_size,
+            max_overflow,
+            pool_timeout,
+            pool_recycle,
+            connect_timeout,
+            **kwargs,
         )
-        return Connect(connection=engine.connect())
+        executor = self.get_pool(conn_str)
+        conn = Connect(engine=engine, executor=executor, logger=self.logger)
+        try:
+            yield conn
+        finally:
+            self._clean_unused_engine()
 
     def drop_schema(
         self,
@@ -312,28 +367,27 @@ class DBManager(metaclass=singletonMeta):
         metadata.reflect(bind=engine)
         metadata.drop_all(bind=engine)
 
-    def _get_checkouts(self, host_or_path) -> int:
+    def _clean_unused_engine(self, timeout=60):
         """
-        Return the count of connections in use
-        """
-        availables = self.engines[host_or_path]
-        checkouts = 0
-        for _, engine in availables.items():
-            checkouts = checkouts + engine.pool.size() + engine.pool.overflow()
-        return checkouts
-
-    def _clean_unused_engine(self, host_or_path):
-        """
-        ensure thread safe to clears engiens
+        Close unused pools/engines after 5 minutes of inactivity.
         """
         unused = 0
-        for conn_str in list(self.engines[host_or_path].keys()):
-            engine = self.engines[host_or_path][conn_str]
-            if engine.pool.checkedout() < 1:
-                unused += 1
-                engine.dispose()
-                del self.engines[host_or_path][conn_str]
-        logger.debug(f"Cleaned {unused} unused connections in the connection pool")
+        now = time.time()
+        with self.lock:
+            for conn_str in list(self.pools.keys()):
+                host_or_path = conn_str.host or conn_str.database
+                last_used = self.last_used.get(conn_str, None)
+                if last_used and now - last_used > timeout:
+                    pool = self.pools.pop(conn_str, None)
+                    # engine = self.engines[host_or_path].pop(conn_str, None)
+                    # if engine and engine.pool.checkedout() == 0:
+                    #     engine.dispose()
+                    if pool:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    del self.last_used[conn_str]
+                    unused += 1
+
+        self.logger.debug(f"Cleaned {unused} unused connections in the connection pool")
 
     def create_schema(
         self,
@@ -382,3 +436,6 @@ class DBManager(metaclass=singletonMeta):
             host_or_path, database, port, username, password, dialect
         ) as conn:
             conn.create_tables(*ddls)
+
+    def _shutdown_dbmanager(self):
+        self._clean_unused_engine(timeout=-1)
