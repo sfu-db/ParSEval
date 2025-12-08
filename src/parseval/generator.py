@@ -86,7 +86,7 @@ class Generator:
         self.constraints: Dict[str, List[rex.Expression]] = defaultdict(list)
 
         planner = Planner()
-        self.query = planner.explain(schema, query)
+        self.plan = planner.explain(schema, query)
 
     def add_constraint(
         self, label, constraints: Union[rex.Expression, List[rex.Expression]]
@@ -103,7 +103,7 @@ class Generator:
         for table_name in instance.catalog.tables:
             instance.create_row(table_name, {})
 
-        speculative = SpeculateEngine().infer(self.query)
+        speculative = SpeculateEngine().infer(self.plan)
         for columnref, datatype in speculative.items():
             alias = columnref.qualified_name
             pool = instance.column_domain.get_or_create_pool(
@@ -117,7 +117,7 @@ class Generator:
 
         tracer = UExprToConstraint(declare=self.add_constraint, threshold=threshold)
         for index in range(max_iter):
-            encoder = PlanEncoder(plan=self.query, instance=instance, trace=tracer)
+            encoder = PlanEncoder(plan=self.plan, instance=instance, trace=tracer)
             encoder.encode()
             plausible = tracer.next_path()
             if plausible is None:
@@ -166,7 +166,7 @@ class Generator:
 
         tracer.reset()
         self.reset()
-        encoder = PlanEncoder(self.query, instance=instance, trace=tracer)
+        encoder = PlanEncoder(self.plan, instance=instance, trace=tracer)
         # encoder.visit(self.query)
         encoder.encode()
         display_uexpr(tracer.root_constraint).write(

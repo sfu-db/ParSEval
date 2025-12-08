@@ -1,0 +1,41 @@
+=== Iteration 0 ===
+-- Operator: Join --
+cds
+-- Operator: Scan --
+cds
+CDSCode
+=== Iteration 1 ===
+-- Operator: Filter --
+AvgScrMath > 560
+-- Operator: Join --
+cds = CDSCode
+-- Operator: Scan --
+cds
+CDSCode
+=== Iteration 2 ===
+-- Operator: Filter --
+Charter Funding Type <> 'Directly funded'
+AvgScrMath <= 560
+-- Operator: Join --
+cds = CDSCode
+-- Operator: Scan --
+cds
+CDSCode
+=== Iteration 3 ===
+-- Operator: Filter --
+Charter Funding Type = 'Directly funded'
+AvgScrMath <= 560
+-- Operator: Join --
+cds = CDSCode
+-- Operator: Scan --
+cds
+CDSCode
+=== Iteration 4 ===
+-- Operator: Filter --
+Charter Funding Type = 'Directly funded'
+AvgScrMath <= 560
+-- Operator: Join --
+cds = CDSCode
+-- Operator: Scan --
+cds
+CDSCode
