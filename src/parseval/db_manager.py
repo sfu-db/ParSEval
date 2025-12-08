@@ -21,10 +21,7 @@ from sqlglot.schema import MappingSchema
 from contextlib import contextmanager
 import time
 import atexit
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    TimeoutError as FuturesTimeout,
-)
+from concurrent.futures import ThreadPoolExecutor
 from .singleton import singletonMeta
 
 

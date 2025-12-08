@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Dict, Any
 if TYPE_CHECKING:
     from src.parseval.dtype import DATATYPE
 
+
 Expression = sqlglot_exp.Expression
 
 
@@ -79,7 +80,7 @@ class FunctionCall(sqlglot_exp.Func):
         args_sql = ", ".join(
             [expr.sql(dialect=dialect, **opts) for expr in self.expressions]
         )
-        return f"{self.name}({args_sql})"
+        return f"{self.this}({args_sql})"
 
 
 class Strftime(FunctionCall):
@@ -110,18 +111,18 @@ class ScalarQuery(Expression):
     }
 
     @property
-    def query(self) -> Expression:
+    def query(self) -> "Expression":
         return self.this
 
     @property
-    def selects(self) -> List[Expression]:
+    def selects(self) -> List["Expression"]:
         return (
             self.query.schema.columns if isinstance(self.query, LogicalOperator) else []
         )
 
     def sql(self, dialect=None, **opts):
-        opts.setdefault("skips", set()).add(self.query.operator_id)
-        return f"{self.key}({self.query.sql(dialect=dialect, **opts)})"
+
+        return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
 
 
 class Schema(Expression):
@@ -169,10 +170,11 @@ class Table(Expression):
         self.set("_columns", columns)
         return columns
 
-    def nullable(self, column_name):
-        if self.args.get("primary_key"):
-            for column_name in self.primary_key.find_all(sqlglot_exp.Identifier):
-                if column_name.this.name == column_name:
+    def nullable(self, column_name: str):
+        primary_key = self.args.get("primary_key", None)
+        if primary_key:
+            for column_name in primary_key.find_all(sqlglot_exp.Identifier):
+                if str(column_name) == column_name:
                     return False
         for constraint in self.constraints.get(column_name, []):
 
@@ -190,9 +192,10 @@ class Table(Expression):
                 ),
             ):
                 return True
-        if self.args.get("primary_key"):
-            for column_name in self.primary_key.find_all(sqlglot_exp.Identifier):
-                if column_name.this.name == column_name:
+        primary_key = self.args.get("primary_key", None)
+        if primary_key:
+            for column_name in primary_key.find_all(sqlglot_exp.Identifier):
+                if str(column_name) == column_name:
                     return True
         return False
 
@@ -241,9 +244,7 @@ class LogicalOperator(sqlglot_exp.Expression):
         indent = opts.get("indent", 0)
         pad = "  " * indent
         lines = [f"{pad}{self._sql(dialect=dialect, **opts)}"]
-
         opts.setdefault("skips", set()).add(self.operator_id)
-
         for child in self.children:
             if child.operator_id in opts["skips"]:
                 continue
@@ -363,8 +364,8 @@ class LogicalFilter(UnaryOperator):
     @property
     def children(self) -> List[LogicalOperator]:
         children = [self.this]
-        for scalar in self.condition.find_all(ScalarQuery):
-            children.append(scalar.this)
+        # for scalar in self.condition.find_all(ScalarQuery):
+        #     children.append(scalar.this)
         return children  # [self.this]
 
     @property
@@ -372,8 +373,8 @@ class LogicalFilter(UnaryOperator):
         return self.args.get("condition")
 
     def _sql(self, dialect=None, **opts):
-        for child in self.children[1:]:
-            opts.setdefault("skips", set()).add(child.operator_id)
+        # for child in self.children[1:]:
+        #     opts.setdefault("skips", set()).add(child.operator_id)
         return (
             f"{self.operator_type}(condition={self.condition}, id={self.operator_id })"
         )
@@ -554,6 +555,25 @@ class LogicalCorrelate(UnaryOperator):
 
     def schema(self):
         return self.this.schema()
+
+
+for klass in [
+    ColumnRef,
+    Is_Null,
+    Is_Not_Null,
+    LogicalOperator,
+    LogicalAggregate,
+    LogicalJoin,
+    LogicalFilter,
+    LogicalProject,
+    LogicalScan,
+    LogicalSort,
+    LogicalCorrelate,
+    ScalarQuery,
+]:
+    generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
+        dialect=self.dialect
+    )
 
 
 def resolve_schema(expr, input_schema: Schema):

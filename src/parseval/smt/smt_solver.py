@@ -91,8 +91,8 @@ def strftime_to_z3(*args):
     to be within reasonable ranges based on the format.
     """
 
-    timestamp = args[1]
-    format_str = args[2].as_string()
+    timestamp = args[2]
+    format_str = args[1].as_string()  # args[2].as_string()
 
     year, month, day, hour, minute, second = symbolic_ymd_hms(timestamp)
 

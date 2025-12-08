@@ -473,23 +473,33 @@ class Function(Symbol):
 
 
 class Row(Symbol):
+    @property
+    def columns(self):
+        return self.args[1:]
+    @property
+    def rowid(self) -> Tuple[Any, ...]:
+        if isinstance(self.args[0], tuple):
+            return self.args[0]
+        return (self.args[0],)
+    
     def __iter__(self):
-        return iter(self.args)
+        return iter(self.columns)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return Row(*self.args[index])
-        return self.args[index]  # return single Symbol
+            return Row(*self.columns[index])
+        return self.columns[index]  # return single Symbol
 
     def __add__(self, other):
         if not isinstance(other, Row):
             raise TypeError(f"Cannot add Row with {type(other)}")
-        new_columns = self.args + other.args
+        new_columns = self.columns + other.columns
         new_metadata = {**self.metadata, **other.metadata}
-        return Row(*new_columns, metadata=new_metadata)
+        rid = self.rowid + other.rowid
+        return Row(rid, *new_columns, metadata=new_metadata)
 
     def __len__(self):
-        return len(self.args)
+        return len(self.columns)
 
 
 def _ensure_symbol(value: Any) -> Symbol:
@@ -508,9 +518,7 @@ class Strftime(Function):
     def _eval_concrete(self, *args):
         from datetime import datetime
 
-        logging.info(args)
-
-        _, date_arg, format_arg = args
+        _, format_arg, date_arg = args
 
         for arg in self.parent.args:
             if isinstance(arg, Symbol) and arg is not self:

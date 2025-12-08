@@ -223,17 +223,17 @@ class ValuePool:
             attempts = 0
             while attempts < 2000:
                 attempts += 1
-                if datatype.is_numeric():
+                if datatype.is_type(*DataType.NUMERIC_TYPES):
                     value = (
                         self._sample_int()
                         if datatype.is_integer()
                         else self._sample_float()
                     )
-                elif datatype.is_string():
+                elif datatype.is_type(*DataType.TEXT_TYPES):
                     value = self._sample_str()
-                elif datatype.is_boolean():
+                elif datatype.is_type(DataType.Type.BOOLEAN):
                     value = self._sample_bool()
-                elif datatype.is_datetime():
+                elif datatype.is_type(*DataType.TEMPORAL_TYPES):
                     value = self._sample_date()
                 else:
                     value = self._sample_int()

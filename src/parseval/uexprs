@@ -28,13 +28,16 @@ class PlausibleBit(IntEnum):
 
     FALSE = 0  # e.g., if condition is false
     TRUE = 1  # e.g., if condition is true
-    JOIN = 2  # e.g., threr exist tuple in right table cannot join with left table
-    NULL = 3  # e.g., column is null
-    DUPLICATE = 4  # e.g., duplicate values exist
-    MAX = 5  # e.g., number of max value
-    MIN = 6  # e.g., number of  min value
-    GROUP_COUNT = 7  # e.g., number of groups
-    GROUP_SIZE = 8  # e.g., size of groups(count of rows in each group)
+    JOIN_TRUE = 2  # e.g., threr exist tuple in both tables can join
+    JOIN_LEFT = 3  # e.g., there exist tuple in left table cannot join with right table,
+    JOIN_RIGHT = 4  # e.g., there exist tuple in right table cannot join with left table
+
+    NULL = 5  # e.g., column is null
+    DUPLICATE = 6  # e.g., duplicate values exist
+    MAX = 7  # e.g., number of max value
+    MIN = 8  # e.g., number of  min value
+    GROUP_COUNT = 9  # e.g., number of groups
+    GROUP_SIZE = 10  # e.g., size of groups(count of rows in each group)
 
     @classmethod
     def from_int(cls, value: Union[int, str, bool, PlausibleBit]) -> "PlausibleBit":
@@ -118,22 +121,23 @@ class _ScopeManager:
         self.operator = operator
 
     def __enter__(self) -> "UExprToConstraint":
-        """
-        Saves the current active node onto the internal state stack.
-        """
+        # 1. Notify Tracer we are entering a node
+        # (Useful if you want to push to a stack or log entry)
+        self.trace.on_scope_enter(self.operator)
         return self.trace
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """
-        Restores the active node from the stack, guaranteed to run.
-        """
-        for pattern in self.trace.leaves:
-            leaf = self.trace.leaves[pattern]
-            if not isinstance(leaf, PlausibleBranch):
-                continue
-            leaf.update_mark()
-        if self.operator.operator_id in self.trace.positive_nodes:
-            self.trace.prev_operator = self.operator.operator_id
+        # 2. CRITICAL: Check if an exception occurred
+        if exc_type is not None:
+            # Logic crashed. Do NOT update symbolic state.
+            # You might want to log this or rollback.
+            logging.error(f"Scope failed for {self.operator}. Rolling back state.")
+            return False  # Propagate the exception upwards
+
+        # 3. Success Path: Delegate finalization to the Tracer
+        # We pass the operator so the tracer knows who is finishing
+        self.trace.on_scope_exit(self.operator)
+
         return False
 
 
@@ -337,7 +341,7 @@ class PlausibleBranch(_Constraint):
 class Constraint(_Constraint):
     PLAUSIBLE_CONFIGS = {
         "filter": (PBit.FALSE, PBit.TRUE),
-        "join": (PBit.TRUE, PBit.FALSE, PBit.JOIN),
+        "join": (PBit.JOIN_TRUE, PBit.JOIN_LEFT, PBit.JOIN_RIGHT),
         "project": (PBit.TRUE, PBit.NULL, PBit.DUPLICATE),
         "groupby": (PBit.TRUE, PBit.GROUP_SIZE, PBit.GROUP_COUNT),
         "aggregate": (PBit.TRUE, PBit.NULL, PBit.DUPLICATE),
@@ -466,7 +470,10 @@ class Constraint(_Constraint):
     ):
         p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
         self.symbolic_exprs[bit].extend(p)
-        self.delta[bit].append(rows)
+        if isinstance(rows, (tuple, list)):
+            self.delta[bit].extend(rows)
+        else:
+            self.delta[bit].append(rows)
 
     def _create_plausible_siblings(self, branch):
         for bit in self.plausible_bits:
@@ -498,9 +505,24 @@ class UExprToConstraint:
         self.declare = declare
         self.threshold = threshold
 
-    def scope(self, operator: LogicalOperator) -> _ScopeManager:
-        """context manager for scoping the trace to a specific operator"""
-        return _ScopeManager(self, operator)
+    def on_scope_enter(self, operator: LogicalOperator):
+        """Optional hook for setup."""
+        # e.g., logging.debug(f"Entering {operator.operator_id}")
+        pass
+
+    def on_scope_exit(self, operator: LogicalOperator):
+        """
+        Refined logic to finalize state after a node is successfully visited.
+        """
+        # 1. Update Leaves (Encapsulated here)
+        for pattern, leaf in self.leaves.items():
+            if isinstance(leaf, PlausibleBranch):
+                leaf.update_mark()
+
+        # 2. Update Path Tracking
+        # Only update history if this node is relevant (in positive_nodes)
+        if operator.operator_id in self.positive_nodes:
+            self.prev_operator = operator.operator_id
 
     def reset(self):
         self.prev_operator = "ROOT"
@@ -531,7 +553,18 @@ class UExprToConstraint:
         operator_id = operator.operator_id
         for start, bit in self.positive_nodes[self.prev_operator]:
             node, b = start, bit
+
             for index, (sql_condition, taken) in enumerate(zip(sql_conditions, takens)):
+                if (
+                    isinstance(sql_condition, rex.sqlglot_exp.Predicate)
+                    and len(node.delta[bit]) > 0
+                    and not set(rows).intersection(set(node.delta[bit]))
+                ):
+                    logging.info(
+                        f"providing rowids: {rows} not in node.delta: {node.delta[bit]}"
+                    )
+                    continue
+
                 node = node.add_child(
                     operator=operator,
                     sql_condition=sql_condition,
@@ -561,7 +594,7 @@ class UExprToConstraint:
             )
         )
         for pattern, leaf in leaves.items():
-            if pattern[-1] == PBit.JOIN or leaf.attempts > self.threshold:
+            if pattern[-1] == PBit.JOIN_RIGHT or leaf.attempts > self.threshold:
                 continue
 
             if leaf.plausible_type in {PlausibleType.UNEXPLORED, PlausibleType.PENDING}:

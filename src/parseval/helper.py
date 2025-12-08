@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable, List, TypeVar, Dict, TYPE_CHECKING
 import re
+from sqlglot.expressions import convert
 
 if TYPE_CHECKING:
     from .symbol import Symbol
@@ -54,3 +55,10 @@ def sort_by_concrete(
         reverse=reverse,
     )
     return null_values + values if null_first else values + null_values
+
+
+def convert_to_literal(value, datatype=None) -> Symbol:
+    converted = convert(value)
+    if datatype:
+        converted.set("datatype", datatype)
+    return converted
