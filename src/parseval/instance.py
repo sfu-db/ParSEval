@@ -5,7 +5,8 @@ from sqlglot import parse, exp
 from collections import OrderedDict, defaultdict
 from .helper import normalize_name
 from .symbol import *
-from .faker import ValueGeneratorRegistry
+
+# from .faker import ValueGeneratorRegistry
 
 from src.parseval.smt.domain import ColumnDomainPool, DomainSpec
 
@@ -19,7 +20,12 @@ class Instance:
         self.name = name
         self.ddls = ddls
         self.dialect = dialect
+        self.foreign_keys = defaultdict(lambda: defaultdict(list))
         self._build_catalog(ddls, dialect)
+        # initialize column domain pool and register domain specs
+        self.column_domain = ColumnDomainPool()
+        self._register_domains()
+
         self.data: Dict[str, List[Row]] = defaultdict(list)  # table_name -> List[Row]
         self.symbols = {}
         self.symbol_to_table = {}
@@ -27,13 +33,9 @@ class Instance:
         self.tuple_id_to_symbols = {}
         self.pk_fk_symbols = {}
 
-        self.column_domain = ColumnDomainPool()
-
     def _build_catalog(self, ddls, dialect):
         ddls = parse(ddls, dialect=dialect)
-
-        dependency, tables, foreign_keys = {}, OrderedDict(), {}
-        foreign_keys = defaultdict(lambda: defaultdict(list))
+        dependency, tables = {}, OrderedDict()
         for stmt_expr in ddls:
             schema_expr = stmt_expr.this
             table_name = schema_expr.this.name
@@ -60,7 +62,10 @@ class Instance:
                     local_column = expr.expressions[0].this
                     ref_table = expr.args.get("reference").find(exp.Table).name
                     ref_column = expr.args.get("reference").this.expressions[0].this
-                    foreign_keys[table_name][local_column] = (ref_table, ref_column)
+                    self.foreign_keys[table_name][local_column] = (
+                        ref_table,
+                        ref_column,
+                    )
                     foreign_key = expr
 
             tables[table_name] = Table(
@@ -72,8 +77,8 @@ class Instance:
             )
             if table_name not in dependency:
                 dependency[table_name] = 0
-            for local_column in foreign_keys[table_name]:
-                from_table = foreign_keys[table_name][local_column][0]
+            for local_column in self.foreign_keys[table_name]:
+                from_table = self.foreign_keys[table_name][local_column][0]
                 dependency[from_table] = dependency.get(from_table, 0) + 1
 
         sorted_table = OrderedDict(
@@ -85,7 +90,44 @@ class Instance:
             }
         )
         self.catalog = Catalog(tables=sorted_table)
-        self.foreign_keys = foreign_keys
+
+    def _register_domains(self):
+        """Register DomainSpec entries in `self.column_domain` for every column.
+
+        This ensures the ColumnDomainPool knows the datatype, uniqueness and
+        nullability for each logical column and can generate/track values.
+        """
+        from src.parseval.smt.domain import DomainSpec
+
+        for table_name, table in self.catalog.tables.items():
+            for col in table.columns:
+                unique = table.is_unique(col.name)
+                nullable = table.nullable(col.name)
+                ds = DomainSpec(
+                    table_name=table_name,
+                    column_name=col.name,
+                    datatype=col.datatype,
+                    unique=unique,
+                    nullable=nullable,
+                )
+                self.column_domain.register_domain(ds)
+        # Link pools for foreign keys so referenced and referencing columns share domain values
+        try:
+            for table_name, fks in self.foreign_keys.items():
+                for local_col, (ref_table, ref_col) in fks.items():
+                    try:
+                        pool_local = self.column_domain.get_or_create_pool(
+                            table_name, table_name, local_col
+                        )
+                        pool_ref = self.column_domain.get_or_create_pool(
+                            ref_table, ref_table, ref_col
+                        )
+                        # merge/equality so values align across FK
+                        self.column_domain.add_equality(pool_ref, pool_local)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
 
     def __repr__(self):
         return f"Instance(name={self.name}, tables={list(self.catalog.tables.keys())})"
@@ -106,7 +148,12 @@ class Instance:
 
         return [row[column_index] for row in self.data[table_name]]
 
-    def create_row(self, table_name: str, values: Dict[str, Any]) -> Dict[str, Row]:
+    def create_row(
+        self,
+        table_name: str,
+        values: Dict[str, Any] | None = None,
+        alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Add a tuple to table and its dependent tables to maintain referential integrity.
 
@@ -118,7 +165,9 @@ class Instance:
             Dict[str, Row]: Map of table names to their new tuples
         """
 
+        values = values or {}
         new_tuples = defaultdict(list)
+        positions: Dict[str, int] = {}
         table = self.catalog.get_table(table_name)
 
         fk_info = self.foreign_keys.get(table_name, {})
@@ -136,36 +185,40 @@ class Instance:
             available_values = [
                 (idx, val.concrete)
                 for idx, val in enumerate(existing_values)
-                if not (table.is_unique(local_col) and val.concrete in used_values)
+                if not (table.is_unique(local_col_name) and val.concrete in used_values)
             ]
-            logging.info(
-                f"available values for {ref_table_name}.{ref_col_name}: {available_values}"
-            )
             if available_values:
                 idx, chosen_value = random.choice(available_values)
-                values[local_col] = chosen_value
+                values[local_col_name] = chosen_value
             else:
                 ref_values = {}
-                ref_position = self._create_row(ref_table_name, ref_values)
+                # materialize referenced row so FK points to an actual tuple
+                ref_position = self._create_row(ref_table_name, ref_values, alias=None)
                 ref_value = self.get_column_data(ref_table_name, ref_col_name)[
                     ref_position
                 ]
-
-                values[local_col] = ref_value.concrete
-                new_tuples[ref_table].append(self.get_row(ref_table_name, ref_position))
+                values[local_col_name] = ref_value.concrete
+                new_tuples[ref_table_name].append(
+                    self.get_row(ref_table_name, ref_position)
+                )
         # Step 2: Create the main row
-        main_pos = self._create_row(table_name, values)
+        main_pos = self._create_row(table_name, values, alias=alias)
         new_tuples[table_name].append(self.get_row(table_name, main_pos))
-        return new_tuples
+        positions[table_name] = main_pos
+        return {"rows": new_tuples, "positions": positions}
 
-    def _create_row(self, table_name: str, concretes: Dict):
+    def _create_row(
+        self,
+        table_name: str,
+        concretes: Dict[str, Any],
+        alias: Optional[str] = None,
+    ):
         """
         Internal helper method to create a row in a table with associated symbols.
 
         Args:
             table_name: Name of the table
-            values: Values for the row
-            multiplicity: Multiplicity of the row
+            concretes: Concrete values for column in the table
 
         Returns:
             int: Index of the new row
@@ -183,47 +236,38 @@ class Instance:
             if column_def.name in concretes:
                 concrete = concretes.get(column_def.name)
             else:
-                concrete = self._assign_concrete_for_column(
-                    table_name,
-                    column_def.name,
-                    str(datatype),
-                    table_expr.is_unique(column_def.name),
+                # Use ColumnDomainPool's ValuePool when possible to sample/generate
+                pool = self.column_domain.get_or_create_pool(
+                    alias or table_name, table_name, column_def.name
                 )
+                vals = pool.get_domain_values()
+                if not vals:
+                    pool.expand_domain(additional_samples=10)
+                    vals = pool.get_domain_values()
+                concrete = random.choice(list(vals))
+                pool.domain.generated.append(concrete)
             z_value = Variable(z_name, dtype=datatype, concrete=concrete)
             new_values.append(z_value)
             self.symbols[z_name] = z_value
             self.symbol_to_table[z_name] = (table_name, column_def.name, column_index)
-            # self.symbol_to_tuple_id[z_name] = tuple_index
-            # self.tuple_id_to_symbols[tuple_index] = z_value
-            # if table.is_unique(column_def) or table.is_foreignkey(column_def):
-            #     self.pk_fk_symbols[z_name] = z_value
-        self.data[table_name].append(Row(*new_values))
+        rowid = "%s_rowid_%d" % (table_name, tuple_index)
+        self.data[table_name].append(Row(rowid, *new_values))
         return tuple_index
 
-    def _assign_concrete_for_column(
-        self, table_name, column_name, datatype: str, is_unique: bool = False
-    ):
+    def reset(self):
+        """Clear instance data and reinitialize column domain pools.
+        Preserves `catalog` and `foreign_keys` (schema), but clears generated
+        rows, symbols and recreates `ColumnDomainPool` and registered domains.
         """
-        Generate a value for a column using the appropriate generator.
-
-        Args:
-            table_name: Name of the table
-            column_name: Name of the column
-            datatype: Type of the column (string or DataType)
-            is_unique: Whether the value should be unique
-
-        Returns:
-            Any: A generated value for the column
-        """
-        existing_values = None
-        if is_unique:
-            table_expr = self.catalog.get_table(table_name)
-            existing_values = set(
-                d.concrete for d in self.get_column_data(table_expr.name, column_name)
-            )
-
-        generator = ValueGeneratorRegistry.get_generator(datatype)
-        return generator(is_unique=is_unique, existing_values=existing_values)
+        self.data.clear()
+        self.symbols.clear()
+        self.symbol_to_table.clear()
+        self.symbol_to_tuple_id.clear()
+        self.tuple_id_to_symbols.clear()
+        self.pk_fk_symbols.clear()
+        # recreate pool and reregister domains
+        self.column_domain = ColumnDomainPool()
+        self._register_domains()
 
     def to_db(
         self, host_or_path, database=None, port=None, username=None, password=None
@@ -255,7 +299,7 @@ class Instance:
                 mapped_data = []
                 for row in rows:
                     data = {}
-                    for column_name, column_value in zip(columns, row.args):
+                    for column_name, column_value in zip(columns, row.columns):
                         data[normalize_name(column_name)] = column_value.concrete
                     mapped_data.append(data)
                 if mapped_data:

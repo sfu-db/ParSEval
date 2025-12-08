@@ -1,8 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
 from enum import Enum
+from collections import UserDict
+from collections.abc import MutableMapping
+from typing import (
+    Any,
+    Dict,
+    List,
+    Set,
+    Union,
+    Optional,
+    Generic,
+    TypeVar,
+    NamedTuple,
+)
 
 
 class ParSEvalState(Enum):
@@ -13,8 +25,6 @@ class ParSEvalState(Enum):
     COMPLETED = "completed"
     ERROR = "error"
 
-
-from typing import Generic, TypeVar, Union, Any, NamedTuple
 
 T = TypeVar("T")  # Type for the success value
 E = TypeVar("E")  # Type for the error value
@@ -74,6 +84,99 @@ class ValidationException(ParSEvalError):
     """
 
     pass
+
+
+class Metadata(UserDict):
+    """
+    A dictionary-like class optimized for handling configuration and metadata.
+    Supports recursive deep merging, path-based deletion, and type-safe updates.
+    """
+
+    def __init__(self, initial_data: Optional[Dict[str, Any]] = None):
+        super().__init__(initial_data)
+
+    def merge(self, other: Dict[str, Any] = None, **kwargs) -> "Metadata":
+        """
+        Recursively merges a dictionary (or kwargs) into the current metadata.
+        - Dicts: Recurse.
+        - Lists: Extend (append).
+        - Sets: Union.
+        - Others: Overwrite.
+        Returns self for chaining.
+        """
+        # Combine explicit dict argument and kwargs
+        sources = []
+        if other:
+            sources.append(other)
+        if kwargs:
+            sources.append(kwargs)
+
+        for source in sources:
+            self._deep_merge_recursive(self.data, source)
+
+        return self
+
+    def delete(self, key: str, strict: bool = False) -> None:
+        """
+        Standard delete.
+        If strict=False, does not raise error if key is missing.
+        """
+        try:
+            del self[key]
+        except KeyError:
+            if strict:
+                raise
+
+    def delete_path(self, path: str, separator: str = ".") -> None:
+        """
+        Deletes a nested key using a dot-notation string.
+        Example: metadata.delete_path("system.network.ip")
+        """
+        keys = path.split(separator)
+        last_key = keys.pop()
+
+        # Traverse to the parent of the target key
+        current_level = self.data
+        for k in keys:
+            if k not in current_level or not isinstance(current_level[k], dict):
+                # Path doesn't exist, return gracefully
+                return
+            current_level = current_level[k]
+
+        # Delete the final key
+        if last_key in current_level:
+            del current_level[last_key]
+
+    def _deep_merge_recursive(
+        self, target: MutableMapping, source: MutableMapping
+    ) -> None:
+        """
+        Internal helper for deep merging.
+        """
+        for key, value in source.items():
+            current_val = target.get(key)
+
+            # Case 1: Merge Nested Dictionaries
+            if isinstance(current_val, MutableMapping) and isinstance(
+                value, MutableMapping
+            ):
+                self._deep_merge_recursive(current_val, value)
+
+            # Case 2: Extend Lists
+            elif isinstance(current_val, list) and isinstance(value, list):
+                target[key].extend(value)
+
+            # Case 3: Union Sets
+            elif isinstance(current_val, set) and isinstance(value, set):
+                target[key].update(value)
+
+            # Case 4: Overwrite
+            else:
+                target[key] = value
+
+    def to_dict(self) -> Dict:
+        """Returns the raw standard dictionary."""
+        return self.data
 
 
 # @dataclass
