@@ -1,7 +1,8 @@
 from __future__ import annotations
 from typing import Callable, List, TypeVar, Dict, TYPE_CHECKING
 import re
-from sqlglot.expressions import convert
+from sqlglot.expressions import convert, Expression, maybe_copy, Literal
+
 
 if TYPE_CHECKING:
     from .symbol import Symbol
@@ -57,8 +58,28 @@ def sort_by_concrete(
     return null_values + values if null_first else values + null_values
 
 
-def convert_to_literal(value, datatype=None) -> Symbol:
-    converted = convert(value)
+import math, numbers, datetime
+
+
+def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
+    converted = None
+    if isinstance(value, Expression):
+        converted = maybe_copy(value, copy)
+    elif isinstance(value, str):
+        converted = Literal.string(value)
+    elif isinstance(value, bool):
+        converted = Literal(this=value, is_string=False)
+    elif value is None or (isinstance(value, float) and math.isnan(value)):
+        converted = Literal(this=None, is_string=False)
+    elif isinstance(value, numbers.Number):
+        converted = Literal.number(value)
+    elif isinstance(value, datetime.datetime):
+        converted = Literal(this=value, is_string=False)
+
+    elif isinstance(value, datetime.date):
+        converted = Literal(this=value, is_string=False)
+    else:
+        raise ValueError(f"Unsupported literal type: {type(value)}")
     if datatype:
         converted.set("datatype", datatype)
     return converted

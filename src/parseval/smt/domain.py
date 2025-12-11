@@ -203,6 +203,10 @@ class ValuePool:
         )
 
     def expand_domain(self, additional_samples: int = 10):
+        if self.domain.column_name == "OpenDate":
+            logger.info(
+                f"Expanding domain for {self.alias} ({self.domain.qualified_name}) with datatype {self.datatype}"
+            )
         """Generate a new value for the pool based on domain spec."""
         if self.choices:
             for choice in self.choices:
@@ -226,7 +230,7 @@ class ValuePool:
                 if datatype.is_type(*DataType.NUMERIC_TYPES):
                     value = (
                         self._sample_int()
-                        if datatype.is_integer()
+                        if datatype.is_type(*DataType.INTEGER_TYPES)
                         else self._sample_float()
                     )
                 elif datatype.is_type(*DataType.TEXT_TYPES):
@@ -237,6 +241,7 @@ class ValuePool:
                     value = self._sample_date()
                 else:
                     value = self._sample_int()
+
                 if value in self.local_excluded or value in self.domain.excluded:
                     continue
                 if self.unique and (
@@ -331,6 +336,7 @@ class ValuePool:
 
         while self._cursor in self.local_excluded or self._cursor in self.local_values:
             self._cursor += -step if descending else step
+
         return self._cursor
 
     def _inconsistency_detected(self):
@@ -515,12 +521,9 @@ class ColumnDomainPool:
     ) -> Optional[ValuePool]:
         qualified_name = f"{table_name}.{column_name}"
         key = f"{alias}" if alias else qualified_name
-
         key = self.union_find.find(key)
-
         if key in self._pools:
             return self._pools[key]
-
         domain = self._domains.get(qualified_name)
         if not domain:
             raise KeyError(f"No DomainSpec registered for {qualified_name}")

@@ -5,9 +5,6 @@ from sqlglot import parse, exp
 from collections import OrderedDict, defaultdict
 from .helper import normalize_name
 from .symbol import *
-
-# from .faker import ValueGeneratorRegistry
-
 from src.parseval.smt.domain import ColumnDomainPool, DomainSpec
 
 import random, logging
@@ -97,8 +94,6 @@ class Instance:
         This ensures the ColumnDomainPool knows the datatype, uniqueness and
         nullability for each logical column and can generate/track values.
         """
-        from src.parseval.smt.domain import DomainSpec
-
         for table_name, table in self.catalog.tables.items():
             for col in table.columns:
                 unique = table.is_unique(col.name)
@@ -122,7 +117,6 @@ class Instance:
                         pool_ref = self.column_domain.get_or_create_pool(
                             ref_table, ref_table, ref_col
                         )
-                        # merge/equality so values align across FK
                         self.column_domain.add_equality(pool_ref, pool_local)
                     except Exception:
                         continue
@@ -238,8 +232,9 @@ class Instance:
             else:
                 # Use ColumnDomainPool's ValuePool when possible to sample/generate
                 pool = self.column_domain.get_or_create_pool(
-                    alias or table_name, table_name, column_def.name
+                    None, table_name, column_def.name
                 )
+
                 vals = pool.get_domain_values()
                 if not vals:
                     pool.expand_domain(additional_samples=10)

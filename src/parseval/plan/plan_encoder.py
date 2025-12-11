@@ -93,7 +93,6 @@ class ProjectEncoder(OperatorEncoder):
                     data.append(smt_expr)
                     smt_conditions.extend(local_context.get("smt_conditions", []))
                     sql_conditions.extend(local_context.get("sql_conditions", []))
-                    tracer.speculate_datatype(local_context.get("datatype", {}))
                 self.append_to_context(node, Row(row.rowid, *data))
 
                 tracer.which_path(
@@ -134,7 +133,6 @@ class FilterEncoder(OperatorEncoder):
             for row in input_data:
                 encoder = ExpressionEncoder(new_condition, row)
                 smt_expr, local_context = encoder.encode(schema=input_schema)
-                tracer.speculate_datatype(local_context.get("datatype", {}))
                 smt_conditions = local_context.get("smt_conditions", [])
                 sql_conditions = local_context.get("sql_conditions", [])
                 try:
@@ -173,7 +171,6 @@ class JoinEncoder(OperatorEncoder):
                     row = lrow + rrow
                     encoder = ExpressionEncoder(node.condition, row)
                     smt_expr, local_context = encoder.encode(schema=node.schema())
-                    tracer.speculate_datatype(local_context.get("datatype", {}))
                     sql_conditions = local_context.get("sql_conditions", [])
                     smt_conditions = local_context.get("smt_conditions", [])
                     try:
@@ -219,7 +216,6 @@ class JoinEncoder(OperatorEncoder):
                     row = lrow + rrow
                     encoder = ExpressionEncoder(node.condition, row)
                     smt_expr, local_context = encoder.encode(schema=node.schema())
-                    tracer.speculate_datatype(local_context.get("datatype", {}))
                     try:
                         branch = smt_expr.concrete is True
                         if smt_expr:
