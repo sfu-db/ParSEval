@@ -1,0 +1,32 @@
+/* --- Remove empty symbol placeholders from all MkDocStrings headings --- */
+.doc-symbol-heading.doc-symbol-module,
+.doc-symbol-heading.doc-symbol-class,
+.doc-symbol-heading.doc-symbol-function,
+.doc-symbol-heading.doc-symbol-method,
+.doc-symbol-heading.doc-symbol-attribute {
+    display: none !important;
+}
+
+/* --- Tighten up spacing for all doc headings --- */
+.doc.doc-heading {
+    margin-top: 1em !important;
+    margin-bottom: 0.4em !important;
+    padding-left: 0 !important;
+}
+
+/* --- Make sure object names align properly --- */
+.doc.doc-heading .doc-object-name {
+    margin-left: 0 !important;
+}
+
+/* --- Optional: Make nested content (functions/classes) visually compact --- */
+.doc.doc-object.doc-function,
+.doc.doc-object.doc-class {
+    margin-top: 0.8em !important;
+    margin-bottom: 1em !important;
+}
+
+/* --- Optional: improve alignment for the source code toggle --- */
+details.mkdocstrings-source summary {
+    margin-left: 0 !important;
+}
