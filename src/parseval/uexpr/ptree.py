@@ -30,9 +30,6 @@ class UExprToConstraint:
         self.prev_operator: Optional[LogicalOperator] = "ROOT"
         self.declare = declare
         self.threshold = threshold
-        self.speculative_datatype: Dict = {}
-        self.speculative_values: Dict = {}
-
         # Index rows -> set of (Constraint, bit) for quick lookup when updating
         # mappings from runtime rows to UExpr nodes. Structure:
         # { rowid: { operator_id:  OrderedSet((Constraint, PlausibleBit), ...)} }
@@ -87,11 +84,6 @@ class UExprToConstraint:
             for k, child in op.children.items():
                 if isinstance(child, Constraint):
                     c.append(child)
-
-    def speculate_datatype(self, mapping: Dict[ColumnRef, Datatype]):
-        # for columnref, datatype in mapping.items():
-        #     self.speculative_datatype[columnref] = datatype
-        pass
 
     def which_path(
         self,
@@ -192,7 +184,6 @@ class UExprToConstraint:
         self, plausible: PlausibleBranch, instance: Instance, skips=None
     ):
         skips = skips or set()
-
         column_domains = instance.column_domain
         for columnref, dtype in self.speculate_datatype:
             alias = columnref.qualified_name

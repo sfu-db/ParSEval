@@ -1,41 +1,78 @@
 === Iteration 0 ===
 -- Operator: Join --
-cds
+CDSCode
 -- Operator: Scan --
-cds
+CDSCode
 CDSCode
 === Iteration 1 ===
--- Operator: Filter --
-AvgScrMath > 560
+-- Operator: Project --
+OpenDate IS NULL
 -- Operator: Join --
-cds = CDSCode
+CDSCode = CDSCode
 -- Operator: Scan --
-cds
+CDSCode
 CDSCode
 === Iteration 2 ===
--- Operator: Filter --
-Charter Funding Type <> 'Directly funded'
-AvgScrMath <= 560
+-- Operator: Project --
+OpenDate IS NULL
 -- Operator: Join --
-cds = CDSCode
+CDSCode = CDSCode
 -- Operator: Scan --
-cds
+CDSCode
 CDSCode
 === Iteration 3 ===
--- Operator: Filter --
-Charter Funding Type = 'Directly funded'
-AvgScrMath <= 560
+-- Operator: Project --
+OpenDate = 2015-12-21 06:40:27.846346
 -- Operator: Join --
-cds = CDSCode
+CDSCode = CDSCode
 -- Operator: Scan --
-cds
+CDSCode
 CDSCode
 === Iteration 4 ===
--- Operator: Filter --
-Charter Funding Type = 'Directly funded'
-AvgScrMath <= 560
+-- Operator: Project --
+OpenDate = 2015-12-21 06:40:27.846346
 -- Operator: Join --
-cds = CDSCode
+CDSCode = CDSCode
 -- Operator: Scan --
-cds
+CDSCode
+CDSCode
+=== Iteration 5 ===
+-- Operator: Project --
+Enrollment (K-12) IS NULL
+OpenDate
+-- Operator: Join --
+CDSCode = CDSCode
+-- Operator: Scan --
+CDSCode
+CDSCode
+=== Iteration 6 ===
+-- Operator: Project --
+Enrollment (K-12) IS NULL
+OpenDate
+-- Operator: Join --
+CDSCode = CDSCode
+-- Operator: Scan --
+CDSCode
+CDSCode
+=== Iteration 7 ===
+-- Operator: Sort --
+Enrollment (K-12) = 8.0
+-- Operator: Project --
+Enrollment (K-12)
+OpenDate
+-- Operator: Join --
+CDSCode = CDSCode
+-- Operator: Scan --
+CDSCode
+CDSCode
+=== Iteration 8 ===
+-- Operator: Sort --
+Enrollment (K-12) = 3.0
+-- Operator: Project --
+Enrollment (K-12)
+OpenDate
+-- Operator: Join --
+CDSCode = CDSCode
+-- Operator: Scan --
+CDSCode
 CDSCode

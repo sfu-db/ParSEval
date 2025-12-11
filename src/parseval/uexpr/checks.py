@@ -190,9 +190,8 @@ class MinMaxStrategy(Strategy):
         if not concretes:
             tracer.declare(node.operator.operator_type, node.sql_condition)
             return
-
-        max_ = max()
-        min_ = min([v.concrete for v in values if v.concrete is not None])
+        max_ = max(concretes)
+        min_ = min(concretes)
         reference = max_ if self.is_max else min_
         ref_literal = convert_to_literal(
             reference, node.sql_condition.args.get("datatype")
