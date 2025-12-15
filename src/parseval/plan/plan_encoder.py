@@ -179,14 +179,16 @@ class JoinEncoder(OperatorEncoder):
                 for rrow in right_input:
                     row = lrow + rrow
                     encoder = ExpressionEncoder()
-                    smt_expr, local_context = encoder.encode(
+                    local_context = encoder.encode(
                         node.condition, row=row, schema=node.schema()
                     )
                     smt_conditions = local_context.get("smt_conditions", [])
                     sql_conditions = self.resolve_sql_conditions(
                         local_context.get("sql_conditions", []), node.schema()
                     )
+
                     try:
+                        smt_expr = local_context[node.condition]
                         if smt_expr:
                             self.append_to_context(node, row)
                             takens = [2 if b else 3 for b in smt_conditions]
