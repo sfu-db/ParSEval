@@ -1,5 +1,5 @@
 from __future__ import annotations
-from .constants import PlausibleBit, PlausibleType
+from ..constants import PlausibleBit, PlausibleType
 from typing import Optional, List, TYPE_CHECKING
 import logging
 

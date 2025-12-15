@@ -138,8 +138,19 @@ class AggFuncRule(SpeculativeRule):
     def apply(self, expr: sqlglot_exp.AggFunc, env: TypeEnv):
         if expr.key in {"sum", "avg"}:
             arg = expr.args.get("this")
+            # if isinstance(s, ColumnRef):
+            #     env.set(s, target_type)
+
             if isinstance(arg, ColumnRef):
-                env.set(arg, DataType.build("INT"))
+
+                ancestor = expr.find_ancestor(LogicalOperator)
+                if isinstance(ancestor, UnaryOperator):
+                    input_schema = ancestor.this.schema()
+                elif isinstance(ancestor, BinaryOperator):
+                    input_schema = ancestor.schema()
+                s = arg.transform(resolve_schema, input_schema)
+
+                env.set(s, DataType.build("INT"))
 
 
 class OrderByNumberRule(SpeculativeRule):

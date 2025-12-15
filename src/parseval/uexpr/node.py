@@ -11,12 +11,12 @@ from .base import _Constraint, PlausibleBit
 #     check_groupcount,
 #     check_groupsize,
 # )
-from .constants import PBit, PlausibleType
+from ..constants import PBit, PlausibleType
 
 if TYPE_CHECKING:
     from src.parseval.plan.rex import LogicalOperator, Expression
 
-from src.parseval.plan import rex
+from src.parseval.plan import ColumnRef
 
 from sqlglot.expressions import AggFunc, Predicate
 
@@ -37,16 +37,16 @@ class PlausibleBranch(_Constraint):
     LABEL_STRATEGIES = {
         # PBit.DUPLICATE: check_cover_duplicate,
         # PBit.NULL: check_cover_null,
-        PBit.TRUE: lambda self: (
-            PlausibleType.COVERED
-            if len(self.parent.symbolic_exprs[PBit.TRUE]) > 2
-            else self.plausible_type
-        ),
-        PBit.FALSE: lambda self: (
-            PlausibleType.COVERED
-            if len(self.parent.symbolic_exprs[PBit.FALSE]) > 2
-            else self.plausible_type
-        ),
+        # PBit.TRUE: lambda self: (
+        #     PlausibleType.COVERED
+        #     if len(self.parent.symbolic_exprs[PBit.TRUE]) > 2
+        #     else self.plausible_type
+        # ),
+        # PBit.FALSE: lambda self: (
+        #     PlausibleType.COVERED
+        #     if len(self.parent.symbolic_exprs[PBit.FALSE]) > 2
+        #     else self.plausible_type
+        # ),
         # PBit.MAX: check_cardinality,
         # PBit.MIN: check_cardinality,
         # PBit.GROUP_COUNT: check_groupcount,
@@ -146,8 +146,8 @@ class Constraint(_Constraint):
         "filter": (PBit.FALSE, PBit.TRUE),
         "join": (PBit.JOIN_TRUE, PBit.JOIN_LEFT, PBit.JOIN_RIGHT),
         "project": (PBit.TRUE, PBit.NULL, PBit.DUPLICATE),
-        "groupby": (PBit.TRUE, PBit.GROUP_SIZE, PBit.GROUP_COUNT),
-        "aggregate": (PBit.TRUE, PBit.NULL, PBit.DUPLICATE),
+        "groupby": (PBit.GROUP_SIZE, PBit.GROUP_COUNT),
+        "aggregate": (PBit.GROUP_SIZE, PBit.NULL, PBit.DUPLICATE),
         "predicate": (PBit.FALSE, PBit.TRUE),
         "sort": (PBit.TRUE, PBit.MAX, PBit.MIN),
     }
@@ -187,7 +187,7 @@ class Constraint(_Constraint):
         elif self.operator.operator_type == "Sort":
             return self.PLAUSIBLE_CONFIGS["sort"]
         elif (
-            isinstance(self.sql_condition, rex.ColumnRef)
+            isinstance(self.sql_condition, ColumnRef)
             or self.operator.operator_type == "Project"
         ):
             return self.PLAUSIBLE_CONFIGS["project"]
@@ -276,7 +276,7 @@ class Constraint(_Constraint):
     ):
         p = symbolic_expr if isinstance(symbolic_expr, list) else [symbolic_expr]
         self.symbolic_exprs[bit].extend(p)
-        self.delta[bit].extend(rowids)
+        self.delta[bit].append(rowids)
         for ridx in rowids:
             op_id = self.operator.operator_id
             self.tree._index_row(op_id, ridx, self, bit, branch)

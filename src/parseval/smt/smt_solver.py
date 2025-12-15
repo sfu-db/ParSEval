@@ -265,6 +265,7 @@ class SMTSolver(SolverAdapter):
         if condition.key.upper() in self._SQL_OP_MAP:
 
             op = self._SQL_OP_MAP[condition.key.upper()]
+
             args = []
             for arg in condition.args:
                 if isinstance(arg, Symbol):
@@ -272,10 +273,15 @@ class SMTSolver(SolverAdapter):
                 else:
                     arg_z3 = arg  # constant
                 args.append(arg_z3)
+            # if condition.key.upper() == "EQ":
+            #     logging.info(f"EQ args: {args}")
+            #     logging.info(f"Types: {[str(a.sort()) for a in args]}")
+            #     logging.info(f"Values: {[str(a) for a in condition.args]}")
             if condition.key.upper() in {"DIV", "FLOORDIV"}:
                 safe_div_constraint = self._ensure_safe_div(args[1])
                 context.setdefault("safe_divisions", []).append(safe_div_constraint)
             if callable(op):
+
                 return op(*args)
             else:
                 raise NotImplementedError(f"Operation {condition.key} not implemented")

@@ -203,10 +203,6 @@ class ValuePool:
         )
 
     def expand_domain(self, additional_samples: int = 10):
-        if self.domain.column_name == "OpenDate":
-            logger.info(
-                f"Expanding domain for {self.alias} ({self.domain.qualified_name}) with datatype {self.datatype}"
-            )
         """Generate a new value for the pool based on domain spec."""
         if self.choices:
             for choice in self.choices:

@@ -6,7 +6,7 @@ from collections import OrderedDict, defaultdict
 from .helper import normalize_name
 from .symbol import *
 from src.parseval.smt.domain import ColumnDomainPool, DomainSpec
-
+from src.parseval.db_manager import DBManager
 import random, logging
 
 
@@ -269,7 +269,6 @@ class Instance:
     ):
         database = database or self.name
         database = database if database.endswith(".sqlite") else database + ".sqlite"
-        from src.parseval.db_manager import DBManager
 
         mapped_data = []
 
@@ -301,6 +300,19 @@ class Instance:
 
                     column_list = ", ".join(columns)
                     stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
+                    with open(f"tests/db/{self.name}_data_inserts.sql", "a") as f:
+                        f.write(f"-- Inserting into table: {table_name} --\n")
+                        for data in mapped_data:
+                            cols = ", ".join(data.keys())
+                            vals = ", ".join(
+                                [
+                                    f"'{str(v)}'" if isinstance(v, str) else str(v)
+                                    for v in data.values()
+                                ]
+                            )
+                            f.write(
+                                f"INSERT INTO {table_name} ({cols}) VALUES ({vals});\n"
+                            )
 
                     # logging.info(mapped_data)
                     conn.insert(stmt, mapped_data)

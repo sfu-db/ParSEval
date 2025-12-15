@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .constants import PBit, PlausibleType
+from ..constants import PBit, PlausibleType
 
 
 @dataclass
@@ -53,7 +53,11 @@ class CoverageTracker:
             except Exception:
                 op_type = None
 
-            condition = str(node.sql_condition) if getattr(node, "sql_condition", None) is not None else "ROOT"
+            condition = (
+                str(node.sql_condition)
+                if getattr(node, "sql_condition", None) is not None
+                else "ROOT"
+            )
 
             per_bit: Dict[PBit, Dict[str, Any]] = {}
             try:
@@ -88,13 +92,23 @@ class CoverageTracker:
                         symbolic_count = 0
 
                 per_bit[bit] = {
-                    "status": status.name if isinstance(status, PlausibleType) else str(status),
+                    "status": (
+                        status.name
+                        if isinstance(status, PlausibleType)
+                        else str(status)
+                    ),
                     "hits": hits,
                     "symbolic_count": symbolic_count,
                     "sample": str(sample) if sample is not None else None,
                 }
 
-            nc = NodeCoverage(pattern=node.pattern(), operator_type=op_type, condition=condition, per_bit=per_bit, metadata=getattr(node, "metadata", {}) or {})
+            nc = NodeCoverage(
+                pattern=node.pattern(),
+                operator_type=op_type,
+                condition=condition,
+                per_bit=per_bit,
+                metadata=getattr(node, "metadata", {}) or {},
+            )
             out.append(nc)
 
             # push children constraints for traversal

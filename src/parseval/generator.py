@@ -2,7 +2,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
 from collections import defaultdict
 from src.parseval.plan.planner import Planner
-from src.parseval.plan.plan_encoder import PlanEncoder, ExpressionEncoder
+from src.parseval.plan.plan_encoder import PlanEncoder
+
+# , ExpressionEncoder
 from src.parseval.plan import rex
 from src.parseval.instance import Instance
 from src.parseval.uexpr import UExprToConstraint
@@ -63,13 +65,13 @@ def get_domainpool(instance: Instance) -> ColumnDomainPool:
     return pool
 
 
-class ExprEncoder(ExpressionEncoder):
-    def __init__(self, constraint, row=None, symbolic_registry=None):
-        super().__init__(constraint, row, symbolic_registry)
+# class ExprEncoder(ExpressionEncoder):
+#     def __init__(self, constraint, row=None, symbolic_registry=None):
+#         super().__init__(constraint, row, symbolic_registry)
 
-    def visit_columnref(self, expr, parent_stack=None, context=None):
-        smt_expr = context[expr.qualified_name]
-        return smt_expr
+#     def visit_columnref(self, expr, parent_stack=None, context=None):
+#         smt_expr = context[expr.qualified_name]
+#         return smt_expr
 
 
 class Generator:
@@ -83,10 +85,24 @@ class Generator:
         self.schema = schema
         self.dialect = dialect
         self.name = name
-        self.constraints: Dict[str, List[rex.Expression]] = defaultdict(list)
+        self.constraints: Dict[str, List[sym.Symbol]] = defaultdict(list)
+
+        self.var_to_columnref: Dict[str, rex.ColumnRef] = {}
+        self.columnref_to_var: Dict[rex.ColumnRef, sym.Variable] = {}
 
         planner = Planner()
         self.plan = planner.explain(schema, query)
+
+    def declare_variable(self, variable: sym.Variable, columnref: rex.ColumnRef):
+        self.var_to_columnref[variable.name] = columnref
+        self.columnref_to_var[columnref] = variable
+
+    def declare_constraint(
+        self, label, constraints: Union[sym.Symbol, List[sym.Symbol]]
+    ):
+        if not isinstance(constraints, list):
+            constraints = [constraints]
+        self.constraints.setdefault(label, []).extend(constraints)
 
     def add_constraint(
         self, label, constraints: Union[rex.Expression, List[rex.Expression]]
@@ -106,16 +122,16 @@ class Generator:
         speculative = SpeculateEngine().infer(self.plan)
         for columnref, datatype in speculative.items():
             alias = columnref.qualified_name
+            logging.info(f"Speculative data type: {alias} -> {datatype}, {columnref}")
             pool = instance.column_domain.get_or_create_pool(
-                alias, table_name=columnref.table, column_name=columnref.name
+                None, table_name=columnref.table, column_name=columnref.name
             )
             logging.info(
-                f"Speculative type: {alias} from {pool.datatype} -> {datatype}"
+                f"Speculative data type: {alias} from {pool.datatype} -> {datatype}"
             )
             pool.datatype = datatype
-            logging.info(f"Updated domain pool datatype: {pool.datatype}")
 
-        tracer = UExprToConstraint(declare=self.add_constraint, threshold=threshold)
+        tracer = UExprToConstraint(declare=self, threshold=threshold)
         for index in range(max_iter):
             encoder = PlanEncoder(plan=self.plan, instance=instance, trace=tracer)
             encoder.encode()
@@ -124,13 +140,15 @@ class Generator:
                 break
             pattern = plausible.pattern()
             logging.info(f"Selecting leaf: ========================= {pattern}")
-            tracer._declare_smt_constraints(plausible)
 
-            solver, var_to_columnref, columnref_to_var = self.generate_smt_conditions(
-                instance
-            )
+            tracer.declare_coverage_constraints(plausible, instance)
 
-            with open("tests/db/constraints.txt", "a") as f:
+            solver = Solver(instance.column_domain)
+            for label, constraints in self.constraints.items():
+                for constraint in constraints:
+                    solver.add_constraint(constraint)
+
+            with open(f"tests/db/{self.name}_constraints.txt", "a") as f:
                 f.write(f"=== Iteration {index} ===\n")
                 for label, constraints in self.constraints.items():
                     f.write(f"-- Operator: {label} --\n")
@@ -143,9 +161,11 @@ class Generator:
                 plausible.mark_infeasible()
             else:
                 concretes = {}
+                logging.info("Satisfying assignment found:")
+                logging.info(self.var_to_columnref)
                 for assignment in solver_result.assignments:
                     var_name = assignment.column
-                    columnref = var_to_columnref[var_name]
+                    columnref = self.var_to_columnref[var_name]
                     table_name = columnref.table
                     concretes.setdefault(table_name, {})[
                         columnref.name

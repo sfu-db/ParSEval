@@ -1,7 +1,7 @@
 from __future__ import annotations
-from typing import Optional, Dict, Any, Set, Union, List, TYPE_CHECKING
+from typing import Optional, Dict, Any, Set, Union, List, TYPE_CHECKING, Tuple
 import logging
-from .node import *
+from .node import Constraint, PlausibleBranch, PlausibleType, PBit
 
 if TYPE_CHECKING:
     from src.parseval.plan.rex import Expression, ColumnRef, Datatype
@@ -10,9 +10,19 @@ if TYPE_CHECKING:
 from collections import defaultdict
 from ordered_set import OrderedSet
 from src.parseval.symbol import Variable, Symbol, Const, Distinct
-from sqlglot.expressions import convert
 from src.parseval.helper import group_by_concrete
 from .checks import resolve_check
+from sqlglot import exp as sqlglot_exp
+from src.parseval.plan import ExpressionEncoder, ColumnRef
+
+
+class ExprEncoder(ExpressionEncoder):
+    # def __init__(self, expr, row, symbolic_registry=None):
+    #     super().__init__(expr, row, symbolic_registry)
+
+    def visit_columnref(self, expr, parent_stack, context):
+        smt_expr = context[expr.qualified_name]
+        return smt_expr
 
 
 class UExprToConstraint:
@@ -152,10 +162,11 @@ class UExprToConstraint:
 
     def _declare_variables(
         self,
-        column_pool,
+        instance: Instance,
         path: List[Constraint],
         patterns: List[PBit],
     ):
+        column_pool = instance.column_domain
         var_to_columnref, columnref_to_var = {}, {}
         for _, node in zip(patterns, path[1:]):
             sql_condition = node.sql_condition
@@ -165,6 +176,9 @@ class UExprToConstraint:
             for columnref in columnrefs:
                 var_name = f"{columnref.qualified_name}"
                 if var_name not in var_to_columnref:
+                    logging.info(
+                        f"Declaring variable for columnref: {columnref.table} -> {columnref.name}, {repr(columnref)}, {sql_condition}"
+                    )
                     domain = column_pool.get_or_create_pool(
                         var_name,
                         table_name=columnref.table,
@@ -173,11 +187,68 @@ class UExprToConstraint:
                     var = Variable(var_name, dtype=domain.datatype)
                     var_to_columnref[var_name] = columnref
                     columnref_to_var[columnref] = var
+
+                    self.declare.declare_variable(var, columnref)
+
                     if domain.unique:
-                        data = domain.domain.generated
-                        values = [Const(d, dtype=domain.datatype) for d in data]
+                        data = instance.get_column_data(
+                            table_name=columnref.table, column_name=columnref.name
+                        )
+                        values = [
+                            Const(d.concrete, dtype=domain.datatype) for d in data
+                        ]
+                        logging.info(
+                            f"Declaring unique constraint for {var_name}: {values}"
+                        )
                         unique_constraint = Distinct(var, *values, dtype="bool")
-                        self.declare("database", unique_constraint)
+                        self.declare.declare_constraint("database", unique_constraint)
+        fk_variables = {}
+        for var_name, columnref in var_to_columnref.items():
+            if (
+                columnref.table in instance.foreign_keys
+                and columnref.name in instance.foreign_keys[columnref.table]
+            ):
+                ref_table, ref_col = instance.foreign_keys[columnref.table][
+                    columnref.name
+                ]
+                fk_constraints = []
+                flag = False
+                fk_varname = f"{ref_table}.{ref_col}"
+
+                for colref2, var2 in columnref_to_var.items():
+                    if colref2.table == ref_table and colref2.name == ref_col:
+                        flag = True
+                        fk_constraints.append(columnref_to_var[columnref].eq(var2))
+                        fk_varname = var2.name
+                domain = column_pool.get_or_create_pool(
+                    None, table_name=ref_table, column_name=ref_col
+                )
+                if not flag:
+                    var = Variable(fk_varname, dtype=domain.datatype)
+                    for c in instance.catalog.get_table(ref_table).columns:
+                        if c.name == ref_col:
+                            fk_ref_col = c
+                            break
+                    fk_variables[fk_varname] = (var, fk_ref_col)
+                    self.declare.declare_variable(var, fk_ref_col)
+                    fk_constraints.append(columnref_to_var[columnref].eq(var))
+
+                data = instance.get_column_data(
+                    table_name=ref_table, column_name=ref_col
+                )
+                for d in data:
+                    fk_constraints.append(
+                        columnref_to_var[columnref].eq(
+                            Const(d.concrete, dtype=domain.datatype)
+                        )
+                    )
+                from functools import reduce
+
+                fk_constraint = reduce(lambda x, y: x.or_(y), fk_constraints)
+                logging.info(f"fk_constraint: {fk_constraint}")
+                self.declare.declare_constraint("database", fk_constraint)
+        for var_name, (var, ref_col) in fk_variables.items():
+            self.declare.declare_variable(var, ref_col)
         return var_to_columnref, columnref_to_var
 
     def declare_coverage_constraints(
@@ -185,21 +256,11 @@ class UExprToConstraint:
     ):
         skips = skips or set()
         column_domains = instance.column_domain
-        for columnref, dtype in self.speculate_datatype:
-            alias = columnref.qualified_name
-            pool = column_domains.get_or_create_pool(
-                alias,
-                table_name=columnref.table,
-                column_name=columnref.name,
-            )
-            if pool:
-                pool.datatype = dtype
-        path = plausible.get_path_to_root()
-        path = list(reversed(path[1:]))
+        path = list(reversed(plausible.get_path_to_root()[1:]))
         patterns = list(reversed(plausible.pattern()))
         context = {"has_having": False, "patterns": patterns}
         var_to_columnref, columnref_to_var = self._declare_variables(
-            column_domains, path, patterns
+            instance, path, patterns
         )
 
         for bit, node in zip(patterns, path[1:]):
@@ -209,50 +270,74 @@ class UExprToConstraint:
             if (node.operator.operator_type, bit) in skips:
                 continue
             declare_strategy = resolve_check(node.operator.operator_type, bit)
-            declare_strategy.declare(self, node, context)
-
-    def _declare_smt_constraints(self, plausible: PlausibleBranch):
-        """
-        declare SMT constraints for the plausible branch
-        """
-        path = plausible.get_path_to_root()
-        path = list(reversed(path[1:]))
-        patterns = list(reversed(plausible.pattern()))
-        # ### we first process constraints in the path to root
-
-        context = {"has_having": False, "patterns": patterns}
-
-        for bit, node in zip(patterns, path[1:]):
-            if context["has_having"]:
-                break
-            logging.info(f"Declaring constraint for bit: {bit}, node: {node}")
-            strategy = resolve_check(node.operator.operator_type, bit)
-            # Check per-tracer configuration whether this strategy should run
-            enabled = True
-            if strategy is not None:
-                if self.strategy_config is not None:
-                    # operator-specific key first
-                    key = (node.operator.operator_type, bit)
-                    if key in self.strategy_config:
-                        enabled = bool(self.strategy_config[key])
-                    elif bit in self.strategy_config:
-                        enabled = bool(self.strategy_config[bit])
-                if enabled:
-                    strategy.declare(self, node, context)
+            constraints = declare_strategy.declare(self, node, context)
+            for constraint in constraints:
+                columnrefs = set(constraint.find_all(ColumnRef))
+                if not columnrefs:
                     continue
+                if isinstance(constraint, sqlglot_exp.Predicate):
+                    ### Encode Coverage to SMT constraints
+                    encoder = ExprEncoder()
+                    try:
+                        kwgs = {
+                            c.qualified_name: columnref_to_var[c] for c in columnrefs
+                        }
+                    except Exception as e:
+                        # logging.info(columnref_to_var)
+                        for c in columnrefs:
+                            logging.info(f"columnref: {c}, {type(c)}")
+                        for key, value in columnref_to_var.items():
+                            logging.info(f"key: {key}, value: {value}, {type(key)}")
+                        raise e
 
-            # Fallback behavior when no strategy is registered
-            if bit is PBit.FALSE:
-                if node.operator.operator_type in {"Having"}:
-                    continue
-                elif isinstance(node.sql_condition, rex.sqlglot_exp.Predicate):
-                    pos_constraint = rex.negate_predicate(node.sql_condition)
-                    self.declare(node.operator.operator_type, pos_constraint)
-            else:
-                if node.operator.operator_type in {"Having"}:
-                    self._declare_having_constraints(node, bit, context)
-                else:
-                    self.declare(node.operator.operator_type, node.sql_condition)
+                    ctx = encoder.encode(constraint, **kwgs)
+                    condition = ctx[constraint]
+                    self.declare.declare_constraint(
+                        node.operator.operator_type, condition
+                    )
+
+    # def _declare_smt_constraints(self, plausible: PlausibleBranch):
+    #     """
+    #     declare SMT constraints for the plausible branch
+    #     """
+    #     path = plausible.get_path_to_root()
+    #     path = list(reversed(path[1:]))
+    #     patterns = list(reversed(plausible.pattern()))
+    #     # ### we first process constraints in the path to root
+
+    #     context = {"has_having": False, "patterns": patterns}
+
+    #     for bit, node in zip(patterns, path[1:]):
+    #         if context["has_having"]:
+    #             break
+    #         logging.info(f"Declaring constraint for bit: {bit}, node: {node}")
+    #         strategy = resolve_check(node.operator.operator_type, bit)
+    #         # Check per-tracer configuration whether this strategy should run
+    #         enabled = True
+    #         if strategy is not None:
+    #             if self.strategy_config is not None:
+    #                 # operator-specific key first
+    #                 key = (node.operator.operator_type, bit)
+    #                 if key in self.strategy_config:
+    #                     enabled = bool(self.strategy_config[key])
+    #                 elif bit in self.strategy_config:
+    #                     enabled = bool(self.strategy_config[bit])
+    #             if enabled:
+    #                 strategy.declare(self, node, context)
+    #                 continue
+
+    #         # Fallback behavior when no strategy is registered
+    #         if bit is PBit.FALSE:
+    #             if node.operator.operator_type in {"Having"}:
+    #                 continue
+    #             elif isinstance(node.sql_condition, rex.sqlglot_exp.Predicate):
+    #                 pos_constraint = rex.negate_predicate(node.sql_condition)
+    #                 self.declare(node.operator.operator_type, pos_constraint)
+    #         else:
+    #             if node.operator.operator_type in {"Having"}:
+    #                 self._declare_having_constraints(node, bit, context)
+    #             else:
+    #                 self.declare(node.operator.operator_type, node.sql_condition)
 
     # def _declare_duplicate_constraints(self, node, context):
     #     if isinstance(node.sql_condition, rex.ColumnRef):

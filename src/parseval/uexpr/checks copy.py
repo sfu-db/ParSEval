@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Dict, Any, TYPE_CHECKING
 from src.parseval.plan import rex
-from .constants import PBit, PlausibleType
+from ..constants import PBit, PlausibleType
 from src.parseval.symbol import Variable
 from src.parseval.helper import group_by_concrete
 import logging

@@ -3,7 +3,6 @@ from __future__ import annotations
 """Public API for the ``src.parseval.uexpr`` package.
 """
 
-from .constants import PBit, PlausibleType, PlausibleBit
 from .node import Constraint, PlausibleBranch
 from .ptree import UExprToConstraint
 from .base import _ScopeManager
