@@ -46,12 +46,6 @@ class OperatorEncoder(ABC):
     def instance(self):
         return self.encoder.instance
 
-    def resolve_sql_conditions(self, sql_conditions: List[Expression], schema: Schema):
-        resolved_conditions = [
-            expr.transform(resolve_schema, schema) for expr in sql_conditions
-        ]
-        return resolved_conditions
-
     @abstractmethod
     def handle(self, node: Any, parent_stack: List[Any]) -> None:
         """
@@ -95,17 +89,12 @@ class ProjectEncoder(OperatorEncoder):
                 data = []
                 sql_conditions, smt_conditions = [], []
                 for proj in node.expressions:
-                    encoder = ExpressionEncoder()
-                    local_context = encoder.encode(proj, schema=input_schema, row=row)
-                    smt_expr = local_context[proj]
+                    encoder = ExpressionEncoder(proj, row)
+                    smt_expr, local_context = encoder.encode(schema=input_schema)
                     data.append(smt_expr)
-                    smt_conditions.extend(local_context.get("smt_conditions"))
-                    sql_conditions.extend(local_context.get("sql_conditions"))
+                    smt_conditions.extend(local_context.get("smt_conditions", []))
+                    sql_conditions.extend(local_context.get("sql_conditions", []))
                 self.append_to_context(node, Row(row.rowid, *data))
-
-                sql_conditions = self.resolve_sql_conditions(
-                    sql_conditions, input_schema
-                )
 
                 tracer.which_path(
                     operator=node,
@@ -134,15 +123,18 @@ class FilterEncoder(OperatorEncoder):
             datatype = scalar.this.args.get("datatype")
             concrete = scalar_out[0][0].concrete
             literal = convert_to_literal(concrete, datatype)
+            # if datatype.is_type(*DataType.NUMERIC_TYPES):
+            #     literal = sqlglot_exp.Literal.number(concrete)
+            # else:
+            #     literal = sqlglot_exp.Literal.string(concrete)
+            # literal.set("datatype", datatype)
             new_condition.find(ScalarQuery).replace(literal)
 
         with self.encoder.scope(node) as tracer:
+
             for row in input_data:
-                encoder = ExpressionEncoder()
-                local_context = encoder.encode(
-                    new_condition, row=row, schema=input_schema
-                )
-                smt_expr = local_context[new_condition]
+                encoder = ExpressionEncoder(new_condition, row)
+                smt_expr, local_context = encoder.encode(schema=input_schema)
                 smt_conditions = local_context.get("smt_conditions", [])
                 sql_conditions = local_context.get("sql_conditions", [])
                 try:
@@ -154,9 +146,6 @@ class FilterEncoder(OperatorEncoder):
                     (b.concrete if b.concrete is not None else 0)
                     for b in smt_conditions
                 ]
-                sql_conditions = self.resolve_sql_conditions(
-                    sql_conditions, input_schema
-                )
 
                 tracer.which_path(
                     operator=node,
@@ -178,14 +167,10 @@ class JoinEncoder(OperatorEncoder):
                 smt_exprs = []
                 for rrow in right_input:
                     row = lrow + rrow
-                    encoder = ExpressionEncoder()
-                    smt_expr, local_context = encoder.encode(
-                        node.condition, row=row, schema=node.schema()
-                    )
+                    encoder = ExpressionEncoder(node.condition, row)
+                    smt_expr, local_context = encoder.encode(schema=node.schema())
+                    sql_conditions = local_context.get("sql_conditions", [])
                     smt_conditions = local_context.get("smt_conditions", [])
-                    sql_conditions = self.resolve_sql_conditions(
-                        local_context.get("sql_conditions", []), node.schema()
-                    )
                     try:
                         if smt_expr:
                             self.append_to_context(node, row)
@@ -211,12 +196,9 @@ class JoinEncoder(OperatorEncoder):
                 row = Row(lrow.rowid, *lrow, *null_vlaues)
                 self.append_to_context(node, row)
                 smt_condition = reduce(lambda x, y: x.and_(y), smt_exprs)
-
                 tracer.which_path(
                     node,
-                    sql_conditions=self.resolve_sql_conditions(
-                        [node.condition], node.schema()
-                    ),
+                    sql_conditions=[node.condition],
                     symbolic_exprs=[smt_condition.not_()],
                     takens=[3],
                     branch=True,
@@ -230,20 +212,15 @@ class JoinEncoder(OperatorEncoder):
             for lrow in left_input:
                 for rrow in right_input:
                     row = lrow + rrow
-                    encoder = ExpressionEncoder()
-                    local_context = encoder.encode(
-                        node.condition, row=row, schema=node.schema()
-                    )
-                    smt_expr = local_context[node.condition]
+                    encoder = ExpressionEncoder(node.condition, row)
+                    smt_expr, local_context = encoder.encode(schema=node.schema())
                     try:
                         branch = smt_expr.concrete is True
                         if smt_expr:
                             self.append_to_context(node, row)
                     except NullValueError:
                         branch = False
-                    sql_conditions = self.resolve_sql_conditions(
-                        local_context.get("sql_conditions", []), node.schema()
-                    )
+                    sql_conditions = local_context.get("sql_conditions", [])
                     smt_conditions = local_context.get("smt_conditions", [])
                     takens = [2 if b.concrete is True else 3 for b in smt_conditions]
                     tracer.which_path(
@@ -403,35 +380,36 @@ class UnionEncoder(OperatorEncoder):
         pass
 
 
-from .context import Context
-
-GLOBAL_SYMBOLIC_REGISTRY = SymbolicRegistry()
-
-
 class ExpressionEncoder:
+    _symbolic_registry: SymbolicRegistry
     DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
-    TRANSFORMS = {}
 
-    def encode(self, expr: Expression, **kwargs):
-        context = Context(**kwargs)
-        parent_stack = []
-        self._visit(expr, parent_stack, context=context)
-        return context
+    def __init__(
+        self,
+        expr: Expression,
+        row: Row,
+        symbolic_registry: Optional[SymbolicRegistry] = None,
+    ):
+        self.expr = expr
+        self.row = row
+        self._symbolic_registry = symbolic_registry or SymbolicRegistry()
 
-    def _visit(self, expr, parent_stack, context):
+    def encode(self, **kwargs) -> Tuple[Symbol, Dict[str, Any]]:
+        context = {**kwargs}
+        result = self._visit(self.expr, context=context)
+        return result, context
+
+    def _visit(self, expr, parent_stack=None, context=None):
         if expr is None:
             return None
         parent_stack = parent_stack or []
-        if expr in context:
-            return context[expr]
+        context = context if context is not None else {}
         expr_key = expr.key if not isinstance(expr, FunctionCall) else str(expr.this)
-        registry = GLOBAL_SYMBOLIC_REGISTRY
-        if expr_key in self.TRANSFORMS:
-            context[expr] = self.TRANSFORMS[expr_key](expr, parent_stack, context)
-        elif registry.has_handler(expr_key):
-            handler = registry.get_handlers(expr_key)
-            is_branch = registry.is_branch(expr_key)
-            with context(is_branch) as track:
+
+        if self._symbolic_registry.has_handler(expr_key):
+            handler = self._symbolic_registry.get_handlers(expr_key)
+            is_branch = self._symbolic_registry.is_branch(expr_key)
+            with self.predicate_scope(context=context, is_branch=is_branch) as track:
                 try:
                     args = tuple(
                         self._visit(e, parent_stack + [e], context=context)
@@ -439,27 +417,25 @@ class ExpressionEncoder:
                         if not isinstance(e, DataType)
                     )
                     smt_expr = handler(*args)
-                    context[expr] = track(expr, smt_expr)
-                    return context[expr]
+                    return track(expr, smt_expr)
                 except KeyError as e:
                     raise NotImplementedError(
                         f"Predicate {expr.key} not supported yet.{e}"
                     )
         else:
-            handler = getattr(self, f"visit_{expr_key}", self.generic_visit)
-            context[expr] = handler(expr, parent_stack, context)
-            return context[expr]
+            handler = getattr(self, f"visit_{expr.key}", self.generic_visit)
+            result = handler(expr, parent_stack, context)
+            return result
 
     def generic_visit(self, expr, parent_stack, context):
         raise NotImplementedError(f"No visit_{expr.key} method defined")
 
-    def visit_columnref(self, expr: ColumnRef, parent_stack, context: Context):
-        smt_expr = context["row"][expr.ref] if "row" in context else context[expr]
-        if not context.in_predicates():
-            # self.in_predicates(context):
-            # schema = context.get("schema")
-            # if schema:
-            #     expr = expr.transform(resolve_schema, schema)
+    def visit_columnref(self, expr: ColumnRef, parent_stack=None, context=None):
+        smt_expr = self.row[expr.ref]
+        if not self.in_predicates(context):
+            schema = context.get("schema")
+            if schema:
+                expr = expr.transform(resolve_schema, schema)
             context.setdefault("sql_conditions", []).append(expr)
             context.setdefault("smt_conditions", []).append(smt_expr)
         return smt_expr
@@ -484,11 +460,13 @@ class ExpressionEncoder:
                         continue
             elif datatype.is_type(*DataType.TEXT_TYPES):
                 value = str(value)
-            else:
-                raise ValueError(f"Unsupported datatype: {datatype}")
         except Exception as e:
             value = None
         return Const(value, dtype=datatype)
+
+    def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
+        this = self._visit(expr.this, parent_stack + [expr], context)
+        return this.not_()
 
     def visit_cast(self, expr: sqlglot_exp.Cast, parent_stack, context):
         inner = self._visit(expr.this, parent_stack + [expr], context)
@@ -496,11 +474,11 @@ class ExpressionEncoder:
         if isinstance(expr.this, ColumnRef):
             context.setdefault("datatype", {})[expr.this] = to_type
         concrete = inner.concrete
-        if to_type.is_type(*DataType.TEMPORAL_TYPES):
-            try:
+        try:
+            if to_type.is_type(*DataType.TEMPORAL_TYPES):
                 concrete = date_parser.parse(inner.concrete)
-            except Exception as e:
-                concrete = None
+        except Exception as e:
+            concrete = None
         try:
             args = (a for a in inner.args)
         except Exception as e:
@@ -518,181 +496,64 @@ class ExpressionEncoder:
                 )
         return self._visit(expr.args.get("default"), parent_stack + [expr], context)
 
+    def visit_logicalcorrelate(self, expr, parent_stack, context):
+        sub_ctx = {
+            "ref_conditions": [],
+            "sql_conditions": [],
+            "smt_conditions": [],
+            "parent": expr,
+        }
+        results = []
 
-# class ExpressionEncoder:
-#     _symbolic_registry: SymbolicRegistry
-#     DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
+        results.append(
+            self.plan_encoder.visit(expr.this, parent_stack + [expr], sub_ctx)
+        )
+        # for child in expr.expressions:
+        #     results.append(self.visit(child, parent_stack + [expr], sub_ctx))
+        #     sqlglot_exp.Subquery
+        context.setdefault("ref_conditions", []).extend(
+            sub_ctx.get("ref_conditions", [])
+        )
+        context.setdefault("smt_conditions", []).extend(
+            sub_ctx.get("smt_conditions", [])
+        )
+        # Merge subquery predicates into main context
+        # context["predicates"].extend(sub_ctx["predicates"])
+        # context["columns"].extend(sub_ctx["columns"])
+        # context["smt_constraints"].extend(sub_ctx["smt_constraints"])
+        logging.info(f"Subquery results: {results}")
+        return results[0]
 
-#     def __init__(
-#         self,
-#         expr: Expression,
-#         row: Row,
-#         symbolic_registry: Optional[SymbolicRegistry] = None,
-#     ):
-#         self.expr = expr
-#         self.row = row
-#         self._symbolic_registry = symbolic_registry or SymbolicRegistry()
+    def in_predicates(self, context):
+        return bool(context.get("_predicate_stack", []))
 
-#     def encode(self, **kwargs) -> Tuple[Symbol, Dict[str, Any]]:
-#         context = {**kwargs}
-#         result = self._visit(self.expr, context=context)
-#         return result, context
+    @contextmanager
+    def predicate_scope(self, context, is_branch: bool):
+        """
+        Context manager to track predicates.
+        If `is_branch` is False, no stack is maintained and `track` is a no-op.
+        """
+        if is_branch:
+            context.setdefault("_predicate_stack", []).append(True)
+            try:
 
-#     def _visit(self, expr, parent_stack=None, context=None):
-#         if expr is None:
-#             return None
-#         parent_stack = parent_stack or []
-#         context = context if context is not None else {}
-#         expr_key = expr.key if not isinstance(expr, FunctionCall) else str(expr.this)
+                def track(expr: Expression, smt_expr):
+                    schema = context.get("schema")
+                    if schema:
+                        expr = expr.transform(resolve_schema, schema)
+                    context.setdefault("sql_conditions", []).append(expr)
+                    context.setdefault("smt_conditions", []).append(smt_expr)
+                    return smt_expr
 
-#         if self._symbolic_registry.has_handler(expr_key):
-#             handler = self._symbolic_registry.get_handlers(expr_key)
-#             is_branch = self._symbolic_registry.is_branch(expr_key)
-#             with self.predicate_scope(context=context, is_branch=is_branch) as track:
-#                 try:
-#                     args = tuple(
-#                         self._visit(e, parent_stack + [e], context=context)
-#                         for e in expr.iter_expressions()
-#                         if not isinstance(e, DataType)
-#                     )
-#                     smt_expr = handler(*args)
-#                     return track(expr, smt_expr)
-#                 except KeyError as e:
-#                     raise NotImplementedError(
-#                         f"Predicate {expr.key} not supported yet.{e}"
-#                     )
-#         else:
-#             handler = getattr(self, f"visit_{expr.key}", self.generic_visit)
-#             result = handler(expr, parent_stack, context)
-#             return result
+                yield track
+            finally:
+                context["_predicate_stack"].pop()
+        else:
 
-#     def generic_visit(self, expr, parent_stack, context):
-#         raise NotImplementedError(f"No visit_{expr.key} method defined")
+            def track(expr, smt_expr):
+                return smt_expr
 
-#     def visit_columnref(self, expr: ColumnRef, parent_stack=None, context=None):
-#         smt_expr = self.row[expr.ref]
-#         if not self.in_predicates(context):
-#             schema = context.get("schema")
-#             if schema:
-#                 expr = expr.transform(resolve_schema, schema)
-#             context.setdefault("sql_conditions", []).append(expr)
-#             context.setdefault("smt_conditions", []).append(smt_expr)
-#         return smt_expr
-
-#     def visit_literal(self, expr: sqlglot_exp.Literal, parent_stack, context):
-#         """We should convert the literal value to the appropriate type const based on its datatype."""
-#         value = expr.this
-#         datatype = expr.args.get("datatype")
-
-#         try:
-#             if datatype.is_type(*DataType.INTEGER_TYPES):
-#                 value = int(value)
-#             elif datatype.is_type(*DataType.REAL_TYPES):
-#                 value = float(value)
-#             elif datatype.is_type(DataType.Type.BOOLEAN):
-#                 value = bool(value)
-#             elif datatype.is_type(*DataType.TEMPORAL_TYPES):
-#                 for fmt in self.DATETIME_FMT:
-#                     try:
-#                         value = datetime.strptime(value, fmt)
-#                     except ValueError:
-#                         continue
-#             elif datatype.is_type(*DataType.TEXT_TYPES):
-#                 value = str(value)
-#         except Exception as e:
-#             value = None
-#         return Const(value, dtype=datatype)
-
-#     def visit_not(self, expr: sqlglot_exp.Not, parent_stack=None, context=None):
-#         this = self._visit(expr.this, parent_stack + [expr], context)
-#         return this.not_()
-
-#     def visit_cast(self, expr: sqlglot_exp.Cast, parent_stack, context):
-#         inner = self._visit(expr.this, parent_stack + [expr], context)
-#         to_type = expr.to
-#         if isinstance(expr.this, ColumnRef):
-#             context.setdefault("datatype", {})[expr.this] = to_type
-#         concrete = inner.concrete
-#         try:
-#             if to_type.is_type(*DataType.TEMPORAL_TYPES):
-#                 concrete = date_parser.parse(inner.concrete)
-#         except Exception as e:
-#             concrete = None
-#         try:
-#             args = (a for a in inner.args)
-#         except Exception as e:
-#             raise e
-#         return inner.__class__(
-#             *args, dtype=expr.to, concrete=concrete, **inner.metadata
-#         )
-
-#     def visit_case(self, expr: sqlglot_exp.Case, parent_stack, context):
-#         for when in expr.args.get("ifs"):
-#             smt_expr = self._visit(when.this, parent_stack + [expr], context)
-#             if smt_expr:
-#                 return self._visit(
-#                     when.args.get("true"), parent_stack + [expr], context
-#                 )
-#         return self._visit(expr.args.get("default"), parent_stack + [expr], context)
-
-#     def visit_logicalcorrelate(self, expr, parent_stack, context):
-#         sub_ctx = {
-#             "ref_conditions": [],
-#             "sql_conditions": [],
-#             "smt_conditions": [],
-#             "parent": expr,
-#         }
-#         results = []
-
-#         results.append(
-#             self.plan_encoder.visit(expr.this, parent_stack + [expr], sub_ctx)
-#         )
-#         # for child in expr.expressions:
-#         #     results.append(self.visit(child, parent_stack + [expr], sub_ctx))
-#         #     sqlglot_exp.Subquery
-#         context.setdefault("ref_conditions", []).extend(
-#             sub_ctx.get("ref_conditions", [])
-#         )
-#         context.setdefault("smt_conditions", []).extend(
-#             sub_ctx.get("smt_conditions", [])
-#         )
-#         # Merge subquery predicates into main context
-#         # context["predicates"].extend(sub_ctx["predicates"])
-#         # context["columns"].extend(sub_ctx["columns"])
-#         # context["smt_constraints"].extend(sub_ctx["smt_constraints"])
-#         logging.info(f"Subquery results: {results}")
-#         return results[0]
-
-#     def in_predicates(self, context):
-#         return bool(context.get("_predicate_stack", []))
-
-#     @contextmanager
-#     def predicate_scope(self, context, is_branch: bool):
-#         """
-#         Context manager to track predicates.
-#         If `is_branch` is False, no stack is maintained and `track` is a no-op.
-#         """
-#         if is_branch:
-#             context.setdefault("_predicate_stack", []).append(True)
-#             try:
-
-#                 def track(expr: Expression, smt_expr):
-#                     schema = context.get("schema")
-#                     if schema:
-#                         expr = expr.transform(resolve_schema, schema)
-#                     context.setdefault("sql_conditions", []).append(expr)
-#                     context.setdefault("smt_conditions", []).append(smt_expr)
-#                     return smt_expr
-
-#                 yield track
-#             finally:
-#                 context["_predicate_stack"].pop()
-#         else:
-
-#             def track(expr, smt_expr):
-#                 return smt_expr
-
-#             yield track
+            yield track
 
 
 class PlanEncoder:

@@ -476,12 +476,13 @@ class Row(Symbol):
     @property
     def columns(self):
         return self.args[1:]
+
     @property
     def rowid(self) -> Tuple[Any, ...]:
         if isinstance(self.args[0], tuple):
             return self.args[0]
         return (self.args[0],)
-    
+
     def __iter__(self):
         return iter(self.columns)
 
@@ -535,6 +536,15 @@ class Strftime(Function):
     @property
     def fmt(self):
         return self.args[2]
+
+
+class ABS(Function):
+    def _eval_concrete(self, *args):
+        logging.info(f"Calculating ABS for args: {args}")
+        try:
+            return abs(args[1])
+        except Exception as e:
+            return None
 
 
 # class DateAdd(Function):
@@ -605,6 +615,7 @@ class SymbolicRegistry:
         "strftime": lambda *args: Strftime(
             "strftime", args[0], args[1], dtype=args[2] if len(args) > 2 else "STRING"
         ),
+        "abs": lambda *args: ABS("ABS", args[0], dtype=args[0].dtype),
     }
 
     def __init__(

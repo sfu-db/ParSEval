@@ -49,20 +49,26 @@ class TestGenerator(unittest.TestCase):
 
         with open(BIRD_DEV_FP, "r") as f:
             data = json.load(f)
-        INDEX = 29
+        INDEX = 83
         for row in data:
-            if row["question_id"] == INDEX:
+            question_id = row["question_id"]
+            if question_id < 83:
+                continue
+            if row["question_id"] <= INDEX:
                 sql = row["SQL"]
                 logger.info(f"Testing query: {sql}")
-                generator = Generator(schema=schema, query=sql, name=f"test_{INDEX}")
+                generator = Generator(
+                    schema=schema, query=sql, name=f"test_{question_id}"
+                )
 
                 with open(f"tests/db/{generator.name}_plan.sql", "w") as f:
+                    f.write(f"-- Query: {sql}\n")
                     f.write(generator.plan.sql())
 
-                instance = generator.generate(max_iter=15)
+                instance = generator.generate(max_iter=25)
                 instance.to_db("tests/db")
 
-                break
+                # break
 
 
 if __name__ == "__main__":

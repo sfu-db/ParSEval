@@ -14,7 +14,8 @@ import pydot
 
 from enum import Enum
 
-from src.parseval.uexpr import Constraint, PlausibleBranch, PBit
+from src.parseval.uexpr import Constraint, PlausibleBranch
+from src.parseval.constants import PBit
 
 NODE_STYLES: Dict[str, Dict[str, str]] = {}
 

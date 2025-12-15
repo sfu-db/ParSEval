@@ -5,6 +5,7 @@ from sqlglot import exp as sqlglot_exp, expressions
 from sqlglot import generator
 from src.parseval.dtype import DataType
 from typing import TYPE_CHECKING, List, Optional, Dict, Any
+from sqlglot.optimizer.simplify import simplify
 
 if TYPE_CHECKING:
     from src.parseval.dtype import DATATYPE
@@ -48,6 +49,17 @@ class ColumnRef(sqlglot_exp.Expression):
     def qualified_name(self) -> str:
         """Get fully qualified column name"""
         return f"{self.alias}.{self.name}" if self.alias else self.name
+
+    @property
+    def hashable_args(self) -> Any:
+        from sqlglot.expressions import _norm_arg
+
+        return frozenset(
+            (k, tuple(_norm_arg(a) for a in v) if type(v) is list else _norm_arg(v))
+            for k, v in self.args.items()
+            if k != "unique"
+            and not (v is None or v is False or (type(v) is list and not v))
+        )
 
     def __str__(self):
         return self.name
@@ -298,11 +310,16 @@ class LogicalScan(LeafOperator):
     arg_types = {
         "this": True,
         "operator_id": True,
+        "expressions": False,
     }
 
     @property
     def table_name(self) -> str:
         return self.text("this")
+
+    @property
+    def columns(self):
+        return self.expressions
 
     def _sql(self, dialect=None, **opts):
         return f"{self.operator_type}(table={self.table_name}, id = {self.operator_id})"
@@ -313,7 +330,7 @@ class LogicalScan(LeafOperator):
     def schema(self):
         if "_schema" in self.args:
             return self.args.get("_schema")
-        scm = Schema(expressions=self.args.get("columns"))
+        scm = Schema(expressions=self.expressions)
         self.set("_schema", scm)
         return scm
 
@@ -597,8 +614,6 @@ def resolve_schema(expr, input_schema: Schema):
 
 def negate_predicate(expr) -> "Expression":
     """Return the negation of this expression."""
-
-    from sqlglot.optimizer.simplify import simplify
 
     if expr.key == "is_null":
         return Is_Not_Null(this=expr.this)

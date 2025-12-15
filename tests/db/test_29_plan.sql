@@ -1,5 +1,0 @@
-Sort(1, dir=['DESCENDING'], offset=0, limit=1)
-  Project($49, $18, id=3)
-    Join(condition=$0 = $29, type=INNER, id=2)
-      Scan(table=frpm, id = 0)
-      Scan(table=schools, id = 1)

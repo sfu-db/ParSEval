@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, TYPE_CHECKING
 from src.parseval.plan.rex import *
 from src.parseval.plan.helper import to_identifier, to_columnref, to_type
-from src.parseval.states import SchemaException, SyntaxException
 import json
 from src.parseval.calcite import get_logical_plan
 
@@ -115,7 +114,7 @@ class Planner:
         res = get_logical_plan(ddls=schema, queries=[sql], dialect=dialect)
         src = json.loads(res)[0]
         if src["state"] != "SUCCESS":
-            raise SyntaxException(f"Plan Error: {src.get('error')}")
+            raise Exception(f"Plan Error: {src.get('error')}")
 
         plan_json = json.loads(src["plan"])
         return self.walk(plan_json)
@@ -156,13 +155,11 @@ class Planner:
             )
             for index, col in enumerate(node.get("columns", []))
         ]
-        return LogicalScan(
-            this=table_name, operator_id=operator_id, expressions=columns
-        )
+        return LogicalScan(this=table_name, operator_id=operator_id, columns=columns)
 
     def parse_project(self, **node):
         child = self.walk(node.get("inputs")[0])
-        expressions = [self.walk(project) for project in node.pop("project", [])]
+        expressions = [self.walk(proj) for proj in node.pop("project", [])]
         operator_id = node.pop("id")
         return LogicalProject(
             this=child, expressions=expressions, operator_id=operator_id
