@@ -167,7 +167,7 @@ cython_debug/
 # .devcontainer
 
 logs
-datasets
+datasets/
 examples
 README-dev.md
 
