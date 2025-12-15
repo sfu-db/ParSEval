@@ -52,8 +52,8 @@ class TestGenerator(unittest.TestCase):
         INDEX = 83
         for row in data:
             question_id = row["question_id"]
-            if question_id < 83:
-                continue
+            # if question_id < 83:
+            #     continue
             if row["question_id"] <= INDEX:
                 sql = row["SQL"]
                 logger.info(f"Testing query: {sql}")

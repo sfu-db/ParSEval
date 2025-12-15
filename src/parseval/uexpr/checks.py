@@ -241,23 +241,6 @@ class GroupSizeStrategy(Strategy):
                         )
                         context["groupid"] = deltas[i]
                         return [constraint]
-
-                #         context["groupid"] = deltas[i]
-                #         break
-
-                # for key, rowid in reversed(
-                #     zip(node.symbolic_exprs[PBit.GROUP_SIZE], node.delta)
-                # ):
-                #     if key.concrete is not None:
-                #         group_key = key
-                #         literal = convert_to_literal(
-                #             group_key.concrete, node.sql_condition.datatype
-                #         )
-                #         constraint = sqlglot_exp.EQ(
-                #             this=node.sql_condition, expression=literal
-                #         )
-                #         context["groupid"] = rowid
-                #         return [constraint]
         elif isinstance(sql_condition, sqlglot_exp.AggFunc):
             self.select_group(node, context)
         return []
