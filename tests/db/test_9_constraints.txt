@@ -1,0 +1,77 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I))
+Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I)))
+Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A))
+Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A)))
+Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A)))
+-- Operator: Filter --
+Gt(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A), Const(@))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@)))
+Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(@)))
+-- Operator: Filter --
+Eq(Variable(T1.Charter Funding Type), Const(Directly funded))
+Ge(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A), Const(@), Const(_))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A), Const(@), Const(_))
+Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(_)))
+Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const(_)))
+-- Operator: Filter --
+Eq(Variable(T1.Charter Funding Type), Const(Directly funded))
+Gt(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?))
+Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(?)))
+Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(?)))
+-- Operator: Project --
+Is_null(Variable(T1.School Code))
+-- Operator: Filter --
+Eq(Variable(T1.Charter Funding Type), Const(Directly funded))
+Gt(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?), Const(C))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?), Const(C))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(C)))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(?))), Eq(Variable(T1.CDSCode), Const(C)))
+-- Operator: Project --
+Is_null(Variable(T1.School Code))
+-- Operator: Filter --
+Eq(Variable(T1.Charter Funding Type), Const(Directly funded))
+Gt(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?), Const(C), Const(G))
+Distinct(Variable(T1.CDSCode), Const(BC5tuDMo3I), Const(A), Const(@), Const(_), Const(?), Const(C), Const(G))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(BC5tuDMo3I))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(C))), Eq(Variable(T0.cds), Const(G)))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(BC5tuDMo3I))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(?))), Eq(Variable(T1.CDSCode), Const(C))), Eq(Variable(T1.CDSCode), Const(G)))
+-- Operator: Project --
+Eq(Variable(T1.School Code), Const(JhkYdlOn7j))
+-- Operator: Filter --
+Eq(Variable(T1.Charter Funding Type), Const(Directly funded))
+Gt(Variable(T0.AvgScrMath), Const(560))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))

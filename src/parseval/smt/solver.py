@@ -10,7 +10,7 @@ from .adapter import SolverAdapter, SolverResult, ValueAssignment
 from .smt_solver import SMTSolver
 from src.parseval.symbol import Variable, Symbol, Condition, IS_NULL, EQ, NEQ
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("parseval.smt.solver")
 
 
 class Solver:
@@ -57,6 +57,9 @@ class Solver:
                     self.pool_mgr.get_pool(var.name)
                     for var in [constraint.left, constraint.right]
                 ]
+                logger.info(
+                    f"Adding equality constraint between {pools[0].alias} {pools[0]} {pools[1]}"
+                )
 
                 if not self.pool_mgr.add_equality(pools[0], pools[1]):
                     raise InConsistency(
@@ -108,7 +111,7 @@ class Solver:
                                     data_type=None,
                                 )
                             )
-                            logging.info(
+                            logger.info(
                                 f"Assigning NULL to {var_name} due to IS NULL constraint"
                             )
 

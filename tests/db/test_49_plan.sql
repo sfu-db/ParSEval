@@ -1,0 +1,11 @@
+-- Query: SELECT DISTINCT County, School, ClosedDate FROM schools WHERE County = ( SELECT County FROM schools WHERE StatusType = 'Closed' GROUP BY County ORDER BY COUNT(School) DESC LIMIT 1 ) AND StatusType = 'Closed' AND school IS NOT NULL
+Aggregate(keys=[$0, $1, $2], aggs=[])
+  Project($4, $6, $21, id=9)
+    Filter(condition=$4 = scalarquery( Project($0, id=6)
+  Sort(1, dir=['DESCENDING'], offset=0, limit=1)
+    Project($0, $1, id=4)
+      Aggregate(keys=[$0], aggs=[COUNT($1)])
+        Project($4, $6, id=2)
+          Filter(condition=$3 = 'Closed', id=1)
+            Scan(table=schools, id = 0)) AND $3 = 'Closed' AND $6 IS NOT NULL, id=8)
+      Scan(table=schools, id = 7)

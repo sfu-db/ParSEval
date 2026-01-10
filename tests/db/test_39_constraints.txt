@@ -1,0 +1,33 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(Jnlz2BzvOH))
+Distinct(Variable(T1.CDSCode), Const(Jnlz2BzvOH))
+Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(Jnlz2BzvOH)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(Jnlz2BzvOH), Const(A))
+Distinct(Variable(T1.CDSCode), Const(Jnlz2BzvOH), Const(A))
+Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(Jnlz2BzvOH))), Eq(Variable(T0.cds), Const(A)))
+-- Operator: Filter --
+Eq(Strftime(strftime, Const(%Y), Variable(T1.OpenDate)), Const(1980))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(Jnlz2BzvOH), Const(A), Const(@))
+Distinct(Variable(T1.CDSCode), Const(Jnlz2BzvOH), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(Jnlz2BzvOH))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@)))
+-- Operator: Filter --
+Eq(Strftime(strftime, Const(%Y), Variable(T1.OpenDate)), Const(1980))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(Jnlz2BzvOH), Const(A), Const(@), Const(!))
+Distinct(Variable(T1.CDSCode), Const(Jnlz2BzvOH), Const(A), Const(@), Const(!))
+Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(Jnlz2BzvOH))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(!)))
+-- Operator: Filter --
+Eq(Variable(T1.County), Const(Fresno))
+Neq(Strftime(strftime, Const(%Y), Variable(T1.OpenDate)), Const(1980))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))

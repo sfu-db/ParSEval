@@ -31,7 +31,9 @@ class Instance:
         self.pk_fk_symbols = {}
 
     def _build_catalog(self, ddls, dialect):
-        ddls = parse(ddls, dialect=dialect)
+        ddls = parse(ddls, dialect="mysql")
+        ddls = [stmt.sql("sqlite") for stmt in ddls]
+        ddls = parse(";".join(ddls), dialect="sqlite")
         dependency, tables = {}, OrderedDict()
         for stmt_expr in ddls:
             schema_expr = stmt_expr.this
@@ -300,7 +302,7 @@ class Instance:
 
                     column_list = ", ".join(columns)
                     stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
-                    with open(f"tests/db/{self.name}_data_inserts.sql", "a") as f:
+                    with open(f"examples/db/{self.name}_data_inserts.sql", "a") as f:
                         f.write(f"-- Inserting into table: {table_name} --\n")
                         for data in mapped_data:
                             cols = ", ".join(data.keys())

@@ -432,14 +432,28 @@ class ITE(Symbol):
 
 class Group(Symbol):
     @property
+    def group_key(self):
+        return self.args[0]
+
+    @property
     def name(self) -> Any:
         return self.args[0]
 
+    @property
+    def rowids(self) -> Tuple[Any, ...]:
+        return self.args[1]
+
+    def extend(self, items: Iterable[Symbol]):
+        object.__setattr__(self, "args", self.args + tuple(items))
+
+    def append(self, item: Symbol):
+        object.__setattr__(self, "args", self.args + (item,))
+
     def __iter__(self):
-        return iter(self.args[1:])
+        return iter(self.args[2:])
 
     def __getitem__(self, index):
-        return self.args[1:][index]
+        return self.args[2:][index]
 
 
 class Quantifier(Symbol):

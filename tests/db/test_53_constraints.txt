@@ -1,0 +1,25 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(2K55tLb5PB))
+Distinct(Variable(T1.CDSCode), Const(2K55tLb5PB))
+Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(2K55tLb5PB)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(2K55tLb5PB), Const(A))
+Distinct(Variable(T1.CDSCode), Const(2K55tLb5PB), Const(A))
+Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(2K55tLb5PB))), Eq(Variable(T0.cds), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T1.MailCity), Const(Fresno))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(2K55tLb5PB), Const(A), Const(!))
+Distinct(Variable(T1.CDSCode), Const(2K55tLb5PB), Const(A), Const(!))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(2K55tLb5PB))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!)))
+-- Operator: Project --
+Eq(Variable(T0.NumTstTakr), Const(9))
+-- Operator: Filter --
+Eq(Variable(T1.MailCity), Const(Fresno))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))

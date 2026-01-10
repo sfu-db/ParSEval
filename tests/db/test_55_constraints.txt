@@ -1,0 +1,92 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A))
+-- Operator: Project --
+Eq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@))
+-- Operator: Project --
+Eq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H))
+-- Operator: Project --
+Eq(Variable(T0.County), Const(Humboldt))
+Eq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I), Const(O))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I), Const(O), Const('))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I), Const(O), Const('), Const(B))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 10 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I), Const(O), Const('), Const(B), Const(`))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))
+=== Iteration 11 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(FXfgHU7AGG), Const(A), Const(@), Const(H), Const(!), Const(I), Const(O), Const('), Const(B), Const(`), Const(P))
+-- Operator: Project --
+Neq(Variable(T0.County), Const(Humboldt))
+Neq(Variable(T0.County), Const(Colusa))
+-- Operator: Filter --
+Eq(Variable(T0.MailState), Const(CA))

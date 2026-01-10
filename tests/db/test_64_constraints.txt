@@ -1,0 +1,23 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(6z99s53fwM))
+-- Operator: Filter --
+Eq(Variable(T0.CharterNum), Const(00D4))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(6z99s53fwM), Const(!))
+-- Operator: Filter --
+Eq(Variable(T0.MailCity), Const(Hickman))
+Neq(Variable(T0.CharterNum), Const(00D4))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(6z99s53fwM), Const(!), Const("))
+-- Operator: Filter --
+Eq(Variable(T0.MailCity), Const(Hickman))
+Eq(Variable(T0.CharterNum), Const(00D4))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(6z99s53fwM), Const(!), Const("), Const(?))
+-- Operator: Filter --
+Eq(Variable(T0.MailCity), Const(Hickman))
+Eq(Variable(T0.CharterNum), Const(00D4))

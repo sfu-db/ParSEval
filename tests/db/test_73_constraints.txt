@@ -1,0 +1,70 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ))
+Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@)))
+-- Operator: Filter --
+Eq(Variable(T1.SOCType), Const(Youth Authority Facilities))
+Neq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?)))
+-- Operator: Filter --
+Eq(Variable(T1.SOCType), Const(Youth Authority Facilities))
+Eq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(3)))
+-- Operator: Project --
+Is_null(Variable(T0.FRPM Count (Ages 5-17)))
+-- Operator: Filter --
+Eq(Variable(T1.SOCType), Const(Youth Authority Facilities))
+Eq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3), Const(C))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3), Const(C))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(3))), Eq(Variable(T0.CDSCode), Const(C)))
+-- Operator: Project --
+Is_null(Variable(T0.FRPM Count (Ages 5-17)))
+-- Operator: Filter --
+Eq(Variable(T1.SOCType), Const(Youth Authority Facilities))
+Eq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3), Const(C), Const(5))
+Distinct(Variable(T0.CDSCode), Const(FRUSrvnyEZ), Const(A), Const(@), Const(?), Const(3), Const(C), Const(5))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(FRUSrvnyEZ))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(3))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(5)))
+-- Operator: Project --
+Eq(Variable(T0.FRPM Count (Ages 5-17)), Const(4.0))
+-- Operator: Filter --
+Eq(Variable(T1.SOCType), Const(Youth Authority Facilities))
+Eq(Variable(T1.MailStreet), Const(PO Box 1040))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))

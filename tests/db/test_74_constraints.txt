@@ -1,0 +1,70 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy))
+Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@)))
+-- Operator: Filter --
+Eq(Variable(T1.EdOpsCode), Const(SPECON))
+Neq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?)))
+-- Operator: Filter --
+Eq(Variable(T1.EdOpsCode), Const(SPECON))
+Eq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(S)))
+-- Operator: Project --
+Is_null(Variable(T0.Low Grade))
+-- Operator: Filter --
+Eq(Variable(T1.EdOpsCode), Const(SPECON))
+Eq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S), Const(#))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S), Const(#))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(S))), Eq(Variable(T0.CDSCode), Const(#)))
+-- Operator: Project --
+Is_null(Variable(T0.Low Grade))
+-- Operator: Filter --
+Eq(Variable(T1.EdOpsCode), Const(SPECON))
+Eq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S), Const(#), Const(B))
+Distinct(Variable(T0.CDSCode), Const(PB1F0al6Oy), Const(A), Const(@), Const(?), Const(S), Const(#), Const(B))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(PB1F0al6Oy))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(S))), Eq(Variable(T0.CDSCode), Const(#))), Eq(Variable(T0.CDSCode), Const(B)))
+-- Operator: Project --
+Eq(Variable(T0.Low Grade), Const(uLf8bMotOb))
+-- Operator: Filter --
+Eq(Variable(T1.EdOpsCode), Const(SPECON))
+Eq(Variable(T1.NCESDist), Const(613360))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))

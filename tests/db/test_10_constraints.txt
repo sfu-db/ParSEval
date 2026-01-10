@@ -1,0 +1,96 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV))
+Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV)))
+Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A))
+Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A)))
+Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A)))
+-- Operator: Project --
+Is_null(Variable(T1.FRPM Count (Ages 5-17)))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!)))
+Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!)))
+-- Operator: Project --
+Is_null(Variable(T1.FRPM Count (Ages 5-17)))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@))
+Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@)))
+Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@)))
+-- Operator: Project --
+Eq(Variable(T1.FRPM Count (Ages 5-17)), Const(9.0))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("))
+Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(")))
+Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const(")))
+-- Operator: Project --
+Is_null(Variable(T0.AvgScrRead))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(_)))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const("))), Eq(Variable(T1.CDSCode), Const(_)))
+-- Operator: Project --
+Is_null(Variable(T0.AvgScrRead))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(#)))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const("))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(#)))
+-- Operator: Sort --
+Eq(Variable(T0.AvgScrRead), Const(8))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(#))), Eq(Variable(T0.cds), Const(D)))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const("))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(#))), Eq(Variable(T1.CDSCode), Const(D)))
+-- Operator: Sort --
+Eq(Variable(T0.AvgScrRead), Const(8))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D), Const($))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D), Const($))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(#))), Eq(Variable(T0.cds), Const(D))), Eq(Variable(T0.cds), Const($)))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const("))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(#))), Eq(Variable(T1.CDSCode), Const(D))), Eq(Variable(T1.CDSCode), Const($)))
+-- Operator: Sort --
+Eq(Variable(T0.AvgScrRead), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D), Const($), Const(E))
+Distinct(Variable(T1.CDSCode), Const(HwHqOstyJV), Const(A), Const(!), Const(@), Const("), Const(_), Const(#), Const(D), Const($), Const(E))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(HwHqOstyJV))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(#))), Eq(Variable(T0.cds), Const(D))), Eq(Variable(T0.cds), Const($))), Eq(Variable(T0.cds), Const(E)))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T1.CDSCode), Const(HwHqOstyJV))), Eq(Variable(T1.CDSCode), Const(A))), Eq(Variable(T1.CDSCode), Const(!))), Eq(Variable(T1.CDSCode), Const(@))), Eq(Variable(T1.CDSCode), Const("))), Eq(Variable(T1.CDSCode), Const(_))), Eq(Variable(T1.CDSCode), Const(#))), Eq(Variable(T1.CDSCode), Const(D))), Eq(Variable(T1.CDSCode), Const($))), Eq(Variable(T1.CDSCode), Const(E)))
+-- Operator: Sort --
+Eq(Variable(T0.AvgScrRead), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))

@@ -1,0 +1,72 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU))
+-- Operator: Filter --
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A))
+-- Operator: Filter --
+Eq(Variable(T0.Charter), Const(1))
+Neq(Variable(T0.DOC), Const(52))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!))
+-- Operator: Filter --
+Eq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Neq(Variable(T0.Charter), Const(1))
+Neq(Variable(T0.DOC), Const(52))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Neq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@), Const(_))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Eq(Variable(T0.Charter), Const(1))
+Neq(Variable(T0.DOC), Const(52))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@), Const(_), Const(W))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Eq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@), Const(_), Const(W), Const(H))
+-- Operator: Project --
+Is_null(Variable(T0.School))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Eq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@), Const(_), Const(W), Const(H), Const(D))
+-- Operator: Project --
+Is_null(Variable(T0.School))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Eq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(DgmHPDYFBU), Const(A), Const(!), Const(?), Const(@), Const(_), Const(W), Const(H), Const(D), Const(`))
+-- Operator: Project --
+Eq(Variable(T0.School), Const(Oe6VFyUwUt))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(Hickman))
+Eq(Variable(T0.Charter), Const(1))
+Eq(Variable(T0.DOC), Const(52))

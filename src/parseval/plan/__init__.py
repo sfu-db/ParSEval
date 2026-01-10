@@ -6,5 +6,6 @@ from .rex import (
     Expression,
     negate_predicate,
 )
+from .planner import Planner
 from .plan_encoder import ExpressionEncoder
 from sqlglot import expressions as sqlglot_exp
