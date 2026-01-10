@@ -5,7 +5,9 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
 sys.path.append(parent_dir)
 from src.parseval.db_manager import DBManager
-from src.parseval.generator import Generator
+from parseval.generator import Generator
+
+# from src.parseval.generator import Generator
 from sqlglot import exp
 import unittest
 from sqlglot import parse
@@ -45,34 +47,58 @@ BIRD_DEV_FP = "datasets/bird/dev.sql"
 
 
 class TestGenerator(unittest.TestCase):
+    # @unittest.skip("Skipping data generation test")
     def test_data_generator(self):
-
+        reset_folder("examples/db")
         with open(BIRD_DEV_FP, "r") as f:
             data = json.load(f)
-        INDEX = 83
+        INDEX = 82
         for row in data:
             question_id = row["question_id"]
-            # if question_id < 83:
-            #     continue
+            if question_id < 79:
+                continue
             if row["question_id"] <= INDEX:
                 sql = row["SQL"]
+                sql = """SELECT NumTstTakr  FROM satscores o                WHERE EXISTS (                SELECT 1                FROM frpm c                WHERE c.CDSCode = o.cds                )"""
                 logger.info(f"Testing query: {sql}")
                 generator = Generator(
                     schema=schema, query=sql, name=f"test_{question_id}"
                 )
 
-                with open(f"tests/db/{generator.name}_plan.sql", "w") as f:
+                with open(f"examples/db/{generator.name}_plan.sql", "w") as f:
                     f.write(f"-- Query: {sql}\n")
                     f.write(generator.plan.sql())
 
-                instance = generator.generate(max_iter=25)
-                instance.to_db("tests/db")
+                instance = generator.generate(max_iter=325)
+                instance.to_db("examples/db")
 
-                # break
+                break
+
+    # @unittest.skip("Skipping data validation test")
+    def test_data_validator(self):
+        with open(BIRD_DEV_FP, "r") as f:
+            data = json.load(f)
+        INDEX = 82
+        for row in data:
+            question_id = row["question_id"]
+            if question_id < 79:
+                continue
+            if row["question_id"] <= INDEX:
+                sql = row["SQL"]
+                host_or_path = "examples/db"
+                db_id = "test_" + str(question_id) + ".sqlite"
+
+                if not os.path.exists(os.path.join(host_or_path, db_id)):
+                    print(f"Database {db_id} does not exist, skipping test.")
+                    break
+                with DBManager().get_connection(host_or_path, db_id) as conn:
+                    data = conn.execute(sql, fetch="all")
+                    if len(data) == 0:
+                        print(f"Query {question_id} returned no results.")
 
 
 if __name__ == "__main__":
 
-    reset_folder("tests/db")
+    #
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
     unittest.main(testRunner=runner, exit=False)

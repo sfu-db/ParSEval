@@ -1,0 +1,7 @@
+-- Query: SELECT NumTstTakr FROM satscores WHERE cds = ( SELECT CDSCode FROM frpm ORDER BY `FRPM Count (K-12)` DESC LIMIT 1 )
+Project($6, id=6)
+  Filter(condition=$0 = scalarquery( Project($0, id=3)
+  Sort(1, dir=['DESCENDING'], offset=0, limit=1)
+    Project($0, $21, id=1)
+      Scan(table=frpm, id = 0)), id=5)
+    Scan(table=satscores, id = 4)

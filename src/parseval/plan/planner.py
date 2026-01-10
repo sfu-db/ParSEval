@@ -63,6 +63,38 @@ def parse_scalary_query(planner, **kwargs) -> Expression:
     )
 
 
+def parse_exists(planner, **kwargs) -> Expression:
+    subquery_predicate = [planner.walk(q) for q in kwargs.pop("query")]
+
+    datatype = to_type(kwargs.pop("type"))
+    exists = sqlglot_exp.Exists(this=subquery_predicate[0], datatype=datatype)
+
+    return exists
+
+
+def parse_field_access(planner, **kwargs) -> Expression:
+
+    datatype = to_type(kwargs.pop("type"))
+    field_name = to_identifier(kwargs.pop("name"))
+
+    return FieldAccess(
+        this=field_name,
+        column=kwargs.pop("column"),
+        datatype=datatype,
+    )
+
+
+def parse_in(planner, **kwargs) -> Expression:
+    operands = [planner.walk(op) for op in kwargs.pop("operands", [])]
+    query = [planner.walk(q) for q in kwargs.pop("query", [])]
+    datatype = to_type(kwargs.pop("type"))
+    if query:
+        return sqlglot_exp.In(this=operands[0], query=query[0], datatype=datatype)
+    # sqlglot_exp.In(
+    #     this=operands[0], expressions=operands[1:], subquery=query[0], datatype=datatype
+    # )
+
+
 class Planner:
 
     EXPRESSION_TRANSFORM = {
@@ -84,6 +116,9 @@ class Planner:
             this=planner.walk(kwargs.pop("operands").pop()),
             to=to_type(kwargs.pop("type")),
         ),
+        "FIELD_ACCESS": lambda planner, **kwargs: parse_field_access(planner, **kwargs),
+        "EXISTS": lambda planner, **kwargs: parse_exists(planner, **kwargs),
+        "IN": lambda planner, **kwargs: parse_in(planner, **kwargs),
         "OTHER_FUNCTION": lambda planner, **kwargs: FunctionCall(
             this=kwargs.pop("operator"),
             expressions=[planner.walk(op) for op in kwargs.pop("operands", [])],
@@ -172,10 +207,16 @@ class Planner:
         child = self.walk(node.get("inputs")[0])
         condition = self.walk(node.get("condition"))
         operator_id = node.get("id")
+        variableset = node.get("variableset")
         klass = (
             LogicalFilter if not isinstance(child, LogicalAggregate) else LogicalHaving
         )
-        return klass(this=child, condition=condition, operator_id=operator_id)
+        return klass(
+            this=child,
+            condition=condition,
+            operator_id=operator_id,
+            variableset=variableset,
+        )
 
     def parse_join(self, **node):
         inputs = node.get("inputs", [])
@@ -200,7 +241,9 @@ class Planner:
                 )
             )
         agg_funcs = [self.walk(func_def) for func_def in node.get("aggs", [])]
-        return LogicalAggregate(this=child, expressions=groupby, aggs=agg_funcs)
+        return LogicalAggregate(
+            this=child, expressions=groupby, aggs=agg_funcs, operator_id=node.get("id")
+        )
 
     def parse_sort(self, **node):
         child = self.walk(node.get("inputs")[0])

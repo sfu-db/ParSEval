@@ -1,0 +1,106 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb))
+Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!)))
+-- Operator: Filter --
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(")))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Neq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*)))
+-- Operator: Project --
+Is_null(Variable(T1.EILName))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(/)))
+-- Operator: Project --
+Is_null(Variable(T1.EILName))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(/))), Eq(Variable(T0.CDSCode), Const(')))
+-- Operator: Project --
+Eq(Variable(T1.EILName), Const(lofzPV6gg7))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(/))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(@)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@), Const(#))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@), Const(#))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(/))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(#)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@), Const(#), Const(2))
+Distinct(Variable(T0.CDSCode), Const(isoXl9bKEb), Const(!), Const("), Const(A), Const(*), Const(/), Const('), Const(@), Const(#), Const(2))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(isoXl9bKEb))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(/))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(#))), Eq(Variable(T0.CDSCode), Const(2)))
+-- Operator: Project --
+Eq(Variable(T1.School), Const(SypSGQxNgd))
+-- Operator: Filter --
+Eq(Variable(T0.County Code), Const(37))
+Eq(Variable(T0.NSLP Provision Status), Const(Breakfast Provision 2))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))

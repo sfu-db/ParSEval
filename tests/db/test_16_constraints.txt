@@ -1,0 +1,78 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71))
+Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!))
+Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!)))
+-- Operator: Filter --
+Eq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?))
+Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?)))
+-- Operator: Filter --
+Le(Variable(T1.NumTstTakr), Const(100))
+Neq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?), Const(S))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?), Const(S))
+Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S)))
+-- Operator: Filter --
+Le(Variable(T1.NumTstTakr), Const(100))
+Eq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_))
+Or(Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S))), Eq(Variable(T1.cds), Const(_)))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Alameda))
+Lt(Variable(T1.NumTstTakr), Const(100))
+Neq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S))), Eq(Variable(T1.cds), Const(_))), Eq(Variable(T1.cds), Const(#)))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Alameda))
+Lt(Variable(T1.NumTstTakr), Const(100))
+Eq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#), Const("))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#), Const("))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S))), Eq(Variable(T1.cds), Const(_))), Eq(Variable(T1.cds), Const(#))), Eq(Variable(T1.cds), Const(")))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Alameda))
+Le(Variable(T1.NumTstTakr), Const(100))
+Neq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#), Const("), Const(+))
+Distinct(Variable(T0.CDSCode), Const(FADfGBiP71), Const(!), Const(?), Const(S), Const(_), Const(#), Const("), Const(+))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(FADfGBiP71))), Eq(Variable(T1.cds), Const(!))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S))), Eq(Variable(T1.cds), Const(_))), Eq(Variable(T1.cds), Const(#))), Eq(Variable(T1.cds), Const("))), Eq(Variable(T1.cds), Const(+)))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Alameda))
+Le(Variable(T1.NumTstTakr), Const(100))
+Eq(Variable(T0.StatusType), Const(Merged))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))

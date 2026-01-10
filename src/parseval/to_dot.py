@@ -86,6 +86,18 @@ EDGE_STYLES = {
         "style": "dotted",
         "fontsize": "12",
     },
+    PBit.HAVING_TRUE: {
+        "color": "#20C997",
+        "label": "TRUE",
+        "style": "dotted",
+        "fontsize": "12",
+    },
+    PBit.HAVING_FALSE: {
+        "color": "#DC3545",
+        "label": "FALSE",
+        "style": "dotted",
+        "fontsize": "12",
+    },
 }
 
 

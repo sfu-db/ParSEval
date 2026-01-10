@@ -3,27 +3,14 @@ from collections import defaultdict
 from typing import Optional, Tuple, List, Union, TYPE_CHECKING, Dict, Any
 
 from .base import _Constraint, PlausibleBit
-
-# from .checks import (
-#     check_cover_duplicate,
-#     check_cover_null,
-#     check_cardinality,
-#     check_groupcount,
-#     check_groupsize,
-# )
 from ..constants import PBit, PlausibleType
 
 if TYPE_CHECKING:
     from src.parseval.plan.rex import LogicalOperator, Expression
-
 from src.parseval.plan import ColumnRef
-
 from sqlglot.expressions import AggFunc, Predicate
-
 from src.parseval.symbol import Symbol
 from .checks import resolve_check
-
-# from .strategy import resolve_strategyf
 
 
 class PlausibleBranch(_Constraint):
@@ -150,6 +137,7 @@ class Constraint(_Constraint):
         "aggregate": (PBit.GROUP_SIZE, PBit.NULL, PBit.DUPLICATE),
         "predicate": (PBit.FALSE, PBit.TRUE),
         "sort": (PBit.TRUE, PBit.MAX, PBit.MIN),
+        "having": (PBit.HAVING_TRUE, PBit.HAVING_FALSE),
     }
 
     def __init__(
@@ -167,7 +155,7 @@ class Constraint(_Constraint):
         self.sql_condition = sql_condition
         self.symbolic_exprs = defaultdict(list)
         self.delta = defaultdict(list)
-        self.metadata = metadata or {}
+        self.metadata = metadata if metadata is not None else {}
 
     @property
     def plausible_bits(self) -> Tuple[PBit, ...]:
@@ -177,6 +165,8 @@ class Constraint(_Constraint):
             if isinstance(self.sql_condition, AggFunc):
                 return self.PLAUSIBLE_CONFIGS["aggregate"]
             return self.PLAUSIBLE_CONFIGS["groupby"]
+        elif self.operator.operator_type == "Having":
+            return self.PLAUSIBLE_CONFIGS["having"]
         elif self.operator.operator_type == "Join":
             return self.PLAUSIBLE_CONFIGS["join"]
         elif (
@@ -215,6 +205,13 @@ class Constraint(_Constraint):
     def __ne__(self, value):
         return not self.__eq__(value)
 
+    def __getitem__(self, key):
+        if hasattr(self, key):
+            return getattr(self, key)
+        elif key in self.metadata:
+            return self.metadata[key]
+        raise KeyError(f"Key {key} not found in {self}.")
+
     def find_child(self, operator: LogicalOperator, sql_condition):
 
         c = [self]
@@ -252,20 +249,6 @@ class Constraint(_Constraint):
             self.children[bit] = child_node
             child_node._create_plausible_siblings(branch=branch)
         return child_node
-
-    def update_metadata(self, **kwargs):
-        for k, v in kwargs.items():
-            if k not in self.metadata:
-                self.metadata[k] = v
-            else:
-                if isinstance(self.metadata[k], dict) and isinstance(v, dict):
-                    self.metadata[k].update(v)
-                elif isinstance(self.metadata[k], list) and isinstance(v, list):
-                    self.metadata[k].extend(v)
-                elif isinstance(self.metadata[k], set) and isinstance(v, set):
-                    self.metadata[k].update(v)
-                else:
-                    self.metadata[k] = v
 
     def update_delta(
         self,

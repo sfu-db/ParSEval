@@ -1,0 +1,25 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(5RViwJPfxU))
+-- Operator: Project --
+Is_null(Variable(T0.GSoffered))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(5RViwJPfxU), Const(A))
+-- Operator: Project --
+Is_null(Variable(T0.GSoffered))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(5RViwJPfxU), Const(A), Const(@))
+-- Operator: Project --
+Eq(Variable(T0.GSoffered), Const(tlWJbAkruG))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(5RViwJPfxU), Const(A), Const(@), Const(_))
+-- Operator: Project --
+Is_null(Variable(T0.Longitude))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(5RViwJPfxU), Const(A), Const(@), Const(_), Const(K))
+-- Operator: Project --
+Is_null(Variable(T0.Longitude))

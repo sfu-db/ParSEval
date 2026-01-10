@@ -18,11 +18,15 @@ if TYPE_CHECKING:
     from src.parseval.uexpr import PlausibleBranch
     from src.parseval.uexpr.ptree import UExprToConstraint, Constraint
 from functools import reduce
+import logging
+
+logger = logging.getLogger("parseval.coverage")
 
 DUPLICATE_THRESHOLD = 1
 NULL_THRESHOLD = 1
 POSITIVE_THRESHOLD = 1
 NEGATIVE_THRESHOLD = 1
+GROUP_SIZE_THRESHOLD = 2
 
 
 class Strategy(ABC):
@@ -40,12 +44,13 @@ class Strategy(ABC):
 
     def select_group(self, node: "Constraint", context: Dict):
         if isinstance(node.sql_condition, sqlglot_exp.AggFunc):
-            keys = node.symbolic_exprs[PBit.GROUP_SIZE]
-            deltas = node.delta
-            for i in range(len(keys) - 1, -1, -1):
-                if keys[i].concrete is not None:
-                    context["groupid"] = deltas[i]
-                    break
+            groups = node.symbolic_exprs[PBit.GROUP_SIZE]
+            for group in groups:
+                if group.group_key and all(
+                    v.concrete is not None for v in group.group_key.values()
+                ):
+                    context["groupid"] = group.rowids
+                    return
 
     @abstractmethod
     def declare(
@@ -59,9 +64,38 @@ class Strategy(ABC):
 
 
 class DuplicateStrategy(Strategy):
+    def declare_agg_funcs(
+        self, tracer: "UExprToConstraint", node: "Constraint", context: dict
+    ):
+        logger.info(
+            f"Declaring duplicate constraints for agg func: {node.sql_condition}"
+        )
+        constraints = []
+        if isinstance(node.sql_condition, sqlglot_exp.AggFunc):
+            for group in node.symbolic_exprs[PBit.GROUP_SIZE]:
+                value_counts = group_by_concrete(group)
+                logger.info(f"Group value counts: {value_counts}")
+                if value_counts:
+                    values = sorted(value_counts.items(), key=lambda x: len(x[1]))
+                    value = values[0][1][0]
+                    datatype = node.sql_condition.args.get("datatype")
+                    if datatype is None:
+                        datatype = value.datatype
+                    literal = convert_to_literal(value.concrete, datatype)
+                    constraint = sqlglot_exp.EQ(
+                        this=node.sql_condition.this, expression=literal
+                    )
+                    logger.info(f"Declared duplicate constraint: {constraint}")
+                    constraints.append(constraint)
+                    context["groupid"] = group.rowids
+                    break
+        return constraints
+
     def declare(
         self, tracer: "UExprToConstraint", node: "Constraint", context: dict
     ) -> List[Expression]:
+        if isinstance(node.sql_condition, sqlglot_exp.AggFunc):
+            return self.declare_agg_funcs(tracer, node, context)
         constraints = []
         if isinstance(node.sql_condition, ColumnRef):
             if not node.sql_condition.args.get("unique", False) and node.symbolic_exprs:
@@ -82,29 +116,16 @@ class DuplicateStrategy(Strategy):
         return constraints
         # tracer.declare(node.operator.operator_type, constraint)
 
-    def check(self, plausible: "PlausibleBranch") -> PlausibleType:
-        """Check if the constraint covers duplicate values."""
+    def _check_project(self, plausible: "PlausibleBranch") -> PlausibleType:
         bit = plausible.bit()
-        current_label = plausible.plausible_type
-        # if current_label in {
-        #     PlausibleType.INFEASIBLE,
-        #     PlausibleType.COVERED,
-        #     PlausibleType.TIMEOUT,
-        # }:
-        #     return current_label
         constraint: Constraint = plausible.parent
-        true_branch = (
-            PBit.TRUE
-            if constraint.operator.operator_type == "Project"
-            else PBit.GROUP_SIZE
-        )
         columnrefs = list(constraint.sql_condition.find_all(ColumnRef))
         if not columnrefs or all(
             [columnref.args.get("unique", False) for columnref in columnrefs]
         ):
             return PlausibleType.INFEASIBLE
         variables = []
-        for smt_expr in constraint.symbolic_exprs[true_branch]:
+        for smt_expr in constraint.symbolic_exprs[PBit.TRUE]:
             variables.extend(smt_expr.find_all(Variable))
 
         constraint.symbolic_exprs[bit].clear()
@@ -116,7 +137,41 @@ class DuplicateStrategy(Strategy):
             ):
                 duplicates_found = True
                 constraint.symbolic_exprs[bit].append(items[0])
-        return PlausibleType.COVERED if duplicates_found else current_label
+        return PlausibleType.COVERED if duplicates_found else plausible.plausible_type
+
+    def _check_aggregate(self, plausible: "PlausibleBranch") -> PlausibleType:
+
+        bit = plausible.bit()
+        node: Constraint = plausible.parent
+        if isinstance(node.sql_condition, sqlglot_exp.AggFunc):
+            columnrefs = list(node.sql_condition.find_all(ColumnRef))
+            if not columnrefs or all(
+                [columnref.args.get("unique", False) for columnref in columnrefs]
+            ):
+                return PlausibleType.INFEASIBLE
+            duplicates_found = False
+            for group in node.symbolic_exprs[PBit.GROUP_SIZE]:
+                groups = group_by_concrete(group)
+                for key, items in groups.items():
+                    if len(items) > plausible.metadata.get(
+                        "DUPLICATE_THRESHOLD", DUPLICATE_THRESHOLD
+                    ):
+                        duplicates_found = True
+            return (
+                PlausibleType.COVERED if duplicates_found else plausible.plausible_type
+            )
+        return plausible.plausible_type
+
+    def check(self, plausible: "PlausibleBranch") -> PlausibleType:
+        """Check if the constraint covers duplicate values."""
+        if plausible.plausible_type in {
+            PlausibleType.COVERED,
+            PlausibleType.INFEASIBLE,
+        }:
+            return plausible.plausible_type
+        if plausible.parent.operator.operator_type == "Aggregate":
+            return self._check_aggregate(plausible)
+        return self._check_project(plausible)
 
 
 class NullStrategy(Strategy):
@@ -138,13 +193,12 @@ class NullStrategy(Strategy):
     def check(self, plausible: "PlausibleBranch") -> PlausibleType:
         bit = plausible.bit()
         label = plausible.plausible_type
-
-        # if label in {
-        #     PlausibleType.INFEASIBLE,
-        #     PlausibleType.COVERED,
-        #     PlausibleType.TIMEOUT,
-        # }:
-        #     return label
+        if label in {
+            PlausibleType.COVERED,
+            PlausibleType.INFEASIBLE,
+            PlausibleType.TIMEOUT,
+        }:
+            return label
 
         constraint: Constraint = plausible.parent
         true_branche = (
@@ -182,9 +236,32 @@ class GroupCountStrategy(Strategy):
         sql_condition = node.sql_condition
         if not isinstance(sql_condition, ColumnRef):
             return []
-        values = [
-            v for v in node.symbolic_exprs[PBit.GROUP_SIZE] if v.concrete is not None
-        ]
+        values = []
+
+        for group in node.symbolic_exprs[PBit.GROUP_SIZE]:
+            group_key = group.group_key[sql_condition]
+            if group_key.concrete is not None:
+                values.append(group_key)
+        #     for kid, key_value in group.group_key.items():
+        #         if key_value.concrete is None:
+        #             continue
+
+        #         if kid == sql_condition and key_value.concrete is not None:
+        #             values.append(key_value)
+        # for k, v in node.symbolic_exprs[PBit.GROUP_SIZE].items():
+        #     if v.concrete is None:
+        #         continue
+        #     values.append(v)
+        #     if v.concrete > 1:
+        #         literal = convert_to_literal(
+        #             v.concrete, node.sql_condition.args.get("datatype")
+        #         )
+        #         constraint = sqlglot_exp.EQ(this=node.sql_condition, expression=literal)
+        #         return [constraint]
+
+        # values = [
+        #     v for v in node.symbolic_exprs[PBit.GROUP_SIZE] if v.concrete is not None
+        # ]
 
         constraints = []
 
@@ -214,12 +291,15 @@ class GroupSizeStrategy(Strategy):
         self, tracer: "UExprToConstraint", node: "Constraint", context: dict
     ) -> None:
         sql_condition = node.sql_condition
+        ### if this is group key part,
         if isinstance(sql_condition, ColumnRef):
+            ## if we want to extend one group only, (i.e., context has groupid)
             if "groupid" in context:
                 rowid = context["groupid"]
-                for key, rid in zip(node.symbolic_exprs[PBit.GROUP_SIZE], node.delta):
-                    if rid == rowid:
-                        group_key = key
+                for group in node.symbolic_exprs[PBit.GROUP_SIZE]:
+                    if rowid == group.rowids:
+                        group_key = group.group_key[sql_condition]
+
                         literal = convert_to_literal(
                             group_key.concrete, node.sql_condition.datatype
                         )
@@ -228,42 +308,37 @@ class GroupSizeStrategy(Strategy):
                         )
                         return [constraint]
             else:
-                keys = node.symbolic_exprs[PBit.GROUP_SIZE]
-                deltas = node.delta
-                for i in range(len(keys) - 1, -1, -1):
-                    if keys[i].concrete is not None:
-                        group_key = keys[i]
-                        literal = convert_to_literal(
-                            group_key.concrete, node.sql_condition.datatype
-                        )
-                        constraint = sqlglot_exp.EQ(
-                            this=node.sql_condition, expression=literal
-                        )
-                        context["groupid"] = deltas[i]
-                        return [constraint]
+                ## if there is no groupid, we pick one group with concrete key
+                groups = node.symbolic_exprs[PBit.GROUP_SIZE]
+                for group in node.symbolic_exprs[PBit.GROUP_SIZE]:
+                    ## we only pick group with concrete value
+                    if group.group_key and any(
+                        v.concrete is None for v in group.group_key.values()
+                    ):
+                        continue
+
+                    group_key = group.group_key[sql_condition]
+                    literal = convert_to_literal(
+                        group_key.concrete, node.sql_condition.datatype
+                    )
+                    constraint = sqlglot_exp.EQ(
+                        this=node.sql_condition, expression=literal
+                    )
+                    context["groupid"] = group.rowids
+                    return [constraint]
         elif isinstance(sql_condition, sqlglot_exp.AggFunc):
             self.select_group(node, context)
         return []
-
-    # return tracer._declare_group_size_constraints(node, context)
 
     def check(self, plausible: "PlausibleBranch") -> PlausibleType:
         bit = plausible.bit()
         label = plausible.plausible_type
         constraint: Constraint = plausible.parent
-        groups = constraint.metadata.get("group")
-        # for smt in constraint.symbolic_exprs[PBit.GROUP_SIZE]:
-        #     variables = smt.find_all(Variable)
-        #     if
-
-        if groups is None:
-            return label
-
-        constraint.symbolic_exprs[bit].clear()
         flag = True
-        for group in groups:
-            if len(group) > 2:
+        for group in constraint.symbolic_exprs[PBit.GROUP_SIZE]:
+            if len(group) > GROUP_SIZE_THRESHOLD:
                 constraint.symbolic_exprs[bit].append(group)
+                return PlausibleType.COVERED
             else:
                 flag = False
 
@@ -321,6 +396,8 @@ class MinMaxStrategy(Strategy):
         values = [v.concrete for v in constraint.symbolic_exprs[PBit.TRUE]]
         filtered = list(filter(lambda x: x is not None, values))
         if not filtered:
+            return PlausibleType.UNEXPLORED
+        if constraint.operator.offset + constraint.operator.limit < len(values):
             return PlausibleType.UNEXPLORED
         min_ = min(filtered)
         max_ = max(filtered)
@@ -484,12 +561,60 @@ class HavingMinStrategy(Strategy):
 
 
 class HavingStrategy(Strategy):
+    def is_having_count(self, smt_expr: Symbol) -> bool:
+
+        if not smt_expr.find_all(Variable):
+            return True
+        return False
+
+    def is_size_one_group(self, smt_expr: Symbol) -> bool:
+        variables = smt_expr.find_all(Variable)
+        if len(variables) == 1:
+            return True
+        return False
+
+    def declare_having_count(self, tracer, node, context):
+        rbit = PBit.HAVING_FALSE if self.bit == PBit.HAVING_TRUE else PBit.HAVING_TRUE
+
+        for rowids, smt_expr in zip(node.delta[rbit], node.symbolic_exprs[rbit]):
+            if self.is_size_one_group(smt_expr):
+                """Extend group size to >1"""
+                continue
+            context["groupid"] = rowids
+            return []
+
     def declare(
         self, tracer: "UExprToConstraint", node: "Constraint", context: dict
     ) -> None:
-        return tracer._declare_having_constraints(node, context)
+        rbit = PBit.HAVING_FALSE if self.bit == PBit.HAVING_TRUE else PBit.HAVING_TRUE
+
+        for rowids, smt_expr in zip(node.delta[rbit], node.symbolic_exprs[rbit]):
+            if self.is_size_one_group(smt_expr) or self.is_having_count(smt_expr):
+                """Extend group size to >1"""
+                context["groupid"] = rowids
+                return []
+            context["has_having"] = True
+            return [smt_expr]
+        # if self.bit == PBit.HAVING_TRUE:
+        #     for smt_expr in node.symbolic_exprs[PBit.HAVING_FALSE]:
+        #         if not smt_expr.find_all(Variable):
+        #             continue
+        #         context["has_having"] = True
+        #         return [smt_expr]
+        # else:
+        #     for smt_expr in node.symbolic_exprs[PBit.HAVING_TRUE]:
+        #         if not smt_expr.find_all(Variable):
+        #             continue
+        #         context["has_having"] = True
+        #         return [smt_expr]
+        return []
 
     def check(self, plausible: "PlausibleBranch") -> PlausibleType:
+        threshold = (
+            POSITIVE_THRESHOLD if self.bit == PBit.HAVING_TRUE else NEGATIVE_THRESHOLD
+        )
+        if len(plausible.parent.symbolic_exprs[self.bit]) >= threshold:
+            return PlausibleType.COVERED
         return plausible.plausible_type
 
 
@@ -505,6 +630,8 @@ REGISTRY: Dict[object, Strategy] = {
     PBit.JOIN_RIGHT: JoinRightStrategy(),
     PBit.TRUE: PredicateStrategy(bit=PBit.TRUE),
     PBit.FALSE: PredicateStrategy(bit=PBit.FALSE),
+    PBit.HAVING_TRUE: HavingStrategy(bit=PBit.HAVING_TRUE),
+    PBit.HAVING_FALSE: HavingStrategy(bit=PBit.HAVING_FALSE),
 }
 
 

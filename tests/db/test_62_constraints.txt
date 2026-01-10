@@ -1,0 +1,117 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u))
+Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@)))
+-- Operator: Filter --
+Eq(Variable(T1.Charter), Const(0))
+Neq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?)))
+-- Operator: Filter --
+Eq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_)))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Neq(Variable(T1.Charter), Const(0))
+Neq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;)))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Neq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;))), Eq(Variable(T0.CDSCode), Const(G)))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Eq(Variable(T1.Charter), Const(0))
+Neq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;))), Eq(Variable(T0.CDSCode), Const(G))), Eq(Variable(T0.CDSCode), Const(')))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Eq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;))), Eq(Variable(T0.CDSCode), Const(G))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(D)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Eq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D), Const(!))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D), Const(!))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;))), Eq(Variable(T0.CDSCode), Const(G))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(D))), Eq(Variable(T0.CDSCode), Const(!)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Eq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
+=== Iteration 10 ===
+-- Operator: database --
+Distinct(Variable(T1.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D), Const(!), Const($))
+Distinct(Variable(T0.CDSCode), Const(Bb9S8GEX u), Const(A), Const(@), Const(?), Const(_), Const(;), Const(G), Const('), Const(D), Const(!), Const($))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Bb9S8GEX u))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(;))), Eq(Variable(T0.CDSCode), Const(G))), Eq(Variable(T0.CDSCode), Const('))), Eq(Variable(T0.CDSCode), Const(D))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const($)))
+-- Operator: Project --
+Eq(Variable(T1.School), Const(O89ZY4lcU3))
+-- Operator: Filter --
+Lt(Floordiv(Mul(Variable(T0.Free Meal Count (K-12)), Const(100)), Variable(T0.Enrollment (K-12))), Const(0.18))
+Eq(Variable(T1.Charter), Const(0))
+Eq(Variable(T1.County), Const(Los Angeles))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))

@@ -284,13 +284,18 @@ def _normalize_ddls(ddls, dialect):
             elif isinstance(expr, exp.PrimaryKey):
                 primary_key_columns.update(expr.expressions)
         scm_expr = schema_expr.copy()
+        
+        col_defs = column_defs
+        if primary_key_columns:
+            col_defs = column_defs + [exp.PrimaryKey(expressions=list(primary_key_columns))]
         scm_expr.set(
             "expressions",
-            column_defs + [exp.PrimaryKey(expressions=list(primary_key_columns))],
+            col_defs,
         )
         tbl = stmt_expr.copy()
         tbl.set("this", scm_expr)
-        schemas.append(tbl.sql())
+        ddl_sql = tbl.sql(dialect).replace("PRIMARY KEY", "")   
+        schemas.append(ddl_sql)
     return schemas
 
 
@@ -304,6 +309,7 @@ def get_logical_plan(
 ):
     function_defs = FUNCTION_DEF if function_defs is None else function_defs
     ddls = _normalize_ddls(ddls, dialect=dialect)
+
     request = {
         "ddl": ddls,
         "queries": [preprocess(sql, dialect=dialect) for sql in queries],

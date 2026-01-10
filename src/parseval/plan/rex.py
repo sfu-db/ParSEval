@@ -133,8 +133,34 @@ class ScalarQuery(Expression):
         )
 
     def sql(self, dialect=None, **opts):
+        if self.query:
+            return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
+        if self.args.get("expressions"):
+            return f"{self.key}( {', '.join([expr.sql(dialect=dialect, **opts) for expr in self.expressions])})"
 
-        return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
+        # return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
+
+
+class FieldAccess(Expression):
+    arg_types = {
+        "this": True,
+        "column": True,
+        "datatype": False,
+        "correlated": False,
+    }
+
+    @property
+    def name(self) -> str:
+        return self.text("this")
+
+    @property
+    def column(self) -> int:
+        return self.args.get("column", 0)
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.key}({self.this}, column={self.column})"
+
+        return super().sql(dialect, **opts)
 
 
 class Schema(Expression):
@@ -381,9 +407,7 @@ class LogicalFilter(UnaryOperator):
     @property
     def children(self) -> List[LogicalOperator]:
         children = [self.this]
-        # for scalar in self.condition.find_all(ScalarQuery):
-        #     children.append(scalar.this)
-        return children  # [self.this]
+        return children
 
     @property
     def condition(self) -> Expression:
@@ -392,9 +416,7 @@ class LogicalFilter(UnaryOperator):
     def _sql(self, dialect=None, **opts):
         # for child in self.children[1:]:
         #     opts.setdefault("skips", set()).add(child.operator_id)
-        return (
-            f"{self.operator_type}(condition={self.condition}, id={self.operator_id })"
-        )
+        return f"{self.operator_type}(condition={self.condition}, id={self.operator_id }, variableset={self.args.get('variableset')})"
 
     def __repr__(self) -> str:
         return (
@@ -587,6 +609,7 @@ for klass in [
     LogicalSort,
     LogicalCorrelate,
     ScalarQuery,
+    FieldAccess,
 ]:
     generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
         dialect=self.dialect

@@ -1,0 +1,61 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o))
+Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o), Const(!))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o), Const(!))
+Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o))), Eq(Variable(T0.cds), Const(!)))
+-- Operator: Filter --
+Gt(Variable(T0.NumTstTakr), Const(500))
+Eq(Variable(T1.Magnet), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o), Const(!), Const(A))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o), Const(!), Const(A))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(A)))
+-- Operator: Filter --
+Gt(Variable(T0.NumTstTakr), Const(500))
+Neq(Variable(T1.Magnet), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o), Const(!), Const(A), Const(O))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o), Const(!), Const(A), Const(O))
+Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(O)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Gt(Variable(T0.NumTstTakr), Const(500))
+Eq(Variable(T1.Magnet), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o), Const(!), Const(A), Const(O), Const(_))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o), Const(!), Const(A), Const(O), Const(_))
+Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(_)))
+-- Operator: Project --
+Is_null(Variable(T1.School))
+-- Operator: Filter --
+Gt(Variable(T0.NumTstTakr), Const(500))
+Eq(Variable(T1.Magnet), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(a1tnQieG4o), Const(!), Const(A), Const(O), Const(_), Const(C))
+Distinct(Variable(T1.CDSCode), Const(a1tnQieG4o), Const(!), Const(A), Const(O), Const(_), Const(C))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(T1.CDSCode)), Eq(Variable(T0.cds), Const(a1tnQieG4o))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(_))), Eq(Variable(T0.cds), Const(C)))
+-- Operator: Project --
+Eq(Variable(T1.School), Const(kD1KnkZ9Xc))
+-- Operator: Filter --
+Gt(Variable(T0.NumTstTakr), Const(500))
+Eq(Variable(T1.Magnet), Const(1))
+-- Operator: Join --
+Eq(Variable(T0.cds), Variable(T1.CDSCode))

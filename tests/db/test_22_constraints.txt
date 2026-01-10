@@ -1,0 +1,92 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3))
+Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3)))
+-- Operator: Filter --
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A))
+Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A)))
+-- Operator: Filter --
+Is_null(Variable(T0.sname))
+Neq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!))
+Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!)))
+-- Operator: Filter --
+Is_null(Variable(T0.sname))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@))
+Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@)))
+-- Operator: Project --
+Is_null(Variable(T0.sname))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("))
+Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const(")))
+-- Operator: Project --
+Is_null(Variable(T0.sname))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?)))
+-- Operator: Project --
+Eq(Variable(T0.sname), Const(1QzO8JMAU9))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?), Const(O))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(O)))
+-- Operator: Project --
+Eq(Variable(T0.NumTstTakr), Const(5))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?), Const(O), Const(G))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(G)))
+-- Operator: Sort --
+Eq(Variable(T0.NumTstTakr), Const(5))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?), Const(O), Const(G), Const(D))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(G))), Eq(Variable(T0.cds), Const(D)))
+-- Operator: Sort --
+Eq(Variable(T0.NumTstTakr), Const(5))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?), Const(O), Const(G), Const(D), Const(`))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(G))), Eq(Variable(T0.cds), Const(D))), Eq(Variable(T0.cds), Const(`)))
+-- Operator: Sort --
+Eq(Variable(T0.NumTstTakr), Const(2))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))
+=== Iteration 10 ===
+-- Operator: database --
+Distinct(Variable(T0.cds), Const(lJ dQy9 M3), Const(A), Const(!), Const(@), Const("), Const(?), Const(O), Const(G), Const(D), Const(`), Const(H))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.cds), Variable(schools.CDSCode)), Eq(Variable(T0.cds), Const(lJ dQy9 M3))), Eq(Variable(T0.cds), Const(A))), Eq(Variable(T0.cds), Const(!))), Eq(Variable(T0.cds), Const(@))), Eq(Variable(T0.cds), Const("))), Eq(Variable(T0.cds), Const(?))), Eq(Variable(T0.cds), Const(O))), Eq(Variable(T0.cds), Const(G))), Eq(Variable(T0.cds), Const(D))), Eq(Variable(T0.cds), Const(`))), Eq(Variable(T0.cds), Const(H)))
+-- Operator: Sort --
+Eq(Variable(T0.NumTstTakr), Const(2))
+-- Operator: Filter --
+Not(Is_null(Variable(T0.sname)))
+Eq(Variable(T0.cname), Const(Contra Costa))

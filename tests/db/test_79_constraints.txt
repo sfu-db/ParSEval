@@ -1,0 +1,172 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("))
+-- Operator: Filter --
+Eq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+))
+-- Operator: Project --
+Eq(Variable(T0.County), Const(San Diego))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?))
+-- Operator: Project --
+Eq(Variable(T0.County), Const(Santa Barbara))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('))
+-- Operator: Project --
+Is_null(Variable(T0.Virtual))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#))
+-- Operator: Project --
+Is_null(Variable(T0.Virtual))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 10 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@))
+-- Operator: Project --
+Is_null(Variable(T0.Virtual))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 11 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2))
+-- Operator: Project --
+Is_null(Variable(T0.Virtual))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 12 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D))
+-- Operator: Aggregate --
+Is_null(Variable(T0.Virtual))
+Eq(Variable(T0.County), Const(San Diego))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 13 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F))
+-- Operator: Aggregate --
+Is_null(Variable(T0.Virtual))
+Eq(Variable(T0.County), Const(San Diego))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 14 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E))
+-- Operator: Aggregate --
+Eq(Variable(T0.Virtual), Const(None))
+Eq(Variable(T0.County), Const(San Diego))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 15 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E), Const(H))
+-- Operator: Aggregate --
+Eq(Variable(T0.Virtual), Const(None))
+Eq(Variable(T0.County), Const(San Diego))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Neq(Variable(T0.County), Const(Santa Barbara))
+Eq(Variable(T0.County), Const(San Diego))
+=== Iteration 16 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E), Const(H), Const(c))
+-- Operator: Aggregate --
+Is_null(Variable(T0.Virtual))
+Eq(Variable(T0.County), Const(Santa Barbara))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 17 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E), Const(H), Const(c), Const(P))
+-- Operator: Aggregate --
+Is_null(Variable(T0.Virtual))
+Eq(Variable(T0.County), Const(Santa Barbara))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 18 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E), Const(H), Const(c), Const(P), Const(b))
+-- Operator: Aggregate --
+Eq(Variable(T0.Virtual), Const(None))
+Eq(Variable(T0.County), Const(Santa Barbara))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))
+=== Iteration 19 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(1egO4 pO3x), Const(!), Const("), Const(*), Const(A), Const(+), Const(?), Const('), Const(#), Const(@), Const(2), Const(D), Const(F), Const(E), Const(H), Const(c), Const(P), Const(b), Const(B))
+-- Operator: Aggregate --
+Eq(Variable(T0.Virtual), Const(None))
+Eq(Variable(T0.County), Const(Santa Barbara))
+-- Operator: Filter --
+Eq(Variable(T0.Virtual), Const(F))
+Eq(Variable(T0.County), Const(Santa Barbara))
+Neq(Variable(T0.County), Const(San Diego))

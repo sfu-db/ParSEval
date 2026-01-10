@@ -1,0 +1,47 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(sqG5cT7nDw))
+Distinct(Variable(T0.CDSCode), Const(sqG5cT7nDw))
+Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(sqG5cT7nDw)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(sqG5cT7nDw), Const(A))
+Distinct(Variable(T0.CDSCode), Const(sqG5cT7nDw), Const(A))
+Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(sqG5cT7nDw))), Eq(Variable(T1.cds), Const(A)))
+-- Operator: Filter --
+Eq(Variable(T1.AvgScrWrite), Const(499))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(sqG5cT7nDw), Const(A), Const(@))
+Distinct(Variable(T0.CDSCode), Const(sqG5cT7nDw), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(sqG5cT7nDw))), Eq(Variable(T1.cds), Const(A))), Eq(Variable(T1.cds), Const(@)))
+-- Operator: Project --
+Is_null(Variable(T0.CharterNum))
+-- Operator: Filter --
+Eq(Variable(T1.AvgScrWrite), Const(499))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(sqG5cT7nDw), Const(A), Const(@), Const(?))
+Distinct(Variable(T0.CDSCode), Const(sqG5cT7nDw), Const(A), Const(@), Const(?))
+Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(sqG5cT7nDw))), Eq(Variable(T1.cds), Const(A))), Eq(Variable(T1.cds), Const(@))), Eq(Variable(T1.cds), Const(?)))
+-- Operator: Project --
+Is_null(Variable(T0.CharterNum))
+-- Operator: Filter --
+Eq(Variable(T1.AvgScrWrite), Const(499))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T1.cds), Const(sqG5cT7nDw), Const(A), Const(@), Const(?), Const(S))
+Distinct(Variable(T0.CDSCode), Const(sqG5cT7nDw), Const(A), Const(@), Const(?), Const(S))
+Or(Or(Or(Or(Or(Eq(Variable(T1.cds), Variable(T0.CDSCode)), Eq(Variable(T1.cds), Const(sqG5cT7nDw))), Eq(Variable(T1.cds), Const(A))), Eq(Variable(T1.cds), Const(@))), Eq(Variable(T1.cds), Const(?))), Eq(Variable(T1.cds), Const(S)))
+-- Operator: Project --
+Eq(Variable(T0.CharterNum), Const(3xLebd WZL))
+-- Operator: Filter --
+Eq(Variable(T1.AvgScrWrite), Const(499))
+-- Operator: Join --
+Eq(Variable(T0.CDSCode), Variable(T1.cds))

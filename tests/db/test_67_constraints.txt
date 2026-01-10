@@ -1,0 +1,30 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(hZHNTlKhFW))
+-- Operator: Filter --
+Eq(Strftime(strftime, Const(%Y), Variable(T0.ClosedDate)), Const(1989))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(hZHNTlKhFW), Const(!))
+-- Operator: Filter --
+Eq(Strftime(strftime, Const(%Y), Variable(T0.ClosedDate)), Const(1989))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(hZHNTlKhFW), Const(!), Const("))
+-- Operator: Filter --
+Eq(Variable(T0.City), Const(San Francisco))
+Neq(Strftime(strftime, Const(%Y), Variable(T0.ClosedDate)), Const(1989))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(hZHNTlKhFW), Const(!), Const("), Const(?))
+-- Operator: Filter --
+Eq(Variable(T0.DOCType), Const(Community College District))
+Neq(Variable(T0.City), Const(San Francisco))
+Neq(Strftime(strftime, Const(%Y), Variable(T0.ClosedDate)), Const(1989))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(hZHNTlKhFW), Const(!), Const("), Const(?), Const(_))
+-- Operator: Filter --
+Eq(Variable(T0.DOCType), Const(Community College District))
+Eq(Variable(T0.City), Const(San Francisco))
+Neq(Strftime(strftime, Const(%Y), Variable(T0.ClosedDate)), Const(1989))

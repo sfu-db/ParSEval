@@ -1,0 +1,57 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4))
+-- Operator: Filter --
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Neq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@), Const(H))
+-- Operator: Project --
+Is_null(Variable(T0.School))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@), Const(H), Const(O))
+-- Operator: Project --
+Is_null(Variable(T0.School))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@), Const(H), Const(O), Const(_))
+-- Operator: Project --
+Eq(Variable(T0.School), Const(YJoIilGc9q))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@), Const(H), Const(O), Const(_), Const(G))
+-- Operator: Project --
+Is_null(Variable(T0.MailZip))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(dlY2otWtM4), Const(A), Const(@), Const(H), Const(O), Const(_), Const(G), Const(!))
+-- Operator: Project --
+Is_null(Variable(T0.MailZip))
+-- Operator: Filter --
+Eq(Variable(T0.AdmLName1), Const(Atoian))
+Eq(Variable(T0.AdmFName1), Const(Avetik))

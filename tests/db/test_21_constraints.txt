@@ -1,0 +1,84 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE))
+Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE)))
+-- Operator: Filter --
+Eq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Filter --
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Neq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@)))
+-- Operator: Filter --
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Eq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Ge(Variable(T0.Free Meal Count (K-12)), Const(500))
+Neq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Ge(Variable(T0.Free Meal Count (K-12)), Const(500))
+Neq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 5 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Ge(Variable(T0.Free Meal Count (K-12)), Const(500))
+Eq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 6 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_), Const(?))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(?)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Ge(Variable(T0.Free Meal Count (K-12)), Const(500))
+Eq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 7 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_), Const(?), Const(C))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(C)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Neq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 8 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_), Const(?), Const(C), Const(I))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Neq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 9 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_), Const(?), Const(C), Const(I), Const("))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(")))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Eq(Variable(T0.County Name), Const(Los Angeles))
+=== Iteration 10 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(qBLMKrqPXE), Const(A), Const(@), Const(B), Const(!), Const(_), Const(?), Const(C), Const(I), Const("), Const(#))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(qBLMKrqPXE))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(B))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(#)))
+-- Operator: Filter --
+Le(Variable(T0.Free Meal Count (K-12)), Const(700))
+Gt(Variable(T0.Free Meal Count (K-12)), Const(500))
+Eq(Variable(T0.County Name), Const(Los Angeles))

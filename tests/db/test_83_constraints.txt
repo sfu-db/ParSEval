@@ -1,22 +1,22 @@
 === Iteration 0 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C))
-Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl))
+Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl)))
 === Iteration 1 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A))
-Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!)))
 -- Operator: Filter --
 Eq(Variable(T1.Magnet), Const(1))
 -- Operator: Join --
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 2 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?))
-Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(")))
 -- Operator: Filter --
 Eq(Variable(T1.GSoffered), Const(K-8))
 Neq(Variable(T1.Magnet), Const(1))
@@ -24,9 +24,9 @@ Neq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 3 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>))
-Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A)))
 -- Operator: Filter --
 Eq(Variable(T1.GSoffered), Const(K-8))
 Eq(Variable(T1.Magnet), Const(1))
@@ -34,9 +34,9 @@ Eq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 4 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_))
-Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*)))
 -- Operator: Filter --
 Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
 Neq(Variable(T1.GSoffered), Const(K-8))
@@ -45,9 +45,9 @@ Neq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 5 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C))
-Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O))
+Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O)))
 -- Operator: Filter --
 Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
 Neq(Variable(T1.GSoffered), Const(K-8))
@@ -56,9 +56,9 @@ Eq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 6 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I))
-Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_))
+Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O))), Eq(Variable(T0.CDSCode), Const(_)))
 -- Operator: Filter --
 Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
 Eq(Variable(T1.GSoffered), Const(K-8))
@@ -67,9 +67,9 @@ Neq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 7 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@))
-Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o))
+Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(o)))
 -- Operator: Filter --
 Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
 Eq(Variable(T1.GSoffered), Const(K-8))
@@ -78,9 +78,9 @@ Eq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 8 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P))
-Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(P)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(o))), Eq(Variable(T0.CDSCode), Const(+)))
 -- Operator: Project --
 Is_null(Variable(T1.City))
 -- Operator: Filter --
@@ -91,9 +91,9 @@ Eq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 9 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("))
-Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(P))), Eq(Variable(T0.CDSCode), Const(")))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+), Const(@))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+), Const(@))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(o))), Eq(Variable(T0.CDSCode), Const(+))), Eq(Variable(T0.CDSCode), Const(@)))
 -- Operator: Project --
 Is_null(Variable(T1.City))
 -- Operator: Filter --
@@ -104,37 +104,11 @@ Eq(Variable(T1.Magnet), Const(1))
 Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
 === Iteration 10 ===
 -- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`))
-Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(P))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(`)))
+Distinct(Variable(T1.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+), Const(@), Const(D))
+Distinct(Variable(T0.CDSCode), Const(MY9uF6u Wl), Const(!), Const("), Const(A), Const(*), Const(O), Const(_), Const(o), Const(+), Const(@), Const(D))
+Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(MY9uF6u Wl))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(*))), Eq(Variable(T0.CDSCode), Const(O))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(o))), Eq(Variable(T0.CDSCode), Const(+))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(D)))
 -- Operator: Project --
-Eq(Variable(T1.City), Const(Wzg43TfQex))
--- Operator: Filter --
-Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
-Eq(Variable(T1.GSoffered), Const(K-8))
-Eq(Variable(T1.Magnet), Const(1))
--- Operator: Join --
-Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
-=== Iteration 11 ===
--- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`), Const(!))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`), Const(!))
-Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(P))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(`))), Eq(Variable(T0.CDSCode), Const(!)))
--- Operator: Aggregate --
-Eq(Variable(T1.City), Const(Wzg43TfQex))
--- Operator: Filter --
-Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
-Eq(Variable(T1.GSoffered), Const(K-8))
-Eq(Variable(T1.Magnet), Const(1))
--- Operator: Join --
-Eq(Variable(T0.CDSCode), Variable(T1.CDSCode))
-=== Iteration 12 ===
--- Operator: database --
-Distinct(Variable(T1.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`), Const(!), Const(b))
-Distinct(Variable(T0.CDSCode), Const(Ei0ShHxb5C), Const(A), Const(?), Const(>), Const(_), Const(C), Const(I), Const(@), Const(P), Const("), Const(`), Const(!), Const(b))
-Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(T1.CDSCode)), Eq(Variable(T0.CDSCode), Const(Ei0ShHxb5C))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(>))), Eq(Variable(T0.CDSCode), Const(_))), Eq(Variable(T0.CDSCode), Const(C))), Eq(Variable(T0.CDSCode), Const(I))), Eq(Variable(T0.CDSCode), Const(@))), Eq(Variable(T0.CDSCode), Const(P))), Eq(Variable(T0.CDSCode), Const("))), Eq(Variable(T0.CDSCode), Const(`))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(b)))
--- Operator: Aggregate --
-Eq(Variable(T1.City), Const(Wzg43TfQex))
+Eq(Variable(T1.City), Const(7EvFLMLMjn))
 -- Operator: Filter --
 Eq(Variable(T0.NSLP Provision Status), Const(Multiple Provision Types))
 Eq(Variable(T1.GSoffered), Const(K-8))

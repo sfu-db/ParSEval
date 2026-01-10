@@ -1,9 +1,6 @@
 from __future__ import annotations
-from typing import Union, List, TYPE_CHECKING
+from typing import Union
 from enum import IntEnum, Enum
-
-if TYPE_CHECKING:
-    from src.parseval.plan.rex import LogicalOperator
 
 
 class PlausibleBit(IntEnum):
@@ -20,6 +17,8 @@ class PlausibleBit(IntEnum):
     MIN = 8  # e.g., number of  min value
     GROUP_COUNT = 9  # e.g., number of groups
     GROUP_SIZE = 10  # e.g., size of groups(count of rows in each group)
+    HAVING_TRUE = 11  # e.g., having condition is true
+    HAVING_FALSE = 12  # e.g., having condition is false
 
     @classmethod
     def from_int(cls, value: Union[int, str, bool, PlausibleBit]) -> "PlausibleBit":

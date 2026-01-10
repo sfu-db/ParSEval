@@ -1,0 +1,30 @@
+=== Iteration 0 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(3G2TdzB1Sk))
+Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(3G2TdzB1Sk)))
+-- Operator: Project --
+Is_null(Variable(T0.Free Meal Count (K-12)))
+=== Iteration 1 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(3G2TdzB1Sk), Const(!))
+Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(3G2TdzB1Sk))), Eq(Variable(T0.CDSCode), Const(!)))
+-- Operator: Project --
+Is_null(Variable(T0.Free Meal Count (K-12)))
+=== Iteration 2 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(3G2TdzB1Sk), Const(!), Const(A))
+Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(3G2TdzB1Sk))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(A)))
+-- Operator: Project --
+Eq(Variable(T0.Free Meal Count (K-12)), Const(6.0))
+=== Iteration 3 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(3G2TdzB1Sk), Const(!), Const(A), Const(?))
+Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(3G2TdzB1Sk))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?)))
+-- Operator: Project --
+Is_null(Variable(T0.Enrollment (K-12)))
+=== Iteration 4 ===
+-- Operator: database --
+Distinct(Variable(T0.CDSCode), Const(3G2TdzB1Sk), Const(!), Const(A), Const(?), Const(/))
+Or(Or(Or(Or(Or(Eq(Variable(T0.CDSCode), Variable(schools.CDSCode)), Eq(Variable(T0.CDSCode), Const(3G2TdzB1Sk))), Eq(Variable(T0.CDSCode), Const(!))), Eq(Variable(T0.CDSCode), Const(A))), Eq(Variable(T0.CDSCode), Const(?))), Eq(Variable(T0.CDSCode), Const(/)))
+-- Operator: Project --
+Is_null(Variable(T0.Enrollment (K-12)))

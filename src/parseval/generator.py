@@ -15,6 +15,18 @@ import logging
 from src.parseval.uexpr.speculate import SpeculateEngine, TypeEnv
 
 from itertools import product
+from src.parseval.logger import Logger
+
+Logger(
+    verbose={
+        "coverage": True,
+        "symbolic": False,
+        "smt": False,
+        "db": False,
+    }
+)
+
+logger = logging.getLogger("parseval.smt")
 
 
 def product_of_columns(table_data: dict[str, list]):
@@ -116,17 +128,17 @@ class Generator:
 
     def generate(self, max_iter, threshold=1):
         instance = Instance(ddls=self.schema, name=self.name, dialect=self.dialect)
-        for table_name in instance.catalog.tables:
-            instance.create_row(table_name, {})
+        # for table_name in instance.catalog.tables:
+        #     instance.create_row(table_name, {})
 
         speculative = SpeculateEngine().infer(self.plan)
         for columnref, datatype in speculative.items():
             alias = columnref.qualified_name
-            logging.info(f"Speculative data type: {alias} -> {datatype}, {columnref}")
+            logger.info(f"Speculative data type: {alias} -> {datatype}, {columnref}")
             pool = instance.column_domain.get_or_create_pool(
                 None, table_name=columnref.table, column_name=columnref.name
             )
-            logging.info(
+            logger.info(
                 f"Speculative data type: {alias} from {pool.datatype} -> {datatype}"
             )
             pool.datatype = datatype
@@ -139,7 +151,7 @@ class Generator:
             if plausible is None:
                 break
             pattern = plausible.pattern()
-            logging.info(f"Selecting leaf: ========================= {pattern}")
+            logger.info(f"Selecting leaf: ========================= {pattern}")
 
             tracer.declare_coverage_constraints(plausible, instance)
 
@@ -148,7 +160,7 @@ class Generator:
                 for constraint in constraints:
                     solver.add_constraint(constraint)
 
-            with open(f"tests/db/{self.name}_constraints.txt", "a") as f:
+            with open(f"examples/db/{self.name}_constraints.txt", "a") as f:
                 f.write(f"=== Iteration {index} ===\n")
                 for label, constraints in self.constraints.items():
                     f.write(f"-- Operator: {label} --\n")
@@ -157,23 +169,26 @@ class Generator:
 
             solver_result = solver.solve()
             if solver_result.status != "sat":
-                logging.info("No satisfying assignment found.")
+                logger.info("No satisfying assignment found.")
                 plausible.mark_infeasible()
             else:
                 concretes = {}
-                logging.info("Satisfying assignment found:")
-                logging.info(self.var_to_columnref)
+                logger.info("Satisfying assignment found:")
+                logger.info(self.var_to_columnref)
                 for assignment in solver_result.assignments:
                     var_name = assignment.column
-                    columnref = self.var_to_columnref[var_name]
-                    table_name = columnref.table
-                    concretes.setdefault(table_name, {})[
-                        columnref.name
-                    ] = assignment.value
+                    if var_name in self.var_to_columnref:
+                        columnref = self.var_to_columnref[var_name]
+                        table_name = columnref.table
+                        concretes.setdefault(table_name, {})[
+                            columnref.name
+                        ] = assignment.value
+                    elif var_name in instance.symbols:
+                        instance.symbols[var_name].concrete = assignment.value
                 if concretes:
                     # plausible.mark_covered()
                     # plausible.update_mark()
-                    logging.info(concretes)
+                    logger.info(concretes)
                     for table_name in instance.catalog.tables:
                         if table_name in concretes:
                             instance.create_row(table_name, concretes[table_name])
@@ -190,7 +205,7 @@ class Generator:
         # encoder.visit(self.query)
         encoder.encode()
         display_uexpr(tracer.root_constraint).write(
-            "tests/db/dot_coverage" + instance.name + ".png", format="png"
+            "examples/db/dot_coverage" + instance.name + ".png", format="png"
         )
         return instance
 
@@ -228,7 +243,7 @@ class Generator:
                     continue
                 for columnref in columnrefs:
                     var_name = f"{columnref.qualified_name}"
-                    logging.info(f"Declaring variable: {var_name}")
+                    logger.info(f"Declaring variable: {var_name}")
                     if var_name not in var_to_columnref:
                         domain = column_pool.get_or_create_pool(
                             var_name,
@@ -267,7 +282,7 @@ class Generator:
 
                 #         condition = ExprEncoder().visit(constraint, context={**ctx})
 
-                #         # logging.info(condition)
+                #         # logger.info(condition)
 
                 if isinstance(constraint, rex.sqlglot_exp.Predicate):
                     ### Encode Coverage to SMT constraints
@@ -279,8 +294,8 @@ class Generator:
                     #     constraint,
                     # ).visit(constraint, context={**columnref_to_var})
                     # if condition is not None:
-                    # logging.info(f"Encoded constraint: {repr(condition)}")
-                    # logging.info(f"From original: {constraint}")
+                    # logger.info(f"Encoded constraint: {repr(condition)}")
+                    # logger.info(f"From original: {constraint}")
                     solver.add_constraint(condition)
 
         return solver, var_to_columnref, columnref_to_var

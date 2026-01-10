@@ -15,6 +15,8 @@ from .checks import resolve_check
 from sqlglot import exp as sqlglot_exp
 from src.parseval.plan import ExpressionEncoder, ColumnRef
 
+logger = logging.getLogger("parseval.symbolic")
+
 
 class ExprEncoder(ExpressionEncoder):
     # def __init__(self, expr, row, symbolic_registry=None):
@@ -90,7 +92,7 @@ class UExprToConstraint:
             op = c.pop()
             op.symbolic_exprs.clear()
             op.delta.clear()
-            op.metadata.clear()
+            # op.metadata.clear()
             for k, child in op.children.items():
                 if isinstance(child, Constraint):
                     c.append(child)
@@ -131,7 +133,8 @@ class UExprToConstraint:
                 smt_expr = symbolic_exprs[index] if index < len(symbolic_exprs) else []
                 b = PBit.from_int(taken)
                 node.update_delta(b, smt_expr, rowids, branch)
-                node.update_metadata(**kwargs)
+
+                # node.update_metadata(**kwargs)
             if branch and (node, b) not in self.positive_nodes[operator.operator_id]:
                 self.positive_nodes[operator_id].add((node, b))
 
@@ -160,11 +163,28 @@ class UExprToConstraint:
                 return leaf
         return None
 
+    def _declare_db_constraints(self, instance, var_to_columnref, columnref_to_var):
+
+        for columnref, variable in columnref_to_var.items():
+            domain = instance.column_domain.get_or_create_pool(
+                variable.name,
+                table_name=columnref.table,
+                column_name=columnref.name,
+            )
+            if domain.unique:
+                data = instance.get_column_data(
+                    table_name=columnref.table, column_name=columnref.name
+                )
+                values = [Const(d.concrete, dtype=domain.datatype) for d in data]
+                unique_constraint = Distinct(variable, *values, dtype="bool")
+                self.declare.declare_constraint("database", unique_constraint)
+
     def _declare_variables(
         self,
         instance: Instance,
         path: List[Constraint],
         patterns: List[PBit],
+        context: Dict,
     ):
         column_pool = instance.column_domain
         var_to_columnref, columnref_to_var = {}, {}
@@ -173,12 +193,12 @@ class UExprToConstraint:
             columnrefs = set(sql_condition.find_all(ColumnRef))
             if not columnrefs:
                 continue
+            if node["subquery"] != context["subquery"]:
+                continue
+
             for columnref in columnrefs:
                 var_name = f"{columnref.qualified_name}"
                 if var_name not in var_to_columnref:
-                    logging.info(
-                        f"Declaring variable for columnref: {columnref.table} -> {columnref.name}, {repr(columnref)}, {sql_condition}"
-                    )
                     domain = column_pool.get_or_create_pool(
                         var_name,
                         table_name=columnref.table,
@@ -197,7 +217,7 @@ class UExprToConstraint:
                         values = [
                             Const(d.concrete, dtype=domain.datatype) for d in data
                         ]
-                        logging.info(
+                        logger.info(
                             f"Declaring unique constraint for {var_name}: {values}"
                         )
                         unique_constraint = Distinct(var, *values, dtype="bool")
@@ -221,7 +241,7 @@ class UExprToConstraint:
                         fk_constraints.append(columnref_to_var[columnref].eq(var2))
                         fk_varname = var2.name
                 domain = column_pool.get_or_create_pool(
-                    None, table_name=ref_table, column_name=ref_col
+                    fk_varname, table_name=ref_table, column_name=ref_col
                 )
                 if not flag:
                     var = Variable(fk_varname, dtype=domain.datatype)
@@ -232,6 +252,15 @@ class UExprToConstraint:
                     fk_variables[fk_varname] = (var, fk_ref_col)
                     self.declare.declare_variable(var, fk_ref_col)
                     fk_constraints.append(columnref_to_var[columnref].eq(var))
+                    if domain.unique:
+                        data = instance.get_column_data(
+                            table_name=ref_table, column_name=ref_col
+                        )
+                        values = [
+                            Const(d.concrete, dtype=domain.datatype) for d in data
+                        ]
+                        unique_constraint = Distinct(var, *values, dtype="bool")
+                        self.declare.declare_constraint("database", unique_constraint)
 
                 data = instance.get_column_data(
                     table_name=ref_table, column_name=ref_col
@@ -245,7 +274,7 @@ class UExprToConstraint:
                 from functools import reduce
 
                 fk_constraint = reduce(lambda x, y: x.or_(y), fk_constraints)
-                logging.info(f"fk_constraint: {fk_constraint}")
+                logger.info(f"fk_constraint: {fk_constraint}")
                 self.declare.declare_constraint("database", fk_constraint)
         for var_name, (var, ref_col) in fk_variables.items():
             self.declare.declare_variable(var, ref_col)
@@ -255,26 +284,38 @@ class UExprToConstraint:
         self, plausible: PlausibleBranch, instance: Instance, skips=None
     ):
         skips = skips or set()
-        column_domains = instance.column_domain
         path = list(reversed(plausible.get_path_to_root()[1:]))
         patterns = list(reversed(plausible.pattern()))
-        context = {"has_having": False, "patterns": patterns}
+        context = {
+            "has_having": False,
+            "patterns": patterns,
+            "subquery": path[1]["subquery"],
+        }
         var_to_columnref, columnref_to_var = self._declare_variables(
-            instance, path, patterns
+            instance, path, patterns, context
         )
 
         for bit, node in zip(patterns, path[1:]):
             if context["has_having"]:
                 break
-            logging.info(f"Declaring constraint for bit: {bit}, node: {node}")
+
             if (node.operator.operator_type, bit) in skips:
+                continue
+            if node["subquery"] != context["subquery"]:
                 continue
             declare_strategy = resolve_check(node.operator.operator_type, bit)
             constraints = declare_strategy.declare(self, node, context)
+
             for constraint in constraints:
+                if isinstance(constraint, Symbol):
+                    logger.info(f"declaring symbol constraint: {constraint}")
+                    self.declare.declare_constraint(
+                        node.operator.operator_type, constraint
+                    )
                 columnrefs = set(constraint.find_all(ColumnRef))
                 if not columnrefs:
                     continue
+
                 if isinstance(constraint, sqlglot_exp.Predicate):
                     ### Encode Coverage to SMT constraints
                     encoder = ExprEncoder()
@@ -283,15 +324,26 @@ class UExprToConstraint:
                             c.qualified_name: columnref_to_var[c] for c in columnrefs
                         }
                     except Exception as e:
-                        # logging.info(columnref_to_var)
+                        # logger.info(columnref_to_var)
                         for c in columnrefs:
-                            logging.info(f"columnref: {c}, {type(c)}")
+                            logger.info(f"columnref: {c}, {type(c)}")
                         for key, value in columnref_to_var.items():
-                            logging.info(f"key: {key}, value: {value}, {type(key)}")
+                            logger.info(f"key: {key}, value: {value}, {type(key)}")
                         raise e
+
+                    def replace(expr, ctx):
+                        if isinstance(expr, ColumnRef):
+                            return ctx[expr.qualified_name]
+
+                        return expr
+
+                    # condition = constraint.transform(replace, kwgs)
 
                     ctx = encoder.encode(constraint, **kwgs)
                     condition = ctx[constraint]
+                    logger.info(
+                        f"Declaring constraint for bit: {bit}, condition: {condition}"
+                    )
                     self.declare.declare_constraint(
                         node.operator.operator_type, condition
                     )
@@ -310,7 +362,7 @@ class UExprToConstraint:
     #     for bit, node in zip(patterns, path[1:]):
     #         if context["has_having"]:
     #             break
-    #         logging.info(f"Declaring constraint for bit: {bit}, node: {node}")
+    #         logger.info(f"Declaring constraint for bit: {bit}, node: {node}")
     #         strategy = resolve_check(node.operator.operator_type, bit)
     #         # Check per-tracer configuration whether this strategy should run
     #         enabled = True
@@ -380,7 +432,7 @@ class UExprToConstraint:
     #     right_table = column_refs[1].table
     #     self.declare(node.operator.operator_type, column_refs[1])
 
-    #     logging.info(
+    #     logger.info(
     #         f"Declaring join right constraint for table: {right_table}, {column_refs[1]}"
     #     )
 
@@ -392,7 +444,7 @@ class UExprToConstraint:
     #     left_table = column_refs[0].table
     #     self.declare(node.operator.operator_type, column_refs[0])
 
-    #     logging.info(
+    #     logger.info(
     #         f"Declaring join left constraint for table: {left_table}, {column_refs[0]}"
     #     )
 
@@ -487,7 +539,7 @@ class UExprToConstraint:
     #     if not node.symbolic_exprs[b]:
     #         return
 
-    # logging.info(f"procesing {bit}, {b} having: {node.sql_condition}")
+    # logger.info(f"procesing {bit}, {b} having: {node.sql_condition}")
     # node.symbolic_exprs[b][0]
     # if bit is PBit.TRUE:
     #     ...
@@ -505,7 +557,7 @@ class UExprToConstraint:
     #     group = groups[-1]
     #     node.metadata.setdefault("group", {})[group.name] = pattern
 
-    # logging.info(f"Declaring having constraint for group: for {node.sql_condition}")
+    # logger.info(f"Declaring having constraint for group: for {node.sql_condition}")
 
     # if isinstance(node.sql_condition, rex.sqlglot_exp.Predicate):
     #     pos_constraint = rex.negate_predicate(node.sql_condition)
