@@ -4,7 +4,6 @@ from typing import Optional, List, TYPE_CHECKING
 import logging
 
 if TYPE_CHECKING:
-    from src.parseval.plan.rex import LogicalOperator
     from .ptree import UExprToConstraint
 
 logger = logging.getLogger("parseval.uexpr")
@@ -33,7 +32,7 @@ class _Constraint:
                     return k
 
     def hit(self):
-        if self.parent is not None and self.parent.operator != "ROOT":
+        if self.parent is not None and self.parent.step != "ROOT":
             bit = self.bit()
             return len(self.parent.symbolic_exprs[bit])
         return 0
@@ -55,25 +54,24 @@ class _Constraint:
         self._pattern = tuple(bits)
         return self._pattern
 
-
 class _ScopeManager:
     """
     Internal context manager class to handle saving and restoring the Trace state.
     This ensures state is always reset correctly, even upon exception.
     """
 
-    def __init__(self, trace_instance: "UExprToConstraint", operator: LogicalOperator):
+    def __init__(self, trace_instance: "UExprToConstraint", step):
         self.trace = trace_instance
-        self.operator = operator
+        self.step = step
 
     def __enter__(self) -> "UExprToConstraint":
         # 1. Notify Tracer we are entering an operator
-        self.trace.on_scope_enter(self.operator)
+        self.trace.on_scope_enter(self.step)
         return self.trace
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
-            logger.error(f"Scope failed for {self.operator}. Rolling back state.")
+            logger.error(f"Scope failed for {self.step}. Rolling back state.")
             return False  # Propagate the exception upwards
-        self.trace.on_scope_exit(self.operator)
+        self.trace.on_scope_exit(self.step)
         return False

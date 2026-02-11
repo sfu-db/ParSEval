@@ -1,17 +1,16 @@
 import os, re
-from .generator import Generator
 from typing import List, Tuple, Set, Union
+from .data_generator import DataGenerator, dbgenerate
 from .db_manager import DBManager
+
+# from .generator import Generator
+
+# from .db_manager import DBManager
 
 
 def instantiate_db(workspace, schema, sql, dialect, **kwargs):
     """generates test database instances based on the input SQL."""
-    max_iter = kwargs.pop("max_iter", 30)
-    threshold = kwargs.pop("threshold", 1)
-    generator = Generator(schema=schema, query=sql, name=kwargs.get("name", "default"))
-    instance = generator.generate(max_iter=max_iter, threshold=threshold)
-    instance.to_db(host_or_path=workspace)
-
+    dbgenerate(ddls=schema, query=sql, workspace=workspace, dialect=dialect, **kwargs)
     return workspace
 
 
@@ -95,10 +94,7 @@ def disprove_queries(schema, gold, pred, dialect, **kwargs):
     gold, pred = remove_limit(gold, pred)
 
     for label, query in zip(["gold", "pred"], [gold, pred]):
-        generator = Generator(schema=schema, query=query, name=label)
-        instance = generator.generate(max_iter=max_iter, threshold=threshold)
-
-        instance.to_db(host_or_path=workspace)
+        dbgenerate(ddls=schema, query=query, workspace=workspace, dialect=dialect, **kwargs)
         result = compare_queries(
             host_or_path=workspace,
             database=f"{label}.sqlite",
@@ -107,8 +103,6 @@ def disprove_queries(schema, gold, pred, dialect, **kwargs):
             dialect=dialect,
             **kwargs,
         )
-
-        print(result)
         if result["state"] == "NEQ":
             return result
 

@@ -28,7 +28,7 @@ class TypeEnv:
     """
 
     def __init__(self):
-        self.env: Dict[Any, DataType] = {}
+        self.env: Dict[Any, 'DataType'] = {}
 
     def set(self, name: ColumnRef, type_: Any):
         new_t = DataType.build(type_)

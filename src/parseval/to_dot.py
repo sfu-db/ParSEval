@@ -14,7 +14,7 @@ import pydot
 
 from enum import Enum
 
-from src.parseval.uexpr import Constraint, PlausibleBranch
+from src.parseval.uexpr.uexprs import Constraint, PlausibleBranch
 from src.parseval.constants import PBit
 
 NODE_STYLES: Dict[str, Dict[str, str]] = {}
@@ -98,6 +98,23 @@ EDGE_STYLES = {
         "style": "dotted",
         "fontsize": "12",
     },
+    PBit.GROUP_NULL: {
+         "color": "#FD7E14",
+        "label": "NULL",
+        "style": "dotted",
+        "fontsize": "12",
+    },
+    PBit.GROUP_DUPLICATE: {
+        "color": "#20C997",
+        "label": "DUP",
+        "style": "dotted",
+        "fontsize": "12",},
+    PBit.AGGREGATE_SIZE: {
+        "color": "#20C997",
+        "label": "AGGREGATE_SIZE",
+        "style": "dotted",
+        "fontsize": "12",
+    }
 }
 
 
@@ -303,11 +320,11 @@ def uexpr_to_dot(
     # Build a human-friendly label for the node.
     if isinstance(node, Constraint):
         if node.sql_condition:
-            label = f"{node.operator.operator_type}({str(node.sql_condition)}) \n {to_string(node.pattern())}"
+            label = f"{node.step_type}({str(node.sql_condition)}) \n {to_string(node.pattern())}"
         else:
             label = "ROOT"
     elif isinstance(node, PlausibleBranch):
-        label = f"{node.plausible_type.value}: {to_string(node.pattern())}"
+        label = f"{node.plausible_type.value}: {to_string(node.pattern())} \n {node.branch}"
     else:
         label = node.__class__.__name__
 

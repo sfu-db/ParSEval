@@ -68,7 +68,7 @@ def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
         converted = maybe_copy(value, copy)
         srctype = converted.args.get("datatype")
     elif isinstance(value, str):
-        converted = Literal.string(value)
+        converted = Literal(this = value, is_string=True)
         srctype = "TEXT"
     elif isinstance(value, bool):
         converted = Literal(this=value, is_string=False)
@@ -88,7 +88,9 @@ def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
     else:
         raise ValueError(f"Unsupported literal type: {type(value)}")
     if datatype:
+        converted.type = datatype
         converted.set("datatype", datatype)
     else:
+        converted.type = DataType.build(srctype)
         converted.set("datatype", DataType.build(srctype))
     return converted

@@ -23,13 +23,14 @@ import time
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 from .singleton import singletonMeta
-
+from .states import SchemaException
 
 class Connect:
-    def __init__(self, engine: Engine, executor, logger=None):
+    def __init__(self, engine: Engine, executor, dialect: str, logger=None):
         self.engine = engine
         self.executor = executor
         self.logger = logger or logging.getLogger(f"parseval.db_manager.connect")
+        self.dialect = dialect
         self._metadata = None
 
     @property
@@ -157,6 +158,43 @@ class Connect:
     def create_tables(self, *ddls):
         for ddl in ddls:
             self.execute(ddl, fetch=None)
+
+    def create_schema(self, schema: MappingSchema | List[str] | Dict[str, Dict[str, str]] | str, dialect: Optional[str] = None):
+        if isinstance(schema, MappingSchema):
+            schema = schema.mapping
+        ddls = []
+        if isinstance(schema, list):
+            ddls.extend(schema)
+        elif isinstance(schema, dict):
+            """
+            we should convert Dict schema to ddl first
+            """
+            for table_name, column_defs in schema.items():
+                columns = [
+                    exp.ColumnDef(
+                        this=exp.to_identifier(column_name, quoted=True),
+                        kind=exp.DataType.build(column_typ),
+                    )
+                    for column_name, column_typ in column_defs.items()
+                ]
+                ddl = exp.Create(
+                    this=exp.Schema(
+                        this=exp.to_identifier(table_name, quoted=True),
+                        expressions=columns,
+                    ),
+                    exists=True,
+                    kind="TABLE",
+                )
+                ddls.append(ddl.sql(dialect=dialect))
+        else:
+            try:
+                for ddl in parse(schema, read=dialect):
+                    ddl.set('exists', True)
+                    ddls.append(ddl.sql(dialect=dialect))
+            except Exception as e:
+                raise SchemaException(f"cannot parse schema {schema}. {e}")
+        
+        self.create_tables(*ddls)
 
     def drop_table(self, table_name):
         self.execute(f"DROP TABLE IF EXISTS {table_name}", fetch=None)
@@ -334,7 +372,7 @@ class DBManager(metaclass=singletonMeta):
             **kwargs,
         )
         executor = self.get_pool(conn_str)
-        conn = Connect(engine=engine, executor=executor, logger=self.logger)
+        conn = Connect(engine=engine, executor=executor, dialect= dialect, logger=self.logger)
         try:
             yield conn
         finally:
@@ -427,7 +465,7 @@ class DBManager(metaclass=singletonMeta):
                 for ddl in parse(schemas, read=dialect):
                     ddls.append(ddl.sql(dialect=dialect))
             except Exception as e:
-                raise ValueError(f"cannot parse schema {schemas}. {e}")
+                raise SchemaException(f"cannot parse schema {schemas}. {e}")
 
         with self.get_connection(
             host_or_path, database, port, username, password, dialect

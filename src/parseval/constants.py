@@ -17,8 +17,12 @@ class PlausibleBit(IntEnum):
     MIN = 8  # e.g., number of  min value
     GROUP_COUNT = 9  # e.g., number of groups
     GROUP_SIZE = 10  # e.g., size of groups(count of rows in each group)
-    HAVING_TRUE = 11  # e.g., having condition is true
-    HAVING_FALSE = 12  # e.g., having condition is false
+    GROUP_NULL = 11
+    GROUP_DUPLICATE = 12
+    AGGREGATE_SIZE = 13
+    HAVING_TRUE = 14  # e.g., having condition is true
+    HAVING_FALSE = 15  # e.g., having condition is false
+    
 
     @classmethod
     def from_int(cls, value: Union[int, str, bool, PlausibleBit]) -> "PlausibleBit":
@@ -33,6 +37,8 @@ class PlausibleBit(IntEnum):
 PBit = PlausibleBit
 
 
+VALID_PATH_BITS = (PBit.FALSE, PBit.TRUE, PBit.JOIN_TRUE, PBit.GROUP_SIZE)
+
 class PlausibleType(Enum):
     """Types of plausible (unexplored) branches."""
 
@@ -43,3 +49,12 @@ class PlausibleType(Enum):
     PENDING = "pending"  # Branch queued for exploration
     TIMEOUT = "timeout"  # Branch exists but solver timed out
     ERROR = "error"  # Branch caused an error during exploration
+
+class BranchType(IntEnum):
+    """Types of branch in plausible node."""
+    POSITIVE = 1
+    NEGATIVE = 0
+    UNDECIDED = -1
+    
+    def __bool__(self):
+        return self == BranchType.POSITIVE

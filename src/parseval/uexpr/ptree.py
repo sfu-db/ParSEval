@@ -5,8 +5,8 @@ from .node import Constraint, PlausibleBranch, PlausibleType, PBit
 
 if TYPE_CHECKING:
     from src.parseval.plan.rex import Expression, ColumnRef, Datatype
-    from src.parseval.plan.rex import LogicalOperator
     from src.parseval.instance import Instance
+    from sqlglot.planner import Step
 from collections import defaultdict
 from ordered_set import OrderedSet
 from src.parseval.symbol import Variable, Symbol, Const, Distinct
@@ -16,7 +16,6 @@ from sqlglot import exp as sqlglot_exp
 from src.parseval.plan import ExpressionEncoder, ColumnRef
 
 logger = logging.getLogger("parseval.symbolic")
-
 
 class ExprEncoder(ExpressionEncoder):
     # def __init__(self, expr, row, symbolic_registry=None):
@@ -34,39 +33,47 @@ class UExprToConstraint:
         positive_nodes: a mapping from operator id to all positive path constraint nodes
         prev_operator: the last SQL operator we have seen
         """
+        self.steps: List[Step] = []
+        self.node_index: Dict[str, Set[Constraint]] = defaultdict(OrderedSet)
         self.constraints = []
         self.leaves: Dict[str, Constraint] = {}
         self.root_constraint = Constraint(self, None, None)
         self.positive_nodes: Dict[str, Set[Constraint]] = defaultdict(set)
         self.positive_nodes["ROOT"].add((self.root_constraint, PBit.TRUE))
-        self.prev_operator: Optional[LogicalOperator] = "ROOT"
+        self.prev_step: Optional[Any] = "ROOT"
+        self.node_index["ROOT"].add(self.root_constraint)
+        self.steps.append("ROOT")
         self.declare = declare
         self.threshold = threshold
+                
         # Index rows -> set of (Constraint, bit) for quick lookup when updating
         # mappings from runtime rows to UExpr nodes. Structure:
         # { rowid: { operator_id:  OrderedSet((Constraint, PlausibleBit), ...)} }
-        self.row_index: Dict[str, Set[Tuple]] = defaultdict(
-            lambda: defaultdict(OrderedSet)
-        )
+        self.row_index: Dict[str, Set[Constraint]] = defaultdict(OrderedSet)
+        # self.row_index: Dict[str, Set[Tuple]] = defaultdict(
+        #     lambda: defaultdict(OrderedSet)
+        # )
         self.strategy_config: Optional[Dict[object, bool]] = None
 
-    def on_scope_enter(self, operator: LogicalOperator):
+    def on_scope_enter(self, step: str):
         """Optional hook for setup."""
         pass
 
-    def on_scope_exit(self, operator: LogicalOperator):
+    def on_scope_exit(self, step: str):
         """
         Refined logic to finalize state after a node is successfully visited.
         """
+        # logging.info(f'Step: {step} in {step in self.positive_nodes}')
         for pattern, leaf in self.leaves.items():
             if isinstance(leaf, PlausibleBranch):
                 leaf.update_mark()
-        if operator.operator_id in self.positive_nodes:
-            self.prev_operator = operator.operator_id
-
+        
+        if step in self.positive_nodes:
+            self.prev_step = step
+        
     def _index_row(
         self,
-        operator_id: str,
+        step_id: str,
         rowid: Any,
         node: Constraint,
         bit: PBit,
@@ -78,11 +85,13 @@ class UExprToConstraint:
         row (or tuple of rowids for composed rows like joins). The index is
         updated from Constraint.update_delta when symbolic rows are recorded.
         """
-        if branch:
-            try:
-                self.row_index[rowid][operator_id].add((node, bit))
-            except Exception:
-                return
+        self.row_index[rowid].add((node, bit))
+        # if branch:
+        #     try:
+                
+        #         self.row_index[rowid][step_id].add((node, bit))
+        #     except Exception:
+        #         return
 
     def reset(self):
         self.prev_operator = "ROOT"
@@ -97,9 +106,270 @@ class UExprToConstraint:
                 if isinstance(child, Constraint):
                     c.append(child)
 
+
+    # def which_path(self, sql_conditions: List[Expression],
+    #                symbolic_exprs: List[Union[List[Symbol], Symbol]],
+    #                takens: List[bool],
+    #                rowids: Tuple[str, ...],
+    #                branch: Union[bool, str],
+    #                **kwargs):
+    #     assert isinstance(rowids, tuple), f"rowids must be a tuple, got {type(rowids)}"
+    #     assert len(sql_conditions) == len(
+    #         takens
+    #     ), f"Conditions and takens length mismatch, sql_conditions: {sql_conditions}, takens: {takens}"
+        
+    #     starts = set()
+        
+    #     starts: Set[tuple] = set()
+    #     for rowid in rowids:
+    #         nodes = self.row_index[rowid][self.prev_step]
+    #         if nodes:
+    #             starts.add(nodes[-1])
+        
+    #     if not starts:
+    #         starts = self.positive_nodes[self.prev_step]
+        
+    #     start = sql_conditions[0]
+        
+        
+        
+        
+    #     return self.which_path(
+    #         self.prev_step,
+    #         sql_conditions,
+    #         symbolic_exprs,
+    #         takens,
+    #         rowids,
+    #         branch,
+    #         **kwargs,
+    #     )
+
+    
+    def _find_child(self, step: str, sql_condition: Expression):
+        for node in reversed(self.node_index.get(step, [])):
+            if node.step == step and node.sql_condition == sql_condition:
+                yield node
+        return None
+    
+    
+    
+    # def update_existing_nodes(self, step: str, sql_condition: Expression, symbolic_expr: Symbol, taken, rowids, branch, existing_nodes = None):
+    #     existing_nodes = set() if existing_nodes is None else existing_nodes
+    #     ## if we already create nodes for this condition
+    #     for node in self._find_child(step, sql_condition):
+    #         existing_nodes.add((node, node.bit()))
+    #     validate_nodes = set()
+    #     ## we only need to update existing nodes that have the same rowids in parent delta
+    #     for node in existing_nodes:
+    #         bit = node.bit()
+    #         if node.parent and rowids in node.parent.delta[bit]:
+    #             validate_nodes.add((node, bit))
+    #     ## if we cannot find an existing node that has the same rowids in parent delta, we need to use all existing nodes
+    #     if existing_nodes and not validate_nodes:
+    #         validate_nodes.update(existing_nodes)
+    #     if validate_nodes:
+    #         return validate_nodes
+        
+    
+    
+    # def find_starting_nodes(self, step: str, sql_condition: Expression, rowids: Tuple[str, ...]):
+    #     existing_nodes = set()
+    #     ## if we already create nodes for this condition
+    #     for node in self._find_child(step, sql_condition):
+    #         existing_nodes.add((node, node.bit()))
+    #     validate_nodes = set()
+    #     ## we only need to update existing nodes that have the same rowids in parent delta
+    #     for node in existing_nodes:
+    #         bit = node.bit()
+    #         if node.parent and rowids in node.parent.delta[bit]:
+    #             validate_nodes.add((node, bit))
+    #     ## if we cannot find an existing node that has the same rowids in parent delta, we need to use all existing nodes
+    #     if existing_nodes and not validate_nodes:
+    #         validate_nodes.update(existing_nodes)
+    #     if validate_nodes:
+    #         return validate_nodes
+    #     ## if we cannot find existing nodes, we need to create new nodes, either from leaves with branch is True, or all positive nodes        
+        
+    #     ## we first find all leaves with branch is True
+    #     for leaf in self.leaves.values():
+    #         if leaf.branch is True:
+    #             existing_nodes.add((leaf.parent, leaf.bit()))
+    #     if not existing_nodes:
+    #         existing_nodes.add((self.root_constraint, PBit.TRUE))
+    #     for node, bit in existing_nodes:
+    #         if node.parent and rowids in node.parent.delta[node.bit()]:
+    #             validate_nodes.add((node, bit))
+    #     if existing_nodes and not validate_nodes:
+    #         validate_nodes.update(existing_nodes)
+        
+    #     for node, bit in validate_nodes:
+    #         child = node.add_child(
+    #             step = step,
+    #             sql_condition=sql_condition,
+    #             bit = bit,
+    #             branch=branch
+    #         )
+    #         new_nodes.add((child, tbit))
+                
+    #     return validate_nodes
+    
+    def update_nodes(self, step: str, sql_condition: Expression, symbolic_expr: Symbol, taken, rowids, branch):
+        existing_nodes = set()
+        tbit = PBit.from_int(taken)
+        for node in self._find_child(step, sql_condition):
+            existing_nodes.add((node, node.bit()))
+        if not existing_nodes:
+            return set()
+        
+        validate_nodes = set()
+        ## we only need to update existing nodes that have the same rowids in parent delta
+        for node, bit in existing_nodes:
+            if node.parent and rowids in node.parent.delta[bit]:
+                validate_nodes.add((node, bit))
+        ## if we cannot find an existing node that has the same rowids in parent delta, we need to use all existing nodes
+        if not validate_nodes:
+            validate_nodes.update(existing_nodes)
+        for node, bit in validate_nodes:
+            logger.info(f"Updating existing node: {node}, bit: {tbit}, rowids: {rowids in node.parent.delta[bit]}, branch: {branch}")
+            node.update_delta(tbit, symbolic_expr, rowids, branch)
+            
+        # logger.info(f'Updated nodes: {len(validate_nodes)} for step: {step}, condition: {sql_condition}, taken: {taken}, rowids: {rowids}, branch: {branch}')
+        return validate_nodes
+        
+    
+    def create_nodes(self, step: str, sql_condition: Expression, symbolic_expr: Symbol, taken, rowids, branch, starting_nodes = None):
+        new_nodes = set()        
+        tbit = PBit.from_int(taken)
+        
+        ## if we already have starting_nodes from previous step, we just create child from them
+        if starting_nodes:
+            for item in starting_nodes:
+                (node, bit) = item
+                child = node.add_child(
+                    step = step,
+                    sql_condition=sql_condition,
+                    bit = bit,
+                    branch=branch
+                )
+                child.update_delta(tbit, symbolic_expr, rowids, branch)
+                new_nodes.add((child, tbit))
+            return new_nodes
+        
+        ### find starting nodes
+        positive_nodes = []
+        ## we first find all leaves with branch is True
+        for leaf in self.leaves.values():
+            if leaf.branch is True:
+                positive_nodes.append((leaf.parent, leaf.bit()))
+            
+        if not positive_nodes:
+            positive_nodes = [(self.root_constraint, PBit.TRUE)]
+        validate_nodes = []
+        for node, bit in positive_nodes:
+            if node.parent and rowids in node.parent.delta[node.bit()]:
+                validate_nodes.append((node, bit))
+        if not validate_nodes:
+            validate_nodes = positive_nodes
+    
+    
+        for item in validate_nodes:
+            (node, bit) = item
+            child = node.add_child(
+                step = step,
+                sql_condition=sql_condition,
+                bit = bit,
+                branch=branch
+            )
+            child.update_delta(tbit, symbolic_expr, rowids, branch)
+            new_nodes.add((child, tbit))
+        return new_nodes
+    
+    def append_to_positive_nodes(self, step: str, sql_condition: Expression, symbolic_expr: Symbol, taken, rowids, branch, tnodes = None):
+        
+        """
+        target_nodes = set()
+        1. if node.step == step and sql_condition == sql_condition:
+            if rowids in node.parent.delta[node.bit()]:
+                node.update_delta
+        2. if no target nodes found:
+            for all leaves with branch is True:
+                target_nodes.add((leaf.parent, leaf.bit()))
+        3. if no target nodes found:
+            target_ndoes = all positive nodes
+        4. if no target nodes found:
+            target_nodes = [(self.root_constraint, PBit.TRUE)]
+        """
+        
+        
+        
+        new_nodes = set()
+        existing_nodes = set()        
+        tbit = PBit.from_int(taken)
+        
+        
+        ## if we already create nodes for this condition
+        for node in self._find_child(step, sql_condition):
+            existing_nodes.add(node)
+        validate_nodes = set()
+        ## we only need to update existing nodes that have the same rowids in parent delta
+        for node in existing_nodes:
+            if node.parent and rowids in node.parent.delta[node.bit()]:
+                validate_nodes.add(node)
+        ## if we cannot find an existing node that has the same rowids in parent delta, we need to use all existing nodes
+        if not validate_nodes:
+            validate_nodes.update(existing_nodes)
+        for node in validate_nodes:
+            logger.info(f"Updating existing node: {node}, bit: {tbit}, rowids: {rowids}, branch: {branch}")
+            node.update_delta(tbit, symbolic_expr, rowids, branch)
+        if validate_nodes:
+            return validate_nodes
+        ## if we need to create new nodes
+        ## if we already have tnodes from previous step, we just create child from them
+        if tnodes:
+            for item in tnodes:
+                (node, bit) = item
+                child = node.add_child(
+                    step = step,
+                    sql_condition=sql_condition,
+                    bit = bit,
+                    branch=branch
+                )
+                child.update_delta(tbit, symbolic_expr, rowids, branch)
+                new_nodes.add((child, tbit))
+            return new_nodes
+        else:
+        
+            ## otherwise, we need to find starting nodes, either from leaves with branch is True, or all positive nodes        
+            positive_nodes = []
+            ## we first find all leaves with branch is True
+            for leaf in self.leaves.values():
+                if leaf.branch is True:
+                    positive_nodes.append((leaf.parent, leaf.bit()))
+                
+            if not positive_nodes:
+                positive_nodes = [(self.root_constraint, PBit.TRUE)]
+            validate_nodes = []
+            for node, bit in positive_nodes:
+                if node.parent and rowids in node.parent.delta[node.bit()]:
+                    validate_nodes.append((node, bit))
+            if not validate_nodes:
+                validate_nodes = positive_nodes
+        
+        
+            for item in validate_nodes:
+                (node, bit) = item
+                child = node.add_child(
+                    step = step,
+                    sql_condition=sql_condition,
+                    bit = bit,
+                    branch=branch
+                )
+                child.update_delta(tbit, symbolic_expr, rowids, branch)
+                new_nodes.add((child, tbit))
+        return new_nodes
     def which_path(
         self,
-        operator: LogicalOperator,
+        step: str,
         sql_conditions: List[Expression],
         symbolic_exprs: List[Union[List[Symbol], Symbol]],
         takens: List[bool],
@@ -110,33 +380,43 @@ class UExprToConstraint:
         assert isinstance(rowids, tuple), f"rowids must be a tuple, got {type(rowids)}"
         assert len(sql_conditions) == len(
             takens
-        ), f"Conditions and takens length mismatch, sql_conditions: {sql_conditions}, takens: {takens}"
-        operator_id = operator.operator_id
-        starts: Set[tuple] = set()
-        for rowid in rowids:
-            nodes = self.row_index[rowid][self.prev_operator]
-            if nodes:
-                starts.add(nodes[-1])
-        if not starts:
-            starts = self.positive_nodes[self.prev_operator]
+        ), f"Conditions and takens length mismatch, sql_conditions: {sql_conditions}, takens: {takens}"        
+        
+        # starts: Set[tuple] = set()
+        # for rowid in rowids:
+        #     nodes = self.row_index[rowid][self.prev_step]
+        #     if nodes:
+        #         starts.add(nodes[-1])
+        # if not starts:
+        #     starts = self.positive_nodes[self.prev_step]
+        new_nodes = []
+        for index, (sql_condition, taken) in enumerate(zip(sql_conditions, takens)):
+            # new_nodes = self.update_nodes(step, sql_condition=sql_condition, symbolic_expr=symbolic_exprs[index], taken=taken, rowids=rowids, branch=branch)
+            # if not new_nodes:
+            #     new_nodes = self.create_nodes(step, sql_condition=sql_condition, symbolic_expr=symbolic_exprs[index], taken=taken, rowids=rowids, branch=branch, starting_nodes=new_nodes)
+            
+            new_nodes = self.append_to_positive_nodes(step, sql_condition=sql_condition, symbolic_expr=symbolic_exprs[index], taken=taken, rowids=rowids, branch=branch, tnodes=new_nodes)
+            
+        # logging.info(f"which_path starts: {len(starts)} for step: {step}, {self.positive_nodes.keys()}")
+        # for start, bit in starts:
+        #     node, b = start, bit
+        #     logging.info(f"Starting which_path from node: {node}, bit: {b}")
+        #     for index, (sql_condition, taken) in enumerate(zip(sql_conditions, takens)):
+        #         node = node.add_child(
+        #             step = step,
+        #             sql_condition=sql_condition,
+        #             bit = b,
+        #             branch=branch,
+        #             **kwargs,
+        #         )
+        #         smt_expr = symbolic_exprs[index] if index < len(symbolic_exprs) else []
+        #         b = PBit.from_int(taken)
+        #         node.update_delta(b, smt_expr, rowids, branch)
 
-        for start, bit in starts:
-            node, b = start, bit
-            for index, (sql_condition, taken) in enumerate(zip(sql_conditions, takens)):
-                node = node.add_child(
-                    operator=operator,
-                    sql_condition=sql_condition,
-                    bit=b,
-                    branch=branch,
-                    **kwargs,
-                )
-                smt_expr = symbolic_exprs[index] if index < len(symbolic_exprs) else []
-                b = PBit.from_int(taken)
-                node.update_delta(b, smt_expr, rowids, branch)
-
-                # node.update_metadata(**kwargs)
-            if branch and (node, b) not in self.positive_nodes[operator.operator_id]:
-                self.positive_nodes[operator_id].add((node, b))
+        #         # node.update_metadata(**kwargs)
+        #     if branch and (node, b) not in self.positive_nodes[step]:
+        #         self.positive_nodes[step].add((node, b))
+                
 
     def next_path(self):
         leaves = dict(
