@@ -42,7 +42,7 @@ class Solver:
 
     def clusters(self) -> List[List[str]]:
         """
-        Yield clusters of variable names  based on constraint variables connectivity.
+        Yield clusters of variable names based on constraint variables connectivity.
         """
         return self.uf.groups()
 
@@ -94,7 +94,6 @@ class Solver:
             self._assert_inconsistency()
         except InConsistency as e:
             return SolverResult(status="unsat", assignments=[])
-
         for cluster in self.clusters():
             constraints = []
             for var_name in cluster:

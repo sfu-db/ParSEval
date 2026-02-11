@@ -14,7 +14,14 @@ from typing import (
     Generic,
     TypeVar,
     NamedTuple,
+    Iterable,
+    Type,
+    Callable,
+    Tuple
 )
+import functools, logging
+
+logger = logging.getLogger("parseval.uexpr")
 
 
 class ParSEvalState(Enum):
@@ -85,6 +92,71 @@ class ValidationException(ParSEvalError):
 
     pass
 
+from sqlglot.errors import ParseError, SchemaError, OptimizeError, UnsupportedError
+ExceptionTypes = Tuple[Type[BaseException], ...]
+
+def raise_exception(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)        
+        except ParseError as e:
+            raise SyntaxException(str(e)) from e
+        except SchemaError as e:
+            raise SchemaException(str(e)) from e
+        except OptimizeError as e:
+            raise UnsupportedError(str(e)) from e
+        except Exception as e:
+            raise ParSEvalError(str(e)) from e
+    return wrapper
+
+def non_fatal(
+    *,
+    default=None,
+    default_from_args: Optional[Callable[..., object]] = None,
+    catch: Optional[Iterable[Type[Exception]]] = None,
+    log: bool = False,
+) -> Callable:        
+    """
+    Decorator that makes a function non-fatal:
+    - Exceptions are caught and suppressed
+    - A default value is returned instead
+    Parameters
+    ----------
+    default:
+        Value returned when an exception is caught.
+    catch:
+        Iterable of exception types to catch.
+        Defaults to (Exception,).
+    log:
+        Whether to log the exception.
+    """
+    exceptions: ExceptionTypes = (
+        tuple(catch) if catch is not None else (Exception,)
+    )
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except exceptions as e:
+                if log:
+                    logger.debug(
+                        "[non_fatal] Ignored error in %s: %s",
+                        func.__qualname__,
+                        e,
+                        exc_info=True,
+                    )
+                if default_from_args is not None:
+                    return default_from_args(*args, **kwargs)
+
+                return default
+
+        return wrapper
+
+    return decorator
+        
 
 class Metadata(UserDict):
     """

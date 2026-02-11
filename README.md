@@ -2,26 +2,6 @@
 
 ParSEval considers the specific behaviors of each query operator and covers all possible execution branches of the logical query plan by adapting the notion of branch coverage to query plans.
 
-## 🆕 Current Status & Upcoming Release
-We are actively refactoring ParSeval to a pure Python implementation to provide a cleaner, more user-friendly interface. The new version will include improved functions for query equivalence checking and database instance generation.
-
-📌 The current codebase may be messy during this transition. The new version will be released soon. We recommend waiting for it to reduce deployment and maintenance effort.
-
-The new version of ParSEval provides the following features in dev branch:
-
-check_equivalence(schema, gold, pred, dialect, verify_first=False) – combines formal verification and test-case-based approaches for query equivalence evaluation. When verify_first=True, ParSEval prioritizes formal verification when checking query pairs, while still leveraging test-case-based evaluation when needed.
-
-instantiate_db(schema, sql, dialect, **kwargs) – generates test database instances based on the input SQL.
-
-Users can set verify_first=False to to use testcase based evaluation only.
-
-## TBD
-1. adapting MySQL/SQLite dialect processing code
-2. Handling special functions from SQLite/MySQL
-3. Merging codebase
-
-
-
 
 ## File Structure
 
@@ -35,6 +15,7 @@ The repo contains following supplemental materials:
 ```
 
 ## Get started 
+
 ### Install the Query Parser
 Please download and set up the query parser from the [repository](https://github.com/sfu-db/qParser).
 ### Set Up the Python Environment
@@ -50,20 +31,21 @@ conda activate parseval-dev
 ```
 2. Install the required dependencies:
 ```bash
-pip install -r requirements.txt
+poetry install
 ```
 
 ### Usage
 
 Normally, one invoke the tool as 
 ```bash
-python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --offline
+from parseval import instantiate_db
+instantiate_db(workspace, schema, sql, dialect, **kwargs):
 ```
 to generate test database instances for input query SQL1.
-
 To test the equivalence of two queries:
 ```bash
-python main.py --schema SCHEMA --dialect sqlite --gold SQL1 --pred SQL2
+from parseval import disprove_queries
+disprove_queries(schema, gold, pred, dialect, **kwargs)
 ```
 
 One can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
@@ -89,17 +71,16 @@ from .registry import ValueGeneratorRegistry
 ValueGeneratorRegistry.register('int', int_generator)
 ```
 
+## TBD
+1. adapting MySQL/SQLite dialect processing code
+2. Handling special functions from SQLite/MySQL
+3. 
 ### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
 - Dataset
     - Download Leetcode/Literature/Bird/Spider datasets [here](https://drive.google.com/drive/folders/12y5tR2JeSf2cVpp_woHn6CiQ9YiY7J25?usp=drive_link).
     - Could also download official database instances for [bird](https://bird-bench.github.io/) and [spider](https://yale-lily.github.io/spider).
 
-### Running Experiments
-Commands needed can be found in the tests folder.
 
-
-### Planed features
-- NULL-related constraints
 
 

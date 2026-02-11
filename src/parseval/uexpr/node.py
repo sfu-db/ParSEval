@@ -5,8 +5,10 @@ from typing import Optional, Tuple, List, Union, TYPE_CHECKING, Dict, Any
 from .base import _Constraint, PlausibleBit
 from ..constants import PBit, PlausibleType
 
+
 if TYPE_CHECKING:
-    from src.parseval.plan.rex import LogicalOperator, Expression
+    from src.parseval.plan.rex import Expression
+    
 from src.parseval.plan import ColumnRef
 from sqlglot.expressions import AggFunc, Predicate
 from src.parseval.symbol import Symbol
@@ -60,6 +62,9 @@ class PlausibleBranch(_Constraint):
     def branch(self) -> bool:
         vaild_bits = (PBit.FALSE, PBit.TRUE, PBit.JOIN_TRUE, PBit.GROUP_SIZE)
         return self._branch and self.bit() in vaild_bits
+    @branch.setter
+    def branch(self, value: bool):
+        self._branch = value # self.branch or value
 
     def mark_pending(self):
         self.attempts += 1
@@ -144,13 +149,13 @@ class Constraint(_Constraint):
         self,
         tree,
         parent=None,
-        operator: Optional[LogicalOperator] = None,
+        step: Optional[str] = None,
         children: Optional[Dict[str, Constraint]] = None,
         sql_condition: Optional[Expression] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(tree, parent)
-        self.operator = operator
+        self.step = step
         self.children = children or {}
         self.sql_condition = sql_condition
         self.symbolic_exprs = defaultdict(list)
@@ -159,47 +164,40 @@ class Constraint(_Constraint):
 
     @property
     def plausible_bits(self) -> Tuple[PBit, ...]:
-        if self.operator is None or self.operator == "ROOT":
+        if self.step is None or self.step == "ROOT":
             return (PBit.TRUE,)
-        if self.operator.operator_type == "Aggregate":
+        
+        if self.step == "Aggregate":
             if isinstance(self.sql_condition, AggFunc):
-                return self.PLAUSIBLE_CONFIGS["aggregate"]
+                if isinstance(self.sql_condition, Predicate):
+                    return self.PLAUSIBLE_CONFIGS["having"]
+                return self.PLAUSIBLE_CONFIGS["Having"]
             return self.PLAUSIBLE_CONFIGS["groupby"]
-        elif self.operator.operator_type == "Having":
-            return self.PLAUSIBLE_CONFIGS["having"]
-        elif self.operator.operator_type == "Join":
+        elif self.step.startswith("Join"):
             return self.PLAUSIBLE_CONFIGS["join"]
-        elif (
-            isinstance(self.sql_condition, Predicate)
-            or self.operator.operator_type == "Filter"
-        ):
+        elif isinstance(self.sql_condition, Predicate):
             return self.PLAUSIBLE_CONFIGS["predicate"]
-        elif self.operator.operator_type == "Sort":
+        elif self.step == "Sort":
             return self.PLAUSIBLE_CONFIGS["sort"]
-        elif (
-            isinstance(self.sql_condition, ColumnRef)
-            or self.operator.operator_type == "Project"
-        ):
+        elif isinstance(self.sql_condition, ColumnRef):
             return self.PLAUSIBLE_CONFIGS["project"]
-        return self.PLAUSIBLE_CONFIGS[self.operator.operator_type.lower()]
+        return self.PLAUSIBLE_CONFIGS[self.step.lower()]
 
     def __str__(self):
-        return f"Constraint({self.operator.operator_type if self.operator else 'ROOT'}, {self.sql_condition})"
+        return f"Constraint({self.step if self.step else 'ROOT'}, {self.sql_condition})"
 
     def __hash__(self):
         """
         Calculates a hash based on the same attributes used in __eq__.
         Use a tuple of immutable attributes for hashing.
         """
-        return hash((self.operator, self.sql_condition))
+        return hash((self.step, self.sql_condition))
 
     def __eq__(self, value):
         if not isinstance(value, Constraint):
             return False
         return (
-            self.operator.operator_type == value.operator.operator_type
-            and self.operator.operator_id == value.operator.operator_id
-            and str(self.sql_condition) == str(value.sql_condition)
+            self.step == value.step and  self.sql_condition == value.sql_condition
         )
 
     def __ne__(self, value):
@@ -212,42 +210,40 @@ class Constraint(_Constraint):
             return self.metadata[key]
         raise KeyError(f"Key {key} not found in {self}.")
 
-    def find_child(self, operator: LogicalOperator, sql_condition):
-
+    def find_child(self, step, sql_condition):
         c = [self]
         while c:
             op = c.pop()
             for k, child in op.children.items():
                 if (
-                    operator.operator_id == op.operator.operator_id
-                    and op.sql_condition == sql_condition
+                    step == op and op.sql_condition == sql_condition
                 ):
+                    
                     return child
-
                 if isinstance(child, Constraint):
                     c.append(child)
         return None
 
     def add_child(
         self,
-        operator: LogicalOperator,
+        step: str,
         sql_condition: Expression,
         bit: PlausibleBit,
         branch: bool,
         **kwargs,
     ):
-
         child_node = self.children.get(bit, None)
         if child_node is None or isinstance(child_node, PlausibleBranch):
             child_node = Constraint(
                 tree=self.tree,
                 parent=self,
                 sql_condition=sql_condition,
-                operator=operator,
+                step=step,
                 metadata={**kwargs},
             )
             self.children[bit] = child_node
             child_node._create_plausible_siblings(branch=branch)
+            self.tree.node_index[step].add(child_node)
         return child_node
 
     def update_delta(
@@ -261,9 +257,20 @@ class Constraint(_Constraint):
         self.symbolic_exprs[bit].extend(p)
         self.delta[bit].append(rowids)
         for ridx in rowids:
-            op_id = self.operator.operator_id
-            self.tree._index_row(op_id, ridx, self, bit, branch)
-
+            self.tree._index_row(self.step, ridx, self, bit, branch)
+        
+        if isinstance(self.children.get(bit, None), PlausibleBranch):
+            self.children[bit].branch = branch
+        #     import logging
+        #     logging.info(f"Updated branch for plausible child {bit} to {branch}")
+    
+    # def _negate_branch(self, branch: bool) -> bool:
+    #     if self.step == "Project":
+    #         return branch
+    #     if self.step in ("Filter", "Join"):
+    #         return not branch
+    #     return branch
+    
     def _create_plausible_siblings(self, branch):
         for bit in self.plausible_bits:
             if bit in self.children:

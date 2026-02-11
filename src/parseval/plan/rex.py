@@ -1,91 +1,203 @@
 from __future__ import annotations
 from abc import abstractmethod
 from functools import reduce
-from sqlglot import exp as sqlglot_exp, expressions
-from sqlglot import generator
-from src.parseval.dtype import DataType
-from typing import TYPE_CHECKING, List, Optional, Dict, Any
+from sqlglot import exp
+from sqlglot import generator, MappingSchema
+from sqlglot.executor.env import ENV
+from parseval.dtype import DataType
+from typing import TYPE_CHECKING, List, Optional, Dict, Any, Tuple, Type
 from sqlglot.optimizer.simplify import simplify
 
-if TYPE_CHECKING:
-    from src.parseval.dtype import DATATYPE
 
-
-Expression = sqlglot_exp.Expression
-
-
-class ColumnRef(sqlglot_exp.Expression):
-    """
-    Column Reference Expression in Logical plan.
-    Args:
-        this: Column name (Identifier)
-        table: Table name (str)
-        ref: Column index in the schema (int)
-        datatype: Data type of the column (DataType)
-    """
-
-    arg_types = {
-        "this": True,
-        "table": False,
-        "ref": False,
-        "datatype": False,
-        "join_mark": False,
-        "alias": False,
+OPS = {**ENV, 
+       "VARIABLE": lambda x: x.concrete,
+       "CONST": lambda x: x.args.get("concrete"),
+       "AND": lambda x, y: x and y,
+       "OR": lambda x, y: x or y,
+       "NOT": lambda x: not x,
+       "NULL": lambda : None,
+       "IS": lambda x, y: x is y
     }
+def ref(self) -> int:
+    return self.args.get("ref", 0)
+def datatype(self) -> DataType:
+    if self.type is not None:
+        return self.type
+    dtype = self.args.get("_type")
+    return DataType.build(dtype)
+
+def concrete(self) -> Any:
+    if isinstance(self, exp.Column):
+        return self.args.get("concrete", None)
+    concretes = [a.concrete for a in self.iter_expressions()]
+    if self.key.upper() not in OPS:
+        return None
+    return OPS[self.key.upper()](*concretes)
+
+def __bool__(self) -> bool:
+    if self.concrete is None:
+        return False
+    return bool(self.concrete)
+    
+setattr(exp.Column, "ref", property(ref))
+setattr(exp.Expression, "datatype", property(datatype))
+setattr(exp.Expression, "concrete", property(concrete))
+
+ColumnRef = exp.Column
+
+class Symbol(exp.Expression):
+    
+    arg_types = {"this": True, "concrete": True}
+    
+    def is_number(self):
+        return self.type.is_type(DataType.NUMERIC_TYPES)
+
+    def is_datetime(self):
+        return self.type.is_type(*DataType.TEMPORAL_TYPES)
+
+    def sql(self, dialect = None, **opts):
+        return f"{self.key}({self.this})"
+        
+class Variable(Symbol):
+    arg_types = {"this": True, "concrete": False}
+    """
+        Represents a symbolic variable with additional attributes.
+    """
+    @property
+    def name(self) -> str:
+        return self.text("this")
 
     @property
-    def ref(self) -> int:
-        return self.args.get("ref", 0)
+    def concrete(self) -> Any:
+        return self.args.get("concrete", None)
+
+class Const(Symbol):
+    arg_types = {"this": True}
+    
+    @property
+    def value(self) -> Any:
+        return self.concrete
 
     @property
-    def table(self) -> str:
-        return self.text("table")
+    def concrete(self):
+        return self.this
+
+class ITE(Symbol):
+    arg_types = {"this": True, "true_branch": True, "false_branch": True}
+    
+    @property
+    def condition(self) -> Symbol:
+        return self.this
 
     @property
-    def datatype(self) -> DATATYPE:
-        return DataType.build(self.args.get("datatype", "UNKNOWN"))
+    def true_branch(self) -> Symbol:
+        return self.args.get("true_branch")
 
     @property
-    def qualified_name(self) -> str:
-        """Get fully qualified column name"""
-        return f"{self.alias}.{self.name}" if self.alias else self.name
+    def false_branch(self) -> Symbol:
+        return self.args.get("false_branch")
+
+
+class Row(Symbol):
+    arg_types = {"this": True, "columns": True}
+    """
+    rowid, {column_name: value, ...}
+        rowid: Tuple
+        column_name: str
+        value: Symbol
+    """
+    
+    @property
+    def columns(self):
+        return tuple(self.args.get("columns", {}).keys())
+    
+    @property
+    def rowid(self) -> Tuple[Any, ...]:
+        if isinstance(self.this, tuple):
+            return self.this
+        return (self.this,)
+    def items(self):
+        return self.args.get('columns', {}).items()
+    
+    def __iter__(self):
+        return iter(self.args.get('columns'))
+    
+    def __getitem__(self, key):
+        return self.args.get("columns", {})[key]
+    
+    
+    def __len__(self):
+        return len(self.args.get("columns", {}))
+    
+    def __add__(self, other):
+        assert isinstance(other, Row), f"Cannot add Row with {type(other)}"
+        new_columns = {**self.args.get("columns"), **other.args.get('columns', {})}
+        rid = self.rowid + other.rowid
+        return Row(this = rid, columns = new_columns)
+
+
+
+class AggGroup(Symbol):
+    """
+        this: rowids of the group,
+        group_key: group by key values,
+        group_values: list of group by key values
+    """
+    arg_types = {"this": True, "group_key": True, "group_values": True}
+    
+    @property
+    def group_key(self):
+        return self.args.get("group_key", ())
 
     @property
-    def hashable_args(self) -> Any:
-        from sqlglot.expressions import _norm_arg
+    def name(self) -> Any:
+        return self.text("this")
 
-        return frozenset(
-            (k, tuple(_norm_arg(a) for a in v) if type(v) is list else _norm_arg(v))
-            for k, v in self.args.items()
-            if k != "unique"
-            and not (v is None or v is False or (type(v) is list and not v))
-        )
+    @property
+    def rowids(self) -> Tuple[Any, ...]:
+        return self.this
 
-    def __str__(self):
-        return self.name
+    # def extend(self, items: Iterable[Symbol]):
+    #     object.__setattr__(self, "args", self.args + tuple(items))
 
-    def __repr__(self):
-        return self.name
+    # def append(self, item: Symbol):
+    #     object.__setattr__(self, "args", self.args + (item,))
 
-    def sql(self, dialect=None, **opts):
-        return f"{self.name}"
+    # def __iter__(self):
+    #     return iter(self.args[2:])
+
+    # def __getitem__(self, index):
+    #     return self.args[2:][index]
 
 
-class Is_Null(sqlglot_exp.Unary, sqlglot_exp.Predicate):
+from sqlglot import generator
+for klass in [
+    Symbol,
+    Variable,
+    Const,
+    ITE,
+    Row,
+    AggGroup
+]:
+    generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
+        dialect=self.dialect
+    )
+
+class Is_Null(exp.Unary, exp.Predicate):
 
     def sql(self, dialect=None, **opts):
         return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
 
 
-class Is_Not_Null(sqlglot_exp.Unary, sqlglot_exp.Predicate):
+class Is_Not_Null(exp.Unary, exp.Predicate):
     def sql(self, dialect=None, **opts):
         return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
 
 
-class FunctionCall(sqlglot_exp.Func):
+class FunctionCall(exp.Func):
     arg_types = {"this": True, "expressions": False}
 
-    def params(self) -> List[sqlglot_exp.Expression]:
+    def params(self) -> List[exp.Expression]:
         return self.expressions
 
     def sql(self, dialect=None, **opts):
@@ -99,11 +211,11 @@ class Strftime(FunctionCall):
     arg_types = {"this": True, "expressions": True, "datatype": True}
 
     @property
-    def fmt(self) -> sqlglot_exp.Expression:
+    def fmt(self) -> exp.Expression:
         return self.expressions[1]
 
     @property
-    def operand(self) -> sqlglot_exp.Expression:
+    def operand(self) -> exp.Expression:
         return self.this
 
 
@@ -111,11 +223,11 @@ class ABS(FunctionCall):
     arg_types = {"this": True, "datatype": True}
 
     @property
-    def operand(self) -> Expression:
+    def operand(self) -> exp.Expression:
         return self.this
 
 
-class ScalarQuery(Expression):
+class ScalarQuery(exp.Expression):
     arg_types = {
         "this": True,
         "datatype": False,
@@ -123,11 +235,11 @@ class ScalarQuery(Expression):
     }
 
     @property
-    def query(self) -> "Expression":
+    def query(self) -> "exp.Expression":
         return self.this
 
     @property
-    def selects(self) -> List["Expression"]:
+    def selects(self) -> List["exp.Expression"]:
         return (
             self.query.schema.columns if isinstance(self.query, LogicalOperator) else []
         )
@@ -141,7 +253,7 @@ class ScalarQuery(Expression):
         # return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
 
 
-class FieldAccess(Expression):
+class FieldAccess(exp.Expression):
     arg_types = {
         "this": True,
         "column": True,
@@ -160,14 +272,22 @@ class FieldAccess(Expression):
     def sql(self, dialect=None, **opts):
         return f"{self.key}({self.this}, column={self.column})"
 
-        return super().sql(dialect, **opts)
+# class DerivedSchema(exp.Expression):
+#     arg_types = {"this": False, "expressions": True}
+#     @property
+#     def columns(self) -> List[exp.Expression]:
+#         return self.expressions
+
+#     def column_names(self) -> List[str]:
+#         """Get list of column names"""
+#         return [col.name for col in self.columns]
 
 
-class Schema(Expression):
+class Schema(exp.Expression):
     arg_types = {"this": False, "expressions": True}
 
     @property
-    def columns(self) -> List[sqlglot_exp.Expression]:
+    def columns(self) -> List[exp.Expression]:
         return self.expressions
 
     def column_names(self) -> List[str]:
@@ -175,7 +295,7 @@ class Schema(Expression):
         return [col.name for col in self.columns]
 
 
-class Table(Expression):
+class Table(exp.Expression):
     arg_types = {
         "this": True,
         "schema": False,
@@ -211,12 +331,12 @@ class Table(Expression):
     def nullable(self, column_name: str):
         primary_key = self.args.get("primary_key", None)
         if primary_key:
-            for column_name in primary_key.find_all(sqlglot_exp.Identifier):
+            for column_name in primary_key.find_all(exp.Identifier):
                 if str(column_name) == column_name:
                     return False
         for constraint in self.constraints.get(column_name, []):
 
-            if isinstance(constraint.kind, sqlglot_exp.NotNullColumnConstraint):
+            if isinstance(constraint.kind, exp.NotNullColumnConstraint):
                 return constraint.kind.args.get("allow_null", False)
         return True
 
@@ -225,20 +345,20 @@ class Table(Expression):
             if isinstance(
                 constraint.kind,
                 (
-                    sqlglot_exp.UniqueColumnConstraint,
-                    sqlglot_exp.PrimaryKeyColumnConstraint,
+                    exp.UniqueColumnConstraint,
+                    exp.PrimaryKeyColumnConstraint,
                 ),
             ):
                 return True
         primary_key = self.args.get("primary_key", None)
         if primary_key:
-            for column_name in primary_key.find_all(sqlglot_exp.Identifier):
+            for column_name in primary_key.find_all(exp.Identifier):
                 if str(column_name) == column_name:
                     return True
         return False
 
 
-class Catalog(Expression):
+class Catalog(exp.Expression):
     arg_types = {"tables": False}
 
     @property
@@ -254,7 +374,124 @@ class Catalog(Expression):
         return self.tables.get(name)
 
 
-class LogicalOperator(sqlglot_exp.Expression):
+from sqlglot.schema import AbstractMappingSchema, MappingSchema, flatten_schema, dict_depth, nested_get, nested_set, SchemaError
+from collections import OrderedDict
+
+# class Catalog2(AbstractMappingSchema, Schema):
+#     def __init__(self, schema = None, constraints = None, primary_keys = None, foreign_keys = None, visible = None, dialect = None, normalize = True):
+#         self.dialect = dialect
+#         self.visible = {} if visible is None else visible
+#         self.normalize = normalize
+#         self._type_mapping_cache: Dict[str, DataType] = {}
+#         self._depth = 0
+#         self.constraints = {}
+#         self.primary_keys = {}
+#         self.foreign_keys = {}
+#         schema = OrderedDict() if schema is None else schema
+#         super().__init__(schema if self.normalize else schema)
+    
+    
+
+class Catalog2(MappingSchema):
+    def __init__(self, schema = None, constraints = None, primary_keys = None, foreign_keys = None, visible = None, dialect = None, normalize = True):
+        self.constraints = {}
+        self.primary_keys = {}
+        self.foreign_keys = {}
+        schema = OrderedDict() if schema is None else schema
+        super().__init__(schema, visible, dialect, normalize)
+        constraints = {} if constraints is None else constraints
+        primary_keys = {} if primary_keys is None else primary_keys
+        foreign_keys = {} if foreign_keys is None else foreign_keys
+        
+        for table_name, table_constraints in constraints.items():
+            for column_name, column_constraints in table_constraints.items():
+                for constraint in column_constraints:
+                    self.add_constraint(table_name, column_name, constraint)
+        for table_name, pks in primary_keys.items():
+            self.add_primary_key(table_name, pks)
+        for table_name, fks in foreign_keys.items():
+            self.add_foreign_key(table_name, fks)
+            
+    def _normalize(self, schema):
+        normalized_mapping: Dict = OrderedDict()
+        flattened_schema = flatten_schema(schema, depth=dict_depth(schema) - 1)
+        for keys in flattened_schema:
+            columns = nested_get(schema, *zip(keys, keys))
+            if not isinstance(columns, dict):
+                raise SchemaError(
+                    f"Table {'.'.join(keys[:-1])} must match the schema's nesting level: {len(flattened_schema[0])}."
+                )
+            normalized_keys = [self._normalize_name(key, is_table=True, dialect= self.dialect, normalize= self.normalize) for key in keys]
+            for column_name, column_type in columns.items():
+                nested_set(
+                    normalized_mapping,
+                    normalized_keys + [self._normalize_name(column_name, dialect= self.dialect, normalize= self.normalize)],
+                    column_type,
+                )
+        return normalized_mapping
+    
+    @property
+    def tables(self):
+        return self.mapping
+    
+    def add_primary_key(self, table: exp.Table | str, columns: List[exp.Identifier] | exp.Identifier):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        pk_set = self.primary_keys.setdefault(table, set())
+        columns = [columns] if isinstance(columns, exp.Identifier) else columns
+        pk_set.update(columns)
+    def get_primary_key(self, table: exp.Table | str):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        return self.primary_keys.get(table, set())
+    
+    def add_foreign_key(self, table: exp.Table | str, foreign_key: List[exp.ForeignKey] | exp.ForeignKey):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        fk_list = self.foreign_keys.setdefault(table, [])
+        fks = [foreign_key] if isinstance(foreign_key, exp.ForeignKey) else foreign_key
+        fk_list.extend(fks)
+    def get_foreign_key(self, table: exp.Table | str):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        return self.foreign_keys.get(table, [])
+    
+    def add_constraint(self, table: exp.Table | str, column: exp.Column | str, constraint):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        column = self._normalize_name(column if isinstance(column, str) else column.this, normalize= self.normalize)
+        table_constraints = self.constraints.setdefault(table, {})
+        column_constraints = table_constraints.setdefault(column, set())
+        column_constraints.add(constraint)
+    
+    def get_column_constraints(self, table: exp.Table | str, column: exp.Column | str):
+        table = self._normalize_name(table if isinstance(table, str) else table.this, self.dialect, self.normalize)
+        column = self._normalize_name(column if isinstance(column, str) else column.this, normalize= self.normalize)
+        table_constraints = self.constraints.get(table, {})
+        column_constraints = table_constraints.get(column, set())
+        return column_constraints
+    
+    def nullable(self, table: exp.Table | str, column: exp.Column| str,normalize: Optional[bool] = None):
+        for constraint in self.get_column_constraints(table,column):
+            if isinstance(constraint.kind, exp.NotNullColumnConstraint):
+                return constraint.kind.args.get("allow_null", False)
+        for pk in self.get_primary_key(table):
+            if pk.name == (column if isinstance(column, str) else column.this):
+                return False
+        return True    
+    
+    def is_unique(self, table: exp.Table | str, column: exp.Column| str,normalize: Optional[bool] = None):  
+        for constraint in self.get_column_constraints(table,column):
+            if isinstance(
+                constraint.kind,
+                (
+                    exp.UniqueColumnConstraint,
+                    exp.PrimaryKeyColumnConstraint,
+                ),
+            ):
+                return True
+        for pk in self.get_primary_key(table):
+            if pk.name == (column if isinstance(column, str) else column.this):
+                return True
+            
+        return False
+
+class LogicalOperator(exp.Expression):
     """
     Represents a single step in a REX (Relational EXpression) plan.
     """
@@ -410,7 +647,7 @@ class LogicalFilter(UnaryOperator):
         return children
 
     @property
-    def condition(self) -> Expression:
+    def condition(self) -> exp.Expression:
         return self.args.get("condition")
 
     def _sql(self, dialect=None, **opts):
@@ -439,7 +676,7 @@ class LogicalSort(UnaryOperator):
     }
 
     @property
-    def sorts(self) -> List[sqlglot_exp.Expression]:
+    def sorts(self) -> List[exp.Expression]:
         return self.expressions
 
     @property
@@ -470,11 +707,11 @@ class LogicalAggregate(UnaryOperator):
     }
 
     @property
-    def keys(self) -> List[sqlglot_exp.Expression]:
+    def keys(self) -> List[exp.Expression]:
         return self.expressions
 
     @property
-    def aggs(self) -> List[sqlglot_exp.Expression]:
+    def aggs(self) -> List[exp.Expression]:
         return self.args.get("aggs", [])
 
     def _sql(self, dialect=None, **opts):
@@ -597,7 +834,7 @@ class LogicalCorrelate(UnaryOperator):
 
 
 for klass in [
-    ColumnRef,
+    # ColumnRef,
     Is_Null,
     Is_Not_Null,
     LogicalOperator,
@@ -635,7 +872,7 @@ def resolve_schema(expr, input_schema: Schema):
     return expr
 
 
-def negate_predicate(expr) -> "Expression":
+def negate_predicate(expr) -> "exp.Expression":
     """Return the negation of this expression."""
 
     if expr.key == "is_null":
@@ -649,21 +886,21 @@ def negate_predicate(expr) -> "Expression":
 # class Planner:
 #     EXPRESSION_HANDLERS = {
 #         "INPUT_REF": lambda planner, **kwargs: ColumnRef(
-#             this=sqlglot_exp.to_identifier(kwargs.pop("name")),
+#             this=exp.to_identifier(kwargs.pop("name")),
 #             datatype=DataType(this=kwargs.pop("type", "UNKNOWN")),
 #             ref=kwargs.pop("index"),
 #         ),
-#         "CAST": lambda self, **kwargs: sqlglot_exp.Cast(
+#         "CAST": lambda self, **kwargs: exp.Cast(
 #             this=self.walk(kwargs.pop("operands").pop()),
 #             to=DataType.build(kwargs.pop("type")),
 #         ),
-#         "SUBSTR": lambda self, **kwargs: sqlglot_exp.Substring(
+#         "SUBSTR": lambda self, **kwargs: exp.Substring(
 #             this=self.walk(kwargs["operands"].pop()),
 #             start=self.walk(kwargs["operands"].pop()),
 #             length=(
 #                 self.walk(kwargs["operands"].pop())
 #                 if kwargs.get("operands", None)
-#                 else sqlglot_exp.Literal.number(-1)
+#                 else exp.Literal.number(-1)
 #             ),
 #         ),
 #         "STRFTIME": lambda self, **kwargs: Strftime(
@@ -678,20 +915,20 @@ def negate_predicate(expr) -> "Expression":
 #         "IS_NULL": lambda self, **kwargs: Is_Null(
 #             this=self.walk(kwargs.pop("operands").pop())
 #         ),
-#         #     "INSTR": lambda args: sqlglot_exp.InStr(
+#         #     "INSTR": lambda args: exp.InStr(
 #         #         this=args[0], substring=args[1], start=args[2] if len(args) == 3 else None
 #         #     ),
-#         #     "UDATE": lambda args: sqlglot_exp.Date(this=args[0]),
-#         #     "||": lambda args: sqlglot_exp.Concat(expressions=args[0]),
-#         #     "LENGTH": lambda args: sqlglot_exp.Length(this=args[0]),
-#         #     "ABS": lambda args: sqlglot_exp.Abs(this=args[0]),
-#         #     "CURRENT_TIMESTAMP": lambda args: sqlglot_exp.CurrentTimestamp,
+#         #     "UDATE": lambda args: exp.Date(this=args[0]),
+#         #     "||": lambda args: exp.Concat(expressions=args[0]),
+#         #     "LENGTH": lambda args: exp.Length(this=args[0]),
+#         #     "ABS": lambda args: exp.Abs(this=args[0]),
+#         #     "CURRENT_TIMESTAMP": lambda args: exp.CurrentTimestamp,
 #         #     "JULIANDAY": lambda args: Julianday(this=args[0]),
 #         #     "STRFTIME": lambda args: _build_strftime(args),
 #     }
 #     TRANSFORM_MAPPING = {
 #         "LogicalTableScan": lambda self, **kwargs: LogicalScan(
-#             this=sqlglot_exp.to_identifier(kwargs.pop("table")),
+#             this=exp.to_identifier(kwargs.pop("table")),
 #             operator_id=kwargs.pop("id", None),
 #         ),
 #         "LogicalProject": lambda self, **kwargs: self.on_project(**kwargs),
@@ -782,7 +1019,7 @@ def negate_predicate(expr) -> "Expression":
 #         for gid, key in enumerate(kwargs.pop("keys")):
 #             groupby.append(
 #                 ColumnRef(
-#                     this=sqlglot_exp.to_identifier(f"${gid}"),
+#                     this=exp.to_identifier(f"${gid}"),
 #                     ref=key.get("column"),
 #                     datatype=DataType.build(key.get("type")),
 #                 )
@@ -803,7 +1040,7 @@ def negate_predicate(expr) -> "Expression":
 #             this=this,
 #             expressions=[
 #                 ColumnRef(
-#                     this=sqlglot_exp.to_identifier(str(s["column"])),
+#                     this=exp.to_identifier(str(s["column"])),
 #                     ref=s["column"],
 #                     datatype=DataType.build(s["type"]),
 #                 )
@@ -817,30 +1054,30 @@ def negate_predicate(expr) -> "Expression":
 
 
 # BINARY_OPERATORS = {
-#     "EQUALS": sqlglot_exp.EQ,
-#     "NOT_EQUALS": sqlglot_exp.NEQ,
-#     "GREATER_THAN": sqlglot_exp.GT,
-#     "LESS_THAN": sqlglot_exp.LT,
-#     "LESS_THAN_OR_EQUAL": sqlglot_exp.LTE,
-#     "GREATER_THAN_OR_EQUAL": sqlglot_exp.GTE,
-#     "LIKE": sqlglot_exp.Like,
-#     "AND": sqlglot_exp.And,
-#     "OR": sqlglot_exp.Or,
-#     "PLUS": sqlglot_exp.Add,
-#     "MINUS": sqlglot_exp.Sub,
-#     "TIMES": sqlglot_exp.Mul,
-#     "DIVIDE": sqlglot_exp.Div,
+#     "EQUALS": exp.EQ,
+#     "NOT_EQUALS": exp.NEQ,
+#     "GREATER_THAN": exp.GT,
+#     "LESS_THAN": exp.LT,
+#     "LESS_THAN_OR_EQUAL": exp.LTE,
+#     "GREATER_THAN_OR_EQUAL": exp.GTE,
+#     "LIKE": exp.Like,
+#     "AND": exp.And,
+#     "OR": exp.Or,
+#     "PLUS": exp.Add,
+#     "MINUS": exp.Sub,
+#     "TIMES": exp.Mul,
+#     "DIVIDE": exp.Div,
 # }
 
 # UNARY_OPERATORS = {
-#     "NOT": sqlglot_exp.Not,
+#     "NOT": exp.Not,
 # }
 # AGG_FUNCS = {
-#     "COUNT": sqlglot_exp.Count,
-#     "SUM": sqlglot_exp.Sum,
-#     "AVG": sqlglot_exp.Avg,
-#     "MAX": sqlglot_exp.Max,
-#     "MIN": sqlglot_exp.Min,
+#     "COUNT": exp.Count,
+#     "SUM": exp.Sum,
+#     "AVG": exp.Avg,
+#     "MAX": exp.Max,
+#     "MIN": exp.Min,
 # }
 
 
@@ -852,10 +1089,10 @@ def negate_predicate(expr) -> "Expression":
 #         precision=kwargs.pop("precision", None),
 #     )
 #     literal = None
-#     if datatype.is_type(*sqlglot_exp.DataType.NUMERIC_TYPES):
-#         literal = sqlglot_exp.Literal.number(value)
+#     if datatype.is_type(*exp.DataType.NUMERIC_TYPES):
+#         literal = exp.Literal.number(value)
 #     else:
-#         literal = sqlglot_exp.Literal.string(value)
+#         literal = exp.Literal.string(value)
 #     literal.set("datatype", datatype)
 #     return literal
 
@@ -865,14 +1102,14 @@ def negate_predicate(expr) -> "Expression":
 #         lambda self, func_class=func_class, **kwargs: func_class(
 #             this=(
 #                 ColumnRef(
-#                     this=sqlglot_exp.to_identifier(
+#                     this=exp.to_identifier(
 #                         f'${kwargs["operands"][0]["column"]}'
 #                     ),
 #                     type=DataType.build(kwargs["operands"][0].get("type")),
 #                     ref=kwargs["operands"][0]["column"],
 #                 )
 #                 if kwargs.get("operands")
-#                 else sqlglot_exp.Star()
+#                 else exp.Star()
 #             ),
 #             distinct=kwargs.get("distinct", False),
 #             ignorenulls=kwargs.get("ignorenulls", False),
@@ -897,7 +1134,7 @@ def negate_predicate(expr) -> "Expression":
 #     )
 
 
-# def parse_case(self, **kwargs) -> Expression:
+# def parse_case(self, **kwargs) -> exp.Expression:
 #     operands = kwargs.pop("operands")
 #     default = self.walk(operands.pop())
 #     whens = []
@@ -905,11 +1142,11 @@ def negate_predicate(expr) -> "Expression":
 #     for index in range(0, len(operands), 2):
 #         when = self.walk(operands[index])
 #         then = self.walk(operands[index + 1])
-#         whens.append(sqlglot_exp.If(this=when, true=then))
-#     return sqlglot_exp.Case(ifs=whens, default=default)
+#         whens.append(exp.If(this=when, true=then))
+#     return exp.Case(ifs=whens, default=default)
 
 
-# def parse_scalary_query(self, **kwargs) -> Expression:
+# def parse_scalary_query(self, **kwargs) -> exp.Expression:
 
 #     query = [self.walk(q) for q in kwargs.pop("query")]
 
@@ -940,7 +1177,7 @@ def negate_predicate(expr) -> "Expression":
 #     )
 
 
-# def negate_predicate(expr) -> "Expression":
+# def negate_predicate(expr) -> "exp.Expression":
 #     """Return the negation of this expression."""
 
 #     from sqlglot.optimizer.simplify import simplify

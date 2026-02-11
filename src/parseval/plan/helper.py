@@ -1,5 +1,6 @@
 from __future__ import annotations
-from sqlglot.expressions import Identifier, to_identifier
+from sqlglot.expressions import Identifier, to_identifier, Expression
+from sqlglot import exp
 from typing import Dict
 from src.parseval.dtype import DataType
 from src.parseval.states import SyntaxException
@@ -57,3 +58,29 @@ def to_type(type_def: str | DataType | dict) -> DataType:
     else:
         raise SyntaxException(f"Invalid type definition: {type_def}")
     return DataType.build(**type_def)
+
+
+def get_operand(expr: Expression, **kwargs):
+    """
+    Retrieves the operand from an expression.
+
+    Args:
+        expr (Expression): The expression to extract the operand from.
+        **kwargs: Additional keyword arguments for operand retrieval.
+
+    Returns:
+        Expression: The operand of the expression.
+
+    Raises:
+        NotImplementedError: If the expression type is not supported.
+    """
+    
+    if kwargs and expr.alias_or_name in kwargs:
+        return get_operand(kwargs[expr.alias_or_name], **kwargs)
+    
+    if isinstance(expr, (exp.Column, exp.Star)):
+        return expr
+    if isinstance(expr, (exp.Alias, exp.Distinct)):
+        return get_operand(expr.this, **kwargs)
+    
+    raise NotImplementedError(f"Operand extraction not implemented for expression type: {type(expr)}")

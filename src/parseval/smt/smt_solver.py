@@ -5,8 +5,8 @@ import z3
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
 from src.parseval.dtype import DataType
-from src.parseval.symbol import Variable, Symbol, Condition, Const
-
+# from src.parseval.symbol import Variable, Symbol, Condition, Const
+from src.parseval.plan.rex import Variable, Symbol, Const
 import logging
 
 SECONDS_PER_MINUTE = 60
