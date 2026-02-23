@@ -65,18 +65,51 @@ class TypeInferencer:
         if isinstance(expr, exp.Column):
             self._set_type(expr, target_type)
 
-# def _set_type(expr, target_type):
-#     target_type = DataType.build(target_type)
-#     old_typ = self.speculates.get(expr)
-#     if old_typ is None:
-#         old_typ = expr.type
+
+def _set_type(expr, target_type):
+    target_type = DataType.build(target_type)
     
-#     self.speculates[expr] = self._unify(old_typ, target_type)
-# SPECULATIVE_TYPES = {
-#     exp.Cast: lambda  self, e: self._speculate_cast(e),
-#     exp.TimeToStr: lambda self, e: self._speculate_with_type(e.find(exp.Column), "DATETIME"),
-#     exp.TsOrDsToTimestamp: lambda self, e: self._speculate_with_type(e.find(exp.Column), "DATETIME"),
-# }
+    old_typ = expr.type
+    expr.type = _coerce(old_typ, target_type)
+    
+def _speculate_with_type( expr: exp.Expression, target_type):
+    if isinstance(expr, exp.Column):
+        _set_type(expr, target_type)
+    return expr
+
+def _speculate_cast(expr: exp.Cast):
+    to_type = expr.args.get("to")
+    return _speculate_with_type(expr.this, to_type)
+    
+        
+
+SPECULATIVE_TYPES = {
+        exp.Cast: lambda  e: _speculate_cast(e),
+        exp.TimeToStr: lambda e: _speculate_with_type(e.find(exp.Column), "DATETIME"),
+        exp.TsOrDsToTimestamp: lambda e: _speculate_with_type(e.find(exp.Column), "DATETIME"),
+    }
+
+def _coerce(t1: DataType, t2: DataType) -> DataType:
+    if t1 is None:
+        return t2
+    if t2 is None or t1.is_type(t2):
+        return t1
+    if t1.is_type(*DataType.TEMPORAL_TYPES):
+        return t1
+    if t2.is_type(*DataType.TEMPORAL_TYPES):
+        return t2
+    if t1.is_type(*DataType.TEXT_TYPES) or t2.is_type(*DataType.TEXT_TYPES):
+        return t1
+    if t1.is_type(*DataType.NUMERIC_TYPES) and t2.is_type(*DataType.NUMERIC_TYPES):
+        if t1.is_type(*DataType.REAL_TYPES) and t2.is_type(*DataType.INTEGER_TYPES):
+            return t1
+        if t2.is_type(*DataType.REAL_TYPES) and t1.is_type(*DataType.INTEGER_TYPES):
+            return t2
+        return DataType.build("INT")
+    if t1.is_type(*DataType.NUMERIC_TYPES) and t2.is_type(*DataType.INTEGER_TYPES):
+        return t1
+    return t2
+    
 @raise_exception
 def preprocess_sql(sql: str, mappingschema: MappingSchema, dialect: str, type_inferencer: Optional[Dict[exp.Expression, Callable]] = None) -> exp.Expression:
     """
@@ -109,12 +142,19 @@ def preprocess_sql(sql: str, mappingschema: MappingSchema, dialect: str, type_in
                     break            
             if not node.table:
                 return exp.convert(node.this.this)
+        if isinstance(node, (exp.Upper, exp.Lower)):
+            return node.this
         return node
     parsed = parsed.transform(transform, tbls)
     parsed = qualify.qualify(parsed, schema=mappingschema, dialect= dialect)
     parsed = annotate_types.annotate_types(parsed, schema=mappingschema)
     
-        
+    # def speculate(node, rules):
+    #     rule = rules.get(type(node))
+    #     if rule:
+    #         return rule(node)
+    #     return node
+    # parsed = parsed.transform(speculate, type_inferencer.SPECULATIVE_TYPES)
     return parsed
 
 

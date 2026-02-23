@@ -5,49 +5,6 @@ from typing import Any, Dict, Tuple, Optional, List
 
 import logging
 
-
-class PredicateTracker(UserDict):
-    """
-    Tracks predicates applied to tables in the execution context.
-    """
-    DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
-    EXPR_CACHE = "_expr_cache"
-    DEFAULT_LIST_KEYS = ["sql_conditions", "smt_conditions"]
-
-    def __call__(self, is_branch: bool = False):
-        """
-        Allow: with ctx(is_branch) as track:
-        """
-        return self.predicate_scope(is_branch)
-
-    def __getitem__(self, key):
-        if key in self.DEFAULT_LIST_KEYS and key not in self.data:
-            self.data[key] = []
-        return super().__getitem__(key)
-
-    def in_predicates(self):
-        return bool(self.data.get("_predicate_stack", []))
-
-    @contextmanager
-    def predicate_scope(self, is_branch: bool):
-        """Context manager to track predicates.  If `is_branch` is False, tracking is a no-op."""
-        if is_branch:
-            self.data.setdefault("_predicate_stack", []).append(True)
-            try:
-                def track(expr, smt_expr):
-                    self.data.setdefault("sql_conditions", []).append(expr)
-                    self.data.setdefault("smt_conditions", []).append(smt_expr)
-                    return smt_expr
-                yield track
-            finally:
-                self.data["_predicate_stack"].pop()
-        else:
-            def track(expr, smt_expr):
-                return smt_expr
-            yield track
-
-
-
 class DerivedSchema:
     def __init__(self, columns, rows=None, column_range=None):
         self.columns = tuple(columns)
@@ -147,14 +104,14 @@ class RowReader:
 
 class Context:
     """
-    Execution context for sql expressions.
+    Encoding context for sql expressions.
     Context is used to hold relevant data tables which can then be queried on with eval.
     References to columns can either be scalar or vectors. When set_row is used, column references
     evaluate to scalars while set_range evaluates to vectors. This allows convenient and efficient
     evaluation of aggregation functions.
     """
 
-    def __init__(self, tables: Dict[str, DerivedSchema], env: Optional[Dict] = None) -> None:
+    def __init__(self, tables: Dict[str, DerivedSchema], external: Optional[Context] = None) -> None:
         """
         Args
             tables: representing the scope of the current execution context.
@@ -164,7 +121,7 @@ class Context:
         self._table: Optional[DerivedSchema] = None
         self.range_readers = {name: table.range_reader for name, table in self.tables.items()}
         self.row_readers = {name: table.reader for name, table in tables.items()}
-        self.env = env if env is not None else {}
+        self.external = external
 
     @property
     def table(self):
@@ -181,6 +138,26 @@ class Context:
     def columns(self) -> Tuple:
         return self.table.columns
     
+    def resolve_table(self, name: str) -> DerivedSchema:
+        """
+        Resolve table through lexical scope chain.
+        """
+        if name in self.tables:
+            return self.tables[name]
+        if self.external:
+            return self.external.resolve_table(name)
+        raise KeyError(f"Table '{name}' not found in scope chain.")
+
+    def resolve_reader(self, name: str):
+        """
+        Resolve row reader for correlated access.
+        """
+        if name in self.row_readers:
+            return self.row_readers[name]
+        if self.external:
+            return self.external.resolve_reader(name)
+        raise KeyError(f"Reader '{name}' not found.")
+    
     def __contains__(self, table: str) -> bool:
         return table in self.tables
     
@@ -191,77 +168,4 @@ class Context:
                 reader = table[i]
             yield reader, self
 
-# class Context:
-#     """
-#     Execution context for sql expressions.
-
-#     Context is used to hold relevant data tables which can then be queried on with eval.
-
-#     References to columns can either be scalar or vectors. When set_row is used, column references
-#     evaluate to scalars while set_range evaluates to vectors. This allows convenient and efficient
-#     evaluation of aggregation functions.
-#     """
-
-#     def __init__(self, tables: Dict[str, List[Any]], rows: Optional[Dict[List[Dict]]], env: Optional[Dict] = None) -> None:
-#         """
-#         Args
-#             tables: representing the scope of the current execution context.
-#             env: dictionary of functions within the execution context.
-#         """
-#         self.tables = tables
-#         self._table: Optional[str] = None
-#         self.rows = rows if rows is not None else {}
-#         self.env = env if env is not None else {}
-
-#     @property
-#     def table(self):
-#         if self._table is None:
-#             self._table = list(self.tables.keys())[0]
-#         return self._table
-
-#     def add_columns(self, *columns: str) -> None:
-#         for table in self.tables.values():
-#             table.extend(*columns)
-
-#     @property
-#     def columns(self) -> Tuple:
-#         return self.tables[self.table]
-
-#     def table_rows(self, table: str) -> List[Dict]:
-#         return self.rows.get(table, [])
     
-
-#     def __iter__(self):
-#         self.env["scope"] = self.row_readers
-#         for i in range(len(self.table.rows)):
-#             for table in self.tables.values():
-#                 reader = table[i]
-#             yield reader, self
-
-#     def table_iter(self, table: str):
-#         self.env["scope"] = self.row_readers
-#         return iter(self.tables[table])
-
-#     def sort(self, key) -> None:
-#         def sort_key(row: Tuple) -> Tuple:
-#             self.set_row(row)
-#             return tuple((t is None, t) for t in self.eval_tuple(key))
-#         self.table.rows.sort(key=sort_key)
-
-#     def set_row(self, row: Tuple) -> None:
-#         for table in self.tables.values():
-#             table.reader.row = row
-#         self.env["scope"] = self.row_readers
-
-#     def set_index(self, index: int) -> None:
-#         for table in self.tables.values():
-#             table[index]
-#         self.env["scope"] = self.row_readers
-
-#     def set_range(self, start: int, end: int) -> None:
-#         for name in self.tables:
-#             self.range_readers[name].range = range(start, end)
-#         self.env["scope"] = self.range_readers
-
-#     def __contains__(self, table: str) -> bool:
-#         return table in self.tables

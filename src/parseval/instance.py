@@ -11,6 +11,7 @@ from src.parseval.faker.domain import ColumnDomainPool
 from src.parseval.db_manager import DBManager
 import random, logging
 
+logger = logging.getLogger("parseval.db")
 
 class Catalog(MappingSchema):
     def __init__(self, schema = None, constraints = None, primary_keys = None, foreign_keys = None, visible = None, dialect = None, normalize = True):
@@ -225,7 +226,6 @@ class Instance(Catalog):
                 }
             }
 
-
         Returns:
             Dict[str, List[Row]]: Map of table names to their new tuples
         """
@@ -234,15 +234,13 @@ class Instance(Catalog):
         for table_name in self.tables:
             if table_name not in concretes:
                 continue
-            table_data = concretes[table_name]
-            if not table_data:
-                continue
+            table_data = concretes.get(table_name, {})
             # Normalize column names
             normalized_data = {}
             for col, vals in table_data.items():
                 norm_col = self._normalize_name(col, dialect=self.dialect)
                 normalized_data[norm_col] = vals
-            num_rows = max(len(v) for v in normalized_data.values())
+            num_rows = max(len(v) for v in normalized_data.values()) if normalized_data else 1
             created_rows[table_name] = []
             
             for ridx in range(num_rows):
@@ -256,7 +254,8 @@ class Instance(Catalog):
                     values=row_values,
                     sync_db=sync_db
                 )
-            created_rows[table_name].append(row)
+                created_rows[table_name].append(row)
+            logger.info(f"Created row for table {table_name} with values {len(created_rows[table_name])}")
         return created_rows
     
 

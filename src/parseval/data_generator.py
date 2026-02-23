@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import Optional, List, Dict, TYPE_CHECKING, Tuple, Union, Set
 from src.parseval.instance import Instance
-from src.parseval.plan.encoder import PlanEncoder
-from src.parseval.uexpr.uexprs import UExprToConstraint, Constraint, PBit
+from src.parseval.plan.planner import Planner, build_graph_from_scopes, Context
+from src.parseval.uexpr.uexprs import UExprToConstraint, Constraint, PBit, StepType
 from src.parseval.constants import PlausibleType
 from src.parseval.plan.rex import Symbol
 from sqlglot.optimizer.scope import Scope
@@ -11,9 +11,9 @@ from .solver.smt import SMTSolver
 from .helper import convert_to_literal
 from functools import reduce
 from collections import deque
-from src.parseval.faker.domain import UnionFind
 from sqlglot import exp
-
+from src.parseval.uexpr.checks import Declare
+from .configuration import Config
 import random, logging
 if TYPE_CHECKING:
     from src.parseval.constants import PBit
@@ -31,33 +31,32 @@ class DataGenerator:
     def set_random_seed(seed: int):
         random.seed(seed)
     
-    def __init__(self, scope: Scope, instance: Instance, table_alias: Optional[Dict] = None, name: Optional[str] = None, workspace: str = None, verbose: bool = False, random_seed: int = 42):
+    def __init__(self, expr: exp.Expression, instance: Instance, table_alias: Optional[Dict] = None, name: Optional[str] = None, workspace: str = None, verbose: bool = False, random_seed: int = 42):
         self.instance = instance
         self.name = name or instance.name
-        self.scope: Scope = scope
+        self.expr: exp.Expression = expr
         self.table_alias: Dict[str, str] = self._table_alias(table_alias)
         self.workspace = workspace
-        self.constraints: Dict[str, List[exp.Expression]] = {} # label -> List[constraints]
+        self.constraints: Dict[str, Set[exp.Expression]] = {} # label -> List[constraints]
         
         self.variables: Dict[Tuple[str, str], exp.Column] = {} # (columnref.table, columnef.name_{suffix}) -> variable
         self.var_to_columnref: Dict[Tuple[str, str], exp.Column] = {}   # columnref.table, columnref.name_{suffix} -> columnref
         self.table_to_vars: Dict[str, List[exp.Column]] = {} # table_name -> List[Variable]
         self.table_column_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {} # (table_name, column) -> List[Variable]
         self.columnref_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {} # (table_alias, column) -> List[Variable]
-        self.uf = UnionFind()
         
         self.tracer = UExprToConstraint()
         DataGenerator.set_random_seed(random_seed)
         self.verbose = verbose
         
         self.query_info = {
-            "tables": list(self.scope.expression.find_all(exp.Table)),
-            "columns": list(self.scope.expression.find_all(exp.Column)),
+            "tables": list(self.expr.find_all(exp.Table)),
+            "columns": list(self.expr.find_all(exp.Column)),
             # "where_conditions": self._extract_conditions(parsed),
-            "joins": [join_condition(join) for join in self.scope.expression.find_all(exp.Join)],
-            "group_by": list(self.scope.expression.find_all(exp.Group)),
-            "order_by": list(self.scope.expression.find_all(exp.Order)),
-            "limit": self.scope.expression.args.get("limit"),
+            "joins": [join_condition(join) for join in self.expr.find_all(exp.Join)],
+            "group_by": list(self.expr.find_all(exp.Group)),
+            "order_by": list(self.expr.find_all(exp.Order)),
+            "limit": self.expr.args.get("limit"),
         }
         
     @property
@@ -87,12 +86,14 @@ class DataGenerator:
     def get_tableref(self, alias_or_name: str) -> str:
         if alias_or_name not in self.table_alias and alias_or_name in self.instance.tables:
             return alias_or_name
+        if alias_or_name not in self.table_alias:
+            return None
         return self.table_alias[alias_or_name]
     
     def _table_alias(self, table_alias:  Optional[Dict] = None) -> str:
         alias = {}
         if table_alias is None:
-            for table in self.scope.expression.find_all(exp.Table):
+            for table in self.expr.find_all(exp.Table):
                 alias[table.alias_or_name] = self.instance._normalize_name(table.name)
         else:
             alias.update(**table_alias)
@@ -102,8 +103,10 @@ class DataGenerator:
     def declare_variable(self, columnref: exp.Column, reuse = True) -> Tuple[str, str]:
         key =(columnref.table, columnref.name)
         if reuse and key in self.variables:
-            return self.variables[key]
+            return key
         table_ref = self.get_tableref(columnref.table)
+        if table_ref is None:
+            return ()
         if not reuse:
             suffix = len(self.columnref_to_vars.get(key, []))
             while (columnref.table, columnref.name + f"_{suffix}") in self.columnref_to_vars:
@@ -117,7 +120,6 @@ class DataGenerator:
         self.table_to_vars.setdefault(table_ref, []).append(variable)
         self.columnref_to_vars.setdefault((columnref.table, columnref.name), []).append(variable)
         self.table_column_to_vars.setdefault((table_ref, columnref.name), []).append(variable)
-        self.uf.find(".".join(key))
         if self.verbose:
             logger.info(f"Declared variable: {str(variable)} for column: {columnref}")
         return key
@@ -127,7 +129,7 @@ class DataGenerator:
     ):
         if not isinstance(constraints, list):
             constraints = [constraints]
-        self.constraints.setdefault(label, []).extend(constraints)
+        self.constraints.setdefault(label, set()).update(constraints)
     
     def _declare_fk_constraints(self):
         fk_infos = self._flatten_foreign_key_info(self.table_to_vars)
@@ -149,22 +151,22 @@ class DataGenerator:
                 continue
             existing_values = self.instance.get_column_data(table_name=table_name, column_name=column_name)
             concretes = [ convert_to_literal(d.concrete, d.type) for d in existing_values]
-            self.declare_constraint("primary_key", exp.Distinct(expressions= concretes + variables, _type="bool"))
+            if len(concretes) + len(variables) > 1:
+                self.declare_constraint("primary_key", exp.Distinct(expressions= concretes + variables, _type="bool"))
             self.declare_constraint("not_null", [v.is_(exp.Null(_type = v.type)).not_() for v in variables])
         
     def _declare_column_constraints(self):
-        
         for (table_name, column_name), variables in self.table_column_to_vars.items():
             for column_constraint in self.instance.get_column_constraints(table_name, column_name):
                 existing_values = self.instance.get_column_data(table_name=table_name, column_name=column_name)
                 concretes = [ convert_to_literal(d.concrete, d.datatype) for d in existing_values]
                 if isinstance(column_constraint.kind, (exp.PrimaryKeyColumnConstraint, exp.UniqueColumnConstraint)):
-                    self.declare_constraint("unique_constraint", exp.Distinct(expressions= concretes + variables, _type="bool"))
+                    if len(concretes + variables) > 1:
+                        self.declare_constraint("unique_constraint", exp.Distinct(expressions= concretes + variables, _type="bool"))
                     
                 if isinstance(column_constraint.kind, (exp.NotNullColumnConstraint, exp.PrimaryKeyColumnConstraint)):
                     if not column_constraint.kind.args.get("allow_null", False):
                         self.declare_constraint("not_null", [v.is_(exp.Null(_type = v.datatype)).not_() for v in variables])
-                    
                 elif isinstance(column_constraint.kind, exp.CheckColumnConstraint):
                     ...
                 
@@ -173,15 +175,23 @@ class DataGenerator:
         self._declare_fk_constraints()
         self._declare_column_constraints()
                 
-    def _declare_variables(self, pattern: Tuple[PBit]):
-        path = self.tracer.leaves[pattern].get_path_to_root()
-        for bit, node in zip(pattern, path[1:]):
-            sql_condition = node.sql_condition
-            columnrefs = set(sql_condition.find_all(exp.Column))
-            variables = [self.declare_variable(columnref) for columnref in columnrefs]
-            self.uf.find(variables[0])
-            for i in range(1, len(variables)):
-                self.uf.union(variables[0], variables[i])
+    def _declare_variables(self, plausible: PlausibleBranch, scope_id):
+        q = deque([(plausible.parent, plausible.bit())])
+        while q:
+            node, bit = q.popleft()
+            if node.scope_id == scope_id and node.sql_condition:
+                sql_condition = node.sql_condition
+                columnrefs = set(sql_condition.find_all(exp.Column))
+                variables = [self.declare_variable(columnref) for columnref in columnrefs]
+            
+            if node.parent.step_type != StepType.ROOT:
+                q.append((node.parent, node.bit()))
+        
+        # path = self.tracer.leaves[pattern].get_path_to_root()
+        # for bit, node in zip(pattern, path[1:]):
+        #     sql_condition = node.sql_condition
+        #     columnrefs = set(sql_condition.find_all(exp.Column))
+        #     variables = [self.declare_variable(columnref) for columnref in columnrefs]
             
         # Declare foreign key constraints
         fk_infos = self._flatten_foreign_key_info(self.table_to_vars)
@@ -197,7 +207,53 @@ class DataGenerator:
             ref_column.type = domain.datatype
             variable = self.declare_variable(ref_column, reuse= False)
             q.append((ref_table_name, ref_col_name))
-            self.uf.union((local_table, local_col), variable)
+    
+    def randomdb(self, expr: exp.Expression, min_rows: int = 10):
+        predicates = expr.find_all(exp.Predicate)
+        if predicates:
+            return
+        
+        limit = expr.find(exp.Limit)
+        offset = expr.find(exp.Offset)
+        
+        if limit:
+            limit = int(limit.expression.this)
+        else:
+            limit = 0
+        
+        if offset:
+            offset = int(offset.expression.this)
+        else:
+            offset = 0
+        table_alias = _table_alias(self.instance, expr)
+        concretes = {table: [] for table in table_alias.values()}
+        for _ in range(max(limit + offset, min_rows)):
+            self.instance.create_rows(concretes)
+        
+    
+    def speculative(self, expr: exp.Expression, min_rows = 15):
+        tracer = UExprToConstraint()
+        
+        predicates = list(expr.find_all(exp.Predicate))
+        columns = list(expr.find_all(exp.Column))
+        
+        table_alias = _table_alias(self.instance, expr)
+        joins = [join_condition(join) for join in expr.find_all(exp.Join)]
+        group_by = list(expr.find_all(exp.Group))
+        order_by = list(expr.find_all(exp.Order))
+        limit = expr.args.get("limit")
+        offset = expr.args.get("offset")
+        
+        if not predicates:
+            self.randomdb(expr, min_rows)
+            return
+        
+        for join in joins:
+            
+            ...
+        
+        
+        
             
     
     def _reset(self):
@@ -207,7 +263,6 @@ class DataGenerator:
         self.table_to_vars.clear()
         self.columnref_to_vars.clear()
         self.table_column_to_vars.clear()
-        self.uf.clear()
         
 
     def _prune_constraints(self, pattern: Tuple[PBit], paths: List[Constraint]):
@@ -230,17 +285,22 @@ class DataGenerator:
                 for rc in removed_constraints:
                     self.constraints[PBit.TRUE].remove(rc)
         
-    def _declare_coverage_constraints(self, plausible, skips : Optional[Set] = None):
+    def declare_coverage_constraint(self, plausible: PlausibleBranch, skips : Optional[Set] = None):
         skips = skips or set()
-        from src.parseval.uexpr.checks import Declare
         declare = Declare(self)
-        path = list(reversed(plausible.get_path_to_root()[1:]))
-        patterns = list(reversed(plausible.pattern()))
-        for bit, node in zip(patterns, path[1:]):            
+        
+        q = deque([(plausible.parent, plausible.bit())])
+        context = {}
+        while q:
+            node, bit = q.popleft()
+            logger.info(f"Declaring constraints for node: {node}, bit: {bit}")
             if node.step_type in skips:
                 continue
-            if not declare.declare(bit, node, {}):
+            if not declare.declare(bit, node, context):
                 return
+            if node.parent is not self.tracer.root:
+                q.append((node.parent, node.bit()))
+
     
     def _print(self, pattern: Tuple[PBit]):
         if not self.verbose:
@@ -251,15 +311,16 @@ class DataGenerator:
                 lines.append(str(c))
         logger.info("\n".join(lines))
         
+        
     def _generate(self, pattern: Tuple[PBit], plausible: PlausibleBranch):
         if plausible.plausible_type == PlausibleType.INFEASIBLE:
-            return
+            return 'unsat', {}
         
         concretes = {}
         
         self._declare_variables(pattern)
         self._declare_db_constraints()
-        self._declare_coverage_constraints(plausible)
+        self.declare_coverage_constraint(plausible)
         
         self._print(pattern)
         
@@ -269,53 +330,150 @@ class DataGenerator:
             for c in cons:
                 solver.add(solver._to_z3_expr(c))
         
-        result = solver.solve()
+        sat, result = solver.solve()
         
-        if result is None:
+        if sat != 'sat':
             plausible.mark_infeasible()
             if self.verbose:
                 logger.debug(f"Pattern {pattern} is infeasible.")
-            return {}
+            return 'unsat', {}
             
-        for key in self.variables:
-            var_name = ".".join(key)
-            if var_name in result:
-                value = result[var_name]
-                columnref = self.var_to_columnref[key]
-                tbl_name = self.get_tableref(columnref.table)
-                concretes.setdefault(tbl_name, {}).setdefault(columnref.name, []).append(value)
-        return concretes
+        return sat, result
         
+    
+    
+    def _generate_for_scope(self, node, parent_ctx: Optional[Context], config: Config, skips) -> Context:
         
-    def generate(self, timeout = 360):
-        from .configuration import Config
-        config = Config()
-        skips = set()
-        encoder = PlanEncoder(scope= self.scope, instance= self.instance, trace = self.tracer, dialect= self.dialect)
-        print("Encoding plan...")
-        ctx = encoder.encode()
-        q = deque([self.tracer.next_path(config= config, skips= skips)])
-        print(f"Start generating data..., {len(q)}, ")
+        tracer = UExprToConstraint()
+        planner = Planner(instance= self.instance, expr = node, parent_context= parent_ctx, tracer= tracer, dialect= self.dialect, verbose= self.verbose)
+        planner.encode()        
+        q = deque([tracer.next_path(config= config, skips= skips)])
         while q:
             pattern, plausible = q.popleft()
-            print(f"processing pattern: {pattern}")
             if pattern is None:
                 break
-            concretes = self._generate(pattern, plausible)
-            if concretes:
-                logger.info(f"Generated concretes for pattern {pattern}: {concretes}")
+            if plausible.plausible_type != PlausibleType.INFEASIBLE:
+                continue
+            self._declare_variables(plausible= plausible, scope_id = node.scope_id)
+            self._declare_db_constraints()
+            self.declare_coverage_constraint(plausible)
+            self._print(pattern)
+            
+            solver = SMTSolver(self.variables, verbose= self.verbose)        
+            for label, cons in self.constraints.items():
+                for c in cons:
+                    solver.add(solver._to_z3_expr(c))
+            sat, result = solver.solve()
+            if sat != 'sat':
+                plausible.mark_infeasible()
+                
+            else:
+                concretes = { tbl_name: {} for tbl_name in self.table_to_vars}
+                if result:
+                    for key in self.variables:
+                        var_name = ".".join(key)
+                        if var_name in result:
+                            value = result[var_name]
+                            columnref = self.var_to_columnref[key]
+                            tbl_name = self.get_tableref(columnref.table)
+                            concretes[tbl_name].setdefault(columnref.name, []).append(value)
                 self.instance.create_rows(concretes)
             self._reset()
-            encoder.encode()
-            q.append(self.tracer.next_path(config= config, skips= skips))
-        from src.parseval.to_dot import display_uexpr
-        display_uexpr(self.tracer.root).write(
-            "examples/tests/dot_coverage_" + self.instance.name + ".png", format="png"
-        )
+            planner.encode()
+            q.append(tracer.next_path(config= config, skips= skips))
+            
+        ctx = planner.encode()
+        tracer.update_stats(config=config)
+        return ctx
         
+        
+    
+    def generate(self, timeout = 360):
+        
+        config = Config()
+        skips = set()
+        visited = set()
+        contexts: Dict[str] = {}
+        scope_graph = build_graph_from_scopes(self.expr)
+        parent_ctx = None
+        q = deque(scope_graph.get_dependency_order())
+        while q:
+            node_id = q.popleft()
+            if node_id in visited:
+                continue
+            node = scope_graph.get_node(node_id)
+            scope = node.scope
+            print(f'start to generate for scope with expression: {scope.expression.sql(dialect=self.dialect)}')
+            print(f'columns: {node.scope_columns}')
+            for sub_scope in scope.subquery_scopes:
+                if sub_scope.is_subquery and not sub_scope.is_correlated_subquery:
+                    
+                    parent = get_parent(sub_scope.expression)
+                    dtype = None
+                    if isinstance(parent, exp.Predicate):
+                        for r in [parent.left, parent.right]:
+                            if r is not sub_scope.expression.parent:
+                                dtype = r.type
+                        
+                        from parseval.plan.helper import to_literal
+                        sub_scope_out = contexts[sub_scope.expression]
+                        values = []
+                        
+                        # concrete = contexts[sub_scope.expression][0][0]
+                        # if is_string:
+                        #     new = exp.Literal.string(concrete)
+                        # else:
+                        #     new = exp.Literal.number(concrete)
+                        # new.type = dtype
+                        # # new = exp.Literal(this = concrete, _type = dtype, is_string = is_string)
+                        # scope.replace(sub_scope.expression.parent, new)
+            
+            scope_ctx = self._generate_for_scope(node, parent_ctx, config, skips)
+            contexts[scope.expression] = scope_ctx
+            visited.add(node_id)
+        
+        # planner = Planner(expr = self.expr, instance= self.instance, tracer = self.tracer, dialect= self.dialect)
+        # ctx = planner.encode()
+        # q = deque([self.tracer.next_path(config= config, skips= skips)])
+        
+        # index = 0
+        # while q:
+        #     pattern, plausible = q.popleft()
+        #     if pattern is None:
+        #         break
+        #     sat, result =  self._generate(pattern, plausible)
+        #     if sat != 'sat':
+        #         plausible.mark_infeasible()
+        #     else:
+        #         concretes = { tbl_name: {} for tbl_name in self.table_to_vars}
+                
+        #         if result:
+        #             for key in self.variables:
+        #                 var_name = ".".join(key)
+        #                 if var_name in result:
+        #                     value = result[var_name]
+        #                     columnref = self.var_to_columnref[key]
+        #                     tbl_name = self.get_tableref(columnref.table)
+        #                     concretes[tbl_name].setdefault(columnref.name, []).append(value)
+                
+        #         self.instance.create_rows(concretes)
+        #         # plausible.mark_covered()
+            
+        #     self._reset()
+        #     self.tracer.reset()
+        #     for table, values in self.instance.data.items():
+        #         logger.info(f"Table {table} has {len(values)} rows after iteration {index}")
+        #     planner.encode()
+        #     q.append(self.tracer.next_path(config= config, skips= skips))
+            
+        # if self.verbose:
+        #     self._reset()
+        #     self.tracer.reset()
+        #     planner.encode()
+        #     self.tracer.update_stats(config=config)
 
 
-def _table_alias(instance: Instance, expr: exp.Expression) -> str:
+def _table_alias(instance: Instance, expr: exp.Expression) -> Dict[str, str]:
     alias = {}
     for table in expr.find_all(exp.Table):
         alias[table.alias_or_name] = instance._normalize_name(table.name)

@@ -207,8 +207,6 @@ class PlanEncoder:
         expr = self.scope.expression
         plan = Plan(expr)
         
-        print(plan)
-        
         finished = set()
         queue = set(plan.leaves)
         contexts = {}
@@ -291,8 +289,7 @@ class PlanEncoder:
         if node.projections is None:
             return context
         prev_step = self.prev_steps.popleft()
-        sink = self.derived_schema(node.projections)
-        
+        sink = self.derived_schema(node.projections)        
         for reader, _ in context:
             row = {}
             sql_conditions, smt_conditions = [], []

@@ -114,6 +114,12 @@ EDGE_STYLES = {
         "label": "AGGREGATE_SIZE",
         "style": "dotted",
         "fontsize": "12",
+    },
+    PBit.PROJECT: {
+        "color": "#17A2B8",
+        "label": "PROJECT",
+        "style": "dashed",
+        "fontsize": "12",
     }
 }
 
@@ -320,7 +326,7 @@ def uexpr_to_dot(
     # Build a human-friendly label for the node.
     if isinstance(node, Constraint):
         if node.sql_condition:
-            label = f"{node.step_type}({str(node.sql_condition)}) \n {to_string(node.pattern())}"
+            label = f"{node.step_type.value.capitalize()}({str(node.sql_condition)}) \n {to_string(node.pattern())}"
         else:
             label = "ROOT"
     elif isinstance(node, PlausibleBranch):

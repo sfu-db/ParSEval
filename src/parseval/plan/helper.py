@@ -2,7 +2,8 @@ from __future__ import annotations
 from sqlglot.expressions import Identifier, to_identifier, Expression
 from sqlglot import exp
 from typing import Dict
-from src.parseval.dtype import DataType
+import math, numbers, datetime
+from parseval.dtype import DataType
 from src.parseval.states import SyntaxException
 from .rex import ColumnRef
 
@@ -60,27 +61,85 @@ def to_type(type_def: str | DataType | dict) -> DataType:
     return DataType.build(**type_def)
 
 
-def get_operand(expr: Expression, **kwargs):
+def to_literal(value, datatype=None, copy = False) -> exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime | exp.DateStrToDate | exp.Expression:
     """
-    Retrieves the operand from an expression.
+    Converts a value into a SQL expression literal, optionally with a specified datatype.
 
     Args:
-        expr (Expression): The expression to extract the operand from.
-        **kwargs: Additional keyword arguments for operand retrieval.
-
-    Returns:
-        Expression: The operand of the expression.
-
-    Raises:
-        NotImplementedError: If the expression type is not supported.
+        value: The value to convert, which can be of various types (e.g., str, bool, None, numbers, datetime).
+        datatype (optional): The datatype to associate with the literal. Defaults to None.
     """
+    concrete = None
+    literal = None
+    srctype = None
+    if isinstance(value, exp.Expression):
+        literal = exp.maybe_copy(value, copy)
+        srctype = literal.type or literal.args.get("datatype")
+        concrete = literal.this
+    elif isinstance(value, str):
+        literal = exp.Literal.string(value)
+        concrete = str(value)
+        srctype = "TEXT"
+    elif isinstance(value, bool):
+        literal = exp.Boolean(this=value)
+        concrete = bool(value)
+        srctype = "BOOLEAN"
+    elif value is None or (isinstance(value, float) and math.isnan(value)):
+        literal = exp.Null()
+        concrete = None
+    elif isinstance(value, numbers.Number):
+        literal = exp.Literal.number(value)
+        concrete = float(value) if isinstance(value, float) else int(value)
+        srctype = "NUMERIC"
+    elif isinstance(value, datetime.datetime):
+        datetime_literal = exp.Literal.string(
+            (value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)).isoformat(
+                sep=" "
+            )
+        )
+        srctype = "DATETIME"
+        concrete = value
+        literal = exp.TimeStrToTime(this=datetime_literal)
+    elif isinstance(value, datetime.date):
+        date_literal = exp.Literal.string(value.strftime("%Y-%m-%d"))
+        literal = exp.DateStrToDate(this=date_literal)
+        srctype = "DATE"
+        concrete = value
+    else:
+        raise ValueError(f"Unsupported literal type: {type(value)}")
+    literal.set("concrete", concrete)
+    if datatype:
+        literal.type = datatype
+        literal.set("datatype", datatype)
+    else:
+        literal.type = DataType.build(srctype)
+        literal.set("datatype", DataType.build(srctype))
+    return literal
+
+def to_const(literal: exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime | exp.DateStrToDate, **kwargs) -> exp.Expression:
+    DATETIME_FMT = kwargs.get("datetime_fmt", ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"])
     
-    if kwargs and expr.alias_or_name in kwargs:
-        return get_operand(kwargs[expr.alias_or_name], **kwargs)
     
-    if isinstance(expr, (exp.Column, exp.Star)):
-        return expr
-    if isinstance(expr, (exp.Alias, exp.Distinct)):
-        return get_operand(expr.this, **kwargs)
-    
-    raise NotImplementedError(f"Operand extraction not implemented for expression type: {type(expr)}")
+    value = literal.this
+    datatype = literal.type
+    try:
+        if datatype.is_type(*exp.DataType.INTEGER_TYPES):
+            value = int(value)
+        elif datatype.is_type(*exp.DataType.REAL_TYPES):
+            value = float(value)
+        elif datatype.is_type(exp.DataType.Type.BOOLEAN):
+            value = bool(value)
+        elif datatype.is_type(*exp.DataType.TEMPORAL_TYPES):
+            from datetime import datetime
+            for fmt in DATETIME_FMT:
+                try:
+                    value = datetime.strptime(value, fmt)
+                except ValueError:
+                    continue
+        elif datatype.is_type(*exp.DataType.TEXT_TYPES):
+            value = str(value)
+        else:
+            raise ValueError(f"Unsupported datatype: {datatype}")
+    except Exception as e:
+        value = None
+    return value
