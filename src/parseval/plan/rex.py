@@ -28,8 +28,13 @@ def datatype(self) -> DataType:
 
 def concrete(self) -> Any:
     if isinstance(self, exp.Column):
-        return self.args.get("concrete", None)
-    concretes = [a.concrete for a in self.iter_expressions()]
+        return self.args.get("concrete")
+    if isinstance(self, exp.Literal):
+        from .helper import to_const
+        return to_const(self)
+        print(f"Literal {self} with type {self.type} has value {self.this}, {self.args['concrete']}, {type(self.args['concrete'])}")
+        return self.args["concrete"]
+    concretes = [a.concrete for a in self.iter_expressions() if not isinstance(a, exp.DataType)]
     if self.key.upper() not in OPS:
         return None
     return OPS[self.key.upper()](*concretes)
@@ -148,6 +153,10 @@ class AggGroup(Symbol):
     @property
     def group_key(self):
         return self.args.get("group_key", ())
+
+    @property
+    def group_values(self):
+        return self.args.get("group_values", [])
 
     @property
     def name(self) -> Any:

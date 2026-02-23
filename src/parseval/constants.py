@@ -23,6 +23,8 @@ class PlausibleBit(IntEnum):
     HAVING_TRUE = 14  # e.g., having condition is true
     HAVING_FALSE = 15  # e.g., having condition is false
     
+    PROJECT = 16  # e.g., projection of a column
+    
 
     @classmethod
     def from_int(cls, value: Union[int, str, bool, PlausibleBit]) -> "PlausibleBit":
@@ -37,7 +39,11 @@ class PlausibleBit(IntEnum):
 PBit = PlausibleBit
 
 
-VALID_PATH_BITS = (PBit.FALSE, PBit.TRUE, PBit.JOIN_TRUE, PBit.GROUP_SIZE)
+VALID_PATH_BITS = (PBit.FALSE, PBit.TRUE, PBit.JOIN_TRUE, PBit.GROUP_SIZE, PBit.PROJECT, PBit.AGGREGATE_SIZE, PBit.HAVING_TRUE, PBit.HAVING_FALSE)
+
+def is_valid_path_bit(bit: PlausibleBit) -> bool:
+    bit = PBit.from_int(bit)
+    return bit in VALID_PATH_BITS
 
 class PlausibleType(Enum):
     """Types of plausible (unexplored) branches."""
@@ -58,3 +64,21 @@ class BranchType(IntEnum):
     
     def __bool__(self):
         return self == BranchType.POSITIVE
+    
+    
+class StepType(Enum):
+    ROOT = "root"
+    SCAN = "scan"
+    JOIN = "join"
+    AGGREGATE = "aggregate"
+    GROUPBY = "groupby"
+    PROJECT = "project"
+    FILTER = "filter"
+    HAVING = "having"
+    SORT = "sort"
+    UNION = "union"
+    EXCEPT = "except"
+    INTERSECT = "intersect"
+    
+    def __repr__(self):
+        return self.name
