@@ -377,7 +377,8 @@ class Declare:
             if group_keys and any(key.concrete is None for key in group_keys):
                 continue
             for row in group.group_values:
-                v = row[node.sql_condition.name]
+                v = row.get(node.sql_condition.table, node.sql_condition.name)
+                # [node.sql_condition.name]
                 values.add(v.concrete)
                 dtype = v.datatype
                 break
@@ -410,7 +411,7 @@ class Declare:
             return True
         v = None
         for row in agg_group.group_values:
-            v = row[node.sql_condition.name]
+            v = row.get(node.sql_condition.table, node.sql_condition.name)
             break
         logger.info(f"Declaring group size constraint for {node.sql_condition}, group picked value: {repr(v)}")
         if v is not None:

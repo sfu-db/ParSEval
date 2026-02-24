@@ -43,6 +43,7 @@ def reset_folder(folder_path):
     assert_folder(folder_path)
 from src.parseval.to_dot import display_uexpr
 from src.parseval.logger import Logger
+from parseval.main import Disprover
 Logger(
     verbose={
         "coverage": True,
@@ -55,37 +56,48 @@ Logger(
 
 logger = logging.getLogger("parseval.coverage")
 
-class TestGenerator(unittest.TestCase):
+class TestMain(unittest.TestCase):
     # @unittest.skip("passed")
     def test_spj_disjunct(self):
-        config = Config()
+        
+        gold = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 " #order by `NumGE1500`
+        pred = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 81 " #order by `NumGE1500`
         for i in range(1):
-            logger.info("==== Running test_parse_spj iteration {} ====".format(i))
-            print("==== Running test_parse_spj iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_spj_disjunct{i}", dialect="sqlite")
-            tracer = UExprToConstraint()
+            disprover = Disprover(schema= schema, gold= gold, pred= pred, host_or_path= "examples/tests", database= f"default_{i}", workspace= "examples/tests")
+            
+            r = disprover.verify()
+            
+            print(r)
+            
+            
+        # config = Config()
+        # for i in range(1):
+        #     logger.info("==== Running test_parse_spj iteration {} ====".format(i))
+        #     print("==== Running test_parse_spj iteration {} ====".format(i))
+        #     instance = Instance(ddls=schema, name=f"test_spj_disjunct{i}", dialect="sqlite")
+        #     tracer = UExprToConstraint()
                 
-            sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
-            sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 " #order by `NumGE1500`
-            expr = preprocess_sql(sql, instance, dialect="sqlite")
-            speculate = Speculative(instance= instance, expr = expr, tracer= tracer, table_alias= None)
+        #     sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
+        #     sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 " #order by `NumGE1500`
+        #     expr = preprocess_sql(sql, instance, dialect="sqlite")
+        #     speculate = Speculative(instance= instance, expr = expr, tracer= tracer, table_alias= None)
             
-            speculate.encode()
-            logger.info(f"Speculative done")
+        #     speculate.encode()
+        #     logger.info(f"Speculative done")
             
-            for _ in range(5):
-                for table in instance.tables:
-                    instance.create_row(table)
-            speculate.encode()
+        #     for _ in range(5):
+        #         for table in instance.tables:
+        #             instance.create_row(table)
+        #     speculate.encode()
             
             
             
-            instance.to_db("examples/tests", f"test_spj_disjunct_{i}")
+        #     instance.to_db("examples/tests", f"test_spj_disjunct_{i}")
             
-            display_uexpr(tracer.root).write(
-                "examples/tests/dot_coverage_" + instance.name + ".png", format="png"
-            )
-    # @unittest.skip("passed")
+        #     display_uexpr(tracer.root).write(
+        #         "examples/tests/dot_coverage_" + instance.name + ".png", format="png"
+        #     )
+    @unittest.skip("passed")
     def test_groupby(self):
         # for i in range(1):
         #     logger.info("==== Running test_groupby iteration {} ====".format(i))

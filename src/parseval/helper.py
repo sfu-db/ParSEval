@@ -126,6 +126,8 @@ def compare_df(result1: List[Tuple], result2: List[Tuple], order_matters: bool) 
         return 0
     if len(result1_filled) > 0 and len(result1_filled[0]) != len(result2_filled[0]):
         return 0
+    return set([tuple(a) for a in result1_filled]) == set([tuple(b) for b in result2_filled])
+
     if not order_matters:
         result1_filled = sorted(result1_filled)
         result2_filled = sorted(result2_filled)
@@ -136,3 +138,5 @@ def compare_df(result1: List[Tuple], result2: List[Tuple], order_matters: bool) 
             return 0
 
     return 1
+
+
