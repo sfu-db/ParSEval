@@ -295,7 +295,7 @@ class UExprToConstraint:
 
     def __init__(self):
         self.leaves: Dict[Tuple[PBit, ...], PlausibleBranch] = {}
-        self.root = Constraint(tree=self, step_type="ROOT", step_name="ROOT")
+        self.root = Constraint(tree=self, step_type= StepType.ROOT, step_name="ROOT")
         
         # Index of leaf patterns to their corresponding Constraint nodes
         self.prev_steps = deque(["ROOT"])
@@ -358,25 +358,24 @@ class UExprToConstraint:
                 if node.has_rowids_for_bit(bit, rowids):
                     starting_nodes.append((node, bit))
                 positive_nodes.append((node, bit))
-                
+        
         if not starting_nodes:
             starting_nodes = set()
             q = deque(positive_nodes)
             while q:
                 node, bit = q.popleft()
                 plausible_child = node.children.get(bit, None)
-                if isinstance(plausible_child, PlausibleBranch) and plausible_child.branch == BranchType.POSITIVE and is_valid_path_bit(bit):
-                    starting_nodes.add((node, bit))
-                elif isinstance(node, Constraint) and node.scope_id == scope_id and node.step_type == step_type and node.step_name == step_name:
+                if isinstance(node, Constraint) and node.scope_id == scope_id and node.step_type == step_type and node.step_name == step_name:
                     starting_nodes.add((node.parent, node.bit()))
+                elif isinstance(plausible_child, PlausibleBranch) and plausible_child.branch == BranchType.POSITIVE and is_valid_path_bit(bit):
+                    starting_nodes.add((node, bit))
+                
                 for child_bit, child in node.children.items():
                     if isinstance(child, Constraint):
                         key = (child.scope_id, child.step_type, child.step_name)
                         if key in self.pnode_index:
                             q.append((child, child_bit))
-        logger.info(f"Finding attachment points for step {step_type} {step_name} with rowids {rowids}. Positive nodes: {positive_nodes}, starting nodes: {starting_nodes}, prev step: {prev_step}")
         assert starting_nodes, f"No attachment point found for step {step_type} {step_name} with rowids {rowids}. Positive nodes: {positive_nodes}, prev step: {prev_step}"
-        
         return starting_nodes
     
     def which_path(self, 

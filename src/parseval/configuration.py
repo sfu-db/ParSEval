@@ -11,6 +11,7 @@ class Config:
     negative_threshold: int = 1
     max_tries: int = 5
     set_semantic: bool = False
+    timeout: int = 360
     seed: int = 42
     
     def __post_init__(self):
@@ -28,5 +29,6 @@ class Config:
             "negative_threshold": self.negative_threshold,
             "max_tries": self.max_tries,
             "set_semantic": self.set_semantic,
+            "timeout": self.timeout,
             "seed": self.seed
         }

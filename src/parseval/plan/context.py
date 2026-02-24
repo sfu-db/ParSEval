@@ -2,6 +2,9 @@ from __future__ import annotations
 from collections import UserDict
 from contextlib import contextmanager
 from typing import Any, Dict, Tuple, Optional, List
+from math import prod
+from itertools import product
+
 
 import logging
 
@@ -11,6 +14,7 @@ class DerivedSchema:
         self.column_range = column_range
         self.reader = RowReader(self.columns, self.column_range)
         self.rows = rows or []
+        self.mask = [True] * len(self.rows)
         
         if rows:
             assert len(rows[0]) == len(self.columns), f"Row length does not match number of columns. {len(rows[0])} != {len(self.columns)}"
@@ -27,6 +31,7 @@ class DerivedSchema:
     def append(self, row):
         assert len(row) == len(self.columns), f"Row length does not match number of columns. {len(row)} != {len(self.columns)}"
         self.rows.append(row)
+        self.mask.append(True)
 
     def pop(self):
         self.rows.pop()
@@ -98,9 +103,25 @@ class RowReader:
         }
         self.row = None
 
+    def rowid(self):
+        return self.row.rowid
     def __getitem__(self, column):
         return self.row[column]
 
+    def get_cell(self, table, column):
+        return self.row[self.columns[column]]
+
+class ProductReader:
+    def __init__(self, table_names, rows):
+        self._names = table_names
+        self._rows = rows
+        
+    def rowid(self):
+        return sum((row.rowid for row in self._rows), ())
+        
+    def get(self, table, column):
+        idx = self._names.index(table)
+        return self._rows[idx][column]
 
 class Context:
     """
@@ -120,9 +141,12 @@ class Context:
         self.tables = tables
         self._table: Optional[DerivedSchema] = None
         self.range_readers = {name: table.range_reader for name, table in self.tables.items()}
+        
         self.row_readers = {name: table.reader for name, table in tables.items()}
+        
         self.external = external
-
+        self.masks = set()
+        
     @property
     def table(self):
         if self._table is None:
@@ -161,11 +185,26 @@ class Context:
     def __contains__(self, table: str) -> bool:
         return table in self.tables
     
+    
     def __iter__(self):
-        self.env["scope"] = self.row_readers
+        # self.env["scope"] = self.row_readers
         for i in range(len(self.table.rows)):
             for table in self.tables.values():
                 reader = table[i]
             yield reader, self
-
+            
+    def table_iter(self, table: str) -> TableIter:
+        return iter(self.tables[table])
     
+    def set_mask(self, rowid) -> None:
+        self.masks.add(rowid)
+        
+    def iters(self, mask = True):
+        names = list(self.tables.keys())
+        tables = [self.tables[name].rows for name in names]
+        for rows in product(*tables):
+            reader = ProductReader(names, rows)
+            if mask and reader.rowid() in self.masks:
+                continue
+            yield reader
+                

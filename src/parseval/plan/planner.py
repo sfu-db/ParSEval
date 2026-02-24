@@ -524,8 +524,7 @@ class Planner:
                     else:
                         ctx = self.encode_condition(operand, scope = context.env["scope"])
                         r = ctx[operand]
-                    mapping[alias_name] = r
-                
+                    mapping[alias_name] = r                
                 operand_schema.append(mapping)
             for i, (a, b) in enumerate(zip(context.table.rows, operand_schema.rows)):
                 new_row = {k: v for k, v in a.items()}

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, List, Dict, TYPE_CHECKING, Tuple, Union, Set
+from typing import Optional, List, Dict, TYPE_CHECKING, Tuple, Union, Set, Callable
 from src.parseval.instance import Instance
 from src.parseval.plan.planner import Planner, build_graph_from_scopes, Context
 from src.parseval.uexpr.uexprs import UExprToConstraint, Constraint, PBit, StepType
@@ -13,6 +13,7 @@ from functools import reduce
 from collections import deque
 from sqlglot import exp
 from src.parseval.uexpr.checks import Declare
+from parseval.plan.speculate import Speculative
 from .configuration import Config
 import random, logging
 if TYPE_CHECKING:
@@ -36,6 +37,7 @@ class DataGenerator:
         self.name = name or instance.name
         self.expr: exp.Expression = expr
         self.table_alias: Dict[str, str] = self._table_alias(table_alias)
+        self.config = Config()
         self.workspace = workspace
         self.constraints: Dict[str, Set[exp.Expression]] = {} # label -> List[constraints]
         
@@ -183,7 +185,6 @@ class DataGenerator:
                 sql_condition = node.sql_condition
                 columnrefs = set(sql_condition.find_all(exp.Column))
                 variables = [self.declare_variable(columnref) for columnref in columnrefs]
-            
             if node.parent.step_type != StepType.ROOT:
                 q.append((node.parent, node.bit()))
         
@@ -208,54 +209,81 @@ class DataGenerator:
             variable = self.declare_variable(ref_column, reuse= False)
             q.append((ref_table_name, ref_col_name))
     
-    def randomdb(self, expr: exp.Expression, min_rows: int = 10):
+    def randomdb(self, expr: exp.Expression, min_rows: int , early_stop: Optional[Callable] = None):
         predicates = expr.find_all(exp.Predicate)
         if predicates:
             return
-        
         limit = expr.find(exp.Limit)
         offset = expr.find(exp.Offset)
-        
         if limit:
             limit = int(limit.expression.this)
         else:
             limit = 0
-        
         if offset:
             offset = int(offset.expression.this)
         else:
             offset = 0
         table_alias = _table_alias(self.instance, expr)
         concretes = {table: [] for table in table_alias.values()}
-        for _ in range(max(limit + offset, min_rows)):
-            self.instance.create_rows(concretes)
+        
+        tries = 0
+        while tries < self.config.max_tries:
+            for _ in range(max(limit + offset, min_rows)):
+                self.instance.create_rows(concretes)
+            if early_stop and early_stop(self.instance):
+                break
         
     
-    def speculative(self, expr: exp.Expression, min_rows = 15):
+    def speculative(self, expr: exp.Expression, min_rows = 15, skips = None, early_stop: Optional[Callable] = None):
+        p = list( expr.find_all(exp.Predicate))
         tracer = UExprToConstraint()
+        table_alias = _table_alias(instance= self.instance, expr = expr)
+        speculate = Speculative(instance= self.instance, expr = expr, verbose= self.verbose, table_alias= table_alias, tracer= tracer)
+        if not p:
+            self.randomdb(expr, min_rows, early_stop= early_stop)
+            speculate.encode()
+            return tracer
         
-        predicates = list(expr.find_all(exp.Predicate))
-        columns = list(expr.find_all(exp.Column))
-        
-        table_alias = _table_alias(self.instance, expr)
-        joins = [join_condition(join) for join in expr.find_all(exp.Join)]
-        group_by = list(expr.find_all(exp.Group))
-        order_by = list(expr.find_all(exp.Order))
-        limit = expr.args.get("limit")
-        offset = expr.args.get("offset")
-        
-        if not predicates:
-            self.randomdb(expr, min_rows)
-            return
-        
-        for join in joins:
+        speculate.encode()
+        q = deque([tracer.next_path(config= self.config, skips= skips)])
+        while q:
+            pattern, plausible = q.popleft()
+            if pattern is None:
+                break
+            if plausible.plausible_type == PlausibleType.INFEASIBLE:
+                continue
+            self._declare_variables(plausible= plausible, scope_id = 0)
+            self._declare_db_constraints()
+            self.declare_coverage_constraint(plausible)
+            self._print(pattern)
+            solver = SMTSolver(self.variables, verbose= self.verbose)        
+            for label, cons in self.constraints.items():
+                for c in cons:
+                    solver.add(solver._to_z3_expr(c))
+            sat, result = solver.solve()
+            if sat != 'sat':
+                plausible.mark_infeasible()
+            else:
+                concretes = { tbl_name: {} for tbl_name in self.table_to_vars}
+                if result:
+                    for key in self.variables:
+                        var_name = ".".join(key)
+                        if var_name in result:
+                            value = result[var_name]
+                            columnref = self.var_to_columnref[key]
+                            tbl_name = self.get_tableref(columnref.table)
+                            concretes[tbl_name].setdefault(columnref.name, []).append(value)
+                self.instance.create_rows(concretes)
             
-            ...
-        
-        
-        
+            if early_stop is not None and early_stop(self.instance):
+                break
             
-    
+            self._reset()
+            speculate.encode()
+            q.append(tracer.next_path(config= self.config, skips= skips))
+            
+        return tracer
+        
     def _reset(self):
         self.variables.clear()
         self.constraints.clear()
@@ -298,7 +326,7 @@ class DataGenerator:
                 continue
             if not declare.declare(bit, node, context):
                 return
-            if node.parent is not self.tracer.root:
+            if node.parent.step_type != StepType.ROOT:
                 q.append((node.parent, node.bit()))
 
     
@@ -386,8 +414,6 @@ class DataGenerator:
         tracer.update_stats(config=config)
         return ctx
         
-        
-    
     def generate(self, timeout = 360):
         
         config = Config()

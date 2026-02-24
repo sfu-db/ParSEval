@@ -9,6 +9,7 @@ from src.parseval.plan.rex import Row, Symbol, Variable
 from .states import raise_exception
 from src.parseval.faker.domain import ColumnDomainPool
 from src.parseval.db_manager import DBManager
+from sqlglot.helper import name_sequence
 import random, logging
 
 logger = logging.getLogger("parseval.db")
@@ -135,6 +136,9 @@ class Instance(Catalog):
         self.port = port
         self.username = username
         self.password = password
+        
+        self.name_seq = name_sequence(self.name)
+        
         
     def _build_catalog2(self, ddls: str, dialect: str):
         dependency, table_constraints = {}, {}
@@ -491,3 +495,37 @@ class Instance(Catalog):
                                 f"INSERT INTO {table_name} ({cols}) VALUES ({vals});\n"
                             )
                     conn.insert(stmt, mapped_data)
+
+        return database
+
+
+from parseval.helper import compare_df
+def early_stopper(instance: Instance, gold: str, pred: Optional[str] = None) -> bool:
+    dbname = instance.name_seq()
+    try:
+        instance.to_db(instance.host_or_path, dbname, port= instance.port, username= instance.username, password= instance.password)
+    except Exception as e:
+        logger.error(f'Error when generating concrete database: {e}')
+        return True
+    
+    with DBManager().get_connection(instance.host_or_path, dbname, instance.username, instance.password, instance.port, instance.dialect) as conn:
+        gold_ret = conn.execute(gold, fetch= "all")
+        if pred is not None:
+            pred_ret = conn.execute(pred, fetch= "all")
+            if not compare_df(gold_ret, pred_ret):
+                return True
+            return False
+        return True if len(gold_ret) > 3 else False
+            
+            
+            
+            
+        
+                
+                
+        
+            
+    
+    
+    
+    
