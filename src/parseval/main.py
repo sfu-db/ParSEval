@@ -83,20 +83,7 @@ class SyntaxChecking(PreCheckingRule):
         
     
     def _check(self, **kwargs):
-        
-        
-        # host_or_path = self.instance.host_or_path
-        # dbname = self.instance.name_seq()
-        # username = self.instance.username
-        # port = self.instance.port
-        # password = self.password = self.instance.password
-        
-        # self.instance.to_db(host_or_path= host_or_path, database= dbname, port= port, username= username, password= password)
-        
-        
-        
         with DBManager().get_connection(host_or_path= self.host_or_path, database= self.database, dialect= self.dialect) as conn:
-            
             scm = self.schema.split(";")
             for s in scm:
                 print(s)
