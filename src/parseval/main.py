@@ -125,17 +125,25 @@ class ResultChecking(PreCheckingRule):
         self.config = config
         
     def _check(self, **kwargs):
-        if self(self.instance):
-            return PreCheckResult(state= "NEQ")
-        else:
-            return PreCheckResult(state='unknown')
+        instance = self.instance
+        with DBManager().get_connection(self.instance.host_or_path, self.instance.database, self.instance.username, instance.password, instance.port, instance.dialect) as conn:
+            gold_ret = conn.execute(self.gold, fetch= "all")
+            if self.pred is not None:
+                pred_ret = conn.execute(self.pred, fetch= "all")
+                if not compare_df(gold_ret, pred_ret, order_matters= False):
+                    return PreCheckResult(state= 'eq')
+                return PreCheckResult(state='neq')
+            
+            if len(gold_ret) > 1:
+                return PreCheckResult(state="success")
+            return PreCheckResult(state="unknown")
+            
     
     def __call__(self, instance: Instance):
         dbname = instance.name_seq()
         print(f'checking in {dbname}')
         try:
             dbname = instance.to_db(instance.host_or_path, dbname, port= instance.port, username= instance.username, password= instance.password)
-            
             print(f'to database from instance properly')
         except Exception as e:
             logger.error(f'Error when generating concrete database: {e}')
@@ -234,3 +242,54 @@ class Disprover:
         
     def verify(self):
         return self._chain.check()
+    
+    
+class DbGenerator:
+    def __init__(self, schema: str, gold: str, pred: str, host_or_path: str, database: str, config: Optional[Config] = None,
+                 port: Optional[int] = None, username: Optional[str] = None,  password: Optional[str] = None, 
+                 dialect: str = "sqlite", workspace=None, name: Optional[str] = "default", verbose=False):
+        self.schema = schema
+        self.gold = gold
+        self.pred = pred
+        self.dialect = dialect
+        self.name = name
+        self.config = config or Config()
+        self.host_or_path = host_or_path
+        self.database = database
+        self.port = port
+        self.username = username
+        self.password = password
+        self.dialect = dialect
+        self.workspace = workspace
+        self.verbose = verbose
+        self._chain = self.__pre_checking()
+    def __pre_checking(self):
+        
+        dbname = self.database + "_syntax"
+        _chain = SyntaxChecking(schema= self.schema, gold= self.gold, host_or_path= self.host_or_path, database= dbname, port= self.port, username= self.username, password= self.password, pred= self.pred, dialect= self.dialect)
+        
+        execution_check = ExecutionChecking(schema = self.schema, gold= self.gold, host_or_path= self.host_or_path, database= self.database, port= self.port, username= self.username, password= self.password, pred= self.pred, dialect= self.dialect, workspace= self.workspace, verbose= self.verbose, config= self.config)
+        _chain.set_next(execution_check)
+        return _chain
+    
+    def __call__(self, *args, **kwds):
+        instance = Instance(self.schema, name = self.database, dialect= self.dialect, host_or_path= self.host_or_path, database= self.database, port= self.port, username= self.username, password= self.password)
+        query = preprocess_sql(query, instance, dialect= self.dialect)
+        generator = DataGenerator(query, instance= instance, workspace= self.workspace, verbose= self.verbose, random_seed= self.config.seed)
+            
+        result_checking = ResultChecking(instance= instance, gold= self.gold, pred= self.pred, dialect= self.dialect, config= self.config)
+            
+        generator.speculative(query, early_stop= result_checking)
+        
+            
+        r = result_checking(instance)
+            
+        if r:
+            return PreCheckResult(state= "NEQ")
+        else:
+            return PreCheckResult(state='unknown')
+        
+        if r.state == 'NEQ':
+            return r
+        
+        

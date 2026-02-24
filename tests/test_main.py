@@ -112,9 +112,6 @@ class TestMain(unittest.TestCase):
         #         "examples/tests/dot_coverage_groupby" + instance.name + ".png", format="png"
         #     )
         from parseval.data_generator import DataGenerator
-        
-        
-            
         config = Config()
         for i in range(1):
             logger.info("==== Running test_groupby iteration {} ====".format(i))
