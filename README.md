@@ -71,10 +71,12 @@ from .registry import ValueGeneratorRegistry
 ValueGeneratorRegistry.register('int', int_generator)
 ```
 
-## TBD
-1. adapting MySQL/SQLite dialect processing code
-2. Handling special functions from SQLite/MySQL
-3. 
+## updates
+1. Replace Calcite with SQLGlot.
+2. Integrate symbolic expressions with SQLGlot classes
+4. handle special functions from SQLite and MySQL
+5. For simple queries, (e.g., select count(*) from singers), randomly generate a database instance.
+    
 ### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
 - Dataset
