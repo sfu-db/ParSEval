@@ -231,56 +231,6 @@ def get_parent(e):
         return get_parent(e.parent)
     return e.parent
 
-
-class Planner:
-    DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
-    def __init__(self,  instance: Instance, scope_node: ScopeNode, tracer: UExprToConstraint, ctx: Optional[Context] = None, verbose: bool = True):
-        self._scope = scope_node
-        self.tracer = tracer
-        
-        self.verbose = verbose
-        self.instance = instance
-        if ctx is None:
-            self.ctx = self.init_context({alias: table for alias, table in self._scope.scope.tables.items()})
-        else:
-            self.ctx = ctx
-    
-    @property
-    def dialect(self):
-        return self.instance.dialect
-    
-    def context(self,  tables):
-        return Context(tables=tables)
-    
-    def derived_schema(self, expressions):
-        return DerivedSchema(
-            expression.alias_or_name if isinstance(expression, exp.Expression) else expression for expression in expressions
-        )
-        
-    def init_context(self,  table_alias):
-        def product(left, right):
-            rows = []
-            for lrow in left:
-                for rrow in right:
-                    rows.append(lrow + rrow)
-            return rows
-        tables = {}
-        start = 0
-        end = 0
-        body = None
-        global_columns = []
-        for alias, table in table_alias.items():
-            columns = self.instance.column_names(table, dialect= self.dialect)
-            global_columns.extend(columns)
-            rows = self.instance.get_rows(table)
-            start = end
-            end += len(columns)
-            scm = DerivedSchema(columns= columns, column_range= range(start, end), rows= rows)
-            tables[alias] = scm 
-            body = rows if body is None else product(body, rows)
-        return Context(tables = tables)
-        
-    
 class Planner:
     
     DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
