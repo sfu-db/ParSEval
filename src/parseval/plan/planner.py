@@ -6,12 +6,11 @@ from dataclasses import dataclass, field
 from sqlglot.optimizer.scope import Scope, traverse_scope
 from sqlglot.planner import Plan, Scan, Aggregate, Join, Sort, SetOperation, Step
 from sqlglot import exp
-from .rex import *
+from parseval.plan.rex import *
 from .context import Context, DerivedSchema
 from src.parseval.constants import PBit
 import logging, math
 from dateutil import parser as date_parser
-from src.parseval.solver.smt import OperationRegistry
 from src.parseval.states import non_fatal
 
 logger = logging.getLogger("parseval.coverage")
