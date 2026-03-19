@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import List, Set, Tuple, Dict, Optional, TYPE_CHECKING, Any
-from collections import defaultdict, deque
 from functools import reduce, total_ordering
 from dataclasses import dataclass, field
 from sqlglot.optimizer.scope import Scope, traverse_scope
@@ -8,16 +7,15 @@ from sqlglot.planner import Plan, Scan, Aggregate, Join, Sort, SetOperation, Ste
 from sqlglot import exp
 from parseval.plan.rex import *
 from .context import Context, DerivedSchema
-from src.parseval.constants import PBit
+from parseval.constants import PBit
 import logging, math
 from dateutil import parser as date_parser
-from src.parseval.states import non_fatal
+from parseval.states import non_fatal
 
 logger = logging.getLogger("parseval.coverage")
 
 if TYPE_CHECKING:
-    from src.parseval.instance import Instance
-    from src.parseval.uexpr.uexprs import UExprToConstraint
+    from parseval.uexpr.uexprs import UExprToConstraint
 
 
 @dataclass
@@ -246,102 +244,50 @@ def get_parent(e):
 
 
 class Planner:
-    DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
-
-    def __init__(
-        self,
-        instance: Instance,
-        scope_node: ScopeNode,
-        tracer: UExprToConstraint,
-        ctx: Optional[Context] = None,
-        verbose: bool = True,
-    ):
-        self._scope = scope_node
-        self.tracer = tracer
-
-        self.verbose = verbose
-        self.instance = instance
-        if ctx is None:
-            self.ctx = self.init_context(
-                {alias: table for alias, table in self._scope.scope.tables.items()}
-            )
-        else:
-            self.ctx = ctx
-
-    @property
-    def dialect(self):
-        return self.instance.dialect
-
-    def context(self, tables):
-        return Context(tables=tables)
-
-    def derived_schema(self, expressions):
-        return DerivedSchema(
-            (
-                expression.alias_or_name
-                if isinstance(expression, exp.Expression)
-                else expression
-            )
-            for expression in expressions
-        )
-
-    def init_context(self, table_alias):
-        def product(left, right):
-            rows = []
-            for lrow in left:
-                for rrow in right:
-                    rows.append(lrow + rrow)
-            return rows
-
-        tables = {}
-        start = 0
-        end = 0
-        body = None
-        global_columns = []
-        for alias, table in table_alias.items():
-            columns = self.instance.column_names(table, dialect=self.dialect)
-            global_columns.extend(columns)
-            rows = self.instance.get_rows(table)
-            start = end
-            end += len(columns)
-            scm = DerivedSchema(
-                columns=columns, column_range=range(start, end), rows=rows
-            )
-            tables[alias] = scm
-            body = rows if body is None else product(body, rows)
-        return Context(tables=tables)
-
-
-class Planner:
 
     DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
 
     def __init__(
         self,
-        instance: Instance,
+        ctx: Context,
         scope_node: ScopeNode,
-        parent_context: Context,
         tracer: UExprToConstraint,
         dialect: str,
         verbose: bool = True,
     ):
+        self.ctx = ctx
         self._scope = scope_node
-        self.parent_context = parent_context
         self.tracer = tracer
         self.dialect = dialect
         self.verbose = verbose
+        self.current_scope = scope_node
+
+    @property
+    def scope(self):
+        return self._scope.scope
+
+    @property
+    def scope_id(self):
+        return self._scope.node_id
 
     def context(self, tables):
-        return Context(tables=tables, external=self.parent_context)
+        return Context(tables=tables)
 
-    def derived_schema(self, expressions):
+    def derived_schema(self, expressions, datatypes=None, nullables=None, uniques=None):
+        datatypes = datatypes or {}
+        columns = []
+        for expression in expressions:
+            if isinstance(expression, exp.Expression):
+                columns.append(expression.alias_or_name)
+                if expression.alias_or_name not in datatypes:
+                    datatypes[expression.alias_or_name] = expression.type
+            else:
+                columns.append(expression)
         return DerivedSchema(
-            (
-                expression.alias_or_name
-                if isinstance(expression, exp.Expression)
-                else expression
-            )
-            for expression in expressions
+            columns=columns,
+            datatypes=datatypes,
+            nullables=nullables,
+            uniqueness=uniques,
         )
 
     def encode(self) -> Context:
@@ -350,6 +296,10 @@ class Planner:
         contexts = {}
         finished = set()
         queue = set(plan.leaves)
+
+        print(
+            f"=== Encoding plan for scope {self.scope_id} with expression: {plan} ==="
+        )
 
         while queue:
             node = queue.pop()
@@ -385,8 +335,7 @@ class Planner:
                     f"Failed to encode step '{node.id}' of type {type(node)}"
                 ) from e
         root = plan.root
-        # outputs = contexts[root].tables[root.name]
-        return contexts[root]
+        # return contexts[root]
 
     def _project_and_filter(self, node: Step, context: Context) -> Context:
         if node.condition:
@@ -399,24 +348,22 @@ class Planner:
         logger.info(
             f"Processing Scan node {node.name} with source: {node.source}, {node.source.alias_or_name}"
         )
-        sql_conditions = []
-        rows = []
+        sql_conditions, rows = [], []
+        alias_or_name = node.source.alias_or_name
+        table_reader = None
         if isinstance(node.source, exp.Table):
-            rows = self.instance.get_rows(node.source.name)
+            table_reader = self.ctx.table_iter(node.source.name)
             scope_columns = self.current_scope.scope_columns
             visited = set()
             for column in scope_columns:
                 if column.sql() in visited:
                     continue
                 visited.add(column.sql())
-                if column.table == node.source.alias_or_name:
-                    dtype = self.instance.get_column_type(
-                        node.source.name, column.name, dialect=self.dialect
-                    )
-                    nullable = self.instance.nullable(node.source.name, column.name)
-                    is_unique = False
-                    if self.instance.is_unique(node.source.name, column.name):
-                        is_unique = True
+                if column.table == alias_or_name:
+                    resolved_schema = self.ctx.resolve_table(node.source.name)
+                    dtype = resolved_schema.get_column_type(column.name)
+                    nullable = resolved_schema.nullable(column.name)
+                    is_unique = resolved_schema.is_unique(column.name)
                     col = exp.Column(
                         this=exp.to_identifier(column.name, quoted=True),
                         table=node.source.alias_or_name,
@@ -426,7 +373,7 @@ class Planner:
                     )
                     col.type = dtype
                     sql_conditions.append(col)
-        if not rows:
+        if table_reader is None:
             self.tracer.which_path(
                 scope_id=self.current_scope.node_id,
                 step_type=node.type_name,
@@ -435,24 +382,25 @@ class Planner:
                 takens=[PBit.TRUE] * len(sql_conditions),
                 branch=True,
             )
-
-        ### we should update coverage here based on the symbolic expressions, instead of just marking all conditions as taken
-        for row in rows:
-            symbolic_exprs = [row[columnref.name] for columnref in sql_conditions]
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type=node.type_name,
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=symbolic_exprs,
-                takens=[PBit.TRUE] * len(symbolic_exprs),
-                branch=True,
-                rowids=row.rowid,
-            )
+        else:
+            for row in table_reader:
+                symbolic_exprs = [row[columnref.name] for columnref in sql_conditions]
+                self.tracer.which_path(
+                    scope_id=self.current_scope.node_id,
+                    step_type=node.type_name,
+                    step_name=node.name,
+                    sql_conditions=sql_conditions,
+                    smt_exprs=symbolic_exprs,
+                    takens=[PBit.TRUE] * len(symbolic_exprs),
+                    branch=True,
+                    rowids=row.rowid(),
+                )
+                rows.append(row.row)
         derived_schema = DerivedSchema(
-            columns=self.instance.column_names(node.source.name, dialect=self.dialect),
+            columns=self.ctx.resolve_table(node.source.name).columns,
             rows=rows,
         )
+
         source_context = self.context({node.name: derived_schema})
         return self._project_and_filter(node, source_context)
 
@@ -467,7 +415,7 @@ class Planner:
                 alias_name = project.alias_or_name
                 if isinstance(project, exp.Alias):
                     project = project.this
-                ctx = self.encode_condition(project, scope=context.env["scope"])
+                ctx = self.encode_condition(project, scope=reader)
                 row[alias_name] = ctx[project]
                 smt_conditions.extend(ctx.get("smt_conditions"))
                 sql_conditions.extend(ctx.get("sql_conditions"))
@@ -478,14 +426,14 @@ class Planner:
                 for smt, sql in zip(smt_conditions, sql_conditions)
             ]
             self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
+                scope_id=self.scope_id,
                 step_type="Project",
                 step_name=node.name,
                 sql_conditions=sql_conditions,
                 smt_exprs=smt_conditions,
                 takens=takens,
                 branch=True,
-                rowids=reader.row.rowid,
+                rowids=reader.rowid(),
             )
         return self.context({node.name: sink})
 
@@ -494,7 +442,7 @@ class Planner:
             return context
         rows = []
         for reader, _ in context:
-            ctx = self.encode_condition(node.condition, scope=context.env["scope"])
+            ctx = self.encode_condition(node.condition, scope=reader)
             result = ctx[node.condition]
             branch = result.concrete is True
             smt_conditions = ctx["smt_conditions"]
@@ -713,111 +661,135 @@ class Planner:
             )
         return self._project_and_filter(node, source_context)
 
-    def aggregate(self, node: Aggregate, context):
-        having_condition = None
-        aggregations, aggregation_alias = [], {}
+    def aggregate(self, node: Aggregate, context: Context):
+        operand_map: dict[str, exp.Expression] = {
+            operand.alias: operand.this for operand in node.operands
+        }
+        group_map: dict[str, exp.Expression] = dict(node.group)
 
-        for agg_func in node.aggregations:
-            if (
-                node.condition
-                and agg_func.alias_or_name == node.condition.alias_or_name
-            ):
-                having_condition = agg_func
+        def restore(expr: exp.Expression) -> exp.Expression:
+            expr = expr.copy()
+            for col_ref in expr.find_all(exp.Column):
+                name = col_ref.name
+                if name in operand_map:
+                    col_ref.replace(operand_map[name].copy())
+                elif name in group_map:
+                    col_ref.replace(group_map[name].copy())
+            return expr
+
+        group_by_columns: list[exp.Expression] = list(node.group.values())
+        h_aliases = {a.alias for a in node.aggregations if isinstance(a, exp.Alias)}
+        having_operand_name: str | None = None
+        if (
+            node.condition is not None
+            and isinstance(node.condition, exp.Column)
+            and node.condition.name in h_aliases
+        ):
+            having_operand_name = node.condition.name
+
+        having_condition: exp.Expression | None = None
+        having_agg_sqls: set[str] = set()
+        if node.condition is not None:
+            if having_operand_name:
+                h_entry = next(
+                    a
+                    for a in node.aggregations
+                    if isinstance(a, exp.Alias) and a.alias == having_operand_name
+                )
+                having_condition = restore(h_entry.this)
+                for agg_func in having_condition.find_all(exp.AggFunc):
+                    having_agg_sqls.add(agg_func.sql())
             else:
-                aggregation_alias[agg_func.alias_or_name] = agg_func.this
-                aggregations.append(agg_func)
+                having_condition = restore(node.condition)
 
-        operand_alias_names = {node.alias_or_name: node.this for node in node.operands}
+        aggregations: list[exp.Expression] = []
+        aggregation_alias: dict[str, exp.Expression] = {}
+        covered_having_aggs: set[str] = set()
 
-        if node.operands:
-            operand_schema = DerivedSchema(self.derived_schema(node.operands).columns)
-            for reader, ctx in context:
-                mapping = {}
-                for operand in node.operands:
-                    alias_name = operand.alias_or_name
-                    if isinstance(operand, exp.Alias):
-                        operand = operand.this
-                    if isinstance(operand, exp.Distinct):
-                        operand = operand.expressions[0]
-                    if isinstance(operand, exp.Star):
-                        r = Const(this=1, dtype=DataType.build("int"))
-                    else:
-                        ctx = self.encode_condition(operand, scope=context.env["scope"])
-                        r = ctx[operand]
-                    mapping[alias_name] = r
-                operand_schema.append(mapping)
-            for i, (a, b) in enumerate(zip(context.table.rows, operand_schema.rows)):
-                new_row = {k: v for k, v in a.items()}
-                new_row.update({k: v for k, v in b.items()})
-                context.table.rows[i] = Row(this=a.rowid, columns=new_row)
-            width = len(context.columns)
-            for column in operand_schema.columns:
-                if column not in context.table.columns:
-                    context.table.add_columns(column)
-            operand_table = DerivedSchema(
-                context.columns,
-                context.table.rows,
-                range(width, -1),
-            )
-            context = self.context(
-                {
-                    None: operand_table,
-                    **context.tables,
-                }
-            )
+        for agg_expr in node.aggregations:
+            if (
+                isinstance(agg_expr, exp.Alias)
+                and agg_expr.alias == having_operand_name
+            ):
+                continue
 
-        sink = self.derived_schema(node.projections)
+            restored = restore(agg_expr)
+            inner = restored.this if isinstance(restored, exp.Alias) else restored
+
+            if inner.sql() in having_agg_sqls:
+                covered_having_aggs.add(inner.sql())
+
+            aggregations.append(restored)
+            aggregation_alias[restored.alias_or_name] = inner
+
+        if having_condition is not None:
+            for having_agg_sql in having_agg_sqls - covered_having_aggs:
+                having_agg_node = next(
+                    f
+                    for f in having_condition.find_all(exp.AggFunc)
+                    if f.sql() == having_agg_sql
+                )
+                internal_alias = f"_having_agg_{len(aggregation_alias)}"
+                aggregations.append(having_agg_node.copy())
+                aggregation_alias[internal_alias] = having_agg_node.copy()
+
+        derived_scm = []
+        dtypes = {}
+        uniques = {}
+        notnulls = {}
+
+        for groupby in group_by_columns:
+            derived_scm.append(groupby)
+            dtypes[groupby] = groupby.type
+            uniques[groupby] = True
+            notnulls[groupby] = groupby.args.get("nullable", True)
+
+        for agg in aggregations:
+            derived_scm.append(agg.sql())
+            dtypes[agg] = agg.type
+            uniques[agg] = False
+            notnulls[agg] = agg.args.get("nullable", True)
+        derived_scm.extend(context.table.columns)
+
+        sink = self.derived_schema(
+            derived_scm, datatypes=dtypes, nullables=notnulls, uniques=uniques
+        )
 
         groups = {}
         for reader, _ in context:
             row = reader.row
             group_key = ()
-            alias = []
-            for gid, expression in node.group.items():
+            for expression in group_by_columns:
                 group_key += (row[expression.alias_or_name],)
-                alias.append(gid)
+
             concrete_group_key = tuple(v.concrete for v in group_key)
             if concrete_group_key not in groups:
-                groups[concrete_group_key] = {
-                    "group_key": group_key,
-                    "rows": [],
-                    "alias": alias,
-                }
+                groups[concrete_group_key] = {"group_key": group_key, "rows": []}
             groups[concrete_group_key]["rows"].append(row)
 
-        self.groupby(node, groups)
-        result_rows = self.aggregate_functions(
-            node, groups, aggregations, operand_alias_names
+        self.groupby(node, group_by_columns=group_by_columns, groups=groups)
+
+        aggregate_results = self.aggregate_functions(
+            node, groups, group_by_columns, aggregations, context=context
         )
 
-        sink = self.derived_schema(list(node.group) + aggregations)
-        if node.projections:
-            for row in result_rows:
-                mappings = {}
-                for project in node.projections:
-                    alias_name = project.alias_or_name
-                    if isinstance(project, exp.Alias):
-                        alias_name = project.this.alias_or_name
-                    mappings[project.alias_or_name] = row[alias_name]
-                sink.append(Row(this=row.rowid, columns=mappings))
-        else:
-            sink.rows.extend(result_rows)
+        sink.rows.extend(aggregate_results)
         context = self.context(
             {node.name: sink, **{name: sink for name in context.tables}}
         )
         if having_condition:
             return self.having(
-                node, having_condition, aggregation_alias, operand_alias_names, context
+                node, having_condition, group_by_columns, aggregations, context
             )
         return context
 
-    def groupby(self, node: Aggregate, groups: Dict):
+    def groupby(self, node: Aggregate, group_by_columns, groups: Dict):
         if not node.group:
             return
 
         sql_conditions, takens = [], []
-        for group in list(node.group.values()):
-            sql_conditions.append(group)
+        for groupby in group_by_columns:
+            sql_conditions.append(groupby)
             takens.append(PBit.GROUP_SIZE)
 
         for _, group_info in groups.items():
@@ -827,7 +799,7 @@ class Planner:
             g = AggGroup(this=rowids, group_key=group_key, group_values=group_rows)
             smt_conditions = [g] * len(sql_conditions)
             self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
+                scope_id=self.scope_id,
                 step_type="Groupby",
                 step_name=node.name,
                 sql_conditions=sql_conditions,
@@ -841,45 +813,43 @@ class Planner:
         self,
         node: Aggregate,
         groups: Dict,
+        group_by_columns,
         aggregations: List,
-        operand_alias_names: Dict,
-    ) -> List[Row]:
+        context: Context,
+    ):
         result_rows = []
         for _, group_info in groups.items():
             group_key = group_info["group_key"]
             group_rows = group_info["rows"]
             rowids = sum((row.rowid for row in group_rows), ())
-            new_row = {g_name: k for g_name, k in zip(group_info["alias"], group_key)}
+            new_row = {g_name: k for g_name, k in zip(group_by_columns, group_key)}
 
             for func_index, agg_func in enumerate(aggregations):
-                alias = agg_func.alias_or_name
-                func = agg_func.this
-                operand_alias = func.this.alias_or_name
-                operand = func.unnest_operands()[0]
-                if operand.alias_or_name in operand_alias_names:
-                    operand = operand_alias_names[operand.alias_or_name]
-
+                operand = agg_func.unnest_operands()[0]
+                is_distinct = isinstance(operand, exp.Distinct)
+                if is_distinct:
+                    operand = operand.expressions[0]
                 values = []
                 for row in group_rows:
-                    v = row[operand_alias]
+                    v = row[operand.name]
                     if isinstance(operand, exp.Star) or v.concrete is not None:
                         values.append(v)
-                if isinstance(operand, exp.Distinct):
+                if is_distinct:
                     values = list(set(values))
-                if isinstance(func, exp.Count):
+                if isinstance(agg_func, exp.Count):
                     value = Const(this=len(values), _type=DataType.build("int"))
                     value.type = DataType.build("int")
-                elif isinstance(func, exp.Sum):
+                elif isinstance(agg_func, exp.Sum):
                     sum_value = (
                         sum(values) if values else Const(0, _type=DataType.build("int"))
                     )
                     value = Const(this=sum_value, _type=DataType.build("int"))
                     value.type = DataType.build("int")
 
-                elif isinstance(func, exp.Max):
+                elif isinstance(agg_func, exp.Max):
                     min_value = max(values) if values else None
                     value = Const(min_value, _type=agg_func.type)
-                elif isinstance(func, exp.Min):
+                elif isinstance(agg_func, exp.Min):
                     min_value = min(values) if values else None
                     value = Const(min_value, _type=agg_func.type)
 
@@ -891,18 +861,31 @@ class Planner:
                     value = Const(avg_value, _type=DataType.build("REAL"))
                 else:
                     raise NotImplementedError(
-                        f"Aggregation function {func} not supported yet."
+                        f"Aggregation function {agg_func} not supported yet."
                     )
-                new_row[alias] = value
+                new_row[agg_func.sql()] = value
+
+                for column in context.table.columns:
+                    if column not in new_row:
+                        values = [
+                            row[column]
+                            for row in group_rows
+                            if row[column].concrete is not None
+                        ]
+                        if values:
+                            value = min(values, key=lambda v: v.concrete)
+                        else:
+                            value = group_rows[0][column]
+                        new_row[column] = value
+
             result_rows.append(Row(this=rowids, columns=new_row))
             g = AggGroup(this=rowids, group_key=group_key, group_values=group_rows)
             sql_conditions = list(aggregations)
-
             smt_conditions = [g] * len(sql_conditions)
             takens = [PBit.AGGREGATE_SIZE] * len(sql_conditions)
             if aggregations:
                 self.tracer.which_path(
-                    scope_id=self.current_scope.node_id,
+                    scope_id=self.scope_id,
                     step_type="Aggregate",
                     step_name=node.name,
                     sql_conditions=sql_conditions,
@@ -910,77 +893,71 @@ class Planner:
                     takens=takens,
                     branch=True,
                     rowids=rowids,
-                    operand_alias_names=operand_alias_names,
                 )
-
         return result_rows
 
     def having(
         self,
         node: Aggregate,
-        having: exp.Expression,
-        aggregation_alias: Dict[str, exp.Expression],
-        operand_alias_names: Dict[str, exp.Expression],
+        having_condition: exp.Expression,
+        group_by_columns: List,
+        aggregations: List,
         context: Context,
-    ) -> Dict:
+    ):
         if node.condition is None:
             return context
-        logger.info(f"Processing Having condition: {having}")
 
-        cond = having.copy()
-
-        def replace_func(e):
-            for alias, agg_func in aggregation_alias.items():
-                if e == agg_func:
-                    return exp.Column(this=exp.to_identifier(alias), table=node.name)
-            return e
-
-        def recover_sql_condition(e):
-            if isinstance(e, exp.Column) and e.alias_or_name in aggregation_alias:
-                r = aggregation_alias[e.alias_or_name]
-                logger.info(f"Recovering SQL condition: {e} to {r}, type{r}")
-                return r
-            return e
-
-        condition = cond.transform(replace_func)
-        condition = condition.this
         rows = []
+
         for reader, _ in context:
-            ctx = self.encode_condition(condition, scope=context.env["scope"])
-            result = ctx[condition]
+            row = {}
+            mappings = {}
+            cond = having_condition.copy()
+
+            for index, func in enumerate(cond.find_all(exp.AggFunc)):
+                if func not in mappings:
+                    column = exp.Column(
+                        this=exp.to_identifier(f"agg_fun_{index}"), _type=func.type
+                    )
+                    mappings[func] = column
+                    row[column.name] = reader.row[func.sql()]
+
+            def replace_func(e):
+                if e in mappings:
+                    return mappings[e]
+                return e
+
+            cond = cond.transform(replace_func)
+            ctx = self.encode_condition(cond, scope=row)
+            result = ctx[cond]
             branch = result.concrete is True
             smt_conditions = ctx["smt_conditions"]
-            sql_conditions = ctx["sql_conditions"]
+            sql_conditions = []
+            for sql_condition in ctx["sql_conditions"]:
+
+                def restore(e):
+                    for k, v in mappings.items():
+                        if e == v:
+                            return k
+                    return e
+
+                sql_conditions.append(sql_condition.transform(restore))
             if branch:
                 rows.append(reader.row)
             takens = [
                 (PBit.HAVING_TRUE if b.concrete is True else PBit.HAVING_FALSE)
                 for b in smt_conditions
             ]
-
-            covered_sql_conditions = []
-
-            for sql_condition in sql_conditions:
-                covered_sql_conditions.append(
-                    sql_condition.transform(recover_sql_condition)
-                )
-
-            logger.info(
-                f"Having condition evaluated to {branch} with SMT conditions {smt_conditions} and SQL conditions {sql_conditions}, covered_sql_conditions: {covered_sql_conditions}"
-            )
             self.tracer.which_path(
                 scope_id=self.current_scope.node_id,
                 step_type="Having",
                 step_name=node.name,
-                sql_conditions=covered_sql_conditions,
+                sql_conditions=sql_conditions,
                 smt_exprs=smt_conditions,
                 takens=takens,
                 branch=branch,
-                rowids=reader.row.rowid,
-                aggregation_alias_names=aggregation_alias,
-                operand_alias_names=operand_alias_names,
+                rowids=reader.rowid(),
             )
-
         return self.context(
             {
                 name: DerivedSchema(
@@ -1115,14 +1092,6 @@ class Planner:
             for smt_cond, sql_cond in mappings.items():
                 ctx.setdefault("sql_conditions", []).append(sql_cond)
                 ctx.setdefault("smt_conditions", []).append(smt_cond)
-        else:
-            logger.info(f"sql conditions: ")
-            for sql_cond in ctx["sql_conditions"]:
-                logger.info(f"{repr(sql_cond)} with type {sql_cond.key}")
-
-            logger.info(f"smt conditions: ")
-            for smt_cond in ctx["smt_conditions"]:
-                logger.info(f"{repr(smt_cond)} with type {smt_cond.key}")
         ctx[condition] = result
         return ctx
 
@@ -1138,6 +1107,10 @@ class Planner:
         return sql_conditions
 
     def transform(self, condition: exp.Expression, ctx: Dict[str, Any]):
+        if isinstance(condition, exp.Subquery):
+            print(
+                f"Encoding subquery with expression: {condition}, {condition.output_name}"
+            )
 
         if isinstance(condition, exp.Predicate):
             ctx.setdefault("smt_conditions", []).append(condition)
@@ -1146,7 +1119,7 @@ class Planner:
             column = condition
             table = column.table
             column_name = column.name
-            row = ctx["scope"][table].row
+            row = ctx["scope"]
             smt_expr = row[column_name]
             ctx.setdefault("mappings", {})[smt_expr] = column
             return smt_expr

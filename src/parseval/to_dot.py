@@ -14,8 +14,8 @@ import pydot
 
 from enum import Enum
 
-from src.parseval.uexpr.uexprs import Constraint, PlausibleBranch
-from src.parseval.constants import PBit
+from parseval.uexpr.uexprs import Constraint, PlausibleBranch
+from parseval.constants import PBit
 
 NODE_STYLES: Dict[str, Dict[str, str]] = {}
 
@@ -99,7 +99,7 @@ EDGE_STYLES = {
         "fontsize": "12",
     },
     PBit.GROUP_NULL: {
-         "color": "#FD7E14",
+        "color": "#FD7E14",
         "label": "NULL",
         "style": "dotted",
         "fontsize": "12",
@@ -108,7 +108,8 @@ EDGE_STYLES = {
         "color": "#20C997",
         "label": "DUP",
         "style": "dotted",
-        "fontsize": "12",},
+        "fontsize": "12",
+    },
     PBit.AGGREGATE_SIZE: {
         "color": "#20C997",
         "label": "AGGREGATE_SIZE",
@@ -120,7 +121,7 @@ EDGE_STYLES = {
         "label": "PROJECT",
         "style": "dashed",
         "fontsize": "12",
-    }
+    },
 }
 
 
@@ -330,7 +331,9 @@ def uexpr_to_dot(
         else:
             label = "ROOT"
     elif isinstance(node, PlausibleBranch):
-        label = f"{node.plausible_type.value}: {to_string(node.pattern())} \n {node.branch}"
+        label = (
+            f"{node.plausible_type.value}: {to_string(node.pattern())} \n {node.branch}"
+        )
     else:
         label = node.__class__.__name__
 

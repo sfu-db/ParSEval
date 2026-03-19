@@ -1,13 +1,7 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, TYPE_CHECKING, Tuple, Union, Set, Callable, Any
+from typing import Optional, List, Dict, TYPE_CHECKING, Tuple, Union, Set, Callable
 from parseval.instance import Instance
-from parseval.plan import (
-    Planner,
-    build_context_from_instance,
-    Context,
-    build_graph_from_scopes,
-)
+from parseval.plan import Planner, build_context_from_instance, Context
 from parseval.uexpr.uexprs import UExprToConstraint, Constraint, PBit, StepType
 from parseval.constants import PlausibleType
 from parseval.plan.rex import Symbol
@@ -31,346 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("parseval.coverage")
 
 
-class BaseGenerator(ABC):
-    def __init__(self, expr: exp.Expression, instance: Instance, generator_config=None):
-        super().__init__()
-        self.expr: exp.Expression = expr
-        self.instance: Instance = instance
-        self._table_alias: Optional[Dict[str, str]] = None
-        self.generator_config = generator_config or Config()
-
-    @property
-    def dialect(self) -> Optional[str]:
-        return self.instance.dialect if self.instance else None
-
-    @property
-    def table_alias(self) -> Dict[str, str]:
-        if self._table_alias is None:
-            alias = {}
-            for table in self.expr.find_all(exp.Table):
-                alias[table.alias_or_name] = self.instance._normalize_name(table.name)
-            self._table_alias = alias
-        return self._table_alias
-
-    @abstractmethod
-    def generate(self, db_queue, stop_event):
-        raise NotImplementedError
-
-    def randomdb(self, min_rows: int):
-        limit = self.expr.args.get("limit")
-        offset = self.expr.args.get("offset")
-        offset = int(offset.text("expression")) if offset else 0
-        if limit:
-            limit = int(limit.text("expression"))
-        concretes = {table: [] for table in self.table_alias.values()}
-        for _ in range(max(limit + offset, min_rows)):
-            self.instance.create_rows(concretes)
-
-
-class DataGenerator(BaseGenerator):
-    def __init__(
-        self,
-        expr: exp.Expression,
-        instance: Instance,
-        name: Optional[str] = None,
-        workspace: str = None,
-        verbose: bool = False,
-        config: Optional[Config] = None,
-    ):
-        super().__init__(expr, instance)
-        self.name = name or instance.name
-        self.workspace = workspace
-        self.verbose = verbose
-        self.config = config or Config()
-
-        self.constraints: Dict[str, Set[exp.Expression]] = (
-            {}
-        )  # label -> List[constraints]
-
-        self.variables: Dict[Tuple[str, str], exp.Column] = (
-            {}
-        )  # (columnref.table, columnef.name_{suffix}) -> variable
-        self.var_to_columnref: Dict[Tuple[str, str], exp.Column] = (
-            {}
-        )  # columnref.table, columnref.name_{suffix} -> columnref
-        self.table_to_vars: Dict[str, List[exp.Column]] = (
-            {}
-        )  # table_name -> List[Variable]
-        self.table_column_to_vars: Dict[Tuple[str, str], List[exp.Column]] = (
-            {}
-        )  # (table_name, column) -> List[Variable]
-        self.columnref_to_vars: Dict[Tuple[str, str], List[exp.Column]] = (
-            {}
-        )  # (table_alias, column) -> List[Variable]
-
-    def get_tableref(self, alias_or_name: str) -> str:
-        if (
-            alias_or_name not in self.table_alias
-            and alias_or_name in self.instance.tables
-        ):
-            return alias_or_name
-        if alias_or_name not in self.table_alias:
-            return None
-        return self.table_alias[alias_or_name]
-
-    def _flatten_foreign_key_info(self, table_to_vars):
-        fk_infos = {}
-        for local_tbl in table_to_vars:
-            tableref = self.get_tableref(local_tbl)
-            fks = self.instance.get_foreign_key(tableref)
-            for fk in fks:
-                local_col = self.instance._normalize_name(fk.expressions[0].name)
-                ref_table = self.instance._normalize_name(
-                    fk.args.get("reference").find(exp.Table).name, is_table=True
-                )
-                ref_col = self.instance._normalize_name(
-                    fk.args.get("reference").this.expressions[0].name
-                )
-                fk_infos[(local_tbl, local_col)] = (ref_table, ref_col)
-        return fk_infos
-
-    def declare_constraint(self, label, constraints: Union[Symbol, List[Symbol]]):
-        if not isinstance(constraints, list):
-            constraints = [constraints]
-        self.constraints.setdefault(label, set()).update(constraints)
-
-    def declare_variable(self, columnref: exp.Column, reuse=True) -> Tuple[str, str]:
-        key = (columnref.table, columnref.name)
-        if reuse and key in self.variables:
-            return key
-        table_ref = self.get_tableref(columnref.table)
-        if table_ref is None:
-            return ()
-        if not reuse:
-            suffix = len(self.columnref_to_vars.get(key, []))
-            while (
-                columnref.table,
-                columnref.name + f"_{suffix}",
-            ) in self.columnref_to_vars:
-                suffix += 1
-            key = (columnref.table, columnref.name + f"_{suffix}")
-        domain = self.instance.column_domains.get_or_create_pool(
-            table=table_ref, column=columnref.name, alias=".".join(key)
-        )
-        variable = exp.Column(this=key[1], table=key[0])
-        variable.type = domain.datatype
-        self.variables[key] = variable
-        self.var_to_columnref[key] = columnref
-        self.table_to_vars.setdefault(table_ref, []).append(variable)
-        self.columnref_to_vars.setdefault((columnref.table, columnref.name), []).append(
-            variable
-        )
-        self.table_column_to_vars.setdefault((table_ref, columnref.name), []).append(
-            variable
-        )
-        if self.verbose:
-            logger.info(f"Declared variable: {str(variable)} for column: {columnref}")
-        return key
-
-    def _declare_fk_constraints(self):
-        fk_infos = self._flatten_foreign_key_info(self.table_to_vars)
-        for local_tbl, local_col in fk_infos:
-            ref_table, ref_col = fk_infos[(local_tbl, local_col)]
-            existing_values = self.instance.get_column_data(
-                table_name=ref_table, column_name=ref_col
-            )
-            concretes = [
-                convert_to_literal(d.args.get("concrete"), d.type)
-                for d in existing_values
-            ]
-            for variable in self.table_column_to_vars.get((ref_table, ref_col), []):
-                concretes.append(variable)
-            for variable in self.table_column_to_vars.get((local_tbl, local_col), []):
-                fk_constraints = [variable.eq(c) for c in concretes]
-                fk_constraint = reduce(lambda x, y: x.or_(y), fk_constraints)
-                self.declare_constraint("foreign_key", fk_constraint)
-
-    def _declare_pk_constraints(self):
-        for (table_name, column_name), variables in self.table_column_to_vars.items():
-            pk_columns = self.instance.get_primary_key(table_name)
-            if column_name not in pk_columns:
-                continue
-            existing_values = self.instance.get_column_data(
-                table_name=table_name, column_name=column_name
-            )
-            concretes = [
-                convert_to_literal(d.concrete, d.type) for d in existing_values
-            ]
-            if len(concretes) + len(variables) > 1:
-                self.declare_constraint(
-                    "primary_key",
-                    exp.Distinct(expressions=concretes + variables, _type="bool"),
-                )
-            self.declare_constraint(
-                "not_null", [v.is_(exp.Null(_type=v.type)).not_() for v in variables]
-            )
-
-    def _declare_column_constraints(self):
-        for (table_name, column_name), variables in self.table_column_to_vars.items():
-            for column_constraint in self.instance.get_column_constraints(
-                table_name, column_name
-            ):
-                existing_values = self.instance.get_column_data(
-                    table_name=table_name, column_name=column_name
-                )
-                concretes = [
-                    convert_to_literal(d.concrete, d.datatype) for d in existing_values
-                ]
-                if isinstance(
-                    column_constraint.kind,
-                    (exp.PrimaryKeyColumnConstraint, exp.UniqueColumnConstraint),
-                ):
-                    if len(concretes + variables) > 1:
-                        self.declare_constraint(
-                            "unique_constraint",
-                            exp.Distinct(
-                                expressions=concretes + variables, _type="bool"
-                            ),
-                        )
-
-                if isinstance(
-                    column_constraint.kind,
-                    (exp.NotNullColumnConstraint, exp.PrimaryKeyColumnConstraint),
-                ):
-                    if not column_constraint.kind.args.get("allow_null", False):
-                        self.declare_constraint(
-                            "not_null",
-                            [
-                                v.is_(exp.Null(_type=v.datatype)).not_()
-                                for v in variables
-                            ],
-                        )
-                elif isinstance(column_constraint.kind, exp.CheckColumnConstraint):
-                    ...
-
-    def randomdb(
-        self, expr: exp.Expression, min_rows: int, early_stop: Optional[Callable] = None
-    ):
-        predicates = expr.find_all(exp.Predicate)
-        if predicates:
-            return
-        limit = expr.find(exp.Limit)
-        offset = expr.find(exp.Offset)
-        if limit:
-            limit = int(limit.expression.this)
-        else:
-            limit = 0
-        if offset:
-            offset = int(offset.expression.this)
-        else:
-            offset = 0
-        table_alias = _table_alias(self.instance, expr)
-        concretes = {table: [] for table in table_alias.values()}
-
-        tries = 0
-        while tries < self.config.max_tries:
-            for _ in range(max(limit + offset, min_rows)):
-                self.instance.create_rows(concretes)
-            if early_stop and early_stop(self.instance):
-                break
-
-    def _reset(self):
-        self.variables.clear()
-        self.constraints.clear()
-        self.var_to_columnref.clear()
-        self.table_to_vars.clear()
-        self.columnref_to_vars.clear()
-        self.table_column_to_vars.clear()
-
-    def declare_coverage_constraint(
-        self, plausible: PlausibleBranch, skips: Optional[Set] = None
-    ):
-        skips = skips or set()
-        declare = Declare(self)
-
-        q = deque([(plausible.parent, plausible.bit())])
-        context = {}
-        while q:
-            node, bit = q.popleft()
-            logger.info(f"Declaring constraints for node: {node}, bit: {bit}")
-            if node.step_type in skips:
-                continue
-            if not declare.declare(bit, node, context):
-                return
-            if node.parent.step_type != StepType.ROOT:
-                q.append((node.parent, node.bit()))
-
-    def _generate(self, scope_node, tracer=None, early_stop=None):
-        config = Config()
-        skips = set()
-        tracer = tracer or UExprToConstraint()
-        context = build_context_from_instance(self.instance)
-        planner = Planner(
-            ctx=context,
-            scope_node=scope_node,
-            tracer=tracer,
-            dialect=self.dialect,
-            verbose=self.verbose,
-        )
-        planner.encode()
-
-        q = deque([tracer.next_path(config=config, skips=skips)])
-        while q:
-            pattern, plausible = q.popleft()
-            if pattern is None:
-                break
-            if plausible.plausible_type != PlausibleType.INFEASIBLE:
-                continue
-            self._declare_variables(plausible=plausible, scope_id=scope_node.scope_id)
-            self._declare_db_constraints()
-            self.declare_coverage_constraint(plausible)
-            self._print(pattern)
-
-            solver = SMTSolver(self.variables, verbose=self.verbose)
-            for label, cons in self.constraints.items():
-                for c in cons:
-                    solver.add(solver._to_z3_expr(c))
-            sat, result = solver.solve()
-            if sat != "sat":
-                plausible.mark_infeasible()
-
-            else:
-                concretes = {tbl_name: {} for tbl_name in self.table_to_vars}
-                if result:
-                    for key in self.variables:
-                        var_name = ".".join(key)
-                        if var_name in result:
-                            value = result[var_name]
-                            columnref = self.var_to_columnref[key]
-                            tbl_name = self.get_tableref(columnref.table)
-                            concretes[tbl_name].setdefault(columnref.name, []).append(
-                                value
-                            )
-                self.instance.create_rows(concretes)
-            self._reset()
-            planner.encode()
-            q.append(tracer.next_path(config=config, skips=skips))
-        return planner.encode()
-
-    def generate(self, early_stop):
-        tracer = UExprToConstraint()
-        scopes = build_graph_from_scopes(self.expr)
-        visited = set()
-        scalar_results = {}
-
-        for node_id in scopes.get_dependency_order():
-            scope_node = scopes.get_node(node_id)
-            expr = scope_node.scope.expression
-            for dep in scope_node.dependencies:
-                if dep in visited:
-                    dep_result = scalar_results.get(dep)
-                    scope_node.scope.replace(
-                        scopes.get_node(dep).scope.expression,
-                        exp.Literal(this=dep_result, _type="literal"),
-                    )
-
-            result = self._generate(
-                scope_node=scope_node, tracer=tracer, early_stop=early_stop
-            )
-            scalar_results[node_id] = result
-
-
-class DataGenerator2:
+class DataGenerator:
     """
     Base class for data generators.
     """
@@ -383,16 +38,17 @@ class DataGenerator2:
         self,
         expr: exp.Expression,
         instance: Instance,
+        table_alias: Optional[Dict] = None,
         name: Optional[str] = None,
         workspace: str = None,
         verbose: bool = False,
-        config: Optional[Config] = None,
+        random_seed: int = 42,
     ):
         self.instance = instance
         self.name = name or instance.name
         self.expr: exp.Expression = expr
-        self.table_alias: Dict[str, str] = self._table_alias(None)
-        self.config = config or Config()
+        self.table_alias: Dict[str, str] = self._table_alias(table_alias)
+        self.config = Config()
         self.workspace = workspace
         self.constraints: Dict[str, Set[exp.Expression]] = (
             {}
@@ -415,6 +71,7 @@ class DataGenerator2:
         )  # (table_alias, column) -> List[Variable]
 
         self.tracer = UExprToConstraint()
+        DataGenerator.set_random_seed(random_seed)
         self.verbose = verbose
 
         self.query_info = {
