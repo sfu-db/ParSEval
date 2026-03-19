@@ -4,7 +4,7 @@ from sqlglot import exp
 from typing import Dict
 import math, numbers, datetime
 from parseval.dtype import DataType
-from src.parseval.states import SyntaxException
+from parseval.states import SyntaxException
 from .rex import ColumnRef
 
 
@@ -61,7 +61,16 @@ def to_type(type_def: str | DataType | dict) -> DataType:
     return DataType.build(**type_def)
 
 
-def to_literal(value, datatype=None, copy = False) -> exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime | exp.DateStrToDate | exp.Expression:
+def to_literal(
+    value, datatype=None, copy=False
+) -> (
+    exp.Literal
+    | exp.Null
+    | exp.Boolean
+    | exp.TimeStrToTime
+    | exp.DateStrToDate
+    | exp.Expression
+):
     """
     Converts a value into a SQL expression literal, optionally with a specified datatype.
 
@@ -93,9 +102,9 @@ def to_literal(value, datatype=None, copy = False) -> exp.Literal | exp.Null | e
         srctype = "NUMERIC"
     elif isinstance(value, datetime.datetime):
         datetime_literal = exp.Literal.string(
-            (value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)).isoformat(
-                sep=" "
-            )
+            (
+                value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
+            ).isoformat(sep=" ")
         )
         srctype = "DATETIME"
         concrete = value
@@ -116,10 +125,15 @@ def to_literal(value, datatype=None, copy = False) -> exp.Literal | exp.Null | e
         literal.set("datatype", DataType.build(srctype))
     return literal
 
-def to_const(literal: exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime | exp.DateStrToDate, **kwargs) -> exp.Expression:
+
+def to_const(
+    literal: (
+        exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime | exp.DateStrToDate
+    ),
+    **kwargs,
+) -> exp.Expression:
     DATETIME_FMT = kwargs.get("datetime_fmt", ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"])
-    
-    
+
     value = literal.this
     datatype = literal.type
     try:
@@ -131,6 +145,7 @@ def to_const(literal: exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime |
             value = bool(value)
         elif datatype.is_type(*exp.DataType.TEMPORAL_TYPES):
             from datetime import datetime
+
             for fmt in DATETIME_FMT:
                 try:
                     value = datetime.strptime(value, fmt)
@@ -143,3 +158,79 @@ def to_const(literal: exp.Literal | exp.Null | exp.Boolean | exp.TimeStrToTime |
     except Exception as e:
         value = None
     return value
+
+
+from typing import Any, List, Optional
+from sqlglot.planner import Aggregate
+
+
+def decode_aggregate(node: Aggregate):
+    operand_map: dict[str, exp.Expression] = {
+        operand.alias: operand.this for operand in node.operands
+    }
+    group_map: dict[str, exp.Expression] = dict(node.group)
+
+    def restore(expr: exp.Expression) -> exp.Expression:
+        expr = expr.copy()
+        for col_ref in expr.find_all(exp.Column):
+            name = col_ref.name
+            if name in operand_map:
+                col_ref.replace(operand_map[name].copy())
+            elif name in group_map:
+                col_ref.replace(group_map[name].copy())
+        return expr
+
+    group_by_columns: list[exp.Expression] = list(node.group.values())
+    h_aliases = {a.alias for a in node.aggregations if isinstance(a, exp.Alias)}
+    having_operand_name: str | None = None
+    if (
+        node.condition is not None
+        and isinstance(node.condition, exp.Column)
+        and node.condition.name in h_aliases
+    ):
+        having_operand_name = node.condition.name
+
+    having_condition: exp.Expression | None = None
+    having_agg_sqls: set[str] = set()
+    if node.condition is not None:
+        if having_operand_name:
+            h_entry = next(
+                a
+                for a in node.aggregations
+                if isinstance(a, exp.Alias) and a.alias == having_operand_name
+            )
+            having_condition = restore(h_entry.this)
+            for agg_func in having_condition.find_all(exp.AggFunc):
+                having_agg_sqls.add(agg_func.sql())
+        else:
+            having_condition = restore(node.condition)
+
+    aggregations: list[exp.Expression] = []
+    aggregation_alias: dict[str, exp.Expression] = {}
+    covered_having_aggs: set[str] = set()
+
+    for agg_expr in node.aggregations:
+        if isinstance(agg_expr, exp.Alias) and agg_expr.alias == having_operand_name:
+            continue
+
+        restored = restore(agg_expr)
+        inner = restored.this if isinstance(restored, exp.Alias) else restored
+
+        if inner.sql() in having_agg_sqls:
+            covered_having_aggs.add(inner.sql())
+
+        aggregations.append(restored)
+        aggregation_alias[restored.alias_or_name] = inner
+
+    if having_condition is not None:
+        for having_agg_sql in having_agg_sqls - covered_having_aggs:
+            having_agg_node = next(
+                f
+                for f in having_condition.find_all(exp.AggFunc)
+                if f.sql() == having_agg_sql
+            )
+            internal_alias = f"_having_agg_{len(aggregation_alias)}"
+            aggregations.append(having_agg_node.copy())
+            aggregation_alias[internal_alias] = having_agg_node.copy()
+
+    return group_by_columns, aggregations, having_condition

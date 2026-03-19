@@ -1,32 +1,33 @@
 from __future__ import annotations
-from ..constants import PlausibleBit, PlausibleType, PBit, BranchType, StepType, is_valid_path_bit
+from ..constants import (
+    PlausibleBit,
+    PlausibleType,
+    PBit,
+    BranchType,
+    StepType,
+    is_valid_path_bit,
+)
 from typing import Optional, Dict, Any, Set, Union, List, TYPE_CHECKING, Tuple
 from collections import defaultdict, deque
 from ordered_set import OrderedSet
-from src.parseval.plan.rex import Symbol, Const, ColumnRef
-from src.parseval.helper import group_by_concrete
-from src.parseval.configuration import Config
-from src.parseval.uexpr.checks import Check
+from parseval.plan.rex import Symbol, Const, ColumnRef
+from parseval.helper import group_by_concrete
+from parseval.configuration import Config
+from parseval.uexpr.checks import Check
 
 if TYPE_CHECKING:
-    from src.parseval.plan.rex import Expression
+    from parseval.plan.rex import Expression
 
 from sqlglot.expressions import AggFunc, Predicate
 
 
-
 import logging
+
 logger = logging.getLogger("parseval.coverage")
 
+
 class _Constraint:
-    __slots__ = (
-        "tree",
-        "parent",
-        "path",
-        "depth",
-        "_pattern",
-        "hits"
-    )
+    __slots__ = ("tree", "parent", "path", "depth", "_pattern", "hits")
 
     def __init__(self, tree, parent: Optional[_Constraint] = None):
         self.tree = tree
@@ -65,7 +66,7 @@ class _Constraint:
 
     def mark_covered(self):
         self.plausible_type = PlausibleType.COVERED
-    
+
     def get_path_to_root(self) -> List[_Constraint]:
         if self.path is not None:
             return self.path
@@ -92,8 +93,7 @@ class PlausibleBranch(_Constraint):
 
     """
 
-    LABEL_STRATEGIES = {
-    }
+    LABEL_STRATEGIES = {}
 
     def __init__(
         self,
@@ -113,13 +113,16 @@ class PlausibleBranch(_Constraint):
     @property
     def branch(self) -> BranchType:
         bit = self.bit()
-        if self._branch in {BranchType.POSITIVE, BranchType.NEGATIVE} or self.parent.coverage.get(bit, []):
-            return self._branch 
+        if self._branch in {
+            BranchType.POSITIVE,
+            BranchType.NEGATIVE,
+        } or self.parent.coverage.get(bit, []):
+            return self._branch
         return BranchType.UNDECIDED
-    
+
     @branch.setter
     def branch(self, value: bool):
-        self._branch = value 
+        self._branch = value
 
     def mark_pending(self):
         self.attempts += 1
@@ -139,14 +142,15 @@ class PlausibleBranch(_Constraint):
             f"PlausibleNode( "
             f"branch={self.branch}, "
             f"type={self.plausible_type.value})"
-            
         )
+
     def __repr__(self):
         return str(self)
 
+
 class Constraint(_Constraint):
     PLAUSIBLE_CONFIGS = {
-        "scan": (PBit.TRUE, ),
+        "scan": (PBit.TRUE,),
         "filter": (PBit.FALSE, PBit.TRUE),
         "join": (PBit.JOIN_TRUE, PBit.JOIN_LEFT, PBit.JOIN_RIGHT),
         "project": (PBit.PROJECT, PBit.NULL, PBit.DUPLICATE),
@@ -174,23 +178,31 @@ class Constraint(_Constraint):
         self.step_name = step_name or step_type.value
         self.sql_condition = sql_condition
         self.children = children or {}
-        self.coverage = defaultdict(list) # Symbolic expressions coverage indexed by bit
-        self.rowid_index: Dict[PBit, List[Tuple[str, ...]]] = defaultdict(list) # # rowids indexed by bit
-        self.table_refs: Set[str] = set() # tables this node references
+        self.coverage = defaultdict(
+            list
+        )  # Symbolic expressions coverage indexed by bit
+        self.rowid_index: Dict[PBit, List[Tuple[str, ...]]] = defaultdict(
+            list
+        )  # # rowids indexed by bit
+        self.table_refs: Set[str] = set()  # tables this node references
         self.metadata = metadata if metadata is not None else {}
 
     @property
     def plausible_bits(self) -> Tuple[PBit, ...]:
         if self.step_type == StepType.ROOT:
             return (PBit.TRUE,)
-        if self.step_type == StepType.PROJECT and isinstance(self.sql_condition, Predicate):
+        if self.step_type == StepType.PROJECT and isinstance(
+            self.sql_condition, Predicate
+        ):
             return self.PLAUSIBLE_CONFIGS["filter"]
         return self.PLAUSIBLE_CONFIGS.get(self.step_type.value, (PBit.TRUE,))
+
     def __repr__(self):
         return str(self)
+
     def __str__(self):
         return f"{self.step_type}({self.sql_condition})"
-    
+
     def __getitem__(self, key):
         if hasattr(self, key):
             return getattr(self, key)
@@ -221,12 +233,19 @@ class Constraint(_Constraint):
             child_node.depth = self.depth + 1
             self.children[bit] = child_node
         return child_node
-    
 
-    def update_coverage(self, bit: PlausibleBit, smt_expr: Union[List[Symbol], Symbol], rowids, branch: bool, name: str = None, **kwargs):
+    def update_coverage(
+        self,
+        bit: PlausibleBit,
+        smt_expr: Union[List[Symbol], Symbol],
+        rowids,
+        branch: bool,
+        name: str = None,
+        **kwargs,
+    ):
         """
         Update delta with table-aware tracking.
-        
+
         Args:
             bit: The plausible bit for this update
             symbolic_expr: Symbolic expression(s) to add
@@ -241,18 +260,17 @@ class Constraint(_Constraint):
         self.rowid_index[bit].append(rowids)
         self.tree._index_row(rowids, self, bit)
         self.metadata.update(kwargs)
-        
+
         # logger.info(f"Updated coverage for node {self} with bit {bit}. Current coverage: {len(self.coverage[bit])}, rowid_index: {len(self.rowid_index[bit])}")
         # logger.info(f'current stats: {self.coverage}, rowid_index: {self.rowid_index}')
-        
-    
+
     def update_branchtype(self, bit: PlausibleBit, branch: bool):
         if isinstance(self.children.get(bit, None), PlausibleBranch):
             branch_type = BranchType(int(branch))
             self.children[bit].branch = branch_type
             if branch_type:
                 self.tree._index_pnode(self, bit)
-            
+
     def has_rowids_for_bit(self, bit: PlausibleBit, rowids) -> bool:
         if rowids in self.rowid_index.get(bit, []):
             return True
@@ -260,7 +278,7 @@ class Constraint(_Constraint):
         #     if set(rowids).intersection(set(rowid)):
         #         return True
         return False
-        
+
     def _branchtype(self, bit: PlausibleBit, branch: bool):
         b = int(branch)
         bit = PBit.from_int(bit)
@@ -269,16 +287,24 @@ class Constraint(_Constraint):
         if is_valid_path_bit(bit) and self.coverage.get(bit, []):
             return BranchType(b)
         return BranchType.UNDECIDED
-        
+
     def upsert_plausible_nodes(self, tbit: PBit, branch):
-        # # 
-        if self.step_type in {StepType.SCAN, StepType.PROJECT, StepType.SORT, StepType.GROUPBY, StepType.AGGREGATE}:
+        # #
+        if self.step_type in {
+            StepType.SCAN,
+            StepType.PROJECT,
+            StepType.SORT,
+            StepType.GROUPBY,
+            StepType.AGGREGATE,
+        }:
             branch = 1
-                    
+
         for bit in self.plausible_bits:
             if bit in self.children:
                 continue
-            branch = self._branchtype(bit, branch) if bit == tbit else BranchType.UNDECIDED
+            branch = (
+                self._branchtype(bit, branch) if bit == tbit else BranchType.UNDECIDED
+            )
             plausible = PlausibleBranch(self.tree, self, branch)
             self.children[bit] = plausible
             child_pattern = self.pattern()
@@ -286,6 +312,7 @@ class Constraint(_Constraint):
                 del self.tree.leaves[child_pattern]
             child_pattern = plausible.pattern()
             self.tree.leaves[child_pattern] = plausible
+
 
 class UExprToConstraint:
     """
@@ -295,21 +322,25 @@ class UExprToConstraint:
 
     def __init__(self):
         self.leaves: Dict[Tuple[PBit, ...], PlausibleBranch] = {}
-        self.root = Constraint(tree=self, step_type= StepType.ROOT, step_name="ROOT")
-        
+        self.root = Constraint(tree=self, step_type=StepType.ROOT, step_name="ROOT")
+
         # Index of leaf patterns to their corresponding Constraint nodes
         self.prev_steps = deque(["ROOT"])
-        self.pnode_index: Dict[Tuple[str, ...], Set[Tuple[Constraint, PBit]]] = defaultdict(OrderedSet) ## index nodes by { (scope_id, step type, step name) : ( Constraint, bit)}
+        self.pnode_index: Dict[Tuple[str, ...], Set[Tuple[Constraint, PBit]]] = (
+            defaultdict(OrderedSet)
+        )  ## index nodes by { (scope_id, step type, step name) : ( Constraint, bit)}
         self._current_step = (None, self.root, PBit.TRUE)
         self._prev_step = None
-        self.row_index: Dict[Tuple[Any, ...], Set[Tuple[_Constraint, PlausibleBit]]] = defaultdict(set) ## index rowids to nodes and bits that cover them
-        
+        self.row_index: Dict[Tuple[Any, ...], Set[Tuple[_Constraint, PlausibleBit]]] = (
+            defaultdict(set)
+        )  ## index rowids to nodes and bits that cover them
+
     def get_prev_step(self, scope_id, step_type, step_name):
         if (scope_id, step_type, step_name) != self._current_step:
             self._prev_step = self._current_step
             self._current_step = (scope_id, step_type, step_name)
         return self._prev_step
-    
+
     def reset(self):
         self._prev_step = None
         self._current_step = (None, self.root, PBit.TRUE)
@@ -323,22 +354,21 @@ class UExprToConstraint:
             node.metadata.clear()
             for child in node.children.values():
                 q.append(child)
-    
+
     def _index_row(self, rowids: Tuple[Any, ...], node: _Constraint, bit: PlausibleBit):
         """
-            Internal helper to index a rowid -> (node, bit) mapping.
-            This accelerates lookup of which UExpr nodes correspond to a runtime
-            row (or tuple of rowids for composed rows like joins). The index is
-            updated from Constraint.update_delta when symbolic rows are recorded.
+        Internal helper to index a rowid -> (node, bit) mapping.
+        This accelerates lookup of which UExpr nodes correspond to a runtime
+        row (or tuple of rowids for composed rows like joins). The index is
+        updated from Constraint.update_delta when symbolic rows are recorded.
         """
         self.row_index[rowids].add((node, bit))
-        
-        
+
     def _index_pnode(self, node: Constraint, bit: PlausibleBit):
         if is_valid_path_bit(bit):
             key = (node.scope_id, node.step_type, node.step_name)
             self.pnode_index[key].add((node, bit))
-            
+
     def _find_positive_branch(self) -> List[Tuple[Constraint, PBit]]:
         candidates = []
         for leaf in self.leaves.values():
@@ -347,10 +377,18 @@ class UExprToConstraint:
         if not candidates:
             candidates.append((self.root, PBit.TRUE))
         return candidates
-        
-    
-    def find_attach_to(self, prev_step, scope_id, step_type: StepType, step_name: str, rowids: Tuple[Any, ...]) -> List[Tuple[Constraint, PBit]]:
-        assert rowids is not None, f"Row IDs must be provided for non-scan steps to find attachment point. get{step_type}"
+
+    def find_attach_to(
+        self,
+        prev_step,
+        scope_id,
+        step_type: StepType,
+        step_name: str,
+        rowids: Tuple[Any, ...],
+    ) -> List[Tuple[Constraint, PBit]]:
+        assert (
+            rowids is not None
+        ), f"Row IDs must be provided for non-scan steps to find attachment point. get{step_type}"
         starting_nodes = []
         positive_nodes = []
         for node, bit in self.pnode_index[prev_step]:
@@ -358,36 +396,49 @@ class UExprToConstraint:
                 if node.has_rowids_for_bit(bit, rowids):
                     starting_nodes.append((node, bit))
                 positive_nodes.append((node, bit))
-        
+
         if not starting_nodes:
             starting_nodes = set()
             q = deque(positive_nodes)
             while q:
                 node, bit = q.popleft()
                 plausible_child = node.children.get(bit, None)
-                if isinstance(node, Constraint) and node.scope_id == scope_id and node.step_type == step_type and node.step_name == step_name:
+                if (
+                    isinstance(node, Constraint)
+                    and node.scope_id == scope_id
+                    and node.step_type == step_type
+                    and node.step_name == step_name
+                ):
                     starting_nodes.add((node.parent, node.bit()))
-                elif isinstance(plausible_child, PlausibleBranch) and plausible_child.branch == BranchType.POSITIVE and is_valid_path_bit(bit):
+                elif (
+                    isinstance(plausible_child, PlausibleBranch)
+                    and plausible_child.branch == BranchType.POSITIVE
+                    and is_valid_path_bit(bit)
+                ):
                     starting_nodes.add((node, bit))
-                
+
                 for child_bit, child in node.children.items():
                     if isinstance(child, Constraint):
                         key = (child.scope_id, child.step_type, child.step_name)
                         if key in self.pnode_index:
                             q.append((child, child_bit))
-        assert starting_nodes, f"No attachment point found for step {step_type} {step_name} with rowids {rowids}. Positive nodes: {positive_nodes}, prev step: {prev_step}"
+        assert (
+            starting_nodes
+        ), f"No attachment point found for step {step_type} {step_name} with rowids {rowids}. Positive nodes: {positive_nodes}, prev step: {prev_step}"
         return starting_nodes
-    
-    def which_path(self, 
-                   scope_id: int,
-                   step_type: str, 
-                   step_name: str, 
-                   sql_conditions: List[Expression],
-                   takens: List[int], 
-                   smt_exprs: Optional[List[Symbol]] = None, 
-                   rowids: Optional[Tuple[Any, ...]] = None,
-                   branch: bool = BranchType.UNDECIDED, 
-                   **kwargs):
+
+    def which_path(
+        self,
+        scope_id: int,
+        step_type: str,
+        step_name: str,
+        sql_conditions: List[Expression],
+        takens: List[int],
+        smt_exprs: Optional[List[Symbol]] = None,
+        rowids: Optional[Tuple[Any, ...]] = None,
+        branch: bool = BranchType.UNDECIDED,
+        **kwargs,
+    ):
         """
         Record which path(s) were taken at a given step in the UExpr execution.
 
@@ -415,46 +466,54 @@ class UExprToConstraint:
                             candidates.append((node.parent, node.bit()))
                 if not candidates:
                     candidates = self._find_positive_branch()
-                
+
                 for node, bit in candidates:
-                    logger.info(f"Attaching step {step_type} {step_name} with rowids {rowids} to node {node} with bit {bit}. prev_step: {prev_step}")
                     node = node.add_child_if_not_exists(
                         scope_id=scope_id,
                         step_type=step_type,
                         step_name=step_name,
                         sql_condition=sql_condition,
-                        bit = bit,
+                        bit=bit,
                         **kwargs,
                     )
                     b = PBit.from_int(taken)
                     node.upsert_plausible_nodes(b, branch=branch)
                     if smt_exprs:
                         smt_expr = smt_exprs[index] if index < len(smt_exprs) else []
-                        node.update_coverage(b, smt_expr, rowids, branch, name=step_name, **kwargs)
+                        node.update_coverage(
+                            b, smt_expr, rowids, branch, name=step_name, **kwargs
+                        )
                     node.update_branchtype(b, branch)
         else:
-            
-            for start, bit in self.find_attach_to(prev_step=prev_step, scope_id= scope_id, step_type= step_type, step_name= step_name, rowids= rowids):
+
+            for start, bit in self.find_attach_to(
+                prev_step=prev_step,
+                scope_id=scope_id,
+                step_type=step_type,
+                step_name=step_name,
+                rowids=rowids,
+            ):
                 node, b = start, bit
-                
-                logger.info(f"Attaching step {step_type} {step_name} with rowids {rowids} to node {node} with bit {bit}. prev_step: {prev_step}")
-                
-                for index, (sql_condition, taken) in enumerate(zip(sql_conditions, takens)):
+                for index, (sql_condition, taken) in enumerate(
+                    zip(sql_conditions, takens)
+                ):
                     node = node.add_child_if_not_exists(
                         scope_id=scope_id,
                         step_type=step_type,
                         step_name=step_name,
                         sql_condition=sql_condition,
-                        bit = b,
+                        bit=b,
                         **kwargs,
                     )
                     b = PBit.from_int(taken)
                     node.upsert_plausible_nodes(b, branch=branch)
                     if smt_exprs:
                         smt_expr = smt_exprs[index] if index < len(smt_exprs) else []
-                        node.update_coverage(b, smt_expr, rowids, branch, name=step_name, **kwargs)
+                        node.update_coverage(
+                            b, smt_expr, rowids, branch, name=step_name, **kwargs
+                        )
                     node.update_branchtype(b, branch)
-            
+
     def get_positive_patterns(self) -> List[Tuple[PBit, ...]]:
         """
         Retrieve all patterns of bits that have been marked as positive branches.
@@ -467,7 +526,7 @@ class UExprToConstraint:
             if leaf.branch is BranchType.POSITIVE:
                 positive_patterns.append(pattern)
         return positive_patterns
-    
+
     def get_unexplored_patterns(self) -> List[Tuple[PBit, ...]]:
         """
         Retrieve all patterns of bits that are unexplored.
@@ -480,7 +539,7 @@ class UExprToConstraint:
             if leaf.plausible_type in {PlausibleType.UNEXPLORED, PlausibleType.PENDING}:
                 unexplored_patterns.append(pattern)
         return unexplored_patterns
-    
+
     def update_stats(self, config: Config):
         """
         Update statistics for all leaves based on the current configuration and coverage.
@@ -491,8 +550,8 @@ class UExprToConstraint:
         check = Check(**config.to_dict())
         for pattern, leaf in self.leaves.items():
             leaf.accept(check)
-        
-    def next_path(self, config: Config, skips = None) -> Optional[_Constraint]:
+
+    def next_path(self, config: Config, skips=None) -> Optional[_Constraint]:
         """
         Given a pattern of plausible bits, find the next unexplored constraint node.
 
@@ -502,27 +561,31 @@ class UExprToConstraint:
         skips = skips or set()
         ## First, run checks to update the plausible types of all leaves based on the current configuration and coverage
         self.update_stats(config)
-        
+
         for pattern, leaf in self.leaves.items():
-            
+
             logger.info(f'pattern: {"/".join(str(p) for p in pattern)}')
             if leaf.attempts > config.max_tries:
                 if leaf.branch == BranchType.UNDECIDED:
                     leaf.mark_infeasible()
                 continue
-            
-            if leaf.plausible_type in {PlausibleType.INFEASIBLE, PlausibleType.COVERED} and leaf.branch != BranchType.POSITIVE:
+
+            if (
+                leaf.plausible_type in {PlausibleType.INFEASIBLE, PlausibleType.COVERED}
+                and leaf.branch != BranchType.POSITIVE
+            ):
                 continue
-                
+
             if pattern in skips:
                 continue
-            
+
             leaf.mark_pending()
-            if leaf.branch == BranchType.NEGATIVE \
-                and leaf.plausible_type not in {PlausibleType.COVERED, PlausibleType.INFEASIBLE}:
+            if leaf.branch == BranchType.NEGATIVE and leaf.plausible_type not in {
+                PlausibleType.COVERED,
+                PlausibleType.INFEASIBLE,
+            }:
                 return pattern, leaf
-            
+
             if leaf.branch in [BranchType.UNDECIDED, BranchType.POSITIVE]:
                 return pattern, leaf
         return None, None
-        
