@@ -62,7 +62,8 @@ class BaseGenerator(ABC):
         offset = int(offset.text("expression")) if offset else 0
         if limit:
             limit = int(limit.text("expression"))
-        concretes = {table: [] for table in self.table_alias.values()}
+        limit = limit or 0
+        concretes = {table: {} for table in self.table_alias.values()}
         for _ in range(max(limit + offset, min_rows)):
             self.instance.create_rows(concretes)
 
