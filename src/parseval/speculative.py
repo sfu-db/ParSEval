@@ -411,21 +411,22 @@ class SpeculativeGenerator(BaseGenerator):
     def generate(self, db_queue, stop_event: threading.Event, host_or_path):
         max_tries = self.generator_config.max_tries
         for _ in range(max_tries):
-            self._generate()
-            self._generate_negative()
-            db_id = self.instance.name_seq()
-            self.instance.to_db(
-                host_or_path=host_or_path,
-                database=db_id,
-            )
-            db_queue.put(
-                {
-                    "host_or_path": host_or_path,
-                    "db_id": db_id,
-                }
-            )
             if stop_event.is_set():
                 break
+            self._generate()
+            self._generate_negative()
+            if not stop_event.is_set():
+                db_id = self.instance.name_seq()
+                self.instance.to_db(
+                    host_or_path=host_or_path,
+                    database=db_id,
+                )
+                db_queue.put(
+                    {
+                        "host_or_path": host_or_path,
+                        "db_id": db_id,
+                    }
+                )
 
         if not stop_event.is_set():
             self.randomdb(min_rows=max_tries)
