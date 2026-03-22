@@ -4,7 +4,7 @@ import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
 sys.path.append(parent_dir)
-from src.parseval.calcite import get_logical_plan
+from parseval.calcite import get_logical_plan
 import unittest
 import json
 import logging
@@ -33,44 +33,13 @@ class TestGenerator(unittest.TestCase):
 
         sql = """SELECT NumTstTakr FROM satscores WHERE cds = ( SELECT CDSCode FROM frpm ORDER BY `FRPM Count (K-12)` DESC LIMIT 1 )"""
         sql = """SELECT NumTstTakr  FROM satscores o                WHERE EXISTS (                SELECT 1                FROM frpm c                WHERE c.CDSCode = o.cds                )"""
-        import json
 
         plan = get_logical_plan(ddls=schema, queries=[sql])
         plan = json.loads(plan)
         for p in plan:
             src = json.loads(p["plan"])
-            # print()
             with open("examples/plan_test.json", "w") as f:
                 json.dump(src, f, indent=4)
-        # logger.info(f"Logical Plan: {plan}")
-
-    # with open("datasets/bird/dev.sql") as fp:
-    #     dataset = json.loads(fp.read())
-
-    # for ridx, row in enumerate(dataset):
-    #     if ridx > 8:
-    #         break
-    #     sql = row["SQL"]
-
-    #     plan = get_logical_plan(ddls=schema, queries=[sql])
-
-    #     # logger.info(f"Logical Plan: {plan}")
-
-    #     with open("tests/db/calcite_logical_plan_" + str(ridx) + ".txt", "w") as f:
-
-    #         src = json.loads(plan)[0]
-    #         src = src["plan"]
-
-    #         json.dump(json.loads(src), f, indent=4)
-    #         # f.write(plan)
-
-    #     # from src.parseval.plan.plan import Planner
-
-    #     # planner = Planner()
-
-    #     # root = planner.explain(schema, sql, dialect="sqlite")
-
-    #     # print(root.schema())
 
 
 if __name__ == "__main__":
