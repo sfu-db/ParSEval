@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo } from "react";
 import { ExperimentResult } from "@/lib/types";
-import { getExecutionAccuracyByExperimentIdAndDataset } from "@/lib/api/eval";
+import { getExecutionAccuracyByExperimentIdAndDataset } from "@/lib/api/evalRecord";
 import { getDatasetsFromExperiments } from "@/lib/utils";
 
 import {

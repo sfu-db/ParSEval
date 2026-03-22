@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { getProjects, createProject } from "@/lib/api/project";
+import { ProjectAPI } from "@/lib/api/project";
 import { Project } from "@/lib/types";
 
 import CreateProjectModal from "@/components/projects/CreateProjectModal";
@@ -18,24 +18,17 @@ const Sidebar = () => {
     const pathname = usePathname();
 
     const [projects, setProjects] = useState<Project[]>([]);
-    const [selectedProject, setSelectedProject] = useState<number | undefined>(undefined);
     const [projectListOpen, setProjectListOpen] = useState(true);
-    const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         const fetchProjects = async () => {
             try {
-                const data = await getProjects();
+                const data = await ProjectAPI.getAll();
                 setProjects(data);
 
-                // auto-select first project
-                if (data.length > 0) {
-                    setSelectedProject(data[0].id);
-                }
             } catch (err) {
                 console.error("Failed to load projects:", err);
             } finally {
-                setLoading(false);
             }
         };
 
@@ -124,7 +117,7 @@ const Sidebar = () => {
                                             open={open}
                                             onClose={() => setOpen(false)}
                                             onCreate={async (data) => {
-                                                const newProject = await createProject(data.name);
+                                                const newProject = await ProjectAPI.create({ name: data.name, description: data.description });
                                                 setProjects((prev) => [...prev, newProject]);
                                             }}
                                         />
