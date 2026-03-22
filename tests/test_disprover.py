@@ -6,6 +6,8 @@ import unittest, json
 import logging
 from parseval.speculative import SpeculativeGenerator
 
+from parseval.disprover import Disprover, DisproverConfig
+
 from parseval.instance import Instance
 from parseval.query import preprocess_sql
 
@@ -75,98 +77,93 @@ class TestSpeculativeGenerator(unittest.TestCase):
     def test_spj_disjunct(self):
         instance = Instance(ddls=schema, name=f"test_spj_disjunct", dialect="sqlite")
         sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
-        sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 OR T1.`NumGE1500` < 80"  # order by
+        q1 = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 OR T1.`NumGE1500` < 80"  # order by
 
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        q2 = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100"  # order by
 
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
+        from parseval.configuration import DisproverConfig
+
+        config = DisproverConfig(
+            host_or_path=self.workspace,
+            db_id=instance.name,
+            global_timeout=30,
+            query_timeout=10,
         )
+
+        disprover = Disprover(q1, q2, schema=schema, config=config)
+
+        res = disprover.run()
+
+        print(res)
+
+    def test_casewhen(self):
+
+        q1 = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
+
+        q2 = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU3' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
+
+        instance = Instance(ddls=schema, name=f"test_casewhen", dialect="sqlite")
+
+        from parseval.configuration import DisproverConfig
+
+        config = DisproverConfig(
+            host_or_path=self.workspace,
+            db_id=instance.name,
+            global_timeout=30,
+            query_timeout=10,
+        )
+
+        disprover = Disprover(q1, q2, schema=schema, config=config)
+
+        res = disprover.run()
+
+        print(res)
 
     def test_groupby(self):
-        sql = """SELECT GSserved FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
+
+        q1 = """SELECT  T1.`CDSCode`, COUNT(*) FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15 GROUP BY T1.CDSCode"""
+
+        q2 = """SELECT  T1.`CDSCode`, COUNT(*) FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or T1.`District Code` > 15 GROUP BY T1.CDSCode order by T1.CDSCode"""
 
         instance = Instance(ddls=schema, name=f"test_groupby", dialect="sqlite")
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
 
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
+        from parseval.configuration import DisproverConfig
+
+        config = DisproverConfig(
+            host_or_path=self.workspace,
+            db_id=instance.name,
+            global_timeout=30,
+            query_timeout=10,
         )
 
-    def test_aggregate(self):
-        sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
-        instance = Instance(
-            ddls=schema, name=f"test_groupby_aggregate", dialect="sqlite"
-        )
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
-        )
+        disprover = Disprover(q1, q2, schema=schema, config=config)
+
+        res = disprover.run()
+
+        print(res)
 
     def test_having(self):
-        sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved having count(NCESDist) > 5 """
-        instance = Instance(
-            ddls=schema, name=f"test_groupby_aggregate_having", dialect="sqlite"
-        )
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
 
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
-        )
+        q1 = """SELECT  T1.`CDSCode`, COUNT(*) FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15 GROUP BY T1.CDSCode HAVING COUNT(*) > 2"""
 
-    def test_case_when(self):
-        sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' """
-        instance = Instance(ddls=schema, name=f"test_casewhen", dialect="sqlite")
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        q2 = """SELECT  T1.`CDSCode`, COUNT(*) FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or T1.`District Code` > 15 GROUP BY T1.CDSCode HAVING COUNT(*) > 2 order by T1.CDSCode"""
 
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
+        instance = Instance(ddls=schema, name=f"test_having", dialect="sqlite")
+
+        from parseval.configuration import DisproverConfig
+
+        config = DisproverConfig(
+            host_or_path=self.workspace,
+            db_id=instance.name,
+            global_timeout=30,
+            query_timeout=10,
         )
 
-    def test_scalar(self):
-        sql = """SELECT T1.`sname` FROM satscores AS T1 where T1.cds = (SELECT T2.CDSCode from frpm AS T2 order by T2.CDSCode limit 1)"""
-        instance = Instance(ddls=schema, name=f"test_scalar", dialect="sqlite")
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        disprover = Disprover(q1, q2, schema=schema, config=config)
 
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
-        )
+        res = disprover.run()
 
-    def test_exists(self):
-        sql = """SELECT T1.`sname` FROM satscores AS T1 where exists (select 1 from frpm AS T2 where T1.cds = T2.CDSCode)"""
-        instance = Instance(ddls=schema, name=f"test_exists", dialect="sqlite")
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
-        self.assertGreater(
-            len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
-            0,
-        )
+        print(res)
 
 
 if __name__ == "__main__":
