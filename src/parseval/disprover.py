@@ -121,7 +121,6 @@ class Disprover:
                 error_msg=error,
                 dialect=self.dialect,
             )
-            # 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
 
     def _generator(self, generator_id: str):
         while not self.stop_event.is_set():
