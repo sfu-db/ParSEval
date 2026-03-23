@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Callable, List, TypeVar, Dict, TYPE_CHECKING, Tuple
 import re
 from sqlglot.expressions import convert, Expression, maybe_copy, Literal
+import math, numbers, datetime
 from .dtype import DataType
 
 if TYPE_CHECKING:
@@ -56,9 +57,6 @@ def sort_by_concrete(
         reverse=reverse,
     )
     return null_values + values if null_first else values + null_values
-
-
-import math, numbers, datetime
 
 
 def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
@@ -186,14 +184,3 @@ def compare_df(result1: List[Tuple], result2: List[Tuple], order_matters: bool) 
     return set([tuple(a) for a in result1_filled]) == set(
         [tuple(b) for b in result2_filled]
     )
-
-    if not order_matters:
-        result1_filled = sorted(result1_filled)
-        result2_filled = sorted(result2_filled)
-
-    # Compare element-wise
-    for r1, r2 in zip(result1_filled, result2_filled):
-        if r1 != r2:
-            return 0
-
-    return 1

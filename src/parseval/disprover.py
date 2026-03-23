@@ -121,6 +121,7 @@ class Disprover:
                 error_msg=error,
                 dialect=self.dialect,
             )
+            # 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
 
     def _generator(self, generator_id: str):
         while not self.stop_event.is_set():
@@ -130,7 +131,7 @@ class Disprover:
             except queue.Full:
                 continue
 
-    def _generat_speculative(self, query, generator_id: str):
+    def _generate_speculative(self, query, generator_id: str):
         if self.stop_event.is_set():
             return
         instance = Instance(
@@ -146,6 +147,8 @@ class Disprover:
                 db_queue=self.queue,
                 stop_event=self.stop_event,
                 host_or_path=self.config.host_or_path,
+                username=self.config.username,
+                password=self.config.password,
             )
         except Exception as e:
             import traceback
@@ -182,18 +185,18 @@ class Disprover:
             if result is not None:
                 return result
         total_workers = self.num_generators + 1
+
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = []
             futures.append(executor.submit(self._checker, 0))
-            print("Checker started.")
-
             for index, query in enumerate([self.preprocessed_q1, self.preprocessed_q2]):
                 futures.append(
-                    executor.submit(self._generat_speculative, query, f"s_{index}")
+                    executor.submit(self._generate_speculative, query, f"s_{index}")
                 )
                 print(f"Generator s_{index} started.")
 
             try:
+                ## Incorrect, when the generator finishes, it should not wait timeout, it should just stop.
                 timed_out = not self.stop_event.wait(timeout=self.config.global_timeout)
                 if timed_out:
                     self.stop_event.set()
