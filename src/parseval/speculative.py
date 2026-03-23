@@ -408,7 +408,14 @@ class SpeculativeGenerator(BaseGenerator):
                 specs = extract_condition_specs(constraint)
                 self.column_specs.extend(specs)
 
-    def generate(self, db_queue, stop_event: threading.Event, host_or_path):
+    def generate(
+        self,
+        db_queue,
+        stop_event: threading.Event,
+        host_or_path,
+        username=None,
+        password=None,
+    ):
         max_tries = self.generator_config.max_tries
         for _ in range(max_tries):
             self._generate()
@@ -417,6 +424,8 @@ class SpeculativeGenerator(BaseGenerator):
             self.instance.to_db(
                 host_or_path=host_or_path,
                 database=db_id,
+                username=username,
+                password=password,
             )
             db_queue.put(
                 {

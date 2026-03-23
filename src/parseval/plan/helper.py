@@ -1,40 +1,9 @@
 from __future__ import annotations
-from sqlglot.expressions import Identifier, to_identifier, Expression
 from sqlglot import exp
-from typing import Dict
 import math, numbers, datetime
 from parseval.dtype import DataType
 from parseval.states import SyntaxException
-from .rex import ColumnRef
-
-
-def to_columnref(
-    name: str | Identifier,
-    datatype: str | DataType | Dict,
-    index=None,
-    **kwargs,
-):
-    """
-    Converts a name and datatype into a ColumnRef object.
-
-    Args:
-        name (str | Identifier): The name of the column, either as a string or an Identifier object.
-        datatype (str | DataType | Dict): The datatype of the column, which can be a string,
-            a DataType object, or a dictionary defining the datatype.
-        index (optional): The index or reference for the column. Defaults to None.
-        **kwargs: Additional keyword arguments to pass to the ColumnRef constructor.
-
-    Returns:
-        ColumnRef: The constructed ColumnRef object.
-
-    Raises:
-        SyntaxException: If the datatype is invalid.
-    """
-    if isinstance(name, ColumnRef):
-        return name
-    name = to_identifier(name)
-    datatype = to_type(datatype)
-    return ColumnRef(this=name, ref=index, datatype=datatype, **kwargs)
+from sqlglot.planner import Aggregate
 
 
 def to_type(type_def: str | DataType | dict) -> DataType:
@@ -158,10 +127,6 @@ def to_const(
     except Exception as e:
         value = None
     return value
-
-
-from typing import Any, List, Optional
-from sqlglot.planner import Aggregate
 
 
 def decode_aggregate(node: Aggregate):
