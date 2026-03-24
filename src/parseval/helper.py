@@ -139,6 +139,10 @@ def to_concrete(value, datatype=None):
     if datatype.is_type(*DataType.TEXT_TYPES):
         return str(value)
     elif datatype.is_type(*DataType.INTEGER_TYPES):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 1
         return int(value)
     elif datatype.is_type(*DataType.REAL_TYPES):
         return float(value)

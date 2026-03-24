@@ -49,7 +49,13 @@ class Disprover:
         port = self.config.port
         username = self.config.username
         password = self.config.password
-        self.instance.to_db(host_or_path=host_or_path, database=db_id)
+        self.instance.to_db(
+            host_or_path=host_or_path,
+            database=db_id,
+            port=port,
+            username=username,
+            password=password,
+        )
 
         q1_result = self._execute_query(
             self.q1,
@@ -213,9 +219,16 @@ class Disprover:
     def early_stop(self, instance: Instance) -> bool:
         if self.stop_event.is_set():
             return True
+        database_name = instance.name
+        database_name = (
+            f"{database_name}.sqlite"
+            if self.dialect.lower() == "sqlite"
+            and not database_name.endswith(".sqlite")
+            else database_name
+        )
         instance.to_db(
             host_or_path=self.config.host_or_path,
-            database=instance.name,
+            database=database_name,
             port=self.config.port,
             username=self.config.username,
             password=self.config.password,
@@ -224,7 +237,7 @@ class Disprover:
 
         self._checker(
             host_or_path=self.config.host_or_path,
-            database=instance.name,
+            database=database_name,
             port=self.config.port,
             username=self.config.username,
             password=self.config.password,
