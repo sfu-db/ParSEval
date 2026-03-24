@@ -155,6 +155,7 @@ class RunResult:
     q2_result: ExecutionResult
     state: str
     set_semantic: bool
+    error_msg: str = ""
 
 
 @dataclass

@@ -262,6 +262,13 @@ class Check:
         threshold = (
             self.positive_threshold if plausible.branch else self.negative_threshold
         )
+        logger.info(
+            "checking predicate constraint for %s, coverage size: %s, threshold: %s",
+            constraint.sql_condition,
+            len(constraint.coverage[bit]),
+            threshold,
+        )
+        constraint.hits[bit] = len(constraint.coverage[bit])
         if len(constraint.coverage[bit]) >= threshold:
             plausible.mark_covered()
 

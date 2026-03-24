@@ -167,8 +167,7 @@ def extract_condition_specs(
     if isinstance(condition, exp.Like):
         col = condition.this
         if isinstance(col, exp.Column):
-
-            pattern = condition.expression
+            pattern = to_concrete(condition.expression, datatype=col.type)
             return [
                 ColumnSpec(table=col.table, column=col.name, op="LIKE", value=pattern)
             ]
@@ -176,13 +175,19 @@ def extract_condition_specs(
     if isinstance(condition, exp.In):
         col = condition.this
         if isinstance(col, exp.Column):
-            values = [v for v in condition.expressions]
+            # Subquery IN predicates are handled through subquery_specs, not as literal lists.
+            if not condition.expressions:
+                return []
+            values = [to_concrete(v, datatype=col.type) for v in condition.expressions]
+            values = [v for v in values if v is not None]
+            if not values:
+                return []
             return [
                 ColumnSpec(
                     table=col.table,
                     column=col.name,
                     op="IN",
-                    value=[v for v in values if v is not None],
+                    value=values,
                 )
             ]
 
@@ -203,7 +208,7 @@ def _min_rows_per_group(having: exp.Expression, min_rows=3) -> int:
             else:
                 values.append(n)
 
-    return max(1, *values)
+    return max([1, min_rows, *values])
 
 
 def _subquery_kind(scope) -> str:
@@ -300,6 +305,86 @@ class SpeculativeGenerator(BaseGenerator):
         self.cte_map: Dict[str, str] = {}
         self._initialize()
 
+    def _build_projection_map(self, scope) -> Dict[Tuple[str, str], Tuple[str, str]]:
+        projection_map: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        selected_sources = getattr(scope, "selected_sources", {}) or {}
+        for source_alias, selected_source in selected_sources.items():
+            if not isinstance(selected_source, tuple) or len(selected_source) != 2:
+                continue
+            _, source_scope = selected_source
+            scope_expression = getattr(source_scope, "expression", None)
+            if scope_expression is None:
+                continue
+            select_expr = scope_expression.unnest()
+            if not isinstance(select_expr, exp.Select):
+                continue
+            for projection in select_expr.expressions:
+                output_name = projection.alias_or_name
+                inner_column = (
+                    projection.this if isinstance(projection, exp.Alias) else projection
+                )
+                if not output_name:
+                    continue
+                if isinstance(inner_column, exp.Column) and inner_column.table:
+                    projection_map[(source_alias, output_name)] = (
+                        inner_column.table,
+                        inner_column.name,
+                    )
+                else:
+                    projection_map[(source_alias, output_name)] = (None, output_name)
+        return projection_map
+
+    def _resolve_column_ref(
+        self,
+        table: Optional[str],
+        column: str,
+        projection_map: Dict[Tuple[str, str], Tuple[str, str]],
+    ) -> Tuple[Optional[str], str]:
+        if not table:
+            return table, column
+        return projection_map.get((table, column), (table, column))
+
+    def _resolve_specs(
+        self,
+        specs: List[Union[ColumnSpec, DisjunctionSpec]],
+        projection_map: Dict[Tuple[str, str], Tuple[str, str]],
+    ) -> List[Union[ColumnSpec, DisjunctionSpec]]:
+        resolved: List[Union[ColumnSpec, DisjunctionSpec]] = []
+        for spec in specs:
+            if isinstance(spec, ColumnSpec):
+                table, column = self._resolve_column_ref(
+                    spec.table, spec.column, projection_map
+                )
+                resolved.append(
+                    ColumnSpec(
+                        table=table,
+                        column=column,
+                        op=spec.op,
+                        value=spec.value,
+                    )
+                )
+            elif isinstance(spec, DisjunctionSpec):
+                branches = []
+                for branch in spec.branches:
+                    branch_specs = []
+                    for branch_spec in branch:
+                        table, column = self._resolve_column_ref(
+                            branch_spec.table, branch_spec.column, projection_map
+                        )
+                        branch_specs.append(
+                            ColumnSpec(
+                                table=table,
+                                column=column,
+                                op=branch_spec.op,
+                                value=branch_spec.value,
+                            )
+                        )
+                    branches.append(branch_specs)
+                resolved.append(DisjunctionSpec(branches=branches))
+            else:
+                resolved.append(spec)
+        return resolved
+
     def _initialize(self):
         scopes = build_graph_from_scopes(self.expr)
         for scope_id in scopes.get_dependency_order():
@@ -337,7 +422,7 @@ class SpeculativeGenerator(BaseGenerator):
                 SubquerySpec(
                     kind=kind,
                     outer_table=o_col.table if o_col and o_col.table else outter_table,
-                    outer_column=o_col.name,
+                    outer_column=o_col.name if o_col is not None else None,
                     inner_table=[t.name for t in scope.tables],
                     inner_alias=[t.alias_or_name for t in scope.tables],
                     inner_specs=inner_specs,
@@ -349,20 +434,16 @@ class SpeculativeGenerator(BaseGenerator):
 
     def _process_select(self, scope_node: ScopeNode):
 
-        expr = scope_node.scope.expression
+        scope = scope_node.scope
+        projection_map = self._build_projection_map(scope)
+        expr = scope.expression
         expr = expr.unnest()
-        limit = expr.args.get("limit")
-        offset = expr.args.get("offset")
-        offset = int(offset.text("expression")) if offset else 0
-
-        if limit:
-            limit = int(limit.text("expression"))
-
-        min_rows = offset + (limit if limit is not None else 3)
 
         where = expr.args.get("where")
         if where:
-            specs = extract_condition_specs(where.this)
+            specs = self._resolve_specs(
+                extract_condition_specs(where.this), projection_map
+            )
             self.column_specs.extend(specs)
 
         joins = expr.args.get("joins", [])
@@ -370,16 +451,24 @@ class SpeculativeGenerator(BaseGenerator):
         for join in joins:
             source_key, join_key, condition = join_condition(join)
             for sk, jk in zip(source_key, join_key):
+                left_table, left_col = self._resolve_column_ref(
+                    sk.table or join.source_name, sk.name, projection_map
+                )
+                right_table, right_col = self._resolve_column_ref(
+                    jk.table or join.alias_or_name, jk.name, projection_map
+                )
                 self.join_specs.append(
                     JoinSpec(
-                        left_table=sk.table or join.source_name,
-                        left_col=sk.name,
-                        right_table=jk.table or join.alias_or_name,
-                        right_col=jk.name,
+                        left_table=left_table,
+                        left_col=left_col,
+                        right_table=right_table,
+                        right_col=right_col,
                         side=join.side or "inner",
                     )
                 )
-            self.column_specs.extend(extract_condition_specs(condition))
+            self.column_specs.extend(
+                self._resolve_specs(extract_condition_specs(condition), projection_map)
+            )
 
         group = expr.args.get("group")
         having = expr.args.get("having")
@@ -390,8 +479,11 @@ class SpeculativeGenerator(BaseGenerator):
             if group:
                 for g in group.expressions:
                     if isinstance(g, exp.Column):
-                        group_cols.append(g.name)
-                        group_tables.append(g.table)
+                        group_table, group_col = self._resolve_column_ref(
+                            g.table, g.name, projection_map
+                        )
+                        group_cols.append(group_col)
+                        group_tables.append(group_table)
                 self.group_specs.append(
                     GroupSpec(
                         tables=group_tables,
@@ -405,46 +497,39 @@ class SpeculativeGenerator(BaseGenerator):
             predicates = list(e.find_all(exp.Predicate))
             if predicates:
                 constraint = reduce(lambda x, y: x.or_(y), predicates)
-                specs = extract_condition_specs(constraint)
+                specs = self._resolve_specs(
+                    extract_condition_specs(constraint), projection_map
+                )
                 self.column_specs.extend(specs)
 
     def generate(
         self,
-        db_queue,
+        early_stoper: Optional[Callable[[], bool]],
         stop_event: threading.Event,
-        host_or_path,
-        username=None,
-        password=None,
+        timeout: Optional[float] = None,
     ):
         max_tries = self.generator_config.max_tries
         for _ in range(max_tries):
-            self._generate()
-            self._generate_negative()
-            db_id = self.instance.name_seq()
-            self.instance.to_db(
-                host_or_path=host_or_path,
-                database=db_id,
-                username=username,
-                password=password,
-            )
-            db_queue.put(
-                {
-                    "host_or_path": host_or_path,
-                    "db_id": db_id,
-                }
-            )
             if stop_event.is_set():
                 break
+            self._generate()
+            if self.generator_config.negative_threshold > 0 and not stop_event.is_set():
+                self._generate_negative()
+            early_stoper(self.instance)
+        lengths = {
+            table_name: len(self.instance.get_rows(table_name))
+            for table_name in self.instance.tables
+        }
+        if any(length < self.generator_config.min_rows for length in lengths.values()):
+            self.randomdb(min_rows=self.generator_config.min_rows)
+            early_stoper(self.instance)
 
-        if not stop_event.is_set():
-            self.randomdb(min_rows=max_tries)
-
-    def _generate_negative(self):
+    def _generate_negative(self, min_rows=1):
         table_plans: Dict[str, TablePlan] = {}
 
         def plan_for(table: str) -> TablePlan:
             if table not in table_plans:
-                table_plans[table] = TablePlan(min_rows=3)
+                table_plans[table] = TablePlan(min_rows=min_rows)
             return table_plans[table]
 
         for join_spec in self.join_specs:
@@ -467,6 +552,8 @@ class SpeculativeGenerator(BaseGenerator):
 
         for column_spec in self.column_specs:
             if isinstance(column_spec, ColumnSpec):
+                if not column_spec.table:
+                    continue
                 tp = plan_for(column_spec.table)
                 real_table = self.table_alias.get(column_spec.table, column_spec.table)
                 pool = self._get_pool(
@@ -479,12 +566,19 @@ class SpeculativeGenerator(BaseGenerator):
                 )
                 tp.col_values[column_spec.column] = invalid_val
 
-    def _generate(self):
+    def _generate(self, min_rows=3):
+        limit = self.expr.find(exp.Limit)
+        offset = self.expr.find(exp.Offset)
+        limit_value = int(limit.expression.this) if limit else 0
+        offset_value = int(offset.expression.this) if offset else 0
+
+        min_rows = max(min_rows, offset_value + limit_value)
+
         table_plans: Dict[str, TablePlan] = {}
 
         def plan_for(table: str) -> TablePlan:
             if table not in table_plans:
-                table_plans[table] = TablePlan(min_rows=3)
+                table_plans[table] = TablePlan(min_rows=min_rows)
             return table_plans[table]
 
         for spec in self.column_specs:
@@ -610,13 +704,19 @@ class SpeculativeGenerator(BaseGenerator):
                                     sq.inner_select_col.name,
                                     alias=f"{sq.inner_select_col.table}.{sq.inner_select_col.name}",
                                 )
-                                reference = inner_pool.generate()
-                                inner_tp.col_values[sq.inner_select_col.name] = (
-                                    reference
-                                )
+                                generated = inner_pool._generate(1, skips={None})
+                                reference = generated[0] if generated else None
+                                if reference is not None:
+                                    inner_pool.add_generated_value(reference)
+                                    inner_tp.col_values[sq.inner_select_col.name] = (
+                                        reference
+                                    )
 
-                            outer_val = pool.generate_for_spec(sq.outer_op, reference)
-                            outer_tp.col_values[sq.outer_column] = outer_val
+                            if reference is not None:
+                                outer_val = pool.generate_for_spec(
+                                    sq.outer_op, reference
+                                )
+                                outer_tp.col_values[sq.outer_column] = outer_val
 
             if sq.kind == "in":
                 for inner_table in sq.inner_table:
@@ -687,7 +787,7 @@ class SpeculativeGenerator(BaseGenerator):
                             if inner_key_val is not None:
                                 outer_tp.col_values[sq.outer_column] = inner_key_val
                                 inner_tp.col_values.setdefault(
-                                    sq.outer_col, inner_key_val
+                                    sq.outer_column, inner_key_val
                                 )
 
             if sq.kind == "exists":
