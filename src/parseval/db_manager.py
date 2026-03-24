@@ -452,6 +452,7 @@ class DBManager(metaclass=singletonMeta):
                 if dialect == "mysql":
                     conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database}`"))
                 elif dialect == "postgres":
+                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                     result = conn.execute(
                         text("SELECT 1 FROM pg_database WHERE datname = :name"),
                         {"name": database},
