@@ -503,6 +503,8 @@ class Instance(Catalog):
         table_name = self._normalize_name(
             table_name, dialect=self.dialect, is_table=True
         )
+        if table_name not in self.tables:
+            return
 
         table_expr = self.tables[table_name]
         tuple_index = len(self.get_rows(table_name))
@@ -519,13 +521,12 @@ class Instance(Catalog):
                     "%s_%s_%s_%s" % (table_name, column, str(datatype), tuple_index)
                 )
                 if column in concretes:
-                    concrete = concretes.get(column)
+                    concrete = concretes[column]
                 else:
                     # Use ColumnDomainPool's ValuePool when possible to sample/generate
                     pool = self.column_domains.get_or_create_pool(table_name, column)
                     concrete = pool.generate()
                     pool.add_generated_value(concrete)
-
                 z_value = Variable(this=z_name, _type=datatype, concrete=concrete)
                 z_value.type = datatype
                 new_values[column] = z_value
@@ -593,8 +594,8 @@ class Instance(Catalog):
 
             deduped = []
             for row in self.get_rows(table_name):
-                concretes = [row[column].concrete for column in self.tables[table_name]]
-                if any(c is None for c in concretes):
+                concretes = [row[column].concrete for column in not_null_columns]
+                if concretes and any(c is None for c in concretes):
                     continue
                 deduped.append(row)
             normalized_table_name = self._normalize_table(
@@ -713,7 +714,6 @@ class Instance(Catalog):
             self._dedupe_unique_rows()
             self._dedupe_null_rows()
         except Exception as e:
-            print(e)
             raise e
 
         with DBManager().get_connection(

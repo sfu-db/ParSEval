@@ -546,7 +546,6 @@ class ValuePool(Generic[ValueType]):
     def generate_for_spec(self, op: str, value, negate: bool = False):
         generator = ValueGeneratorFactory.create(self)
         value = generator.generate_for_spec(op, value, negate=negate)
-        # self._record_generation(value=value, is_new=value not in self._generated_values)
         return value
 
     def _generate(
@@ -858,6 +857,9 @@ class StringGenerator(ValueGenerator[str]):
         raise RuntimeError("StringGenerator could not produce a valid value")
 
     def validate(self, value, skips=None):
+
+        if not self.pool.nullable and value is None:
+            raise ValueError("Generated None for nullable domain")
         if skips:
             return value not in skips
         return True

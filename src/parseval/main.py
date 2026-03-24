@@ -8,6 +8,9 @@ def disprove(
     schema,
     host_or_path,
     db_id,
+    username=None,
+    password=None,
+    port=None,
     global_timeout=360,
     query_timeout=10,
     set_semantic=True,
@@ -25,7 +28,6 @@ def disprove(
 ):
     from parseval.disprover import Disprover
     from parseval.configuration import DisproverConfig, GeneratorConfig
-    from parseval.instance import Instance
 
     generator_config = GeneratorConfig(
         null_threshold=null_threshold,
@@ -43,6 +45,9 @@ def disprove(
     config = DisproverConfig(
         host_or_path=host_or_path,
         db_id=db_id,
+        username=username,
+        password=password,
+        port=port,
         global_timeout=global_timeout,
         query_timeout=query_timeout,
         set_semantic=set_semantic,
@@ -139,8 +144,8 @@ def instantiate_db(
         stop_event=stop_event,
         timeout=global_timeout,
     )
-    if early_stop(instance):
-        return
+    # if early_stop(instance):
+    #     return
 
     generator = DataGenerator(
         query,

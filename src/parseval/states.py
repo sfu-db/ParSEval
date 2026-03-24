@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from collections import UserDict
-from collections.abc import MutableMapping
 from typing import (
     Any,
     Dict,
