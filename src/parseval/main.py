@@ -1,4 +1,5 @@
 from typing import List, Optional
+from parseval.query import preprocess_sql
 
 
 def disprove(
@@ -70,7 +71,6 @@ def instantiate_db(
     port=None,
     global_timeout=360,
     query_timeout=10,
-    set_semantic=True,
     null_threshold=1,
     unique_threshold=1,
     duplicate_threshold=2,
@@ -87,15 +87,14 @@ def instantiate_db(
     from parseval.configuration import GeneratorConfig
     from parseval.instance import Instance
     from parseval.db_manager import DBManager
-    from parseval.states import ExecutionResult
     import threading
 
     stop_event = threading.Event()
 
-    def early_stop(self, instance: Instance) -> bool:
+    def early_stop(instance: Instance) -> bool:
         instance.to_db(
             host_or_path=host_or_path,
-            database=instance.name,
+            database=f"{instance.name}.sqlite",
             port=port,
             username=username,
             password=password,
@@ -104,7 +103,7 @@ def instantiate_db(
 
         with DBManager().get_connection(
             host_or_path=host_or_path,
-            database=db_id,
+            database=f"{instance.name}.sqlite",
             dialect=dialect,
             port=port,
             username=username,
@@ -112,9 +111,7 @@ def instantiate_db(
         ) as conn:
             results = None
             try:
-                results = conn.execute(
-                    query, fetch="all", timeout=self.config.query_timeout
-                )
+                results = conn.execute(query, fetch="all", timeout=query_timeout)
                 return len(results) >= min_rows
             except Exception as e:
                 return False
@@ -132,10 +129,11 @@ def instantiate_db(
         negative_threshold=negative_threshold,
         min_rows=min_rows,
         max_tries=max_tries,
-        dialect=dialect,
     )
 
-    spec = SpeculativeGenerator(query, instance, generator_config=generator_config)
+    expr = preprocess_sql(query, instance, dialect=dialect)
+
+    spec = SpeculativeGenerator(expr, instance, generator_config=generator_config)
     spec.generate(
         early_stoper=early_stop,
         stop_event=stop_event,
@@ -152,3 +150,5 @@ def instantiate_db(
     )
 
     generator.generate(early_stop=early_stop, stop_event=stop_event)
+
+    early_stop(instance)

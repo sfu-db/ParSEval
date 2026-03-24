@@ -691,45 +691,10 @@ class Instance(Catalog):
                 stmt = f"INSERT INTO {table} ({column_list}) VALUES ({', '.join(parameters)})"
                 conn.insert(stmt, mapped_data)
 
-    def to_db2(
-        self,
-        host_or_path,
-        database=None,
-        port=None,
-        username=None,
-        password=None,
-        truncate_first=True,
-    ):
-        database = database or self.name
-        if self.dialect == "sqlite":
-            database = (
-                database if database.endswith(".sqlite") else database + ".sqlite"
-            )
-        with DBManager().get_connection(
-            host_or_path, database, port=port, username=username, password=password
-        ) as conn:
-            if truncate_first:
-                for table_name in self.tables:
-                    conn.drop_table(table_name)
-            conn.create_schema(self.ddls, dialect=self.dialect)
-            all_rows = conn.get_all_table_rows()
-            concretes = {}
-            for table in all_rows:
-                if not all_rows[table]:
-                    continue
-                concretes[table] = []
-                columns = all_rows[table][0]
-                for row in all_rows[table][1:]:
-                    values = {name: value for name, value in zip(columns, row)}
-                    concretes[table].append(values)
-            for table_name in self.tables:
-                for row in concretes.get(table_name, []):
-                    self.create_row(table_name=table_name, values=row)
-
     def to_db(
         self,
         host_or_path,
-        database=None,
+        database,
         port=None,
         username=None,
         password=None,

@@ -345,28 +345,20 @@ class Connect:
 
         return records
 
-        # if fetch == "all":
-        #     rows = cursor_result.fetchall()
-        # elif fetch in {"one", 1}:
-        #     row = cursor_result.fetchone()
-        #     rows = [row] if row is not None else []
-        # elif fetch == "random":
-        #     sample = cursor_result.fetchmany(20)
-        #     rows = [random.choice(sample)] if sample else []
-        # elif isinstance(fetch, int) and fetch > 1:
-        #     rows = cursor_result.fetchmany(fetch)
-        # else:
-        #     rows = []
-
     def create_tables(self, *ddls: str) -> None:
         """Execute one or more DDL statements (CREATE TABLE …)."""
         for ddl in ddls:
             self.execute(ddl, fetch=None)
         self._invalidate_metadata()
 
+    def clear_tables(self, *table_names: str) -> None:
+        """DELETE all rows from the specified tables."""
+        for name in table_names:
+            self.execute(f"DELETE FROM {name}", fetch=None)
+
     def drop_table(self, table_name: str) -> None:
         """Drop a table if it exists."""
-        self.execute(f"DROP TABLE IF EXISTS {table_name}", fetch=None)
+        self.execute(f"""DROP TABLE IF EXISTS "{table_name}";""", fetch=None)
         self._invalidate_metadata()
 
     def insert(self, stmt: str, data: List[Dict[str, Any]]) -> None:
