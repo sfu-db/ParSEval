@@ -10,7 +10,21 @@ class GeneratorConfig:
     group_size_threshold: int = 3
     positive_threshold: int = 2
     negative_threshold: int = 1
-    max_tries: int = 5
+    min_rows: int = 3
+    max_tries: int = 2
+
+    def to_dict(self):
+        return {
+            "null_threshold": self.null_threshold,
+            "unique_threshold": self.unique_threshold,
+            "duplicate_threshold": self.duplicate_threshold,
+            "group_count_threshold": self.group_count_threshold,
+            "group_size_threshold": self.group_size_threshold,
+            "positive_threshold": self.positive_threshold,
+            "negative_threshold": self.negative_threshold,
+            "max_tries": self.max_tries,
+            "min_rows": self.min_rows,
+        }
 
 
 @dataclass

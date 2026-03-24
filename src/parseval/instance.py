@@ -337,6 +337,8 @@ class Instance(Catalog):
         normalized_concretes = {}
 
         for tbl_name, table_data in concretes.items():
+            if not tbl_name:
+                continue
             n_tbl_name = self._normalize_table(tbl_name, dialect=self.dialect)
             for col_name, values in table_data.items():
                 n_col_name = self._normalize_name(col_name, dialect=self.dialect)
@@ -505,6 +507,11 @@ class Instance(Catalog):
         table_expr = self.tables[table_name]
         tuple_index = len(self.get_rows(table_name))
         concretes = {self._normalize_name(k): v for k, v in concretes.items()}
+
+        existing_index = self._find_existing_row(table_name, concretes)
+        if existing_index is not None:
+            return existing_index
+
         for _ in range(100):
             new_values = {}
             for column, datatype in table_expr.items():
@@ -531,17 +538,114 @@ class Instance(Catalog):
                 try:
                     self.sync_db(table_name, row)
                     self.add_row(table_name, Row(rowid, (new_values)))
+                    self._register_row_values(table_name, new_values)
                     # self.data[table_name].append(Row(rowid, (new_values)))
                     return tuple_index
                 except Exception as e:
                     continue
             else:
                 self.add_row(table_name, Row(this=rowid, columns=new_values))
+                self._register_row_values(table_name, new_values)
 
                 return tuple_index
         raise_exception(
             f"Failed to create row for table {table_name} after 100 attempts"
         )
+
+    def _dedupe_unique_rows(self):
+        for table_name in self.tables:
+            unique_columns = [
+                column_name
+                for column_name in self.tables[table_name]
+                if self.is_unique(table_name, column_name)
+            ]
+            if not unique_columns:
+                continue
+
+            deduped = []
+            seen = {column_name: set() for column_name in unique_columns}
+            for row in self.get_rows(table_name):
+                is_duplicate = False
+                for index, column in enumerate(unique_columns):
+                    key = row[column].concrete
+                    if key in seen[column]:
+                        is_duplicate = True
+                        break
+                    seen[column].add(key)
+                if not is_duplicate:
+                    deduped.append(row)
+                    for column in unique_columns:
+                        seen[column].add(row[column].concrete)
+            normalized_table_name = self._normalize_table(
+                table_name, dialect=self.dialect
+            )
+            self.data[normalized_table_name] = deduped
+
+    def _dedupe_null_rows(self):
+        for table_name in self.tables:
+            not_null_columns = [
+                column_name
+                for column_name in self.tables[table_name]
+                if self.nullable(table_name, column_name) is False
+            ]
+            if not not_null_columns:
+                continue
+
+            deduped = []
+            for row in self.get_rows(table_name):
+                concretes = [row[column].concrete for column in self.tables[table_name]]
+                if any(c is None for c in concretes):
+                    continue
+                deduped.append(row)
+            normalized_table_name = self._normalize_table(
+                table_name, dialect=self.dialect
+            )
+            self.data[normalized_table_name] = deduped
+
+    def _find_existing_row(
+        self, table_name: str, concretes: Dict[str, Any]
+    ) -> Optional[int]:
+        unique_columns = [
+            column
+            for column in concretes
+            if column in self.tables[table_name] and self.is_unique(table_name, column)
+        ]
+        if not unique_columns:
+            return None
+
+        candidate_indexes = None
+        for column in unique_columns:
+            matching_indexes = {
+                idx
+                for idx, symbol in enumerate(self.get_column_data(table_name, column))
+                if symbol.concrete == concretes[column]
+            }
+            if not matching_indexes:
+                return None
+            candidate_indexes = (
+                matching_indexes
+                if candidate_indexes is None
+                else candidate_indexes & matching_indexes
+            )
+            if not candidate_indexes:
+                return None
+
+        for idx in sorted(candidate_indexes):
+            row = self.get_row(table_name, idx)
+            if all(
+                row[column].concrete == concrete
+                for column, concrete in concretes.items()
+            ):
+                return idx
+        return None
+
+    def _register_row_values(self, table_name: str, row_values: Dict[str, Variable]):
+        for column, value in row_values.items():
+            try:
+                pool = self.column_domains.get_or_create_pool(table_name, column)
+            except KeyError:
+                continue
+            pool.add_generated_value(value.concrete)
 
     def reset(self):
         """Clear instance data and reinitialize column domain pools.
@@ -588,7 +692,13 @@ class Instance(Catalog):
                 conn.insert(stmt, mapped_data)
 
     def to_db2(
-        self, host_or_path, database=None, port=None, username=None, password=None
+        self,
+        host_or_path,
+        database=None,
+        port=None,
+        username=None,
+        password=None,
+        truncate_first=True,
     ):
         database = database or self.name
         if self.dialect == "sqlite":
@@ -598,6 +708,9 @@ class Instance(Catalog):
         with DBManager().get_connection(
             host_or_path, database, port=port, username=username, password=password
         ) as conn:
+            if truncate_first:
+                for table_name in self.tables:
+                    conn.drop_table(table_name)
             conn.create_schema(self.ddls, dialect=self.dialect)
             all_rows = conn.get_all_table_rows()
             concretes = {}
@@ -620,6 +733,7 @@ class Instance(Catalog):
         port=None,
         username=None,
         password=None,
+        truncate_first=True,
         return_inserted=False,
     ):
         database = database or self.name
@@ -629,8 +743,13 @@ class Instance(Catalog):
             )
 
         inserts_str = []
-
         mapped_data = []
+        try:
+            self._dedupe_unique_rows()
+            self._dedupe_null_rows()
+        except Exception as e:
+            print(e)
+            raise e
 
         with DBManager().get_connection(
             host_or_path=host_or_path,
@@ -640,6 +759,9 @@ class Instance(Catalog):
             password=password,
             dialect=self.dialect,
         ) as conn:
+            if truncate_first:
+                for table_name in self.tables:
+                    conn.drop_table(table_name)
             conn.create_tables(*self.ddls.split(";"))
             for table_name in self.tables:
                 rows = self.get_rows(table_name)
@@ -658,7 +780,7 @@ class Instance(Catalog):
                 if mapped_data:
 
                     column_list = ", ".join(columns)
-                    stmt = f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(parameters)})"
+                    stmt = f"""INSERT INTO "{table_name}" ({column_list}) VALUES ({', '.join(parameters)})"""
                     if return_inserted:
                         inserts_str.append(f"-- Inserting into table: {table_name} --")
                         for data in mapped_data:

@@ -140,6 +140,16 @@ class RowReader:
         if self.row is not None:
             return self.row[column]
 
+    def get(self, table, column):
+        del table
+        if self.row is not None:
+            return self.row[column]
+
+    def items(self):
+        if self.row is not None:
+            return self.row.items()
+        return ()
+
     def get_cell(self, table, column):
         if self.row is not None:
             return self.row[self.columns[column]]

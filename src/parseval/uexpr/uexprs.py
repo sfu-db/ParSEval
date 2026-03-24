@@ -13,7 +13,7 @@ from ordered_set import OrderedSet
 from parseval.plan.rex import Symbol, Const, ColumnRef
 from parseval.helper import group_by_concrete
 from parseval.configuration import Config
-from parseval.uexpr.checks import Check
+from parseval.uexpr.coverage import CoverageCalculator
 
 if TYPE_CHECKING:
     from parseval.plan.rex import Expression
@@ -123,10 +123,6 @@ class PlausibleBranch(_Constraint):
     @branch.setter
     def branch(self, value: bool):
         self._branch = value
-
-    def mark_pending(self):
-        self.attempts += 1
-        self.plausible_type = PlausibleType.PENDING
 
     def mark_infeasible(self):
         self.plausible_type = PlausibleType.INFEASIBLE
@@ -261,9 +257,6 @@ class Constraint(_Constraint):
         self.tree._index_row(rowids, self, bit)
         self.metadata.update(kwargs)
 
-        # logger.info(f"Updated coverage for node {self} with bit {bit}. Current coverage: {len(self.coverage[bit])}, rowid_index: {len(self.rowid_index[bit])}")
-        # logger.info(f'current stats: {self.coverage}, rowid_index: {self.rowid_index}')
-
     def update_branchtype(self, bit: PlausibleBit, branch: bool):
         if isinstance(self.children.get(bit, None), PlausibleBranch):
             branch_type = BranchType(int(branch))
@@ -323,7 +316,6 @@ class UExprToConstraint:
     def __init__(self):
         self.leaves: Dict[Tuple[PBit, ...], PlausibleBranch] = {}
         self.root = Constraint(tree=self, step_type=StepType.ROOT, step_name="ROOT")
-
         # Index of leaf patterns to their corresponding Constraint nodes
         self.prev_steps = deque(["ROOT"])
         self.pnode_index: Dict[Tuple[str, ...], Set[Tuple[Constraint, PBit]]] = (
@@ -334,6 +326,7 @@ class UExprToConstraint:
         self.row_index: Dict[Tuple[Any, ...], Set[Tuple[_Constraint, PlausibleBit]]] = (
             defaultdict(set)
         )  ## index rowids to nodes and bits that cover them
+        self.attempt_index: Dict[Tuple[Any, ...], int] = defaultdict(int)
 
     def get_prev_step(self, scope_id, step_type, step_name):
         if (scope_id, step_type, step_name) != self._current_step:
@@ -349,6 +342,7 @@ class UExprToConstraint:
             node = q.popleft()
             if isinstance(node, PlausibleBranch):
                 continue
+            node.hits.clear()
             node.coverage.clear()
             node.rowid_index.clear()
             node.metadata.clear()
@@ -368,6 +362,13 @@ class UExprToConstraint:
         if is_valid_path_bit(bit):
             key = (node.scope_id, node.step_type, node.step_name)
             self.pnode_index[key].add((node, bit))
+
+    def leaf_key(self, leaf: PlausibleBranch) -> Tuple[Any, ...]:
+        node = leaf.parent
+        condition = (
+            node.sql_condition.sql() if getattr(node, "sql_condition", None) else "ROOT"
+        )
+        return (node.scope_id, node.step_type, node.step_name, condition, leaf.bit())
 
     def _find_positive_branch(self) -> List[Tuple[Constraint, PBit]]:
         candidates = []
@@ -547,9 +548,25 @@ class UExprToConstraint:
         Args:
             config: Configuration object containing parameters for checks.
         """
-        check = Check(**config.to_dict())
+        calculator = CoverageCalculator(**config.to_dict())
         for pattern, leaf in self.leaves.items():
-            leaf.accept(check)
+            # leaf.attempts = self.attempt_index[self.leaf_key(leaf)]
+            if leaf.attempts >= config.max_tries:
+                leaf.mark_covered()
+                continue
+            coverage = calculator.evaluate_leaf(leaf)
+            leaf.parent.hits[leaf.bit()] = coverage.hits
+            if coverage.forced_branch is not None:
+                leaf.branch = coverage.forced_branch
+            if coverage.infeasible:
+                leaf.mark_infeasible()
+            elif coverage.covered:
+                leaf.mark_covered()
+            elif leaf.plausible_type in {
+                PlausibleType.COVERED,
+                PlausibleType.PENDING,
+            }:
+                leaf.plausible_type = PlausibleType.UNEXPLORED
 
     def next_path(self, config: Config, skips=None) -> Optional[_Constraint]:
         """
@@ -562,30 +579,39 @@ class UExprToConstraint:
         ## First, run checks to update the plausible types of all leaves based on the current configuration and coverage
         self.update_stats(config)
 
+        candidates = []
         for pattern, leaf in self.leaves.items():
-
             logger.info(f'pattern: {"/".join(str(p) for p in pattern)}')
-            if leaf.attempts > config.max_tries:
-                if leaf.branch == BranchType.UNDECIDED:
-                    leaf.mark_infeasible()
+            if self.attempt_index[self.leaf_key(leaf)] >= config.max_tries:
                 continue
 
-            if (
-                leaf.plausible_type in {PlausibleType.INFEASIBLE, PlausibleType.COVERED}
-                and leaf.branch != BranchType.POSITIVE
-            ):
+            if leaf.plausible_type in {
+                PlausibleType.INFEASIBLE,
+                PlausibleType.ERROR,
+                PlausibleType.TIMEOUT,
+            }:
                 continue
 
             if pattern in skips:
                 continue
 
-            leaf.mark_pending()
-            if leaf.branch == BranchType.NEGATIVE and leaf.plausible_type not in {
-                PlausibleType.COVERED,
-                PlausibleType.INFEASIBLE,
-            }:
-                return pattern, leaf
+            candidates.append((pattern, leaf))
 
-            if leaf.branch in [BranchType.UNDECIDED, BranchType.POSITIVE]:
-                return pattern, leaf
+        def _priority(item):
+            pattern, leaf = item
+            branch_priority = {
+                BranchType.POSITIVE: 0,
+                BranchType.UNDECIDED: 1,
+                BranchType.NEGATIVE: 2,
+            }.get(leaf.branch, 3)
+            covered_penalty = 1 if leaf.plausible_type == PlausibleType.COVERED else 0
+            return (covered_penalty, branch_priority, -len(pattern), leaf.attempts)
+
+        for pattern, leaf in sorted(candidates, key=_priority):
+            key = self.leaf_key(leaf)
+            self.attempt_index[key] += 1
+            leaf.mark_pending()
+            # leaf.attempts = self.attempt_index[key]
+            leaf.plausible_type = PlausibleType.PENDING
+            return pattern, leaf
         return None, None

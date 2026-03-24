@@ -1,8 +1,9 @@
 from __future__ import annotations
-from typing import Callable, List, TypeVar, Dict, TYPE_CHECKING, Tuple
+from typing import Callable, List, Dict, TYPE_CHECKING, Tuple
 import re
-from sqlglot.expressions import convert, Expression, maybe_copy, Literal
-import math, numbers, datetime
+from sqlglot.expressions import Expression, maybe_copy, Literal
+import math, numbers
+import datetime as dt
 from .dtype import DataType
 
 if TYPE_CHECKING:
@@ -76,11 +77,11 @@ def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
     elif isinstance(value, numbers.Number):
         converted = Literal.number(value)
         srctype = "NUMERIC"
-    elif isinstance(value, datetime.datetime):
+    elif isinstance(value, dt.datetime):
         converted = Literal(this=value, is_string=False)
         srctype = "DATETIME"
 
-    elif isinstance(value, datetime.date):
+    elif isinstance(value, dt.date):
         converted = Literal(this=value, is_string=False)
         srctype = "DATE"
     else:

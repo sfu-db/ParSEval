@@ -146,7 +146,15 @@ def preprocess_sql(sql: str, mappingschema: MappingSchema, dialect: str, type_in
             return node.this
         return node
     parsed = parsed.transform(transform, tbls)
-    parsed = qualify.qualify(parsed, schema=mappingschema, dialect= dialect)
+    try:
+        parsed = qualify.qualify(parsed, schema=mappingschema, dialect=dialect)
+    except Exception:
+        parsed = qualify.qualify(
+            parsed,
+            schema=mappingschema,
+            dialect=dialect,
+            validate_qualify_columns=False,
+        )
     parsed = annotate_types.annotate_types(parsed, schema=mappingschema)
     
     # def speculate(node, rules):
