@@ -1,4 +1,8 @@
 from .utils import Logger
+from .main import disprove, instantiate_db
+
+__all__ = ["disprove", "instantiate_db", "Logger"]
+
 
 # import os, re
 # from typing import List, Tuple, Set, Union
