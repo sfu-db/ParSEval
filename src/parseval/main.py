@@ -39,7 +39,6 @@ def disprove(
         negative_threshold=negative_threshold,
         min_rows=min_rows,
         max_tries=max_tries,
-        dialect=dialect,
     )
 
     config = DisproverConfig(
