@@ -39,31 +39,13 @@ poetry install
 Normally, one invoke the tool as 
 ```bash
 from parseval import instantiate_db
-instantiate_db(workspace, schema, sql, dialect, **kwargs):
+instantiate_db(sql, schema, host_or_path, db_id, dialect, **kwargs):
 ```
 to generate test database instances for input query SQL1.
 To test the equivalence of two queries:
 ```bash
-instance = Instance(ddls=schema, name=f"test_spj_disjunct", dialect="sqlite")
-sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
-q1 = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 OR T1.`NumGE1500` < 80"  # order by
-
-q2 = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100"  # order by
-
-from parseval.configuration import DisproverConfig
-
-config = DisproverConfig(
-    host_or_path="WORKSPACE_PATH",
-    db_id=instance.name,
-    global_timeout=30,
-    query_timeout=10,
-)
-
-disprover = Disprover(q1, q2, schema=schema, config=config)
-
-res = disprover.run()
-
-print(res)
+from parseval import disprove
+disprove(sql1, sql2, schema, host_or_path = "/tmp", dialect = "sqlite", **kwargs)
 ```
 
 One can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
