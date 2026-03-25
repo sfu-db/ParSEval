@@ -569,7 +569,7 @@ class Instance(Catalog):
                 is_duplicate = False
                 for index, column in enumerate(unique_columns):
                     key = row[column].concrete
-                    if key in seen[column]:
+                    if key in seen[column] or key is None:
                         is_duplicate = True
                         break
                     seen[column].add(key)
