@@ -1,7 +1,7 @@
 version: '3.8'
 services:
   # Update this to the name of the service you want to work with in your docker-compose.yml file
-  parseval-dev:
+  dev:
     # Uncomment if you want to override the service's Dockerfile to one in the .devcontainer 
     # folder. Note that the path of the Dockerfile and context is relative to the *primary* 
     # docker-compose.yml file (the first in the devcontainer.json "dockerComposeFile"
@@ -9,11 +9,23 @@ services:
     #
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ./Dockerfile
+    #   dockerfile: .devcontainer/Dockerfile
 
     volumes:
       # Update this to wherever you want VS Code to mount the folder of your project
-      - ..:/workspaces:cached
+      - ..:/workspace:cached
+    shm_size: 16g
+    environment:
+      - PYTHONUNBUFFERED=1
+    tty: true
+    stdin_open: true
+
+    # Uncomment the next four lines if you will use a ptrace-based debugger like C++, Go, and Rust.
+    # cap_add:
+    #   - SYS_PTRACE
+    # security_opt:
+    #   - seccomp:unconfined
 
     # Overrides default command so things don't shut down after the process ends.
     command: sleep infinity
