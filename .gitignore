@@ -185,4 +185,7 @@ src/expr/
 src/instance/
 src/expression/
 
-web/node_modulesweb/
+web/node_modules
+
+web/.next/
+web/dist/
