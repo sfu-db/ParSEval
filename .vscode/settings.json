@@ -1,6 +1,4 @@
 {
-    "python.defaultInterpreterPath": "/opt/homebrew/Caskroom/miniconda/base/envs/myenv/bin/python",
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": []
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
