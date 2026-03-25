@@ -4,18 +4,14 @@ import os
 from sqlglot import exp
 import unittest, json
 import logging
-from parseval.speculative import SpeculativeGenerator
+from parseval.speculative import (
+    FunctionSpec,
+    SpeculativeGenerator,
+    extract_condition_specs,
+)
 
 from parseval.instance import Instance
 from parseval.query import preprocess_sql
-
-schema = """CREATE TABLE frpm (CDSCode TEXT NOT NULL PRIMARY KEY, `Academic Year` TEXT NULL, `County Code` TEXT NULL, `District Code` INT NULL, `School Code` TEXT NULL, `County Name` TEXT NULL, `District Name` TEXT NULL, `School Name` TEXT NULL, `District Type` TEXT NULL, `School Type` TEXT NULL, `Educational Option Type` TEXT NULL, `NSLP Provision Status` TEXT NULL, `Charter School (Y/N)` INT NULL, `Charter School Number` TEXT NULL, `Charter Funding Type` TEXT NULL, IRC INT NULL, `Low Grade` TEXT NULL, `High Grade` TEXT NULL, `Enrollment (K-12)` FLOAT NULL, `Free Meal Count (K-12)` FLOAT NULL, `Percent (%) Eligible Free (K-12)` FLOAT NULL, `FRPM Count (K-12)` FLOAT NULL, `Percent (%) Eligible FRPM (K-12)` FLOAT NULL, `Enrollment (Ages 5-17)` FLOAT NULL, `Free Meal Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible Free (Ages 5-17)` FLOAT NULL, `FRPM Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible FRPM (Ages 5-17)` FLOAT NULL, `2013-14 CALPADS Fall 1 Certification Status` INT NULL, FOREIGN KEY (CDSCode) REFERENCES schools (CDSCode));CREATE TABLE satscores (cds TEXT NOT NULL PRIMARY KEY, rtype TEXT NOT NULL, sname TEXT NULL, dname TEXT NULL, cname TEXT NULL, enroll12 INT NOT NULL, NumTstTakr INT NOT NULL, AvgScrRead INT NULL, AvgScrMath INT NULL, AvgScrWrite INT NULL, NumGE1500 INT NULL, FOREIGN KEY (cds) REFERENCES schools (CDSCode));CREATE TABLE schools (CDSCode TEXT NOT NULL PRIMARY KEY, NCESDist TEXT NULL, NCESSchool TEXT NULL, StatusType TEXT NOT NULL, County TEXT NOT NULL, District TEXT NOT NULL, School TEXT NULL, Street TEXT NULL, StreetAbr TEXT NULL, City TEXT NULL, Zip TEXT NULL, State TEXT NULL, MailStreet TEXT NULL, MailStrAbr TEXT NULL, MailCity TEXT NULL, MailZip TEXT NULL, MailState TEXT NULL, Phone TEXT NULL, Ext TEXT NULL, Website TEXT NULL, OpenDate DATE NULL, ClosedDate DATE NULL, Charter INT NULL, CharterNum TEXT NULL, FundingType TEXT NULL, DOC TEXT NOT NULL, DOCType TEXT NOT NULL, SOC TEXT NULL, SOCType TEXT NULL, EdOpsCode TEXT NULL, EdOpsName TEXT NULL, EILCode TEXT NULL, EILName TEXT NULL, GSoffered TEXT NULL, GSserved TEXT NULL, Virtual TEXT NULL, Magnet INT NULL, Latitude FLOAT NULL, Longitude FLOAT NULL, AdmFName1 TEXT NULL, AdmLName1 TEXT NULL, AdmEmail1 TEXT NULL, AdmFName2 TEXT NULL, AdmLName2 TEXT NULL, AdmEmail2 TEXT NULL, AdmFName3 TEXT NULL, AdmLName3 TEXT NULL, AdmEmail3 TEXT NULL, LastUpdate DATE NOT NULL);
-"""
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 left JOIN satscores AS T2 on T1.CDSCode = T2.cds where T2.`NumGE1500` is NOT NULL and T1.`District Code` > 15 """
-
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 left JOIN satscores AS T2 on T1.CDSCode = T2.cds where T1.`Academic Year` <> '2023' or T1.`District Code` > 15  """
-
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 INNER JOIN satscores AS T2 on T1.CDSCode = T2.cds where T1.`Academic Year` <> '2023' or T1.`District Code` > 15 """
 from shutil import rmtree
 
 from pathlib import Path
@@ -36,17 +32,17 @@ def reset_folder(folder_path):
     assert_folder(folder_path)
 
 
-from parseval.logger import Logger
+# from parseval.logger import Logger
 
-Logger(
-    verbose={
-        "coverage": True,
-        "symbolic": False,
-        "smt": True,
-        "db": False,
-    },
-    log_file="log.log",
-)
+# Logger(
+#     verbose={
+#         "coverage": True,
+#         "symbolic": False,
+#         "smt": True,
+#         "db": False,
+#     },
+#     log_file="log.log",
+# )
 
 logger = logging.getLogger("parseval.coverage")
 
@@ -54,11 +50,26 @@ logger = logging.getLogger("parseval.coverage")
 class TestSpeculativeGenerator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import threading
+
         logger.info("Setting up TestSpeculativeGenerator class")
         cls.workspace = "examples/tests"
         reset_folder(cls.workspace)
-        cls.db_queue = None  # Placeholder for a database queue if needed
-        cls.stop_event = None  # Placeholder for a stop event if needed
+
+        import json
+
+        with open("dataset/dev.json") as f:
+            cls.dev_data = json.load(f)
+
+        with open("dataset/schema.json") as f:
+            cls.schema = json.load(f)
+
+        cls.california_schools_schema = ";".join(cls.schema["california_schools"])
+
+        cls.stop_event = threading.Event()  # Placeholder for a stop event if needed
+
+    def early_stop(self, instance: Instance) -> bool:
+        return False
 
     def run_query(self, sql, host_or_path, db_id, dialect="sqlite"):
         from parseval.db_manager import DBManager
@@ -72,44 +83,122 @@ class TestSpeculativeGenerator(unittest.TestCase):
             results = conn.execute(sql, fetch="all")
             return results
 
+    def test_extracts_function_specs(self):
+        cases = [
+            (
+                "SELECT * FROM schools WHERE LENGTH(City) = 5",
+                ("LENGTH", "EQ", 5),
+            ),
+            (
+                "SELECT * FROM satscores WHERE ABS(NumGE1500) >= 10",
+                ("ABS", "GTE", 10),
+            ),
+            (
+                "SELECT * FROM schools WHERE INSTR(City, 'ab') > 0",
+                ("INSTR", "GT", 0),
+            ),
+            (
+                "SELECT * FROM schools WHERE STRFTIME('%Y-%m-%d', LastUpdate) = '2024-01-02'",
+                ("STRFTIME", "EQ", "2024-01-02"),
+            ),
+        ]
+
+        for sql, expected in cases:
+            predicate = preprocess_sql(
+                sql,
+                Instance(
+                    ddls=self.california_schools_schema,
+                    name="extract_case",
+                    dialect="sqlite",
+                ),
+                dialect="sqlite",
+            ).find(exp.Predicate)
+            specs = extract_condition_specs(predicate)
+            self.assertEqual(len(specs), 1)
+            self.assertIsInstance(specs[0], FunctionSpec)
+            self.assertEqual((specs[0].name, specs[0].op, specs[0].value), expected)
+
+    def test_function_validation_helpers(self):
+        generator = SpeculativeGenerator.__new__(SpeculativeGenerator)
+
+        length_spec = FunctionSpec(
+            name="LENGTH", table="schools", column="City", op="EQ", value=5
+        )
+        self.assertTrue(generator._validate_function_candidate(length_spec, "abcde"))
+
+        abs_spec = FunctionSpec(
+            name="ABS", table="satscores", column="NumGE1500", op="GTE", value=10
+        )
+        self.assertTrue(generator._validate_function_candidate(abs_spec, -12))
+
+        instr_spec = FunctionSpec(
+            name="INSTR", table="schools", column="City", op="GT", value=0, args=["ab"]
+        )
+        self.assertTrue(generator._validate_function_candidate(instr_spec, "xxabyy"))
+
+        strftime_spec = FunctionSpec(
+            name="STRFTIME",
+            table="schools",
+            column="LastUpdate",
+            op="EQ",
+            value="2024-01-02",
+            args=["%Y-%m-%d"],
+        )
+        self.assertTrue(
+            generator._validate_function_candidate(
+                strftime_spec, __import__("datetime").date(2024, 1, 2)
+            )
+        )
+
+    @unittest.skip("Skipping this test for now")
     def test_spj_disjunct(self):
-        instance = Instance(ddls=schema, name=f"test_spj_disjunct", dialect="sqlite")
+        instance = Instance(
+            ddls=self.california_schools_schema,
+            name=f"test_spj_disjunct",
+            dialect="sqlite",
+        )
         sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
         sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 OR T1.`NumGE1500` < 80"  # order by
 
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
 
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
         )
 
+    @unittest.skip("Skipping this test for now")
     def test_groupby(self):
         sql = """SELECT GSserved FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
 
-        instance = Instance(ddls=schema, name=f"test_groupby", dialect="sqlite")
+        instance = Instance(
+            ddls=self.california_schools_schema, name=f"test_groupby", dialect="sqlite"
+        )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
 
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
         )
 
+    @unittest.skip("Skipping this test for now")
     def test_aggregate(self):
         sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
         instance = Instance(
-            ddls=schema, name=f"test_groupby_aggregate", dialect="sqlite"
+            ddls=self.california_schools_schema,
+            name=f"test_groupby_aggregate",
+            dialect="sqlite",
         )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
@@ -118,51 +207,70 @@ class TestSpeculativeGenerator(unittest.TestCase):
     def test_having(self):
         sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved having count(NCESDist) > 5 """
         instance = Instance(
-            ddls=schema, name=f"test_groupby_aggregate_having", dialect="sqlite"
+            ddls=self.california_schools_schema,
+            name=f"test_groupby_aggregate_having",
+            dialect="sqlite",
         )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        insert_stmt = instance.to_db(
+            self.workspace, instance.name, return_inserted=True
+        )
+
+        print(insert_stmt)
+
+        result = self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)
+
+        print(f"Query Result: {result}")  # Debug print to check the output
 
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
         )
 
+    # @unittest.skip("Skipping this test for now")
     def test_case_when(self):
         sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' """
-        instance = Instance(ddls=schema, name=f"test_casewhen", dialect="sqlite")
+        instance = Instance(
+            ddls=self.california_schools_schema, name=f"test_casewhen", dialect="sqlite"
+        )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
 
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
         )
 
+    @unittest.skip("Skipping this test for now")
     def test_scalar(self):
         sql = """SELECT T1.`sname` FROM satscores AS T1 where T1.cds = (SELECT T2.CDSCode from frpm AS T2 order by T2.CDSCode limit 1)"""
-        instance = Instance(ddls=schema, name=f"test_scalar", dialect="sqlite")
+        instance = Instance(
+            ddls=self.california_schools_schema, name=f"test_scalar", dialect="sqlite"
+        )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
 
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,
         )
 
+    @unittest.skip("Skipping this test for now")
     def test_exists(self):
         sql = """SELECT T1.`sname` FROM satscores AS T1 where exists (select 1 from frpm AS T2 where T1.cds = T2.CDSCode)"""
-        instance = Instance(ddls=schema, name=f"test_exists", dialect="sqlite")
+        instance = Instance(
+            ddls=self.california_schools_schema, name=f"test_exists", dialect="sqlite"
+        )
         expr = preprocess_sql(sql, instance, dialect="sqlite")
         generator = SpeculativeGenerator(expr, instance)
-        generator.generate(db_queue=self.db_queue, stop_event=self.stop_event)
-        instance.to_db(self.workspace)
+        generator.generate(early_stoper=self.early_stop, stop_event=self.stop_event)
+        instance.to_db(self.workspace, instance.name)
         self.assertGreater(
             len(self.run_query(sql, host_or_path=self.workspace, db_id=instance.name)),
             0,

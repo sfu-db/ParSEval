@@ -38,16 +38,13 @@ def reset_folder(folder_path):
     assert_folder(folder_path)
 
 
-from parseval.logger import Logger
+from parseval import Logger
 
 Logger(
-    verbose={
-        "coverage": True,
-        "symbolic": False,
-        "smt": True,
-        "db": False,
-    },
-    log_file="log.log",
+    log_file="logs/test_disprover.log",
+    level=logging.DEBUG,
+    structured_logs={"coverage"},
+    log_files={"coverage": "logs/test_disprover_coverage.log"},
 )
 
 logger = logging.getLogger("parseval.coverage")
