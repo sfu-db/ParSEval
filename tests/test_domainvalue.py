@@ -41,7 +41,62 @@ class TestDomainValue(unittest.TestCase):
             table = random.choice(list(instance.tables.keys()))
             print(f"Generating row for table: {table}")
             instance.create_row(table)
-        instance.to_db(self.workspace, workspace=self.workspace)
+        instance.to_db(self.workspace)
+
+    def test_unique_column_spec_values_do_not_repeat(self):
+        instance = Instance(
+            ddls=schema, name="test_unique_column_spec_values_do_not_repeat", dialect="sqlite"
+        )
+        pool = instance.column_domains.get_or_create_pool("schools", "cdscode")
+
+        values = [pool.generate_for_spec("EQ", "fixed") for _ in range(5)]
+
+        for value in values:
+            instance._create_row(
+                "schools",
+                concretes={
+                    "cdscode": value,
+                    "county": "county",
+                    "district": "district",
+                    "statustype": "active",
+                    "doc": "54",
+                    "doctype": "doctype",
+                    "lastupdate": "2020-01-01",
+                },
+            )
+
+        cds_codes = [
+            symbol.concrete
+            for symbol in instance.get_column_data("schools", "cdscode")
+        ]
+        self.assertEqual(len(cds_codes), len(set(cds_codes)))
+
+    def test_duplicate_primary_key_reuses_existing_row(self):
+        instance = Instance(
+            ddls=schema, name="test_duplicate_primary_key_reuses_existing_row", dialect="sqlite"
+        )
+
+        first = instance._create_row(
+            "schools",
+            concretes={
+                "cdscode": "fixed",
+                "county": "county",
+                "district": "district",
+                "statustype": "active",
+                "doc": "54",
+                "doctype": "doctype",
+                "lastupdate": "2020-01-01",
+            },
+        )
+        second = instance._create_row(
+            "schools",
+            concretes={
+                "cdscode": "fixed",
+            },
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(instance.get_rows("schools")), 1)
 
     def test_value_generator_spec(self):
         instance = Instance(
@@ -71,7 +126,7 @@ class TestDomainValue(unittest.TestCase):
                 index = instance._create_row("schools", concretes={column_name: value})
                 row = instance.get_column_data("schools", column_name)[index]
 
-        instance.to_db(self.workspace, workspace=self.workspace)
+        instance.to_db(self.workspace)
 
 
 if __name__ == "__main__":

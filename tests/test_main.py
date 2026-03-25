@@ -1,28 +1,26 @@
-import sys
-import os
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-sys.path.append(parent_dir)
+import sys, os, sqlite3
 
 from sqlglot import exp
 import unittest, json
 import logging
-from src.parseval.plan.planner import Planner
-from src.parseval.instance import Instance
-from src.parseval.query import preprocess_sql
-from src.parseval.data_generator import DataGenerator
-from src.parseval.uexpr.uexprs import UExprToConstraint
-from src.parseval.plan.speculate import Speculative
-from src.parseval.configuration import Config
+from parseval.to_dot import display_uexpr
 
-schema = """CREATE TABLE frpm (CDSCode TEXT NOT NULL PRIMARY KEY, `Academic Year` TEXT NULL, `County Code` TEXT NULL, `District Code` INT NULL, `School Code` TEXT NULL, `County Name` TEXT NULL, `District Name` TEXT NULL, `School Name` TEXT NULL, `District Type` TEXT NULL, `School Type` TEXT NULL, `Educational Option Type` TEXT NULL, `NSLP Provision Status` TEXT NULL, `Charter School (Y/N)` INT NULL, `Charter School Number` TEXT NULL, `Charter Funding Type` TEXT NULL, IRC INT NULL, `Low Grade` TEXT NULL, `High Grade` TEXT NULL, `Enrollment (K-12)` FLOAT NULL, `Free Meal Count (K-12)` FLOAT NULL, `Percent (%) Eligible Free (K-12)` FLOAT NULL, `FRPM Count (K-12)` FLOAT NULL, `Percent (%) Eligible FRPM (K-12)` FLOAT NULL, `Enrollment (Ages 5-17)` FLOAT NULL, `Free Meal Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible Free (Ages 5-17)` FLOAT NULL, `FRPM Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible FRPM (Ages 5-17)` FLOAT NULL, `2013-14 CALPADS Fall 1 Certification Status` INT NULL, FOREIGN KEY (CDSCode) REFERENCES schools (CDSCode));CREATE TABLE satscores (cds TEXT NOT NULL PRIMARY KEY, rtype TEXT NOT NULL, sname TEXT NULL, dname TEXT NULL, cname TEXT NULL, enroll12 INT NOT NULL, NumTstTakr INT NOT NULL, AvgScrRead INT NULL, AvgScrMath INT NULL, AvgScrWrite INT NULL, NumGE1500 INT NULL, FOREIGN KEY (cds) REFERENCES schools (CDSCode));CREATE TABLE schools (CDSCode TEXT NOT NULL PRIMARY KEY, NCESDist TEXT NULL, NCESSchool TEXT NULL, StatusType TEXT NOT NULL, County TEXT NOT NULL, District TEXT NOT NULL, School TEXT NULL, Street TEXT NULL, StreetAbr TEXT NULL, City TEXT NULL, Zip TEXT NULL, State TEXT NULL, MailStreet TEXT NULL, MailStrAbr TEXT NULL, MailCity TEXT NULL, MailZip TEXT NULL, MailState TEXT NULL, Phone TEXT NULL, Ext TEXT NULL, Website TEXT NULL, OpenDate DATE NULL, ClosedDate DATE NULL, Charter INT NULL, CharterNum TEXT NULL, FundingType TEXT NULL, DOC TEXT NOT NULL, DOCType TEXT NOT NULL, SOC TEXT NULL, SOCType TEXT NULL, EdOpsCode TEXT NULL, EdOpsName TEXT NULL, EILCode TEXT NULL, EILName TEXT NULL, GSoffered TEXT NULL, GSserved TEXT NULL, Virtual TEXT NULL, Magnet INT NULL, Latitude FLOAT NULL, Longitude FLOAT NULL, AdmFName1 TEXT NULL, AdmLName1 TEXT NULL, AdmEmail1 TEXT NULL, AdmFName2 TEXT NULL, AdmLName2 TEXT NULL, AdmEmail2 TEXT NULL, AdmFName3 TEXT NULL, AdmLName3 TEXT NULL, AdmEmail3 TEXT NULL, LastUpdate DATE NOT NULL);
-"""
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 left JOIN satscores AS T2 on T1.CDSCode = T2.cds where T2.`NumGE1500` is NOT NULL and T1.`District Code` > 15 """
+from parseval.utils import Logger
 
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 left JOIN satscores AS T2 on T1.CDSCode = T2.cds where T1.`Academic Year` <> '2023' or T1.`District Code` > 15  """
+from parseval.instance import Instance
+from parseval.constants import PBit
+from parseval.data_generator import (
+    DataGenerator,
+    OperatorConstraintRequest,
+    OperatorRuleRegistry,
+)
+from parseval.query import preprocess_sql
+from parseval.speculative import SpeculativeGenerator
 
-# sql = """SELECT T1.`District Code`, T2.`NumGE1500`  FROM frpm AS T1 INNER JOIN satscores AS T2 on T1.CDSCode = T2.cds where T1.`Academic Year` <> '2023' or T1.`District Code` > 15 """
+# from tqdm import tqdm
+
+# schema = """CREATE TABLE frpm (CDSCode TEXT NOT NULL PRIMARY KEY, `Academic Year` TEXT NULL, `County Code` TEXT NULL, `District Code` INT NULL, `School Code` TEXT NULL, `County Name` TEXT NULL, `District Name` TEXT NULL, `School Name` TEXT NULL, `District Type` TEXT NULL, `School Type` TEXT NULL, `Educational Option Type` TEXT NULL, `NSLP Provision Status` TEXT NULL, `Charter School (Y/N)` INT NULL, `Charter School Number` TEXT NULL, `Charter Funding Type` TEXT NULL, IRC INT NULL, `Low Grade` TEXT NULL, `High Grade` TEXT NULL, `Enrollment (K-12)` FLOAT NULL, `Free Meal Count (K-12)` FLOAT NULL, `Percent (%) Eligible Free (K-12)` FLOAT NULL, `FRPM Count (K-12)` FLOAT NULL, `Percent (%) Eligible FRPM (K-12)` FLOAT NULL, `Enrollment (Ages 5-17)` FLOAT NULL, `Free Meal Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible Free (Ages 5-17)` FLOAT NULL, `FRPM Count (Ages 5-17)` FLOAT NULL, `Percent (%) Eligible FRPM (Ages 5-17)` FLOAT NULL, `2013-14 CALPADS Fall 1 Certification Status` INT NULL, FOREIGN KEY (CDSCode) REFERENCES schools (CDSCode));CREATE TABLE satscores (cds TEXT NOT NULL PRIMARY KEY, rtype TEXT NOT NULL, sname TEXT NULL, dname TEXT NULL, cname TEXT NULL, enroll12 INT NOT NULL, NumTstTakr INT NOT NULL, AvgScrRead INT NULL, AvgScrMath INT NULL, AvgScrWrite INT NULL, NumGE1500 INT NULL, FOREIGN KEY (cds) REFERENCES schools (CDSCode));CREATE TABLE schools (CDSCode TEXT NOT NULL PRIMARY KEY, NCESDist TEXT NULL, NCESSchool TEXT NULL, StatusType TEXT NOT NULL, County TEXT NOT NULL, District TEXT NOT NULL, School TEXT NULL, Street TEXT NULL, StreetAbr TEXT NULL, City TEXT NULL, Zip TEXT NULL, State TEXT NULL, MailStreet TEXT NULL, MailStrAbr TEXT NULL, MailCity TEXT NULL, MailZip TEXT NULL, MailState TEXT NULL, Phone TEXT NULL, Ext TEXT NULL, Website TEXT NULL, OpenDate DATE NULL, ClosedDate DATE NULL, Charter INT NULL, CharterNum TEXT NULL, FundingType TEXT NULL, DOC TEXT NOT NULL, DOCType TEXT NOT NULL, SOC TEXT NULL, SOCType TEXT NULL, EdOpsCode TEXT NULL, EdOpsName TEXT NULL, EILCode TEXT NULL, EILName TEXT NULL, GSoffered TEXT NULL, GSserved TEXT NULL, Virtual TEXT NULL, Magnet INT NULL, Latitude FLOAT NULL, Longitude FLOAT NULL, AdmFName1 TEXT NULL, AdmLName1 TEXT NULL, AdmEmail1 TEXT NULL, AdmFName2 TEXT NULL, AdmLName2 TEXT NULL, AdmEmail2 TEXT NULL, AdmFName3 TEXT NULL, AdmLName3 TEXT NULL, AdmEmail3 TEXT NULL, LastUpdate DATE NOT NULL);
+# """
 from shutil import rmtree
 
 from pathlib import Path
@@ -41,178 +39,133 @@ def rm_folder(folder_path):
 def reset_folder(folder_path):
     rm_folder(folder_path)
     assert_folder(folder_path)
-from src.parseval.to_dot import display_uexpr
-from src.parseval.logger import Logger
-from parseval.main import Disprover
-Logger(
-    verbose={
-        "coverage": True,
-        "symbolic": False,
-        "smt": True,
-        "db": False,
-    },
-    log_file="log.log"
-)
+
 
 logger = logging.getLogger("parseval.coverage")
 
+
 class TestMain(unittest.TestCase):
-    # @unittest.skip("passed")
+
+    @classmethod
+    def setUpClass(cls):
+        logger.info("Setting up TestMain class")
+        cls.workspace = "examples/instantiations"
+        reset_folder(cls.workspace)
+        import json
+
+        with open("dataset/dev.json") as f:
+            cls.dev_data = json.load(f)
+
+        with open("dataset/schema.json") as f:
+            cls.schema = json.load(f)
+
+    def _run_query(self, instance: Instance, sql: str):
+
+        # instance.to_db(self.workspace)
+        database = os.path.join(self.workspace, f"{instance.name}.sqlite")
+        with sqlite3.connect(database) as conn:
+            return conn.execute(sql).fetchall()
+
+    def _execute_sql(self, host_or_path: str, database: str, sql: str):
+        database_path = os.path.join(host_or_path, f"{database}.sqlite")
+        with sqlite3.connect(database_path) as conn:
+            return conn.execute(sql).fetchall()
+
+    @unittest.skip("Skipping this test for now")
+    def test_speculative(self):
+        import threading
+
+        db_queue = []
+        stop_event = threading.Event()
+        for idx, row in enumerate(self.dev_data):
+            sql = row["SQL"]
+            db_id = row["db_id"]
+            question_id = row["question_id"]
+            name = f"{row['db_id']}_{row['question_id']}"
+            schema = ";".join(self.schema[db_id])
+            instance = Instance(ddls=schema, name=name, dialect="sqlite")
+            try:
+                expr = preprocess_sql(sql, instance, dialect="sqlite")
+                generator = SpeculativeGenerator(expr=expr, instance=instance)
+                result = generator.generate(
+                    db_queue=db_queue,
+                    stop_event=stop_event,
+                    host_or_path=self.workspace,
+                )
+                good = self._run_query(instance, sql)
+
+                if idx % 50 == 0:
+                    print(f"Processed {idx} examples")
+            except Exception as e:
+                good = str(e)
+                print(f"Error processing {sql}: ")
+                # raise e
+                continue
+            finally:
+                with open(os.path.join(self.workspace, f"progress.json"), "a") as f:
+                    f.write(f"{db_id}_{question_id}: {good}\n")
+
+    @unittest.skip("Skipping this test for now")
     def test_spj_disjunct(self):
-        
-        gold = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 " #order by `NumGE1500`
-        pred = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 81 " #order by `NumGE1500`
-        for i in range(1):
-            disprover = Disprover(schema= schema, gold= gold, pred= pred, host_or_path= "examples/tests", database= f"default_{i}", workspace= "examples/tests")
-            
-            r = disprover.verify()
-            
-            print(r)
-            
-            
-        # config = Config()
-        # for i in range(1):
-        #     logger.info("==== Running test_parse_spj iteration {} ====".format(i))
-        #     print("==== Running test_parse_spj iteration {} ====".format(i))
-        #     instance = Instance(ddls=schema, name=f"test_spj_disjunct{i}", dialect="sqlite")
-        #     tracer = UExprToConstraint()
-                
-        #     sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' or CAST(  T1.`District Code`  AS INT) > 15"""
-        #     sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 " #order by `NumGE1500`
-        #     expr = preprocess_sql(sql, instance, dialect="sqlite")
-        #     speculate = Speculative(instance= instance, expr = expr, tracer= tracer, table_alias= None)
-            
-        #     speculate.encode()
-        #     logger.info(f"Speculative done")
-            
-        #     for _ in range(5):
-        #         for table in instance.tables:
-        #             instance.create_row(table)
-        #     speculate.encode()
-            
-            
-            
-        #     instance.to_db("examples/tests", f"test_spj_disjunct_{i}")
-            
-        #     display_uexpr(tracer.root).write(
-        #         "examples/tests/dot_coverage_" + instance.name + ".png", format="png"
-        #     )
-    @unittest.skip("passed")
-    def test_groupby(self):
-        # for i in range(1):
-        #     logger.info("==== Running test_groupby iteration {} ====".format(i))
-        #     print("==== Running test_groupby iteration {} ====".format(i))
-        #     instance = Instance(ddls=schema, name=f"test_groupby_{i}", dialect="sqlite")
-        #     sql = """SELECT GSserved FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
-        #     expr = preprocess_sql(sql, instance, dialect="sqlite")
-        #     generator = DataGenerator(expr= expr, instance= instance, name=f"test_groupby_{i}", workspace="examples/tests", verbose=True)
-        #     generator.generate()
-        #     generator.instance.to_db("examples/tests", f"test_groupby_{i}")
-        #     display_uexpr(generator.tracer.root).write(
-        #         "examples/tests/dot_coverage_groupby" + instance.name + ".png", format="png"
-        #     )
-        from parseval.data_generator import DataGenerator
-        config = Config()
-        for i in range(1):
-            logger.info("==== Running test_groupby iteration {} ====".format(i))
-            print("==== Running test_parse_spj iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_groupby{i}", dialect="sqlite")
-            tracer = UExprToConstraint()
-            sql = """SELECT GSserved FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
-            expr = preprocess_sql(sql, instance, dialect="sqlite")            
-            generator = DataGenerator(expr= expr, instance= instance, name=f"test_groupby{i}", workspace="examples/tests", verbose=True)
-            tracer = generator.speculative(generator.expr)
-            generator.instance.to_db("examples/tests", f"test_groupby{i}")
-            display_uexpr(tracer.root).write(
-                "examples/tests/dot_test_groupby_" + instance.name + ".png", format="png"
-            )
-        
-            
-            # # sql2 = """SELECT T1.`sname` FROM satscores AS T1 where T1.cds = (SELECT T2.CDSCode from frpm AS T2 order by T2.CDSCode limit 1)"""
-            # # expr = preprocess_sql(sql2, instance, dialect= 'sqlite')
-            # speculate = Speculative(instance= instance, expr = expr, config= config, tracer= tracer)
-            
-            # speculate.encode()
-            # logger.info(f"Speculative done")
-            
-            # for _ in range(5):
-            #     for table in instance.tables:
-            #         instance.create_row(table, {"city": "Adelanto" })
-            # speculate.encode()            
-            # instance.to_db("examples/tests", f"dot_coverage_groupby{i}")
-            # display_uexpr(tracer.root).write(
-            #     "examples/tests/dot_coverage_groupby" + instance.name + ".png", format="png"
-            # )
-            
-    @unittest.skip("passed")
-    def test_aggregate(self):
-        for i in range(1):
-            logger.info("==== Running test_parse_spj iteration {} ====".format(i))
-            print("==== Running test_parse_spj iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_aggregate{i}", dialect="sqlite")
-            sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved """
-            expr = preprocess_sql(sql, instance, dialect="sqlite")
-            generator = DataGenerator(expr= expr, instance= instance, name=f"test_aggregate{i}", workspace="examples/tests", verbose=True)
-            generator.generate()
-            generator.instance.to_db("examples/tests", f"test_aggregate{i}")
-                
-            display_uexpr(generator.tracer.root).write(
-                "examples/tests/dot_coverage_aggregate" + instance.name + ".png", format="png"
-            )
-    @unittest.skip("passed")
-    def test_having(self):
-        for i in range(1):
-            logger.info("==== Running test_having iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_{i}", dialect="sqlite")
-            sql = """SELECT GSserved, count(NCESDist) FROM schools WHERE City = 'Adelanto' GROUP BY GSserved having count(NCESDist) > 1 """
-            expr = preprocess_sql(sql, instance, dialect="sqlite")
-            generator = DataGenerator(expr= expr, instance= instance, name=f"test_{i}", workspace="examples/tests", verbose=True)
-            generator.generate()
-            generator.instance.to_db("examples/tests", f"test_having{i}")
-                
-            display_uexpr(generator.tracer.root).write(
-                "examples/tests/dot_coverage_having" + instance.name + ".png", format="png"
-            )
-    
-    @unittest.skip("case when passed")
-    def test_case_when(self):
-        
-        for i in range(1):
-            logger.info("==== Running test_parse_spj iteration {} ====".format(i))
-            print("==== Running test_parse_spj iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_case_when{i}", dialect="sqlite")
-                
-            sql = """SELECT  T1.`CDSCode`, CASE WHEN T1.`School Name`  = 'SFU' THEN 1 WHEN T1.`School Name`  = 'SFU2' THEN 2 ELSE 0 END  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' """
-            expr = preprocess_sql(sql, instance, dialect="sqlite")
-            generator = DataGenerator(expr= expr, instance= instance, name=f"test_case_when{i}", workspace="examples/tests", verbose=True)
-            generator.generate()
-            
-            generator.instance.to_db("examples/tests", f"test_case_when_{i}")
-                
-            display_uexpr(generator.tracer.root).write(
-                "examples/tests/dot_coverage_" + instance.name + ".png", format="png"
-            )
-    @unittest.skip("passed")
-    def test_scalar(self):
-        for i in range(1):
-            logger.info("==== Running test_scalar iteration {} ====".format(i))
-            print("==== Running test_scalar iteration {} ====".format(i))
-            instance = Instance(ddls=schema, name=f"test_scalar{i}", dialect="sqlite")
-                
-            sql = """SELECT  T1.`CDSCode`, (SELECT count(*) FROM schools) as cnt  FROM frpm AS T1  where T1.`Academic Year`  <> '2023' """
-            sql = """SELECT T1.`sname` FROM satscores AS T1 where T1.cds = (SELECT T2.CDSCode from frpm AS T2 order by T2.CDSCode limit 1)"""
-            
-            # sql = """SELECT T1.`sname` FROM satscores AS T1 where exists (select 1 from frpm AS T2 where T1.cds = T2.CDSCode)"""
-            # sql = "SELECT T1.`sname` FROM satscores AS T1 JOIN frpm AS T2 on T1.cds = T2.CDSCode where T1.`NumGE1500` > 100 or T1.`NumGE1500` < 80 "
-            expr = preprocess_sql(sql, instance, dialect="sqlite")
-            generator = DataGenerator(expr= expr, instance= instance, name=f"test_scalar{i}", workspace="examples/tests", verbose=True)
-            generator.generate()
-            generator.instance.to_db("examples/tests", f"test_scalar_{i}")
-            display_uexpr(generator.tracer.root).write(
-                "examples/tests/dot_coverage_scalar" + instance.name + ".png", format="png"
-            )
+        successes = 0
+        unsupported = []
+        for row in self.dev_data:
+            sql = row["SQL"]
+            db_id = row["db_id"]
+            if db_id != "california_schools":
+                break
+            question_id = row["question_id"]
+            name = f"{row['db_id']}_{row['question_id']}"
+            instance = Instance(ddls=schema, name=name, dialect="sqlite")
+            try:
+                expr = preprocess_sql(sql, instance, dialect="sqlite")
+                generator = DataGenerator(expr=expr, instance=instance, verbose=False)
+                result = generator.generate(timeout=10)
+                good = self._run_query(instance, sql)
+                successes += 1
+                with open(os.path.join(self.workspace, f"progress.json"), "a") as f:
+                    f.write(f"{db_id}_{question_id}: {good}\n")
+            except Exception as e:
+                print(sql)
+                print(f"Error processing {name}: {e}")
+                unsupported.append((name, str(e)))
+                continue
+
+        print(f"successful generations: {successes}")
+        if unsupported:
+            print(f"unsupported queries: {len(unsupported)}")
+        self.assertGreaterEqual(successes, 70)
+
+    def test_instantiate_db(self):
+        from parseval import instantiate_db
+
+        for idx, row in enumerate(self.dev_data):
+            sql = row["SQL"]
+            db_id = row["db_id"]
+            question_id = row["question_id"]
+            name = f"{row['db_id']}_{row['question_id']}"
+            schema = ";".join(self.schema[db_id])
+            try:
+                instantiate_db(
+                    query=sql,
+                    schema=schema,
+                    host_or_path=self.workspace,
+                    db_id=name,
+                    dialect="sqlite",
+                )
+                good = self._execute_sql(self.workspace, f"{name}", sql)
+                if idx % 50 == 0:
+                    print(f"Processed {idx} examples")
+            except Exception as e:
+                good = str(e)
+                print(f"Error processing {sql}: ")
+                raise e
+                continue
+            finally:
+                with open(os.path.join(self.workspace, f"progress.json"), "a") as f:
+                    f.write(f"{db_id}_{question_id}: {good}\n")
+
 
 if __name__ == "__main__":
-    reset_folder("examples/tests")
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
     unittest.main(testRunner=runner, exit=False)
