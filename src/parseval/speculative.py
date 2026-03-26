@@ -937,20 +937,13 @@ class SpeculativeGenerator(BaseGenerator):
                     pass
 
         concretes = {}
-        ffffflag = False
+
         for table, tp in table_plans.items():
             real_table = self.table_alias.get(table, table)
             for _ in range(tp.min_rows):
                 for col, val in tp.col_values.items():
                     concretes.setdefault(real_table, {}).setdefault(col, []).append(val)
-            if tp.min_rows == 6:
-                print(concretes)
-                ffffflag = True
         r = self.instance.create_rows(concretes=concretes)
-
-        if ffffflag:
-            for table, rows in r.items():
-                print(f"Table: {table}: {len(rows)} rows")
 
     def _get_pool(self, table: str, column: str, alias: Optional[str] = None):
         return self.instance.column_domains.get_or_create_pool(

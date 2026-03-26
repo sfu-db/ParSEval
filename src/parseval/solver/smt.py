@@ -267,7 +267,11 @@ def lift_nullif(left, right):
         z3.If(
             right_null,
             option_sort.Some(left_value),
-            z3.If(left_value == right_value, option_sort.NULL, option_sort.Some(left_value)),
+            z3.If(
+                left_value == right_value,
+                option_sort.NULL,
+                option_sort.Some(left_value),
+            ),
         ),
     )
 
@@ -522,7 +526,9 @@ class OperationRegistry:
                 result_sort=z3.RealSort(),
                 null_condition=lambda lv, rv: rv == 0,
             ),
-            "concrete": lambda left, right: None if left is None or right in (None, 0) else left / right,
+            "concrete": lambda left, right: (
+                None if left is None or right in (None, 0) else left / right
+            ),
             "nullable": "both",
             "return_type": "float",
         },
@@ -741,7 +747,7 @@ class SMTSolver:
             if var_name not in self.constrained_var_names:
                 continue
             concrete = self._z3_to_python(
-                model.evaluate(z3var, model_completion=False), model=model
+                model.evaluate(z3var, model_completion=True), model=model
             )
             variable = self.context["z3_to_variable"][var_name]
             dtype = DataType.build(variable.type)
@@ -757,23 +763,31 @@ class SMTSolver:
                 continue
 
             result[var_name] = concrete
-        print(f"SMT RESULT: {result}")
         if self.verbose:
             logger.info(result)
         return result
 
+    def _decode_option_value(self, val, model: Optional[z3.ModelRef] = None):
+        decl = val.decl()
+        name = decl.name() if decl is not None else ""
+        if name == "NULL":
+            return None
+        if name == "Some" and val.num_args() == 1:
+            return self._z3_to_python(val.arg(0), model=model)
+
+        # Fallback for partially simplified constructor terms.
+        rendered = str(z3.simplify(val))
+        if rendered == "NULL":
+            return None
+        if rendered.startswith("Some(") and val.num_args() == 1:
+            return self._z3_to_python(val.arg(0), model=model)
+        raise RuntimeError(f"Invalid option value: {val}")
+
     def _z3_to_python(self, val, model: Optional[z3.ModelRef] = None):
-        if isinstance(val.sort(), z3.DatatypeSortRef):
-            opt = OptionTypeRegistry.from_sort(val.sort())
-            is_null = model.evaluate(opt.is_NULL(val), model_completion=True)
-            is_some = model.evaluate(opt.is_Some(val), model_completion=True)
-            if is_null:
-                return None
-            if is_some:
-                inner_val = model.evaluate(opt.value(val), model_completion=True)
-                return self._z3_to_python(inner_val, model=model)
-            else:
-                raise RuntimeError(f"Invalid option value: {val}")
+        if isinstance(val.sort(), z3.DatatypeSortRef) and OptionTypeRegistry.is_option_sort(
+            val.sort()
+        ):
+            return self._decode_option_value(val, model=model)
 
         # ---------- Int ----------
         if z3.is_int_value(val):

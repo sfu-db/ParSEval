@@ -37,6 +37,7 @@ class DisproverConfig:
     query_timeout: int = 10
     global_timeout: int = 360
     set_semantic: bool = False
+    use_data_generator: bool = True
 
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
 
