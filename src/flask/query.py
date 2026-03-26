@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import multiprocessing
+import traceback
 from pathlib import Path
 from typing import Any
 
 from sqlglot import exp, parse
-
+from .utils import unique_path
 from .enums import DBLevel, QueryLevel
 
 try:
@@ -150,16 +152,14 @@ def disprove_queries(
         password=password,
     )
 
-    disprover_cls = _load_disprover()
-    disprover = disprover_cls(
+    return _run_disprover_isolated(
         q1=q1,
         q2=q2,
         schema=process_ddl_by_db_level(schema, dialect, db_level),
         dialect=dialect,
         config=config,
-        exisiting_dbs=existing_dbs,
+        existing_dbs=existing_dbs,
     )
-    return disprover.run()
 
 
 def execution_result_to_payload(
@@ -298,3 +298,106 @@ def _load_disprover():
     except ModuleNotFoundError:
         from src.parseval.disprover import Disprover
     return Disprover
+
+
+def _run_disprover_isolated(
+    *,
+    q1: str,
+    q2: str,
+    schema: str | None,
+    dialect: str,
+    config: DisproverConfig,
+    existing_dbs: list[tuple[str, str, int | None, str | None, str | None]],
+) -> RunResult:
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_disprover_worker,
+        args=(result_queue, q1, q2, schema, dialect, config, existing_dbs),
+        daemon=True,
+    )
+    process.start()
+    process.join(timeout=max(config.global_timeout + 5, 5))
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1)
+        return _solver_failure_result(
+            q1=q1,
+            q2=q2,
+            host_or_path=config.host_or_path,
+            db_id=config.db_id,
+            set_semantic=config.set_semantic,
+            error_msg=(
+                f"disprover subprocess timed out after {config.global_timeout} seconds"
+            ),
+        )
+
+    if not result_queue.empty():
+        kind, payload = result_queue.get()
+        if kind == "ok":
+            return payload
+        return _solver_failure_result(
+            q1=q1,
+            q2=q2,
+            host_or_path=config.host_or_path,
+            db_id=config.db_id,
+            set_semantic=config.set_semantic,
+            error_msg=payload,
+        )
+
+    return _solver_failure_result(
+        q1=q1,
+        q2=q2,
+        host_or_path=config.host_or_path,
+        db_id=config.db_id,
+        set_semantic=config.set_semantic,
+        error_msg=f"disprover subprocess exited with code {process.exitcode}",
+    )
+
+
+def _disprover_worker(
+    result_queue: Any,
+    q1: str,
+    q2: str,
+    schema: str | None,
+    dialect: str,
+    config: DisproverConfig,
+    existing_dbs: list[tuple[str, str, int | None, str | None, str | None]],
+) -> None:
+    try:
+        disprover_cls = _load_disprover()
+        disprover = disprover_cls(
+            q1=q1,
+            q2=q2,
+            schema=schema,
+            dialect=dialect,
+            config=config,
+            exisiting_dbs=existing_dbs,
+        )
+        result_queue.put(("ok", disprover.run()))
+    except BaseException:
+        result_queue.put(("error", traceback.format_exc()))
+        raise
+
+
+def _solver_failure_result(
+    *,
+    q1: str,
+    q2: str,
+    host_or_path: str,
+    db_id: str,
+    set_semantic: bool,
+    error_msg: str,
+) -> RunResult:
+    return RunResult(
+        q1=q1,
+        q2=q2,
+        host_or_path=host_or_path,
+        db_id=db_id,
+        q1_result=None,
+        q2_result=None,
+        state="ERROR",
+        set_semantic=set_semantic,
+        error_msg=error_msg,
+    )

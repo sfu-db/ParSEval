@@ -339,6 +339,8 @@ class DatabaseResultSink:
 
         for item in list(record.counterexamples):
             db.session.delete(item)
+        if record.counterexamples:
+            db.session.flush()
 
         for level in result.levels.values():
             db.session.add(
@@ -394,7 +396,7 @@ class EvaluationSubmissionService:
         )
         db.session.add(job)
         db.session.flush()
-        recompute_model_run_status(run_case.run_id)
+        recompute_model_run_state(run_case.run_id)
         db.session.commit()
         self._runtime.submit(EvaluationTaskPayload(evaluation_job_id=job.id))
         logger.info(f"Submitted evaluation job {job.id} for run case {run_case.id}")
@@ -416,7 +418,7 @@ class EvaluationSubmissionService:
         )
         db.session.add(job)
         db.session.flush()
-        recompute_model_run_status(run_id)
+        recompute_model_run_state(run_id)
         db.session.commit()
         self._runtime.submit(EvaluationTaskPayload(evaluation_job_id=job.id))
         return job
@@ -528,31 +530,47 @@ class EvaluationConsumer:
     def process_task(self, payload: EvaluationTaskPayload) -> None:
         with self._app.app_context():
             job = db.session.get(EvaluationJob, payload.evaluation_job_id)
-            # EvaluationTaskPayload(evaluation_job_id=job.id)
-            logger.info(f"Processing evaluation job {payload.evaluation_job_id}, {job}")
+            logger.info(
+                "Processing evaluation job %s, loaded job=%r",
+                payload.evaluation_job_id,
+                job,
+            )
             if job is None or job.status == RunStatus.DONE.value:
                 return
             logger.info(
-                f"Starting evaluation job {job.id} for run case {job.run_case_id}"
+                "Starting evaluation job %s for run case %s",
+                job.id,
+                job.run_case_id,
             )
-            job.status = RunStatus.RUNNING.value
-            if job.started_at is None:
-                job.started_at = utcnow()
-            job.error_message = None
-            recompute_model_run_status(job.run_id)
-            db.session.commit()
-
             try:
+                job.status = RunStatus.RUNNING.value
+                if job.started_at is None:
+                    job.started_at = utcnow()
+                job.error_message = None
+                recompute_model_run_state(job.run_id)
+                db.session.commit()
+                logger.info("Evaluation job %s marked running", job.id)
+                logger.info("Evaluation job %s entering engine.evaluate", job.id)
                 result = self._engine.evaluate(job)
+                logger.info(
+                    "Evaluation job %s engine.evaluate completed with state=%s",
+                    job.id,
+                    result.state,
+                )
+                logger.info("Evaluation job %s entering result persistence", job.id)
                 self._sink.persist(job, result)
+                logger.info("Evaluation job %s finished result persistence", job.id)
                 job.status = RunStatus.DONE.value
                 job.finished_at = utcnow()
                 job.error_message = None
-                recompute_model_run_status(job.run_id)
+                recompute_model_run_state(job.run_id)
                 db.session.commit()
+                logger.info("Evaluation job %s committed successfully", job.id)
             except Exception as exc:
-                logger.error(f"Evaluation job {job.id} failed with exception: {exc}")
-                logger.exception("Evaluation job %s failed", payload.evaluation_job_id)
+                logger.exception(
+                    "Evaluation job %s failed during process_task",
+                    payload.evaluation_job_id,
+                )
                 db.session.rollback()
                 failed_job = db.session.get(EvaluationJob, payload.evaluation_job_id)
                 if failed_job is None:
@@ -560,8 +578,15 @@ class EvaluationConsumer:
                 failed_job.status = RunStatus.ERROR.value
                 failed_job.finished_at = utcnow()
                 failed_job.error_message = str(exc)
-                recompute_model_run_status(failed_job.run_id)
+                recompute_model_run_state(failed_job.run_id)
                 db.session.commit()
+            except BaseException:
+                logger.exception(
+                    "Evaluation job %s aborted by BaseException",
+                    payload.evaluation_job_id,
+                )
+                db.session.rollback()
+                raise
 
 
 class EvaluationRuntime:
@@ -628,30 +653,51 @@ class EvaluationRuntime:
             except queue.Empty:
                 continue
             try:
+                logger.info(
+                    "Evaluation worker picked up job %s",
+                    payload.evaluation_job_id,
+                )
                 self._consumer.process_task(payload)
+                logger.info(
+                    "Evaluation worker finished job %s",
+                    payload.evaluation_job_id,
+                )
+            except BaseException:
+                logger.exception(
+                    "Evaluation worker crashed while processing job %s",
+                    payload.evaluation_job_id,
+                )
+                raise
             finally:
                 self._queue.task_done()
 
 
-def recompute_model_run_status(run_id: int) -> None:
+def recompute_model_run_state(run_id: int) -> None:
     run = db.session.get(ModelRun, run_id)
     if run is None:
         return
-    statuses = list(
-        db.session.scalars(
-            select(EvaluationJob.status).where(EvaluationJob.run_id == run_id)
-        )
-    )
-    if not statuses:
+    jobs = db.session.scalars(
+        select(EvaluationJob).where(EvaluationJob.run_id == run_id)
+    ).all()
+    if not jobs:
         return
+    statuses = [job.status for job in jobs]
     if RunStatus.ERROR.value in statuses:
         run.status = RunStatus.ERROR.value
+        run.metric_json = _empty_metric_json()
     elif RunStatus.RUNNING.value in statuses:
         run.status = RunStatus.RUNNING.value
+        run.metric_json = _empty_metric_json()
     elif RunStatus.PENDING.value in statuses:
         run.status = RunStatus.PENDING.value
+        run.metric_json = _empty_metric_json()
     elif all(status == RunStatus.DONE.value for status in statuses):
         run.status = RunStatus.DONE.value
+        run.metric_json = _aggregate_metric_json(run, jobs)
+
+
+def recompute_model_run_status(run_id: int) -> None:
+    recompute_model_run_state(run_id)
 
 
 def build_evaluation_runtime(app: Flask) -> EvaluationRuntime:
@@ -663,6 +709,63 @@ def build_evaluation_runtime(app: Flask) -> EvaluationRuntime:
     )
     runtime.start()
     return runtime
+
+
+def _empty_metric_json() -> dict[str, float | None]:
+    return {"EXEC ACC": None, "EXACT MATCH": None}
+
+
+def _aggregate_metric_json(
+    run: ModelRun, jobs: list[EvaluationJob]
+) -> dict[str, float | None]:
+    if not jobs:
+        return _empty_metric_json()
+
+    strictest_key = _strictest_result_key(run)
+    exact_matches = 0
+    execution_matches = 0
+    for job in jobs:
+        result = job.result_json if isinstance(job.result_json, dict) else {}
+        if result.get("exactMatch") is True:
+            exact_matches += 1
+        results_by_settings = result.get("resultsBySettings")
+        if not isinstance(results_by_settings, dict):
+            continue
+        strictest_result = results_by_settings.get(strictest_key)
+        if not isinstance(strictest_result, dict):
+            continue
+        if strictest_result.get("state") == "equivalent":
+            execution_matches += 1
+
+    total = len(jobs)
+    return {
+        "EXEC ACC": execution_matches / total,
+        "EXACT MATCH": exact_matches / total,
+    }
+
+
+def _strictest_result_key(run: ModelRun) -> str:
+    settings = run.setting_json if isinstance(run.setting_json, dict) else {}
+    project_settings = (
+        run.project.settings_json if run.project and isinstance(run.project.settings_json, dict) else {}
+    )
+    db_levels = (
+        settings.get("dbLevels")
+        or settings.get("db_levels")
+        or project_settings.get("dbLevels")
+        or project_settings.get("db_levels")
+        or [level.value for level in DBLevel.ordered()]
+    )
+    query_levels = (
+        settings.get("queryLevels")
+        or settings.get("query_levels")
+        or project_settings.get("queryLevels")
+        or project_settings.get("query_levels")
+        or [level.value for level in QueryLevel.ordered()]
+    )
+    db_level = list(db_levels)[-1]
+    query_level = list(query_levels)[-1]
+    return f"db={db_level}|query={query_level}"
 
 
 def _require_string(data: dict[str, Any], key: str) -> str:

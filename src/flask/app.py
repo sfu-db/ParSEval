@@ -11,6 +11,10 @@ from .models import db, migrate_legacy_flask_schema
 from .routes import api
 
 import logging
+from parseval.utils import Logger
+
+
+Logger(forbidden={"coverage": True})
 
 logging.basicConfig(
     level=logging.INFO,  # or DEBUG, WARNING, ERROR, etc.

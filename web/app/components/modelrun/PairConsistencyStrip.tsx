@@ -226,6 +226,9 @@ function ResultTable({ columns, rows, emptyMessage }: { columns?: string[]; rows
 }
 
 function QueryResultCard({ title, result, accent }: { title: string; result: QueryResult | undefined; accent: string }) {
+    const errorMessage = result?.error_msg?.trim();
+    const syntaxError = Boolean(errorMessage && /syntax error/i.test(errorMessage));
+
     return (
         <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden", background: C.panel }}>
             <div style={{ padding: "10px 14px", borderBottom: `1px solid ${C.border}`, background: `${accent}10`, color: accent, fontFamily: F.body, fontSize: 12, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>
@@ -236,19 +239,23 @@ function QueryResultCard({ title, result, accent }: { title: string; result: Que
                     <span>Dialect: {result?.dialect ?? "-"}</span>
                     <span>Elapsed: {typeof result?.elapsed_time === "number" ? `${result.elapsed_time} ms` : "-"}</span>
                 </div>
-                {result?.error_msg ? (
+                {errorMessage ? (
                     <div style={{ border: `1px solid ${C.nequiv}44`, background: `${C.nequiv}10`, borderRadius: 8, padding: "10px 12px", color: C.nequiv, fontFamily: F.body, fontSize: 12 }}>
-                        {result.error_msg}
+                        {errorMessage}
                     </div>
                 ) : null}
-                <div>
-                    <div style={{ marginBottom: 6, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Query</div>
-                    <pre style={{ margin: 0, background: C.faint, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, fontFamily: F.mono, color: C.text }}>{result?.query ?? "-"}</pre>
-                </div>
-                <div>
-                    <div style={{ marginBottom: 6, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Rows</div>
-                    <ResultTable columns={result?.columns} rows={result?.rows} emptyMessage="No rows returned." />
-                </div>
+                {!syntaxError ? (
+                    <>
+                        <div>
+                            <div style={{ marginBottom: 6, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Query</div>
+                            <pre style={{ margin: 0, background: C.faint, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, fontFamily: F.mono, color: C.text }}>{result?.query ?? "-"}</pre>
+                        </div>
+                        <div>
+                            <div style={{ marginBottom: 6, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Rows</div>
+                            <ResultTable columns={result?.columns} rows={result?.rows} emptyMessage="No rows returned." />
+                        </div>
+                    </>
+                ) : null}
             </div>
         </div>
     );
@@ -281,6 +288,7 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
     const [detail, setDetail] = useState<RelaxedEquivalenceRecord | null>(null);
     const [loadingDetail, setLoadingDetail] = useState(false);
     const [detailError, setDetailError] = useState<string | null>(null);
+    const [selectedSettingKey, setSelectedSettingKey] = useState<SettingKey | null>(visibleSettings[0]?.key ?? null);
 
     useEffect(() => {
         let active = true;
@@ -308,10 +316,22 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
         };
     }, [row]);
 
+    useEffect(() => {
+        setSelectedSettingKey((current) => {
+            if (current && visibleSettings.some((setting) => setting.key === current)) {
+                return current;
+            }
+            return visibleSettings[0]?.key ?? null;
+        });
+    }, [row, visibleSettings]);
+
     const counterExamples = visibleSettings.filter((setting) => row.labels[setting.key] === false);
     const equivSettings = visibleSettings.filter((setting) => row.labels[setting.key] === true);
     const naSettings = visibleSettings.filter((setting) => row.labels[setting.key] === null || row.labels[setting.key] === undefined);
-    const witnessRecord = detail?.counternexample?.[0];
+    const selectedSetting = visibleSettings.find((setting) => setting.key === selectedSettingKey) ?? visibleSettings[0] ?? null;
+    const selectedCounterExample = detail?.counternexample?.find((item) =>
+        item.settings.some((setting) => `${setting.db_level}_${setting.query_level}` === selectedSetting?.key)
+    );
 
     return (
         <div onClick={(event) => { if (event.target === event.currentTarget) onClose(); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
@@ -344,31 +364,6 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
                         ))}
                     </div>
 
-                    <div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                            <h4 style={{ margin: 0, fontFamily: F.display, fontSize: 14, fontWeight: 700, color: C.text }}>Counter-Examples</h4>
-                            <span style={{ background: `${C.nequiv}18`, color: C.nequiv, border: `1px solid ${C.nequiv}44`, borderRadius: 10, padding: "1px 8px", fontSize: 11, fontWeight: 700, fontFamily: F.mono }}>{counterExamples.length} setting{counterExamples.length !== 1 ? "s" : ""}</span>
-                        </div>
-                        {counterExamples.length === 0 ? (
-                            <div style={{ background: `${C.equiv}0f`, border: `1px solid ${C.equiv}33`, borderRadius: 10, padding: "14px 18px", display: "flex", alignItems: "center", gap: 10 }}>
-                                <span style={{ fontSize: 18 }}>✓</span>
-                                <span style={{ fontFamily: F.body, fontSize: 13, color: C.equiv, fontWeight: 600 }}>No counter-examples. The predicted SQL is equivalent under all evaluated settings.</span>
-                            </div>
-                        ) : (
-                            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                                {counterExamples.map((setting) => (
-                                    <div key={setting.key} style={{ background: `${C.nequiv}08`, border: `1px solid ${C.nequiv}30`, borderLeft: `4px solid ${setting.color}`, borderRadius: 10, padding: "14px 18px" }}>
-                                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                                            <div style={{ width: 10, height: 10, borderRadius: "50%", background: setting.color, flexShrink: 0 }} />
-                                            <span style={{ fontFamily: F.body, fontSize: 13, fontWeight: 700, color: C.text }}>{setting.label}</span>
-                                            <span style={{ background: `${C.nequiv}18`, color: C.nequiv, border: `1px solid ${C.nequiv}44`, borderRadius: 4, padding: "1px 7px", fontSize: 10, fontWeight: 700, fontFamily: F.mono }}>≠ not equivalent</span>
-                                        </div>
-                                        <p style={{ margin: 0, fontFamily: F.body, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>{getSettingExplanation(setting.key)}</p>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
 
                     <div>
                         <h4 style={{ margin: "0 0 10px", fontFamily: F.display, fontSize: 14, fontWeight: 700, color: C.text }}>All Settings</h4>
@@ -376,11 +371,29 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
                             {visibleSettings.map((setting) => {
                                 const value = row.labels[setting.key];
                                 const accent = value === true ? C.equiv : value === false ? C.nequiv : C.muted;
+                                const selected = selectedSetting?.key === setting.key;
                                 return (
-                                    <div key={setting.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: C.faint, border: `1px solid ${C.border}`, borderLeft: `4px solid ${setting.color}`, borderRadius: 8, padding: "10px 14px" }}>
+                                    <button
+                                        key={setting.key}
+                                        type="button"
+                                        onClick={() => setSelectedSettingKey(setting.key)}
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "space-between",
+                                            background: selected ? `${setting.color}12` : C.faint,
+                                            border: `1px solid ${selected ? setting.color : C.border}`,
+                                            borderLeft: `4px solid ${setting.color}`,
+                                            borderRadius: 8,
+                                            padding: "10px 14px",
+                                            cursor: "pointer",
+                                            textAlign: "left",
+                                            boxShadow: selected ? `inset 0 0 0 1px ${setting.color}22` : "none",
+                                        }}
+                                    >
                                         <span style={{ fontFamily: F.body, fontSize: 12, fontWeight: 600, color: C.text }}>{setting.label}</span>
                                         <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 700, color: accent }}>{value === true ? "✓" : value === false ? "✗" : "-"}</span>
-                                    </div>
+                                    </button>
                                 );
                             })}
                         </div>
@@ -405,26 +418,37 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
                         {detailError ? <div style={{ color: C.nequiv, fontSize: 12, fontFamily: F.body }}>{detailError}</div> : null}
                         {!loadingDetail && !detailError ? (
                             <div style={{ display: "grid", gap: 16 }}>
-                                {detail?.counternexample?.map((item, index) => (
-                                    <div key={`${item.db_id}-${item.question_id}-${index}`} style={{ display: "grid", gap: 14, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, background: C.faint }}>
+                                {selectedSetting ? (
+                                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                                        <span style={{ fontFamily: F.body, fontSize: 12, fontWeight: 700, color: C.text }}>Selected setting</span>
+                                        <span style={{ background: C.faint, border: `1px solid ${C.border}`, borderRadius: 999, padding: "3px 8px", fontFamily: F.mono, fontSize: 11, color: C.text }}>
+                                            {selectedSetting.dbLevel}_{selectedSetting.queryLevel}
+                                        </span>
+                                    </div>
+                                ) : null}
+                                {selectedCounterExample ? (
+                                    <div key={`${selectedCounterExample.db_id}-${selectedCounterExample.question_id}-${selectedSetting?.key ?? "selected"}`} style={{ display: "grid", gap: 14, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, background: C.faint }}>
                                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                                            <span style={{ fontFamily: F.body, fontSize: 12, fontWeight: 700, color: C.text }}>Counterexample {index + 1}</span>
-                                            <span style={{ fontFamily: F.mono, fontSize: 11, color: C.muted }}>{item.state}</span>
-                                            {item.settings.map((setting, settingIndex) => (
+                                            <span style={{ fontFamily: F.body, fontSize: 12, fontWeight: 700, color: C.text }}>Counterexample</span>
+                                            <span style={{ fontFamily: F.mono, fontSize: 11, color: C.muted }}>{selectedCounterExample.state}</span>
+                                            {selectedCounterExample.settings.map((setting, settingIndex) => (
                                                 <span key={`${setting.db_level}-${setting.query_level}-${settingIndex}`} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 999, padding: "3px 8px", fontFamily: F.mono, fontSize: 11, color: C.text }}>{setting.db_level}_{setting.query_level}</span>
                                             ))}
                                         </div>
                                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                                            <QueryResultCard title="Gold Query Result" result={item.q1_result} accent="#0550ae" />
-                                            <QueryResultCard title="Pred Query Result" result={item.q2_result} accent="#6d28d9" />
+                                            <QueryResultCard title="Gold Query Result" result={selectedCounterExample.q1_result} accent="#0550ae" />
+                                            <QueryResultCard title="Pred Query Result" result={selectedCounterExample.q2_result} accent="#6d28d9" />
                                         </div>
                                         <div>
                                             <div style={{ marginBottom: 10, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Witness Database</div>
-                                            <WitnessDatabaseCard database={item.witeness_db} />
+                                            <WitnessDatabaseCard database={selectedCounterExample.witeness_db} />
                                         </div>
                                     </div>
-                                )) ?? null}
-                                {!detail?.counternexample?.length ? <WitnessDatabaseCard database={witnessRecord?.witeness_db} /> : null}
+                                ) : (
+                                    <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px", background: C.faint, color: C.muted, fontSize: 12, fontFamily: F.body }}>
+                                        No witness database or query results are available for the selected setting.
+                                    </div>
+                                )}
                             </div>
                         ) : null}
                     </div>
