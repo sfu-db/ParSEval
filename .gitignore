@@ -187,3 +187,5 @@ src/expression/
 src/parseval/solver/
 examples/
 pyproject.toml
+
+src/flask/static
