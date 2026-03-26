@@ -117,7 +117,7 @@ const Sidebar = () => {
                                             open={open}
                                             onClose={() => setOpen(false)}
                                             onCreate={async (data) => {
-                                                const newProject = await ProjectAPI.create({ name: data.name, description: data.description });
+                                                const newProject = await ProjectAPI.create({ name: data.name, description: data.description, settings: data.settings });
                                                 setProjects((prev) => [...prev, newProject]);
                                             }}
                                         />

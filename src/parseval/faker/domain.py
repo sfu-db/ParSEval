@@ -15,12 +15,12 @@ from typing import (
     Type,
 )
 from abc import ABC, abstractmethod
-import random, time, logging, threading
+import random, time as time_module, logging, threading
 from collections import deque
 from sqlglot.schema import normalize_name
 import string, re, uuid
 from decimal import Decimal
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from sqlglot import exp
 from parseval.dtype import DataType
 from parseval.plan.rex import Is_Null
@@ -131,6 +131,22 @@ def _offset(value: Any, n: int, _flip: bool = False) -> Any:
         return value
 
     return value
+
+
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        try:
+            if _DATE_RE.match(value):
+                return datetime.strptime(value, "%Y-%m-%d")
+            if _DATETIME_RE.match(value):
+                return datetime.fromisoformat(value.replace(" ", "T"))
+        except ValueError:
+            return None
+    return None
 
 
 def _midpoint(low: Any, high: Any) -> Any:
@@ -530,7 +546,6 @@ class ValuePool(Generic[ValueType]):
     def generate_for_spec(self, op: str, value, negate: bool = False):
         generator = ValueGeneratorFactory.create(self)
         value = generator.generate_for_spec(op, value, negate=negate)
-        # self._record_generation(value=value, is_new=value not in self._generated_values)
         return value
 
     def _generate(
@@ -572,7 +587,7 @@ class ValueGenerator(ABC, Generic[ValueType]):
     def negating_value(self, op: str, value: Any): ...
 
     def _default(self) -> Any:
-        return self.generate()
+        return self.generate(None)
 
     def _null_guard(self, value: Any) -> Any:
         """Replace None for NOT NULL columns with the type-appropriate default."""
@@ -596,8 +611,13 @@ class ValueGenerator(ABC, Generic[ValueType]):
         )
         candidate = self._null_guard(candidate)
         if self.pool.unique:
-            used = self.pool.available_values
-            return self._find_unused(candidate, _direction(op), used)
+            used = (
+                set(self.pool.available_values)
+                | set(self.pool._generated_values)
+                | set(self.pool.domain.generated)
+            )
+            candidate = self._find_unused(candidate, _direction(op), used)
+            self.pool.add_generated_value(candidate)
         return candidate
 
     def _find_unused(self, start: Any, direction: int, used: Set[Any]) -> Any:
@@ -640,7 +660,7 @@ class IntGenerator(ValueGenerator[int]):
         if op == "EQ":
             return int(value)
         if op == "NEQ":
-            return value + 1
+            return int(value) + 1
         if op == "GT":
             return value + 1
         if op == "GTE":
@@ -670,7 +690,7 @@ class IntGenerator(ValueGenerator[int]):
 
     def propagate_constraints(self):
         self.min_value = 0
-        self.max_value = 400
+        self.max_value = 1000
         self.fixed_value = None
         self._in_values = None
         for c in self.pool.constraints:
@@ -837,6 +857,9 @@ class StringGenerator(ValueGenerator[str]):
         raise RuntimeError("StringGenerator could not produce a valid value")
 
     def validate(self, value, skips=None):
+
+        if not self.pool.nullable and value is None:
+            raise ValueError("Generated None for nullable domain")
         if skips:
             return value not in skips
         return True
@@ -848,43 +871,34 @@ class DateGenerator(ValueGenerator[datetime]):
             # Between case
             if op == "BETWEEN":
                 lo, hi = value
-                lo_dt = (
-                    lo
-                    if isinstance(lo, datetime)
-                    else datetime(lo.year, lo.month, lo.day)
-                )
-                hi_dt = (
-                    hi
-                    if isinstance(hi, datetime)
-                    else datetime(hi.year, hi.month, hi.day)
-                )
+                lo_dt = _coerce_datetime(lo)
+                hi_dt = _coerce_datetime(hi)
+                if lo_dt is None or hi_dt is None:
+                    return value
                 return lo_dt + (hi_dt - lo_dt) / 2
             if op == "IN":
-                return random.choice(value) if value else None
+                candidates = [
+                    candidate
+                    for candidate in (_coerce_datetime(v) for v in value)
+                    if candidate is not None
+                ]
+                return random.choice(candidates) if candidates else None
             return value
 
-        v = (
-            value
-            if isinstance(value, datetime)
-            else (
-                datetime(value.year, value.month, value.day)
-                if isinstance(value, date)
-                else None
-            )
-        )
+        v = _coerce_datetime(value)
         if v is None:
             return value
 
         if op == "EQ":
             return v
         if op == "NEQ":
-            return v + timedelta(days=_ONE_DAY)
+            return v + _ONE_DAY
         if op == "GT":
-            return v + timedelta(days=_ONE_DAY)
+            return v + _ONE_DAY
         if op == "GTE":
             return v
         if op == "LT":
-            return v - timedelta(days=_ONE_DAY)
+            return v - _ONE_DAY
         if op == "LTE":
             return v
         return value
@@ -894,10 +908,8 @@ class DateGenerator(ValueGenerator[datetime]):
             return self.satisfying_value(_NEG_OP[op], value)
         if op == "BETWEEN":
             lo, _ = value
-            lo_dt = (
-                lo if isinstance(lo, datetime) else datetime(lo.year, lo.month, lo.day)
-            )
-            return lo_dt - timedelta(days=1)
+            lo_dt = _coerce_datetime(lo)
+            return lo_dt - timedelta(days=1) if lo_dt is not None else None
         return None
 
     def propagate_constraints(self):

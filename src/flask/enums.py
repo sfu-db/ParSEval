@@ -4,7 +4,7 @@ enums.py — shared enum definitions for the QueryLens equivalence checking syst
 Design notes
 ------------
 DBLevel and QueryLevel form two independent orderings.  Their Cartesian product
-(DBLevel × QueryLevel) defines the 25 EquivalenceLevel combinations used as
+(DBLevel × QueryLevel) defines the 8 EquivalenceLevel combinations used as
 labels in EvalRecord.  Storing them as separate columns (db_level, query_level)
 rather than a single string makes filtering and aggregation efficient.
 
@@ -23,14 +23,13 @@ class DBLevel(str, enum.Enum):
     """
 
     NONE = "NONE"  # no constraints — any database instance
-    PK = "PK"  # primary key uniqueness only
     PK_FK = "PK_FK"  # PK + foreign key referential integrity
     PK_FK_NULL = "PK_FK_NULL"  # PK + FK + NOT NULL
     FULL = "FULL"  # all schema constraints (CHECK, UNIQUE, etc.)
 
     @classmethod
     def ordered(cls) -> list["DBLevel"]:
-        return [cls.NONE, cls.PK, cls.PK_FK, cls.PK_FK_NULL, cls.FULL]
+        return [cls.NONE, cls.PK_FK, cls.PK_FK_NULL, cls.FULL]
 
 
 class QueryLevel(str, enum.Enum):
@@ -39,15 +38,12 @@ class QueryLevel(str, enum.Enum):
     Ordered from least to most restrictive.
     """
 
-    POSITIVE = "POSITIVE"  # basic positive-relational fragment
-    AGGREGATE_NULL = "AGGREGATE_NULL"  # + aggregation and NULL handling
     SET = "SET"  # + set semantics (UNION, INTERSECT, EXCEPT)
     BAG = "BAG"  # + bag/multiset semantics (UNION ALL)
-    FULL = "FULL"  # full SQL including ORDER BY, LIMIT, etc.
 
     @classmethod
     def ordered(cls) -> list["QueryLevel"]:
-        return [cls.POSITIVE, cls.AGGREGATE_NULL, cls.SET, cls.BAG, cls.FULL]
+        return [cls.SET, cls.BAG]
 
 
 class MetricType(str, enum.Enum):

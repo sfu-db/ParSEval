@@ -5,12 +5,16 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING, Callable, Tuple
 from sqlglot.expressions import DataType
 from sqlglot import exp
 
-# from src.parseval.plan.rex import Variable
 from datetime import datetime
 from contextlib import contextmanager
 from parseval.plan.rex import Const
 
 logger = logging.getLogger("parseval.smt")
+
+try:
+    from z3.z3util import get_vars
+except Exception:
+    get_vars = None
 
 
 @contextmanager
@@ -91,13 +95,13 @@ def _to_z3val(dtype: DataType, value, z3ctx: Optional[z3.Context] = None) -> z3.
     dtype = DataType.build(dtype)
     if str(dtype) == "UNKNOWN":
         dtype = infer(value)
+    if value is None and dtype.is_type(DataType.Type.NULL):
+        option_sort = OptionTypeRegistry.get(z3.IntSort(z3ctx), z3ctx)
+        return option_sort.NULL
     try:
         base_sort = _to_z3_sort(dtype, z3ctx)
         option_sort = OptionTypeRegistry.get(base_sort)
     except Exception as e:
-        print(
-            f"Error creating Z3 sort for data type {dtype}: {dtype}, {value}, {repr(dtype.parent)}"
-        )
         raise e
     if value is None:
         return option_sort.NULL
@@ -155,6 +159,119 @@ def unwrap_option(expr):
     return opt.value(expr)
 
 
+def lift_nullable_unary(func, arg, result_sort: Optional[z3.SortRef] = None):
+    if not is_option_expr(arg):
+        return func(arg)
+
+    opt = option_of(arg)
+    raw = unwrap_option(arg)
+    result = func(raw)
+    if result_sort is None:
+        result_sort = result.sort()
+    option_sort = OptionTypeRegistry.get(result_sort)
+    return z3.If(opt.is_Some(arg), option_sort.Some(result), option_sort.NULL)
+
+
+def _coerce_numeric_sort(expr, target_sort: z3.SortRef):
+    if expr.sort() == target_sort:
+        return expr
+    if target_sort.kind() == z3.Z3_REAL_SORT and expr.sort().kind() == z3.Z3_INT_SORT:
+        return z3.ToReal(expr)
+    return expr
+
+
+def lift_nullable_binary(
+    func,
+    left,
+    right,
+    result_sort: Optional[z3.SortRef] = None,
+    null_condition: Optional[Callable[[z3.ExprRef, z3.ExprRef], z3.BoolRef]] = None,
+):
+    left_is_option = is_option_expr(left)
+    right_is_option = is_option_expr(right)
+    if not left_is_option and not right_is_option:
+        raw_left, raw_right = left, right
+        if result_sort is None:
+            result = func(raw_left, raw_right)
+            return result
+        raw_left = _coerce_numeric_sort(raw_left, result_sort)
+        raw_right = _coerce_numeric_sort(raw_right, result_sort)
+        if null_condition is None:
+            return func(raw_left, raw_right)
+        option_sort = OptionTypeRegistry.get(result_sort)
+        return z3.If(
+            null_condition(raw_left, raw_right),
+            option_sort.NULL,
+            option_sort.Some(func(raw_left, raw_right)),
+        )
+
+    null_checks = []
+    raw_left = left
+    raw_right = right
+    if left_is_option:
+        left_opt = option_of(left)
+        null_checks.append(left_opt.is_NULL(left))
+        raw_left = unwrap_option(left)
+    if right_is_option:
+        right_opt = option_of(right)
+        null_checks.append(right_opt.is_NULL(right))
+        raw_right = unwrap_option(right)
+
+    if result_sort is None:
+        result_sort = raw_left.sort()
+    raw_left = _coerce_numeric_sort(raw_left, result_sort)
+    raw_right = _coerce_numeric_sort(raw_right, result_sort)
+    option_sort = OptionTypeRegistry.get(result_sort)
+    null_expr = z3.Or(*null_checks) if null_checks else z3.BoolVal(False)
+    if null_condition is not None:
+        null_expr = z3.Or(null_expr, null_condition(raw_left, raw_right))
+    return z3.If(
+        null_expr,
+        option_sort.NULL,
+        option_sort.Some(func(raw_left, raw_right)),
+    )
+
+
+def lift_nullif(left, right):
+    left_is_option = is_option_expr(left)
+    right_is_option = is_option_expr(right)
+
+    if not left_is_option and not right_is_option:
+        option_sort = OptionTypeRegistry.get(left.sort())
+        return z3.If(left == right, option_sort.NULL, option_sort.Some(left))
+
+    if left_is_option:
+        left_opt = option_of(left)
+        left_null = left_opt.is_NULL(left)
+        left_value = unwrap_option(left)
+        result_sort = left_value.sort()
+    else:
+        left_null = z3.BoolVal(False)
+        left_value = left
+        result_sort = left.sort()
+
+    option_sort = OptionTypeRegistry.get(result_sort)
+    if right_is_option:
+        right_opt = option_of(right)
+        right_null = right_opt.is_NULL(right)
+        right_value = unwrap_option(right)
+        right_value = _coerce_numeric_sort(right_value, result_sort)
+    else:
+        right_null = z3.BoolVal(False)
+        right_value = _coerce_numeric_sort(right, result_sort)
+
+    left_value = _coerce_numeric_sort(left_value, result_sort)
+    return z3.If(
+        left_null,
+        option_sort.NULL,
+        z3.If(
+            right_null,
+            option_sort.Some(left_value),
+            z3.If(left_value == right_value, option_sort.NULL, option_sort.Some(left_value)),
+        ),
+    )
+
+
 def declare_sort(
     variable: exp.Column, z3ctx: Optional[z3.Context] = None
 ) -> z3.ConstRef:
@@ -167,21 +284,27 @@ def declare_sort(
 
 
 def lift_is(expr1, expr2):
-    null_checks = []
-    raw_expr1 = expr1
-    raw_expr2 = expr2
+    if is_option_expr(expr1) and is_option_expr(expr2):
+        opt1 = option_of(expr1)
+        opt2 = option_of(expr2)
+        left_is_null = opt1.is_NULL(expr1)
+        right_is_null = opt2.is_NULL(expr2)
+        left_is_some = opt1.is_Some(expr1)
+        right_is_some = opt2.is_Some(expr2)
+        return z3.Or(
+            z3.And(left_is_null, right_is_null),
+            z3.And(left_is_some, right_is_some, opt1.value(expr1) == opt2.value(expr2)),
+        )
+
     if is_option_expr(expr1):
         opt1 = option_of(expr1)
-        null_checks.append(expr1 == opt1.NULL)
-        raw_expr1 = opt1.value(expr1)
+        return z3.And(opt1.is_Some(expr1), opt1.value(expr1) == expr2)
+
     if is_option_expr(expr2):
         opt2 = option_of(expr2)
-        null_checks.append(expr2 == opt2.NULL)
-        raw_expr2 = opt2.value(expr2)
-    if not null_checks:
-        return raw_expr1 == raw_expr2
-    return z3.If(z3.Or(*null_checks), z3.BoolVal(True), raw_expr1 == raw_expr2)
-    ...
+        return z3.And(opt2.is_Some(expr2), expr1 == opt2.value(expr2))
+
+    return expr1 == expr2
 
 
 def lift_options(func, *args):
@@ -196,15 +319,6 @@ def lift_options(func, *args):
             raw_args.append(a)
 
     return z3.And(z3.Not(z3.Or(*null_checks)), func(*raw_args))
-
-    # if not null_checks:
-    #         return func(*raw_args)
-    #     # return z3.If(z3.Not(z3.Or(*null_checks)), func(*raw_args), z3.BoolVal(True))
-    return z3.And(z3.Not(z3.Or(*null_checks)), func(*raw_args))
-    return func(*raw_args)
-
-
-#
 
 
 def null_if_any(bsort, *args):
@@ -241,7 +355,16 @@ def like_to_z3(var, pattern: str):
         raw = opt.value(var)
     parts = []
     constraints = []
-    pattern = pattern.as_string()
+
+    if is_option_expr(pattern):
+        pattern = z3.simplify(unwrap_option(pattern))
+
+    if z3.is_string_value(pattern):
+        pattern = pattern.as_string()
+    elif isinstance(pattern, str):
+        pattern = pattern
+    else:
+        raise NotImplementedError("LIKE currently requires a concrete string pattern")
 
     for i, ch in enumerate(pattern):
         if ch == "_":
@@ -250,11 +373,11 @@ def like_to_z3(var, pattern: str):
             parts.append(c)
         elif ch == "%":
             tail = z3.String(f"p{i}")
-            constraints.append(z3.Length(tail) >= 1)
+            constraints.append(z3.Length(tail) >= 0)
             parts.append(tail)
         else:
             parts.append(z3.StringVal(ch))
-    expr = parts[0]
+    expr = parts[0] if parts else z3.StringVal("")
     for p in parts[1:]:
         expr = z3.Concat(expr, p)
 
@@ -356,7 +479,7 @@ class OperationRegistry:
         "IS": {
             "type": "identity",
             "arg_types": "any",
-            "symbolic": lambda *args: args[0] == args[1],
+            "symbolic": lambda *args: lift_is(args[0], args[1]),
             "concrete": lambda *args: args[0] is args[1],
             "nullable": False,
             "return_type": "boolean",  # IS NULL is a special case
@@ -364,7 +487,9 @@ class OperationRegistry:
         "LENGTH": {
             "type": "function",
             "arg_types": "any",
-            "symbolic": lambda args: z3.Length(args[0]),
+            "symbolic": lambda arg: lift_nullable_unary(
+                lambda raw: z3.Length(raw), arg, z3.IntSort()
+            ),
             "concrete": lambda args: len(args[0]),
             "nullable": "any",
             "return_type": "int",
@@ -372,7 +497,9 @@ class OperationRegistry:
         "Abs": {
             "type": "function",
             "arg_types": "any",
-            "symbolic": lambda args: z3.If(args[0] >= 0, args[0], -args[0]),
+            "symbolic": lambda arg: lift_nullable_unary(
+                lambda raw: z3.If(raw >= 0, raw, -raw), arg
+            ),
             "concrete": lambda args: abs(args[0]),
             "nullable": "any",
             "return_type": "int",
@@ -380,10 +507,59 @@ class OperationRegistry:
         "CAST": {
             "type": "function",
             "arg_types": "any",
-            "symbolic": lambda args: args[0],
+            "symbolic": lambda arg: arg,
             "concrete": lambda args: args[0],
             "nullable": "any",
             "return_type": "int",
+        },
+        "DIV": {
+            "type": "arithmetic",
+            "arg_types": "any",
+            "symbolic": lambda left, right: lift_nullable_binary(
+                lambda lv, rv: lv / rv,
+                left,
+                right,
+                result_sort=z3.RealSort(),
+                null_condition=lambda lv, rv: rv == 0,
+            ),
+            "concrete": lambda left, right: None if left is None or right in (None, 0) else left / right,
+            "nullable": "both",
+            "return_type": "float",
+        },
+        "NULLIF": {
+            "type": "function",
+            "arg_types": "any",
+            "symbolic": lambda left, right: lift_nullif(left, right),
+            "concrete": lambda left, right: None if left == right else left,
+            "nullable": "any",
+            "return_type": "any",
+        },
+        "BETWEEN": {
+            "type": "comparison",
+            "arg_types": "any",
+            "symbolic": lambda value, low, high: lift_options(
+                lambda v, lo, hi: z3.And(lo <= v, v <= hi), value, low, high
+            ),
+            "concrete": lambda value, low, high: low <= value <= high,
+            "nullable": "both",
+            "return_type": "boolean",
+        },
+        "IN": {
+            "type": "comparison",
+            "arg_types": "any",
+            "symbolic": lambda *args: (
+                z3.Or(
+                    *[
+                        lift_options(lambda lv, rv: lv == rv, args[0], candidate)
+                        for candidate in args[1:]
+                    ]
+                )
+                if len(args) > 1
+                else z3.BoolVal(False)
+            ),
+            "concrete": lambda value, *values: value in values,
+            "nullable": "both",
+            "return_type": "boolean",
         },
     }
 
@@ -423,40 +599,6 @@ class OperationRegistry:
         return func["concrete"](*args)
 
 
-# smt_exmpr = OperationRegistry.get("GT")['symbolic'](v1, z3.IntVal(30))
-# val1 = _to_z3val(DataType.build("int"), 12)
-# smt_exmpr = OperationRegistry.eval_symbol("EQ", v1, _to_z3val(DataType.build("int"), None))
-
-# solver = z3.Solver()
-# solver.add(smt_exmpr)
-# solver.add(OperationRegistry.eval_symbol("EQ", v1, val1))
-
-# print(smt_exmpr)
-# print(solver.sexpr())
-# print(solver.check())
-# print(solver.model())
-
-# print(solver.model().evaluate(v1))
-
-# def lift_binary(op, left, right, z3ctx: Optional[z3.Context] = None):
-#     if not (is_option_expr(left) or is_option_expr(right)):
-#         return apply_raw_binary(op, left, right)
-#     opt = option_of(left if is_option_expr(left) else right)
-#     def null_check(x):
-#         if is_option_expr(x):
-#             o = option_of(x)
-#             return x == o.NULL
-#         return z3.BoolVal(False)
-#     null_expr = z3.Or(null_check(left), null_check(right))
-#     lv = unwrap_option(left) if is_option_expr(left) else left
-#     rv = unwrap_option(right) if is_option_expr(right) else right
-#     raw = apply_raw_binary(op, lv, rv)
-#     if raw.sort() == z3.BoolSort():
-#         return z3.And(z3.Not(null_expr), raw)
-#     result_opt = OptionTypeRegistry.get(raw.sort())
-#     return z3.If(null_expr, result_opt.NULL, result_opt.Some(raw))
-
-
 class SMTSolver:
     def __init__(
         self, variables, z3ctx: Optional[z3.Context] = None, verbose: bool = False
@@ -467,7 +609,8 @@ class SMTSolver:
         self.solver = z3.Solver(ctx=self.z3ctx)
         self.model = None
         self.context = {}
-        # self.uf = z3.UnionFind(ctx=self.z3ctx)
+        self._domain_constraints_applied = False
+        self.constrained_var_names = set()
 
         z3.set_option(html_mode=False)
         z3.set_option(rational_to_decimal=True)
@@ -475,12 +618,15 @@ class SMTSolver:
         z3.set_option(max_width=21049)
         z3.set_option(max_args=100)
 
-    def add(self, constraint):
+    def add(self, constraint, track_vars: bool = True):
 
         try:
             if z3.is_bool(constraint):
                 if self.verbose:
                     logger.info(constraint)
+                if track_vars and get_vars is not None:
+                    for var in get_vars(constraint):
+                        self.constrained_var_names.add(str(var))
                 self.solver.add(constraint)
         except Exception as e:
             print(f"Error adding constraint: {constraint}")
@@ -488,9 +634,7 @@ class SMTSolver:
 
     def solve(self):
 
-        if self.solver.check() != z3.sat:
-            return "unsat", {}
-        with checkpoint(self.solver):
+        if not self._domain_constraints_applied:
             for var_name, z3var in self.context.get("variable_to_z3", {}).items():
                 column = self.context["z3_to_variable"][str(z3var)]
                 dtype = DataType.build(column.type)
@@ -499,8 +643,10 @@ class SMTSolver:
                 if dtype.is_type(*DataType.TEXT_TYPES):
                     self._ensure_str_printable(z3var)
                     self._ensure_str_length(z3var, 0)
+            self._domain_constraints_applied = True
 
         if self.solver.check() != z3.sat:
+            print("SMT solver determined unsat without model generation")
             return "unsat", {}
         self.solver.check()
         if self.solver.check() != z3.sat:
@@ -517,7 +663,7 @@ class SMTSolver:
             ascii_printable = z3.Range(chr(32), chr(126))
             ascii_printable_word = z3.Plus(ascii_printable)  # allows zero or more
             constraint = z3.InRe(s, ascii_printable_word)
-            self.add(constraint)
+            self.add(constraint, track_vars=False)
 
     def _ensure_str_length(self, s, length: int) -> z3.BoolRef:
         if is_option_expr(s):
@@ -529,11 +675,31 @@ class SMTSolver:
                     z3.Length(os) > z3.IntVal(length, ctx=self.z3ctx),
                     z3.SubString(os, 0, 1) != z3.StringVal(" ", ctx=self.z3ctx),
                 )
-                self.add(z3.Implies(opt1.is_Some(s), cccc, ctx=self.z3ctx))
+                self.add(
+                    z3.Implies(opt1.is_Some(s), cccc, ctx=self.z3ctx), track_vars=False
+                )
 
     def _ensure_dt_format(self, s) -> z3.BoolRef:
-        self.add(s > datetime(1970, 1, 1, 0, 0, 0).timestamp())
-        self.add(s < datetime(2030, 1, 1, 0, 0, 0).timestamp())
+        lower = z3.IntVal(
+            int(datetime(1970, 1, 1, 0, 0, 0).timestamp()), ctx=self.z3ctx
+        )
+        upper = z3.IntVal(
+            int(datetime(2030, 1, 1, 0, 0, 0).timestamp()), ctx=self.z3ctx
+        )
+        if is_option_expr(s):
+            opt = option_of(s)
+            value = unwrap_option(s)
+            self.add(
+                z3.Implies(opt.is_Some(s), value > lower, ctx=self.z3ctx),
+                track_vars=False,
+            )
+            self.add(
+                z3.Implies(opt.is_Some(s), value < upper, ctx=self.z3ctx),
+                track_vars=False,
+            )
+            return
+        self.add(s > lower, track_vars=False)
+        self.add(s < upper, track_vars=False)
 
     def _ensure_safe_div(self, denominator) -> z3.BoolRef:
         return denominator != 0
@@ -553,7 +719,8 @@ class SMTSolver:
                     raise e
             return self.context["variable_to_z3"][col_key]
         elif isinstance(condition, exp.Null):
-            return _to_z3val(condition.datatype, None, z3ctx=self.z3ctx)
+            dtype = condition.args.get("_type") or DataType.build("NULL")
+            return _to_z3val(dtype, None, z3ctx=self.z3ctx)
         elif isinstance(condition, (exp.Literal, Const)):
             v = _to_z3val(condition.datatype, condition.this, z3ctx=self.z3ctx)
             return v
@@ -570,16 +737,11 @@ class SMTSolver:
 
     def z3_to_python(self, model: z3.ModelRef):
         result = {}
-
-        decls = [d.name() for d in model.decls()]
-        logger.info(f"Model declarations: {decls}")
         for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-            if var_name not in decls:
-                logger.info(f"Variable {var_name} not in model declarations, skipping")
+            if var_name not in self.constrained_var_names:
                 continue
-
             concrete = self._z3_to_python(
-                model.evaluate(z3var, model_completion=True), model=model
+                model.evaluate(z3var, model_completion=False), model=model
             )
             variable = self.context["z3_to_variable"][var_name]
             dtype = DataType.build(variable.type)
@@ -595,6 +757,7 @@ class SMTSolver:
                 continue
 
             result[var_name] = concrete
+        print(f"SMT RESULT: {result}")
         if self.verbose:
             logger.info(result)
         return result
@@ -631,29 +794,3 @@ class SMTSolver:
             return False
 
         return str(val)
-
-
-# # exprs = exp.And(this= exp.And(
-# #     this= exp.GT(this = exp.Column(this="age", table="T1", datatype="INT"), expression=exp.Literal(this = 30, datatype="INT")),
-# #     expression= exp.LT(this = exp.Column(this="age", table="T1", datatype="INT"), expression=exp.Literal(this = 40, datatype="INT"))
-# # ), expression= exp.NEQ(this = exp.Column(this="name", table="T1", datatype="TEXT"), expression=exp.Literal(this = "Alice", datatype="TEXT")))
-
-# # exprs = exp.And(this = exp.Column(this="age", table="T1", datatype="INT") > exp.Literal(this = 30, datatype="INT"), expression= exp.LT(this = exp.Column(this="age", table="T1", datatype="INT"), expression=exp.Literal(this = 40, datatype="INT")))
-
-# exprs = exp.Like(this = exp.Column(this="name", table="T1", datatype="TEXT"), expression=exp.Literal(this = "A%", datatype="TEXT"))
-
-# for _ in range(5):
-#     solver = SMTSolver()
-#     exprs = exp.EQ(this = exp.Column(this="name", table="T1", datatype="TEXT"), expression=exp.Column(this = "Alice", table = "T2", datatype="TEXT"))
-
-#     # # # exprs = exp.Not(this = exp.Is(this = exp.Column(this="age", table="T1", datatype="STRING"), expression=exp.Literal(this = None, datatype="STRING")))
-
-#     smt_expr = solver._to_z3_expr(exprs)
-#     # # print(solver.context)
-#     # print(smt_expr)
-#     solver.add(smt_expr)
-#     print(solver.solve())
-#     # # # print(solver.solver.check())
-#     # # # print(solver.solver.model())
-
-#     # # print(datetime.now().timestamp())

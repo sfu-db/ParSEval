@@ -41,9 +41,9 @@ export function ModelRunChart({
     return (
         <Card>
             <CardContent className="p-6">
-                <div className="grid gap-6">
-                    <div className="grid gap-6 xl:grid-cols-[1.1fr_1fr]">
-                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div className="grid gap-6 ">
+                    <div className="grid gap-6 xl:grid-cols-[1.1fr_1fr] items-stretch">
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 h-full flex flex-col">
                             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                                 <div>
                                     <div className="text-lg font-semibold text-slate-900">Execution Accuracy</div>
@@ -87,7 +87,7 @@ export function ModelRunChart({
                                 </div>
                             ) : null}
 
-                            <div className="h-80">
+                            <div className="h-[380px]">
                                 <SettingRateBarChart
                                     results={chartResults}
                                     onDrillDown={(info) => {
@@ -99,17 +99,17 @@ export function ModelRunChart({
                             </div>
                         </div>
 
-                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                            <SettingConfusionHeatmap
-                                results={heatmapResults}
-                                selectedCell={selectedHeatmapCell}
-                                onCellSelect={onHeatmapCellSelect}
-                            />
-                        </div>
-                    </div>
+                        <div className="flex flex-col rounded-xl border border-slate-200 bg-slate-50 p-4 h-full">
+                            <div className="flex-1 min-h-0">
+                                <SettingConfusionHeatmap
+                                    results={heatmapResults}
+                                    selectedCell={selectedHeatmapCell}
+                                    onCellSelect={onHeatmapCellSelect}
+                                />
 
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                        <SettingStateSankey results={heatmapResults} />
+                            </div>
+
+                        </div>
                     </div>
                 </div>
             </CardContent>

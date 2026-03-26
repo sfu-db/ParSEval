@@ -80,8 +80,8 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
     }
 
     return (
-        <div className="space-y-3">
-            <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex h-full min-h-0 flex-col gap-3" >
+            <div className="flex flex-wrap items-start justify-between gap-2">
                 <div>
                     <div className="text-lg font-semibold text-slate-900">Multi-Setting Confusion</div>
                     <div className="mt-1 text-sm text-slate-500">
@@ -94,7 +94,7 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                     {selectedCell ? (
                         <button
                             type="button"
-                            className="rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600"
+                            className="rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600"
                             onClick={() => onCellSelect(null)}
                         >
                             Clear Cell Filter
@@ -103,7 +103,7 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                     <div className="inline-flex rounded-lg border border-slate-200 bg-white p-1">
                         <button
                             type="button"
-                            className={`rounded-md px-3 py-1.5 text-sm font-medium ${viewMode === "joint_equiv" ? "bg-slate-900 text-white" : "text-slate-600"}`}
+                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "joint_equiv" ? "bg-slate-900 text-white" : "text-slate-600"}`}
                             onClick={() => {
                                 setViewMode("joint_equiv");
                                 if (selectedCell?.mode !== "joint_equiv") onCellSelect(null);
@@ -113,7 +113,7 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                         </button>
                         <button
                             type="button"
-                            className={`rounded-md px-3 py-1.5 text-sm font-medium ${viewMode === "disagree" ? "bg-slate-900 text-white" : "text-slate-600"}`}
+                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "disagree" ? "bg-slate-900 text-white" : "text-slate-600"}`}
                             onClick={() => {
                                 setViewMode("disagree");
                                 if (selectedCell?.mode !== "disagree") onCellSelect(null);
@@ -125,12 +125,12 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                 </div>
             </div>
 
-            <div className="overflow-x-auto">
-                <table className="w-full border-collapse" style={{ fontFamily: F.mono, fontSize: 12 }}>
+            <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-slate-200 bg-white">
+                <table className="w-full border-collapse" style={{ fontFamily: F.mono, fontSize: 11 }}>
                     <thead>
                         <tr>
                             <th
-                                className="sticky left-0 z-10 bg-slate-50 px-3 py-2 text-left text-[11px] font-bold uppercase tracking-[0.06em] text-slate-500"
+                                className="sticky left-0 top-0 z-20 bg-slate-50 px-2.5 py-1.5 text-left text-[10px] font-bold uppercase tracking-[0.06em] text-slate-500"
                                 style={{ borderBottom: `1px solid ${C.border}`, fontFamily: F.body }}
                             >
                                 Setting
@@ -138,7 +138,7 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                             {settings.map((setting) => (
                                 <th
                                     key={setting.key}
-                                    className="px-3 py-2 text-center text-[11px] font-bold"
+                                    className="sticky top-0 z-10 bg-slate-50 px-2 py-1.5 text-center text-[10px] font-bold"
                                     style={{ borderBottom: `1px solid ${C.border}`, color: setting.color, fontFamily: F.body }}
                                 >
                                     {setting.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold text-slate-500" title={getSettingExplanation(setting.key)}>?</span>
@@ -150,8 +150,8 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                         {settings.map((row, rowIndex) => (
                             <tr key={row.key}>
                                 <td
-                                    className="sticky left-0 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800"
-                                    style={{ borderBottom: `1px solid ${C.border}`, fontFamily: F.body }}
+                                    className="sticky left-0 z-10 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold text-slate-800"
+                                    style={{ borderBottom: `0.5px solid ${C.border}`, fontFamily: F.body }}
                                 >
                                     {row.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold text-slate-500" title={getSettingExplanation(row.key)}>?</span>
                                 </td>
@@ -173,13 +173,13 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                                     return (
                                         <td
                                             key={cell.colKey}
-                                            className="px-2 py-2 text-center"
+                                            className="px-1.5 py-1 text-center"
                                             style={{ borderBottom: `1px solid ${C.border}` }}
                                             title={title}
                                         >
                                             <button
                                                 type="button"
-                                                className="mx-auto flex h-11 w-16 items-center justify-center rounded-md border text-xs font-bold transition"
+                                                className="mx-auto flex h-8 w-12 items-center justify-center rounded-md border text-[10px] font-bold transition"
                                                 style={{
                                                     background,
                                                     borderColor: isSelected ? C.activeRing : C.border,

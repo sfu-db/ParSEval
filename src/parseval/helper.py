@@ -1,7 +1,9 @@
 from __future__ import annotations
-from typing import Callable, List, TypeVar, Dict, TYPE_CHECKING, Tuple
+from typing import Callable, List, Dict, TYPE_CHECKING, Tuple
 import re
-from sqlglot.expressions import convert, Expression, maybe_copy, Literal
+from sqlglot.expressions import Expression, maybe_copy, Literal
+import math, numbers
+import datetime as dt
 from .dtype import DataType
 
 if TYPE_CHECKING:
@@ -58,9 +60,6 @@ def sort_by_concrete(
     return null_values + values if null_first else values + null_values
 
 
-import math, numbers, datetime
-
-
 def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
     converted = None
     srctype = None
@@ -78,11 +77,11 @@ def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
     elif isinstance(value, numbers.Number):
         converted = Literal.number(value)
         srctype = "NUMERIC"
-    elif isinstance(value, datetime.datetime):
+    elif isinstance(value, dt.datetime):
         converted = Literal(this=value, is_string=False)
         srctype = "DATETIME"
 
-    elif isinstance(value, datetime.date):
+    elif isinstance(value, dt.date):
         converted = Literal(this=value, is_string=False)
         srctype = "DATE"
     else:
@@ -140,6 +139,10 @@ def to_concrete(value, datatype=None):
     if datatype.is_type(*DataType.TEXT_TYPES):
         return str(value)
     elif datatype.is_type(*DataType.INTEGER_TYPES):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 1
         return int(value)
     elif datatype.is_type(*DataType.REAL_TYPES):
         return float(value)
@@ -186,14 +189,3 @@ def compare_df(result1: List[Tuple], result2: List[Tuple], order_matters: bool) 
     return set([tuple(a) for a in result1_filled]) == set(
         [tuple(b) for b in result2_filled]
     )
-
-    if not order_matters:
-        result1_filled = sorted(result1_filled)
-        result2_filled = sorted(result2_filled)
-
-    # Compare element-wise
-    for r1, r2 in zip(result1_filled, result2_filled):
-        if r1 != r2:
-            return 0
-
-    return 1

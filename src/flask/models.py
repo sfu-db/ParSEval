@@ -1,72 +1,700 @@
-"""
-app.py — Flask application factory.
+from __future__ import annotations
 
-Usage
------
-  # Development
-  flask --app querylens_api.app run --debug
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
-  # Production (gunicorn)
-  gunicorn "querylens_api.app:create_app()"
-"""
-
-import os
-from flask import Flask, jsonify
-from marshmallow import ValidationError
-
-from .models import db
-from .routes import api
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import UniqueConstraint, inspect, select, text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import JSON
 
 
-def create_app(config: dict | None = None) -> Flask:
-    app = Flask(__name__)
+db = SQLAlchemy()
 
-    # ── Default configuration ─────────────────────────────────────────────────
-    app.config.setdefault(
-        "SQLALCHEMY_DATABASE_URI",
-        os.environ.get("DATABASE_URL", "sqlite:///querylens.db"),
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class DBConnectionInfo(db.Model):
+    __tablename__ = "db_connection_info"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset",
+            "db_id",
+            "dialect",
+            "host",
+            name="uq_db_connection_identity",
+        ),
     )
-    app.config.setdefault("SQLALCHEMY_TRACK_MODIFICATIONS", False)
-    app.config.setdefault("JSON_SORT_KEYS", False)
 
-    if config:
-        app.config.update(config)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    dataset: Mapped[str | None] = mapped_column(db.String(255))
+    db_id: Mapped[str | None] = mapped_column(db.String(255))
+    host: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    port: Mapped[int] = mapped_column(nullable=False)
+    username: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    password: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    database: Mapped[str] = mapped_column(db.String(255), nullable=True)
+    dialect: Mapped[str] = mapped_column(db.String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
-    # ── Extensions ────────────────────────────────────────────────────────────
-    db.init_app(app)
+    run_cases: Mapped[list["RunCase"]] = relationship(
+        back_populates="db_connection_info"
+    )
 
-    # ── Blueprints ────────────────────────────────────────────────────────────
-    app.register_blueprint(api)
+    @property
+    def host_or_path(self) -> str:
+        if self.dialect == "sqlite":
+            return str(Path(self.host) / self.database) if self.database else self.host
+        if self.port:
+            return f"{self.host}:{self.port}"
+        return self.host
 
-    # ── Create tables (dev only — use Flask-Migrate in production) ────────────
-    with app.app_context():
-        db.create_all()
 
-    # ── Error handlers ────────────────────────────────────────────────────────
-    @app.errorhandler(400)
-    def bad_request(e):
-        return jsonify({"error": str(e)}), 400
+class Project(db.Model):
+    __tablename__ = "projects"
 
-    @app.errorhandler(404)
-    def not_found(e):
-        return jsonify({"error": "Not found"}), 404
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(db.Text)
+    settings_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
-    @app.errorhandler(405)
-    def method_not_allowed(e):
-        return jsonify({"error": "Method not allowed"}), 405
+    runs: Mapped[list["ModelRun"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
-    @app.errorhandler(500)
-    def internal_error(e):
-        db.session.rollback()
-        return jsonify({"error": "Internal server error"}), 500
 
-    @app.errorhandler(ValidationError)
-    def handle_marshmallow(e):
-        return jsonify({"error": "Validation failed", "details": e.messages}), 400
+class ModelRun(db.Model):
+    __tablename__ = "model_runs"
 
-    # ── Health check ──────────────────────────────────────────────────────────
-    @app.route("/health")
-    def health():
-        return jsonify({"status": "ok"})
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        db.ForeignKey("projects.id"), nullable=False
+    )
+    model: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    status: Mapped[str] = mapped_column(
+        db.String(64), default="pending", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    run_name: Mapped[str | None] = mapped_column(db.String(255))
+    dataset: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    prompt_template: Mapped[str | None] = mapped_column(db.Text)
+    uploaded_file_path: Mapped[str | None] = mapped_column(db.Text)
+    metric_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    setting_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
-    return app
+    project: Mapped[Project] = relationship(back_populates="runs")
+    run_cases: Mapped[list["RunCase"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+    evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class RunCase(db.Model):
+    __tablename__ = "run_cases"
+    __table_args__ = (
+        UniqueConstraint("run_id", "question_id", name="uq_run_case_question"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(db.ForeignKey("model_runs.id"), nullable=False)
+    db_connection_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("db_connection_info.id")
+    )
+    question_id: Mapped[int | None] = mapped_column(nullable=True)
+    db_id: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    dataset: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    host_or_path_legacy: Mapped[str] = mapped_column(
+        "host_or_path", db.Text, nullable=False, default=""
+    )
+    dialect: Mapped[str | None] = mapped_column(db.String(255))
+    schema_json: Mapped[dict | list | str | None] = mapped_column(JSON)
+    question: Mapped[str | None] = mapped_column(db.Text)
+    evidence: Mapped[str | None] = mapped_column(db.Text)
+    prompt: Mapped[str | None] = mapped_column(db.Text)
+    gold: Mapped[str] = mapped_column(db.Text, nullable=False)
+    pred: Mapped[str] = mapped_column(db.Text, nullable=False)
+    source: Mapped[str] = mapped_column(db.String(64), default="upload", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    run: Mapped[ModelRun] = relationship(back_populates="run_cases")
+    db_connection_info: Mapped[DBConnectionInfo | None] = relationship(
+        back_populates="run_cases"
+    )
+    evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(
+        back_populates="run_case", cascade="all, delete-orphan"
+    )
+
+    @property
+    def host_or_path(self) -> str:
+        if self.db_connection_info is None:
+            return ""
+        return self.db_connection_info.host_or_path
+
+
+class EvaluationJob(db.Model):
+    __tablename__ = "evaluation_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(db.ForeignKey("model_runs.id"), nullable=False)
+    run_case_id: Mapped[int] = mapped_column(
+        db.ForeignKey("run_cases.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        db.String(64), default="pending", nullable=False
+    )
+    queued_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column()
+    finished_at: Mapped[datetime | None] = mapped_column()
+    error_message: Mapped[str | None] = mapped_column(db.Text)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    artifact_path: Mapped[str | None] = mapped_column(db.Text)
+
+    run: Mapped[ModelRun] = relationship(back_populates="evaluation_jobs")
+    run_case: Mapped[RunCase] = relationship(back_populates="evaluation_jobs")
+    relaxed_equivalence: Mapped["RelaxedEquivalence | None"] = relationship(
+        back_populates="evaluation_job", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class RelaxedEquivalence(db.Model):
+    __tablename__ = "relaxed_equivalences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evaluation_job_id: Mapped[int] = mapped_column(
+        db.ForeignKey("evaluation_jobs.id"), nullable=False, unique=True
+    )
+    state: Mapped[str] = mapped_column(db.String(64), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    evaluation_job: Mapped[EvaluationJob] = relationship(
+        back_populates="relaxed_equivalence"
+    )
+    counterexamples: Mapped[list["CounterExample"]] = relationship(
+        back_populates="equivalence", cascade="all, delete-orphan"
+    )
+
+
+class CounterExample(db.Model):
+    __tablename__ = "counterexamples"
+    __table_args__ = (
+        UniqueConstraint(
+            "equivalence_id",
+            "db_level",
+            "query_level",
+            name="uq_counterexample_level",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    equivalence_id: Mapped[int] = mapped_column(
+        db.ForeignKey("relaxed_equivalences.id"), nullable=False
+    )
+    db_level: Mapped[str] = mapped_column(db.String(64), nullable=False)
+    query_level: Mapped[str] = mapped_column(db.String(64), nullable=False)
+    state: Mapped[str] = mapped_column(db.String(64), default="pending", nullable=False)
+    witness_db_json: Mapped[dict | None] = mapped_column(JSON)
+    q1_result_json: Mapped[dict | None] = mapped_column(JSON)
+    q2_result_json: Mapped[dict | None] = mapped_column(JSON)
+
+    equivalence: Mapped[RelaxedEquivalence] = relationship(
+        back_populates="counterexamples"
+    )
+
+
+def migrate_legacy_flask_schema(root_path: str) -> None:
+    engine = db.engine
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "db_connection_info" in tables:
+            _maybe_add_column(conn, inspector, "db_connection_info", "dataset", "TEXT")
+            _maybe_add_column(conn, inspector, "db_connection_info", "db_id", "TEXT")
+        if "evaluation_jobs" in tables:
+            _maybe_add_column(
+                conn, inspector, "evaluation_jobs", "run_case_id", "INTEGER"
+            )
+        if "run_cases" in tables:
+            _maybe_add_column(
+                conn, inspector, "run_cases", "db_connection_id", "INTEGER"
+            )
+        if "relaxed_equivalences" in tables:
+            _maybe_add_column(
+                conn, inspector, "relaxed_equivalences", "evaluation_job_id", "INTEGER"
+            )
+        if "counterexamples" in tables:
+            _maybe_add_column(conn, inspector, "counterexamples", "db_level", "TEXT")
+            _maybe_add_column(conn, inspector, "counterexamples", "query_level", "TEXT")
+
+        if "eval_records" in tables:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT run_id, question_id, db_id, dataset, host_or_path, schema_json,
+                           question, evidence, gold, prompt, pred
+                    FROM eval_records
+                    """
+                )
+            ).mappings()
+            for row in rows:
+                _ensure_run_case(
+                    conn,
+                    root_path=root_path,
+                    run_id=row["run_id"],
+                    question_id=row["question_id"],
+                    db_id=row["db_id"],
+                    dataset=row["dataset"],
+                    host_or_path=row["host_or_path"] or "",
+                    dialect=None,
+                    schema_json=_load_jsonish(row["schema_json"]),
+                    question=row["question"],
+                    evidence=row["evidence"],
+                    prompt=row["prompt"],
+                    gold=row["gold"],
+                    pred=row["pred"],
+                    source="upload",
+                )
+
+        inspector = inspect(engine)
+        job_columns = (
+            {column["name"] for column in inspector.get_columns("evaluation_jobs")}
+            if "evaluation_jobs" in tables
+            else set()
+        )
+        legacy_job_columns = {
+            "gold",
+            "pred",
+            "ddls",
+            "db_id",
+            "dataset",
+            "host_or_path",
+            "question_id",
+            "question",
+            "evidence",
+            "dialect",
+        }
+        if "run_case_id" in job_columns and legacy_job_columns.issubset(job_columns):
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, run_id, run_case_id, gold, pred, ddls, db_id, dataset,
+                           host_or_path, question_id, question, evidence, dialect
+                    FROM evaluation_jobs
+                    WHERE run_case_id IS NULL
+                    """
+                )
+            ).mappings()
+            for row in rows:
+                run_case_id = _ensure_run_case(
+                    conn,
+                    root_path=root_path,
+                    run_id=row["run_id"],
+                    question_id=row["question_id"],
+                    db_id=row["db_id"],
+                    dataset=row["dataset"],
+                    host_or_path=row["host_or_path"] or "",
+                    dialect=row["dialect"],
+                    schema_json=_load_jsonish(row["ddls"]),
+                    question=row["question"],
+                    evidence=row["evidence"],
+                    prompt=None,
+                    gold=row["gold"],
+                    pred=row["pred"],
+                    source="queued",
+                )
+                conn.execute(
+                    text(
+                        "UPDATE evaluation_jobs SET run_case_id = :run_case_id WHERE id = :id"
+                    ),
+                    {"run_case_id": run_case_id, "id": row["id"]},
+                )
+
+        inspector = inspect(engine)
+        relaxed_columns = (
+            {column["name"] for column in inspector.get_columns("relaxed_equivalences")}
+            if "relaxed_equivalences" in tables
+            else set()
+        )
+        legacy_relaxed_columns = {
+            "run_id",
+            "dataset",
+            "db_id",
+            "question_id",
+            "gold",
+            "pred",
+        }
+        if "evaluation_job_id" in relaxed_columns and legacy_relaxed_columns.issubset(
+            relaxed_columns
+        ):
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, run_id, dataset, db_id, question_id, gold, pred
+                    FROM relaxed_equivalences
+                    WHERE evaluation_job_id IS NULL
+                    """
+                )
+            ).mappings()
+            for row in rows:
+                job = (
+                    conn.execute(
+                        text(
+                            """
+                        SELECT ej.id
+                        FROM evaluation_jobs ej
+                        JOIN run_cases rc ON rc.id = ej.run_case_id
+                        WHERE ej.run_id = :run_id
+                          AND rc.dataset = :dataset
+                          AND rc.db_id = :db_id
+                          AND ((rc.question_id IS NULL AND :question_id IS NULL) OR rc.question_id = :question_id)
+                          AND rc.gold = :gold
+                          AND rc.pred = :pred
+                        ORDER BY ej.id DESC
+                        LIMIT 1
+                        """
+                        ),
+                        row,
+                    )
+                    .mappings()
+                    .first()
+                )
+                if job is not None:
+                    conn.execute(
+                        text(
+                            "UPDATE relaxed_equivalences SET evaluation_job_id = :evaluation_job_id WHERE id = :id"
+                        ),
+                        {"evaluation_job_id": job["id"], "id": row["id"]},
+                    )
+
+        inspector = inspect(engine)
+        run_case_columns = (
+            {column["name"] for column in inspector.get_columns("run_cases")}
+            if "run_cases" in tables
+            else set()
+        )
+        if {"db_connection_id", "dataset", "db_id"}.issubset(run_case_columns):
+            select_host = "host_or_path," if "host_or_path" in run_case_columns else ""
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, dataset, db_id, dialect, {select_host} db_connection_id
+                    FROM run_cases
+                    WHERE db_connection_id IS NULL
+                    """
+                )
+            ).mappings()
+            for row in rows:
+                db_connection_id = _ensure_db_connection(
+                    conn,
+                    root_path=root_path,
+                    dataset=row["dataset"],
+                    db_id=row["db_id"],
+                    dialect=row["dialect"],
+                    host_or_path=row.get("host_or_path") or "",
+                )
+                conn.execute(
+                    text(
+                        "UPDATE run_cases SET db_connection_id = :db_connection_id WHERE id = :id"
+                    ),
+                    {"db_connection_id": db_connection_id, "id": row["id"]},
+                )
+
+        inspector = inspect(engine)
+        counter_columns = (
+            {column["name"] for column in inspector.get_columns("counterexamples")}
+            if "counterexamples" in tables
+            else set()
+        )
+        if {"db_level", "query_level", "settings_json"}.issubset(counter_columns):
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, settings_json
+                    FROM counterexamples
+                    WHERE db_level IS NULL OR query_level IS NULL
+                    """
+                )
+            ).mappings()
+            for row in rows:
+                payload = _load_jsonish(row["settings_json"]) or []
+                first = (
+                    payload[0]
+                    if isinstance(payload, list)
+                    and payload
+                    and isinstance(payload[0], dict)
+                    else {}
+                )
+                conn.execute(
+                    text(
+                        "UPDATE counterexamples SET db_level = :db_level, query_level = :query_level WHERE id = :id"
+                    ),
+                    {
+                        "db_level": first.get("db_level", "NONE"),
+                        "query_level": first.get("query_level", "BAG"),
+                        "id": row["id"],
+                    },
+                )
+
+
+def _ensure_run_case(
+    conn,
+    *,
+    root_path: str,
+    run_id: int,
+    question_id: int | None,
+    db_id: str,
+    dataset: str,
+    host_or_path: str,
+    dialect: str | None,
+    schema_json,
+    question: str | None,
+    evidence: str | None,
+    prompt: str | None,
+    gold: str,
+    pred: str,
+    source: str,
+) -> int:
+    if question_id is not None:
+        existing = conn.execute(
+            text(
+                "SELECT id FROM run_cases WHERE run_id = :run_id AND question_id = :question_id LIMIT 1"
+            ),
+            {"run_id": run_id, "question_id": question_id},
+        ).scalar_one_or_none()
+    else:
+        existing = conn.execute(
+            text(
+                """
+                SELECT id FROM run_cases
+                WHERE run_id = :run_id
+                  AND question_id IS NULL
+                  AND db_id = :db_id
+                  AND dataset = :dataset
+                  AND gold = :gold
+                  AND pred = :pred
+                LIMIT 1
+                """
+            ),
+            {
+                "run_id": run_id,
+                "db_id": db_id,
+                "dataset": dataset,
+                "gold": gold,
+                "pred": pred,
+            },
+        ).scalar_one_or_none()
+    if existing is not None:
+        return int(existing)
+
+    inserted = conn.execute(
+        text(
+            """
+            INSERT INTO run_cases (
+                run_id, db_connection_id, question_id, db_id, dataset, host_or_path, dialect, schema_json,
+                question, evidence, prompt, gold, pred, source, created_at
+            ) VALUES (
+                :run_id, :db_connection_id, :question_id, :db_id, :dataset, :host_or_path, :dialect, :schema_json,
+                :question, :evidence, :prompt, :gold, :pred, :source, :created_at
+            )
+            """
+        ),
+        {
+            "host_or_path": _normalize_connection_fields(
+                root_path=root_path,
+                dataset=dataset,
+                db_id=db_id,
+                dialect=dialect,
+                host_or_path=host_or_path,
+            )["host_or_path"],
+            "run_id": run_id,
+            "db_connection_id": _ensure_db_connection(
+                conn,
+                root_path=root_path,
+                dataset=dataset,
+                db_id=db_id,
+                dialect=dialect,
+                host_or_path=host_or_path,
+            ),
+            "question_id": question_id,
+            "db_id": db_id,
+            "dataset": dataset,
+            "dialect": dialect,
+            "schema_json": (
+                json.dumps(schema_json)
+                if isinstance(schema_json, (dict, list))
+                else schema_json
+            ),
+            "question": question,
+            "evidence": evidence,
+            "prompt": prompt,
+            "gold": gold,
+            "pred": pred,
+            "source": source,
+            "created_at": utcnow(),
+        },
+    )
+    return int(inserted.lastrowid)
+
+
+def ensure_db_connection_info(
+    *,
+    root_path: str,
+    dataset: str,
+    db_id: str,
+    dialect: str | None,
+    host_or_path: str,
+) -> DBConnectionInfo:
+    normalized = _normalize_connection_fields(
+        root_path=root_path,
+        dataset=dataset,
+        db_id=db_id,
+        dialect=dialect,
+        host_or_path=host_or_path,
+    )
+    create_payload = {
+        key: value for key, value in normalized.items() if key != "host_or_path"
+    }
+    if create_payload["dialect"] == "sqlite":
+        Path(str(create_payload["host"])).mkdir(parents=True, exist_ok=True)
+    connection = (
+        db.session.query(DBConnectionInfo)
+        .filter_by(
+            dataset=create_payload["dataset"],
+            db_id=create_payload["db_id"],
+            dialect=create_payload["dialect"],
+            host=create_payload["host"],
+            database=create_payload["database"],
+        )
+        .one_or_none()
+    )
+    if connection is not None:
+        return connection
+    connection = DBConnectionInfo(**create_payload)
+    db.session.add(connection)
+    db.session.flush()
+    return connection
+
+
+def prune_orphan_db_connections() -> None:
+    connection_ids = set(
+        db.session.scalars(
+            select(RunCase.db_connection_id).where(
+                RunCase.db_connection_id.is_not(None)
+            )
+        )
+    )
+    orphaned = db.session.query(DBConnectionInfo)
+    if connection_ids:
+        orphaned = orphaned.filter(DBConnectionInfo.id.not_in(connection_ids))
+    orphaned.delete(synchronize_session=False)
+
+
+def _ensure_db_connection(
+    conn,
+    *,
+    root_path: str,
+    dataset: str,
+    db_id: str,
+    dialect: str | None,
+    host_or_path: str,
+) -> int:
+    normalized = _normalize_connection_fields(
+        root_path=root_path,
+        dataset=dataset,
+        db_id=db_id,
+        dialect=dialect,
+        host_or_path=host_or_path,
+    )
+    existing = conn.execute(
+        text(
+            """
+            SELECT id
+            FROM db_connection_info
+            WHERE dataset = :dataset
+              AND db_id = :db_id
+              AND dialect = :dialect
+              AND host = :host
+              AND database = :database
+            LIMIT 1
+            """
+        ),
+        normalized,
+    ).scalar_one_or_none()
+    if existing is not None:
+        return int(existing)
+    inserted = conn.execute(
+        text(
+            """
+            INSERT INTO db_connection_info (
+                name, dataset, db_id, host, port, username, password, database, dialect, created_at
+            ) VALUES (
+                :name, :dataset, :db_id, :host, :port, :username, :password, :database, :dialect, :created_at
+            )
+            """
+        ),
+        {**normalized, "created_at": utcnow()},
+    )
+    return int(inserted.lastrowid)
+
+
+def _normalize_connection_fields(
+    *,
+    root_path: str,
+    dataset: str,
+    db_id: str,
+    dialect: str | None,
+    host_or_path: str,
+) -> dict[str, object]:
+    normalized_dialect = (dialect or "sqlite").strip().lower()
+    if normalized_dialect == "sqlite":
+        host = str(Path(root_path) / "static" / dataset)
+        database = f"{db_id}.sqlite"
+    else:
+        host = host_or_path.strip()
+        database = db_id
+    resolved_host_or_path = (
+        str(Path(host) / database) if normalized_dialect == "sqlite" else host
+    )
+    return {
+        "name": f"{dataset}:{db_id}:{normalized_dialect}",
+        "dataset": dataset,
+        "db_id": db_id,
+        "host": host,
+        "port": 0,
+        "username": "",
+        "password": "",
+        "database": database,
+        "dialect": normalized_dialect,
+        "host_or_path": resolved_host_or_path,
+    }
+
+
+def _maybe_add_column(
+    conn, inspector, table_name: str, column_name: str, column_type: str
+) -> None:
+    existing = {column["name"] for column in inspector.get_columns(table_name)}
+    if column_name in existing:
+        return
+    conn.execute(
+        text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+    )
+
+
+def _load_jsonish(value):
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value

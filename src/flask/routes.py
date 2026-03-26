@@ -1,606 +1,412 @@
-"""
-routes.py — Flask blueprints for every resource.
+from __future__ import annotations
 
-URL design
-----------
-/api/v1/projects                          Projects CRUD
-/api/v1/projects/<id>/runs               ModelRuns per project
-/api/v1/runs/<id>                        ModelRun detail / update
-/api/v1/runs/<id>/metrics                Patch metric values
-/api/v1/runs/<id>/evals                  EvalRecords (bulk create, list, filter)
-/api/v1/runs/<id>/evals/<qid>            Single EvalRecord by question_id
-/api/v1/runs/<id>/evals/<qid>/labels     Patch equivalence labels on an EvalRecord
-/api/v1/runs/<id>/executions             QueryExecution list / create
-/api/v1/runs/<id>/executions/<qid>       Both executions for a question (gold+pred pair)
-/api/v1/runs/<id>/equivalences           RelaxedEquivalence list / create
-/api/v1/runs/<id>/equivalences/<qid>     Single equivalence record
-/api/v1/equivalences/<id>/counterexamples  CounterExample list / create
-/api/v1/counterexamples/<id>/state       Patch state of a counterexample
-/api/v1/datasets                         Dataset registry
-"""
+import json
+import re
+from pathlib import Path
+from typing import Any
 
-from flask import Blueprint, jsonify, request
-from marshmallow import ValidationError
+from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from .models import (
-    db,
-    Project,
-    Dataset,
+    EvaluationJob,
     ModelRun,
-    EvalRecord,
-    EquivalenceLabel,
-    QueryExecution,
+    Project,
     RelaxedEquivalence,
-    CounterExample,
+    RunCase,
+    db,
+    ensure_db_connection_info,
+    prune_orphan_db_connections,
 )
 from .schemas import (
-    ProjectCreateSchema,
-    ProjectSchema,
-    DatasetSchema,
-    ModelRunCreateSchema,
-    ModelRunMetricPatchSchema,
-    ModelRunSchema,
-    ModelRunListSchema,
-    EvalRecordBulkCreateSchema,
-    EvalRecordSchema,
-    EquivalenceLabelPatchSchema,
-    QueryExecutionCreateSchema,
-    QueryExecutionSchema,
-    RelaxedEquivalenceCreateSchema,
-    RelaxedEquivalenceSchema,
-    RelaxedEquivalenceListSchema,
-    CounterExampleCreateSchema,
-    CounterExampleSchema,
-    CounterExampleStatePatchSchema,
-    PaginationSchema,
-    validate_label_keys,
+    normalize_metric,
+    serialize_evaluation_job,
+    serialize_model_run,
+    serialize_project,
+    serialize_relaxed_equivalence,
+    serialize_run_case_as_eval_record,
 )
-from .enums import DBLevel, QueryLevel, CounterExampleState, RunStatus
-
-api = Blueprint("api", __name__, url_prefix="/api/v1")
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+api = Blueprint("querylens_api", __name__)
 
 
-def _bad_request(msg: str, details=None):
-    body = {"error": msg}
-    if details:
-        body["details"] = details
-    return jsonify(body), 400
+def error(message: str, status: int = 400):
+    return jsonify({"error": message}), status
 
 
-def _not_found(entity: str, id):
-    return jsonify({"error": f"{entity} {id!r} not found"}), 404
+def json_body() -> dict[str, Any]:
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
 
 
-def _validate(schema_cls, data: dict):
-    """Validate and deserialise; raises ValidationError on failure."""
-    return schema_cls().load(data)
+def require_string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} is required")
+    return value.strip()
 
 
-def _paginate(query, schema_cls):
-    """Apply pagination from query-string and return paginated envelope."""
-    params = PaginationSchema().load(request.args)
-    page, per_page = params["page"], params["per_page"]
-    paginated = db.paginate(query, page=page, per_page=per_page, error_out=False)
-    schema = schema_cls(many=True)
-    return jsonify(
-        {
-            "items": schema.dump(paginated.items),
-            "total": paginated.total,
-            "page": paginated.page,
-            "per_page": paginated.per_page,
-            "pages": paginated.pages,
-        }
+def optional_string(data: dict[str, Any], key: str, default: str = "") -> str:
+    value = data.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    return value
+
+
+def require_int(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    return value
+
+
+def parse_limit_offset() -> tuple[int, int]:
+    limit_arg = request.args.get("limit", "100")
+    offset_arg = request.args.get("offset", "0")
+    try:
+        limit = max(0, int(limit_arg))
+        offset = max(0, int(offset_arg))
+    except ValueError as exc:
+        raise ValueError("limit and offset must be integers") from exc
+    return limit, offset
+
+
+def slugify_filename(value: str | None, default: str) -> str:
+    base = (value or default).strip().lower()
+    slug = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-._")
+    return slug or default
+
+
+def save_uploaded_payload(
+    project_id: int, run: ModelRun, payload: dict[str, Any]
+) -> str:
+    static_root = Path(current_app.root_path) / "static" / "upload"
+    static_root.mkdir(parents=True, exist_ok=True)
+    filename = f"project-{project_id}-run-{run.id}-{slugify_filename(run.run_name, run.model)}.json"
+    file_path = static_root / filename
+    file_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    return f"/static/upload/{filename}"
+
+
+def delete_relative_file(relative_url: str | None) -> None:
+    if not relative_url:
+        return
+    file_path = Path(current_app.root_path) / relative_url.lstrip("/")
+    if file_path.is_file():
+        file_path.unlink()
+
+
+def build_model_run(
+    project_id: int,
+    payload: dict[str, Any],
+    fallback_metric: dict[str, float] | None = None,
+) -> ModelRun:
+    model = require_string(payload, "model")
+    dataset = require_string(payload, "dataset")
+    metric = normalize_metric(payload.get("metric"))
+    if fallback_metric:
+        for key, value in fallback_metric.items():
+            if metric.get(key) is None:
+                metric[key] = value
+    return ModelRun(
+        project_id=project_id,
+        model=model,
+        status=(payload.get("status") or "pending"),
+        run_name=payload.get("run"),
+        dataset=dataset,
+        prompt_template=payload.get("promptTemplate"),
+        metric_json=metric,
+        setting_json=(
+            payload.get("setting") if isinstance(payload.get("setting"), dict) else {}
+        ),
     )
 
 
-# ─── Projects ─────────────────────────────────────────────────────────────────
+def build_run_case(run_id: int, payload: dict[str, Any], source: str) -> RunCase:
+    question_id = payload.get("question_id")
+    if question_id is not None:
+        question_id = require_int(question_id, "question_id")
+    dataset = require_string(payload, "dataset")
+    db_id = require_string(payload, "db_id")
+    dialect = (
+        payload.get("dialect") if isinstance(payload.get("dialect"), str) else "sqlite"
+    )
+    connection = ensure_db_connection_info(
+        root_path=current_app.root_path,
+        dataset=dataset,
+        db_id=db_id,
+        dialect=dialect,
+        host_or_path=optional_string(payload, "host_or_path"),
+    )
+    return RunCase(
+        run_id=run_id,
+        db_connection_id=connection.id,
+        question_id=question_id,
+        db_id=db_id,
+        dataset=dataset,
+        host_or_path_legacy=connection.host_or_path,
+        dialect=dialect,
+        schema_json=payload.get("schema"),
+        question=(
+            payload.get("question")
+            if isinstance(payload.get("question"), str)
+            else None
+        ),
+        evidence=(
+            payload.get("evidence")
+            if isinstance(payload.get("evidence"), str)
+            else None
+        ),
+        prompt=(
+            payload.get("prompt") if isinstance(payload.get("prompt"), str) else None
+        ),
+        gold=require_string(payload, "gold"),
+        pred=require_string(payload, "pred"),
+        source=source,
+    )
 
 
-@api.route("/projects", methods=["GET"])
+def evaluation_runtime():
+    runtime = current_app.extensions.get("evaluation_runtime")
+    if runtime is None:
+        raise RuntimeError("Evaluation runtime is not configured")
+    return runtime
+
+
+@api.errorhandler(ValueError)
+def handle_value_error(error: ValueError):
+    return jsonify({"error": str(error)}), 400
+
+
+@api.get("/projects")
 def list_projects():
     projects = db.session.scalars(select(Project).order_by(Project.id)).all()
-    return jsonify(ProjectSchema(many=True).dump(projects))
+    return jsonify([serialize_project(project) for project in projects])
 
 
-@api.route("/projects", methods=["POST"])
+@api.post("/projects")
 def create_project():
-    try:
-        data = _validate(ProjectCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    project = Project(**data)
+    payload = json_body()
+    settings = (
+        payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+    )
+    project = Project(
+        name=require_string(payload, "name"),
+        description=payload.get("description"),
+        settings_json=settings,
+    )
     db.session.add(project)
     db.session.commit()
-    return jsonify(ProjectSchema().dump(project)), 201
+    return jsonify(serialize_project(project)), 201
 
 
-@api.route("/projects/<int:project_id>", methods=["GET"])
+@api.get("/projects/<int:project_id>")
 def get_project(project_id: int):
     project = db.session.get(Project, project_id)
-    if not project:
-        return _not_found("Project", project_id)
-    return jsonify(ProjectSchema().dump(project))
+    if project is None:
+        return error(f"Project {project_id} not found", 404)
+    return jsonify(serialize_project(project))
 
 
-@api.route("/projects/<int:project_id>", methods=["DELETE"])
+@api.delete("/projects/<int:project_id>")
 def delete_project(project_id: int):
     project = db.session.get(Project, project_id)
-    if not project:
-        return _not_found("Project", project_id)
+    if project is None:
+        return error(f"Project {project_id} not found", 404)
+    for run in project.runs:
+        delete_relative_file(run.uploaded_file_path)
+        for job in run.evaluation_jobs:
+            delete_relative_file(job.artifact_path)
     db.session.delete(project)
+    db.session.flush()
+    prune_orphan_db_connections()
     db.session.commit()
     return "", 204
 
 
-# ─── ModelRuns ────────────────────────────────────────────────────────────────
-
-
-@api.route("/projects/<int:project_id>/runs", methods=["GET"])
-def list_runs(project_id: int):
+@api.get("/projects/<int:project_id>/model-runs")
+def list_model_runs(project_id: int):
     project = db.session.get(Project, project_id)
-    if not project:
-        return _not_found("Project", project_id)
-
-    # Optional filters from query-string
-    dataset = request.args.get("dataset")
-    status = request.args.get("status")
-    model = request.args.get("model")
-
-    q = (
+    if project is None:
+        return error(f"Project {project_id} not found", 404)
+    limit, offset = parse_limit_offset()
+    runs = db.session.scalars(
         select(ModelRun)
         .where(ModelRun.project_id == project_id)
-        .order_by(ModelRun.created_at.desc())
-    )
-    if dataset:
-        q = q.where(ModelRun.dataset == dataset)
-    if status:
-        q = q.where(ModelRun.status == status)
-    if model:
-        q = q.where(ModelRun.model.ilike(f"%{model}%"))
-
-    return _paginate(q, ModelRunListSchema)
+        .order_by(ModelRun.created_at.desc(), ModelRun.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return jsonify([serialize_model_run(run) for run in runs])
 
 
-@api.route("/runs", methods=["POST"])
-def create_run():
-    try:
-        data = _validate(ModelRunCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    if not db.session.get(Project, data["project_id"]):
-        return _bad_request(f"Project {data['project_id']} not found")
-
-    run = ModelRun(**data)
+@api.post("/projects/<int:project_id>/model-runs")
+def create_model_run(project_id: int):
+    if db.session.get(Project, project_id) is None:
+        return error(f"Project {project_id} not found", 404)
+    run = build_model_run(project_id, json_body())
     db.session.add(run)
     db.session.commit()
-    return jsonify(ModelRunSchema().dump(run)), 201
+    return jsonify(serialize_model_run(run)), 201
 
 
-@api.route("/runs/<int:run_id>", methods=["GET"])
-def get_run(run_id: int):
-    run = db.session.get(ModelRun, run_id)
-    if not run:
-        return _not_found("ModelRun", run_id)
-    return jsonify(ModelRunSchema().dump(run))
+@api.post("/projects/<int:project_id>/model-runs/upload")
+def upload_model_run(project_id: int):
+    if db.session.get(Project, project_id) is None:
+        return error(f"Project {project_id} not found", 404)
 
+    payload = json_body()
+    run_payload = payload.get("run")
+    results_payload = payload.get("results")
+    if not isinstance(run_payload, dict):
+        raise ValueError("run is required")
+    if not isinstance(results_payload, list):
+        raise ValueError("results must be an array")
 
-@api.route("/runs/<int:run_id>/status", methods=["PATCH"])
-def patch_run_status(run_id: int):
-    run = db.session.get(ModelRun, run_id)
-    if not run:
-        return _not_found("ModelRun", run_id)
+    run = build_model_run(project_id, run_payload)
+    db.session.add(run)
+    db.session.flush()
+    run.uploaded_file_path = save_uploaded_payload(project_id, run, payload)
 
-    body = request.get_json() or {}
-    new_status = body.get("status")
-    if new_status not in [s.value for s in RunStatus]:
-        return _bad_request(f"Invalid status {new_status!r}")
+    runtime = evaluation_runtime()
+    run_cases: list[RunCase] = []
+    seen_question_ids: set[int] = set()
+    for item in results_payload:
+        if not isinstance(item, dict):
+            raise ValueError("Each result must be an object")
+        run_case = build_run_case(run.id, item, source="upload")
+        if run_case.question_id is not None:
+            if run_case.question_id in seen_question_ids:
+                raise ValueError(
+                    f"Duplicate question_id {run_case.question_id} in upload results"
+                )
+            seen_question_ids.add(run_case.question_id)
+        run_cases.append(run_case)
 
-    run.status = new_status
+    db.session.add_all(run_cases)
+    db.session.flush()
     db.session.commit()
-    return jsonify(ModelRunSchema().dump(run))
+
+    for run_case in run_cases:
+        persisted_run_case = db.session.get(RunCase, run_case.id)
+        if persisted_run_case is None:
+            raise RuntimeError(f"RunCase {run_case.id} not found after commit")
+        runtime.submission_service.submit_runcase(persisted_run_case)
+
+    persisted_run = db.session.get(ModelRun, run.id)
+    if persisted_run is None:
+        raise RuntimeError(f"ModelRun {run.id} not found after commit")
+    return jsonify(serialize_model_run(persisted_run)), 201
 
 
-@api.route("/runs/<int:run_id>/metrics", methods=["PATCH"])
-def patch_run_metrics(run_id: int):
-    run = db.session.get(ModelRun, run_id)
-    if not run:
-        return _not_found("ModelRun", run_id)
-
-    try:
-        data = _validate(ModelRunMetricPatchSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    if data.get("exec_acc") is not None:
-        run.exec_acc = data["exec_acc"]
-    if data.get("exact_match") is not None:
-        run.exact_match = data["exact_match"]
-
-    db.session.commit()
-    return jsonify(ModelRunSchema().dump(run))
+@api.post("/projects/<int:project_id>/model-runs/<int:model_run_id>/evaluations")
+def create_evaluation_job(project_id: int, model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None or run.project_id != project_id:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    runtime = evaluation_runtime()
+    job = runtime.submission_service.submit(json_body(), project_id, model_run_id)
+    return jsonify(serialize_evaluation_job(job)), 202
 
 
-# ─── EvalRecords ──────────────────────────────────────────────────────────────
-
-
-@api.route("/runs/<int:run_id>/evals", methods=["GET"])
-def list_evals(run_id: int):
-    if not db.session.get(ModelRun, run_id):
-        return _not_found("ModelRun", run_id)
-
-    db_id = request.args.get("db_id")
-    dataset = request.args.get("dataset")
-
-    q = (
-        select(EvalRecord)
-        .where(EvalRecord.run_id == run_id)
-        .options(selectinload(EvalRecord.labels))
-        .order_by(EvalRecord.question_id)
-    )
-    if db_id:
-        q = q.where(EvalRecord.db_id == db_id)
-    if dataset:
-        q = q.where(EvalRecord.dataset == dataset)
-
-    return _paginate(q, EvalRecordSchema)
-
-
-@api.route("/runs/<int:run_id>/evals", methods=["POST"])
-def bulk_create_evals(run_id: int):
-    """
-    Bulk insert eval records for a run.
-    Idempotent: existing (run_id, question_id) rows are skipped.
-    """
-    if not db.session.get(ModelRun, run_id):
-        return _not_found("ModelRun", run_id)
-
-    try:
-        data = _validate(EvalRecordBulkCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    # Load existing question_ids to skip duplicates
-    existing_qids = set(
-        db.session.scalars(
-            select(EvalRecord.question_id).where(EvalRecord.run_id == run_id)
-        ).all()
-    )
-
-    created = []
-    for rec_data in data["records"]:
-        if rec_data["question_id"] in existing_qids:
-            continue
-        rec = EvalRecord(run_id=run_id, **rec_data)
-        db.session.add(rec)
-        created.append(rec_data["question_id"])
-
-    db.session.commit()
-    return (
-        jsonify(
-            {"created": len(created), "skipped": len(data["records"]) - len(created)}
-        ),
-        201,
-    )
-
-
-@api.route("/runs/<int:run_id>/evals/<int:question_id>", methods=["GET"])
-def get_eval(run_id: int, question_id: int):
-    record = db.session.scalar(
-        select(EvalRecord)
-        .where(EvalRecord.run_id == run_id, EvalRecord.question_id == question_id)
-        .options(selectinload(EvalRecord.labels))
-    )
-    if not record:
-        return _not_found(f"EvalRecord (run={run_id}, question={question_id})", "")
-    return jsonify(EvalRecordSchema().dump(record))
-
-
-@api.route("/runs/<int:run_id>/evals/<int:question_id>/labels", methods=["PATCH"])
-def patch_eval_labels(run_id: int, question_id: int):
-    """
-    Upsert equivalence labels on an EvalRecord.
-    Body: { "labels": { "PK_FK_POSITIVE": true, "NONE_FULL": false, … } }
-    """
-    record = db.session.scalar(
-        select(EvalRecord)
-        .where(EvalRecord.run_id == run_id, EvalRecord.question_id == question_id)
-        .options(selectinload(EvalRecord.labels))
-    )
-    if not record:
-        return _not_found(f"EvalRecord (run={run_id}, question={question_id})", "")
-
-    try:
-        data = _validate(EquivalenceLabelPatchSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    invalid_keys = validate_label_keys(data["labels"])
-    if invalid_keys:
-        return _bad_request("Invalid equivalence level keys", {"invalid": invalid_keys})
-
-    # Build index of existing labels
-    existing = {
-        (lbl.db_level.value, lbl.query_level.value): lbl for lbl in record.labels
-    }
-
-    for level_key, is_equiv in data["labels"].items():
-        # Find the split point: try each DBLevel as a prefix
-        # Sort longest-first so PK_FK_NULL matches before PK_FK, PK_FK before PK
-        db_level = next(
-            (
-                db
-                for db in sorted(DBLevel, key=lambda d: len(d.value), reverse=True)
-                if level_key.startswith(db.value + "_")
-            ),
-            None,
-        )
-        if db_level is None:
-            continue
-        ql_str = level_key[len(db_level.value) + 1 :]
-        try:
-            query_level = QueryLevel(ql_str)
-        except ValueError:
-            continue
-
-        key = (db_level.value, query_level.value)
-        if key in existing:
-            existing[key].is_equivalent = is_equiv
-        else:
-            lbl = EquivalenceLabel(
-                eval_record_id=record.id,
-                db_level=db_level,
-                query_level=query_level,
-                is_equivalent=is_equiv,
-            )
-            db.session.add(lbl)
-
-    db.session.commit()
-    db.session.refresh(record)
-    return jsonify(EvalRecordSchema().dump(record))
-
-
-# ─── QueryExecutions ──────────────────────────────────────────────────────────
-
-
-@api.route("/runs/<int:run_id>/executions", methods=["POST"])
-def create_execution(run_id: int):
-    if not db.session.get(ModelRun, run_id):
-        return _not_found("ModelRun", run_id)
-
-    try:
-        data = _validate(QueryExecutionCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    execution = QueryExecution(run_id=run_id, **data)
-    db.session.add(execution)
-    db.session.commit()
-    return jsonify(QueryExecutionSchema().dump(execution)), 201
-
-
-@api.route("/runs/<int:run_id>/executions/<int:question_id>", methods=["GET"])
-def get_executions_for_question(run_id: int, question_id: int):
-    """Returns both gold and pred executions for a question as {gold: …, pred: …}."""
-    executions = db.session.scalars(
-        select(QueryExecution).where(
-            QueryExecution.run_id == run_id,
-            QueryExecution.question_id == question_id,
-        )
+@api.get("/projects/<int:project_id>/model-runs/<int:model_run_id>/evaluations")
+def list_evaluation_jobs(project_id: int, model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None or run.project_id != project_id:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    limit, offset = parse_limit_offset()
+    jobs = db.session.scalars(
+        select(EvaluationJob)
+        .where(EvaluationJob.run_id == model_run_id)
+        .order_by(EvaluationJob.queued_at.desc(), EvaluationJob.id.desc())
+        .offset(offset)
+        .limit(limit)
     ).all()
-
-    result = {ex.role: QueryExecutionSchema().dump(ex) for ex in executions}
-    return jsonify(result)
+    return jsonify([serialize_evaluation_job(job) for job in jobs])
 
 
-# ─── RelaxedEquivalences ──────────────────────────────────────────────────────
+@api.get("/evaluations/<int:evaluation_job_id>")
+def get_evaluation_job(evaluation_job_id: int):
+    job = db.session.get(EvaluationJob, evaluation_job_id)
+    if job is None:
+        return error(f"EvaluationJob {evaluation_job_id} not found", 404)
+    return jsonify(serialize_evaluation_job(job))
 
 
-@api.route("/runs/<int:run_id>/equivalences", methods=["GET"])
-def list_equivalences(run_id: int):
-    if not db.session.get(ModelRun, run_id):
-        return _not_found("ModelRun", run_id)
-
-    state = request.args.get("state")
-    db_id = request.args.get("db_id")
-    dataset = request.args.get("dataset")
-
-    q = (
-        select(RelaxedEquivalence)
-        .where(RelaxedEquivalence.run_id == run_id)
-        .options(selectinload(RelaxedEquivalence.counterexamples))
-        .order_by(RelaxedEquivalence.question_id)
-    )
-    if state:
-        q = q.where(RelaxedEquivalence.state == state)
-    if db_id:
-        q = q.where(RelaxedEquivalence.db_id == db_id)
-    if dataset:
-        q = q.where(RelaxedEquivalence.dataset == dataset)
-
-    return _paginate(q, RelaxedEquivalenceListSchema)
-
-
-@api.route("/runs/<int:run_id>/equivalences", methods=["POST"])
-def create_equivalence(run_id: int):
-    if not db.session.get(ModelRun, run_id):
-        return _not_found("ModelRun", run_id)
-
-    try:
-        data = _validate(RelaxedEquivalenceCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    equiv = RelaxedEquivalence(run_id=run_id, **data)
-    db.session.add(equiv)
+@api.delete("/projects/<int:project_id>/model-runs/<int:model_run_id>")
+def delete_model_run(project_id: int, model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None or run.project_id != project_id:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    delete_relative_file(run.uploaded_file_path)
+    for job in run.evaluation_jobs:
+        delete_relative_file(job.artifact_path)
+    db.session.delete(run)
+    db.session.flush()
+    prune_orphan_db_connections()
     db.session.commit()
-    return jsonify(RelaxedEquivalenceSchema().dump(equiv)), 201
+    return "", 204
 
 
-@api.route("/runs/<int:run_id>/equivalences/<int:question_id>", methods=["GET"])
-def get_equivalence(run_id: int, question_id: int):
-    equiv = db.session.scalar(
-        select(RelaxedEquivalence)
-        .where(
-            RelaxedEquivalence.run_id == run_id,
-            RelaxedEquivalence.question_id == question_id,
-        )
-        .options(
-            selectinload(RelaxedEquivalence.counterexamples).selectinload(
-                CounterExample.gold_execution
-            ),
-            selectinload(RelaxedEquivalence.counterexamples).selectinload(
-                CounterExample.pred_execution
-            ),
-        )
-    )
-    if not equiv:
-        return _not_found(
-            f"RelaxedEquivalence (run={run_id}, question={question_id})", ""
-        )
-    return jsonify(RelaxedEquivalenceSchema().dump(equiv))
+@api.get("/model-runs/<int:model_run_id>")
+def get_model_run(model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    return jsonify(serialize_model_run(run))
 
 
-# ─── CounterExamples ──────────────────────────────────────────────────────────
-
-
-@api.route("/equivalences/<int:equivalence_id>/counterexamples", methods=["GET"])
-def list_counterexamples(equivalence_id: int):
-    equiv = db.session.get(RelaxedEquivalence, equivalence_id)
-    if not equiv:
-        return _not_found("RelaxedEquivalence", equivalence_id)
-
-    cexs = db.session.scalars(
-        select(CounterExample)
-        .where(CounterExample.equivalence_id == equivalence_id)
-        .options(
-            selectinload(CounterExample.gold_execution),
-            selectinload(CounterExample.pred_execution),
-        )
-        .order_by(CounterExample.db_level, CounterExample.query_level)
+@api.get("/model-runs/<int:model_run_id>/eval-records")
+def list_eval_records(model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    limit, offset = parse_limit_offset()
+    run_cases = db.session.scalars(
+        select(RunCase)
+        .where(RunCase.run_id == model_run_id)
+        .order_by(RunCase.question_id, RunCase.id)
+        .offset(offset)
+        .limit(limit)
     ).all()
-    return jsonify(CounterExampleSchema(many=True).dump(cexs))
-
-
-@api.route("/equivalences/<int:equivalence_id>/counterexamples", methods=["POST"])
-def create_counterexample(equivalence_id: int):
-    equiv = db.session.get(RelaxedEquivalence, equivalence_id)
-    if not equiv:
-        return _not_found("RelaxedEquivalence", equivalence_id)
-
-    try:
-        data = _validate(CounterExampleCreateSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    cex = CounterExample(equivalence_id=equivalence_id, **data)
-    db.session.add(cex)
-    db.session.commit()
-    return jsonify(CounterExampleSchema().dump(cex)), 201
-
-
-@api.route("/counterexamples/<int:cex_id>/state", methods=["PATCH"])
-def patch_counterexample_state(cex_id: int):
-    cex = db.session.get(CounterExample, cex_id)
-    if not cex:
-        return _not_found("CounterExample", cex_id)
-
-    try:
-        data = _validate(CounterExampleStatePatchSchema, request.get_json() or {})
-    except ValidationError as e:
-        return _bad_request("Validation failed", e.messages)
-
-    cex.state = data["state"]
-    db.session.commit()
-    return jsonify(CounterExampleSchema().dump(cex))
-
-
-# ─── Datasets ─────────────────────────────────────────────────────────────────
-
-
-@api.route("/datasets", methods=["GET"])
-def list_datasets():
-    datasets = db.session.scalars(select(Dataset).order_by(Dataset.name)).all()
-    return jsonify(DatasetSchema(many=True).dump(datasets))
-
-
-# ─── Aggregation endpoints ────────────────────────────────────────────────────
-
-
-@api.route("/runs/<int:run_id>/summary", methods=["GET"])
-def run_summary(run_id: int):
-    """
-    Returns per-equivalence-level accuracy for a run — the key metric
-    for the QueryLens dashboard.
-
-    Response shape:
-    {
-      "run_id": 1,
-      "total_questions": 200,
-      "metrics": {
-        "EXEC_ACC": 0.82,
-        "EXACT_MATCH": 0.71
-      },
-      "equivalence_rates": {
-        "NONE_POSITIVE": { "checked": 200, "equivalent": 160, "rate": 0.80 },
-        "PK_POSITIVE":   { "checked": 200, "equivalent": 155, "rate": 0.775 },
-        ...
-      }
-    }
-    """
-    run = db.session.get(ModelRun, run_id)
-    if not run:
-        return _not_found("ModelRun", run_id)
-
-    total = (
-        db.session.scalar(
-            select(db.func.count())
-            .select_from(EvalRecord)
-            .where(EvalRecord.run_id == run_id)
-        )
-        or 0
-    )
-
-    # Aggregate per (db_level, query_level)
-    label_agg = db.session.execute(
-        select(
-            EquivalenceLabel.db_level,
-            EquivalenceLabel.query_level,
-            db.func.count().label("checked"),
-            db.func.sum(db.func.cast(EquivalenceLabel.is_equivalent, db.Integer)).label(
-                "equivalent"
-            ),
-        )
-        .join(EvalRecord, EquivalenceLabel.eval_record_id == EvalRecord.id)
-        .where(EvalRecord.run_id == run_id)
-        .group_by(EquivalenceLabel.db_level, EquivalenceLabel.query_level)
-    ).all()
-
-    rates = {}
-    for row in label_agg:
-        key = f"{row.db_level.value}_{row.query_level.value}"
-        checked = row.checked
-        equiv = row.equivalent or 0
-        rates[key] = {
-            "checked": checked,
-            "equivalent": equiv,
-            "rate": round(equiv / checked, 4) if checked else None,
-        }
-
     return jsonify(
-        {
-            "run_id": run_id,
-            "total_questions": total,
-            "metrics": {
-                "EXEC_ACC": run.exec_acc,
-                "EXACT_MATCH": run.exact_match,
-            },
-            "equivalence_rates": rates,
-        }
+        [serialize_run_case_as_eval_record(run_case) for run_case in run_cases]
     )
+
+
+@api.get("/model-runs/<int:model_run_id>/relaxed-equivalence-record")
+def get_relaxed_equivalence_record(model_run_id: int):
+    run = db.session.get(ModelRun, model_run_id)
+    if run is None:
+        return error(f"ModelRun {model_run_id} not found", 404)
+    dataset = request.args.get("dataset")
+    db_id = request.args.get("db-id")
+    question_id = request.args.get("question-id")
+    if not dataset or not db_id or question_id is None:
+        raise ValueError("dataset, db-id, and question-id are required")
+    try:
+        question_id_int = int(question_id)
+    except ValueError as exc:
+        raise ValueError("question-id must be an integer") from exc
+
+    record = db.session.scalar(
+        select(RelaxedEquivalence)
+        .join(RelaxedEquivalence.evaluation_job)
+        .join(EvaluationJob.run_case)
+        .where(
+            EvaluationJob.run_id == model_run_id,
+            RunCase.dataset == dataset,
+            RunCase.db_id == db_id,
+            RunCase.question_id == question_id_int,
+        )
+    )
+    if record is None:
+        return error("RelaxedEquivalenceRecord not found", 404)
+    return jsonify(serialize_relaxed_equivalence(record))

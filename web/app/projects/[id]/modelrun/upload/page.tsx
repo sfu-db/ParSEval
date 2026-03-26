@@ -1,16 +1,15 @@
 "use client";
 
-import type { ChangeEvent } from "react";
-import { useMemo, useState } from "react";
+import type { ChangeEvent, DragEvent } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ModelRunAPI, type ModelRunUploadPayload } from "@/lib/api/modelRun";
+import { ModelRunAPI, type ModelRunUploadPayload, type UploadEvalRecord } from "@/lib/api/modelRun";
 import { getSettingsForRows } from "@/lib/settings";
-import type { EvalRecord } from "@/lib/types";
 
-type UploadRecord = Omit<EvalRecord, "runId">;
+type UploadRecord = UploadEvalRecord;
 
 type ParsedUpload = {
     run?: Partial<ModelRunUploadPayload["run"]>;
@@ -21,8 +20,6 @@ function normalizeParsedRecord(value: unknown, fallbackDataset: string): UploadR
     if (!value || typeof value !== "object") return null;
 
     const record = value as Record<string, unknown>;
-    const labels = record.labels && typeof record.labels === "object" ? (record.labels as UploadRecord["labels"]) : {};
-
     if (typeof record.question_id !== "number" || typeof record.db_id !== "string") {
         return null;
     }
@@ -31,13 +28,14 @@ function normalizeParsedRecord(value: unknown, fallbackDataset: string): UploadR
         question_id: record.question_id,
         db_id: record.db_id,
         dataset: typeof record.dataset === "string" && record.dataset ? record.dataset : fallbackDataset,
-        host_or_path: typeof record.host_or_path === "string" ? record.host_or_path : "",
+        schema: record.schema,
+        host_or_path: typeof record.host_or_path === "string" ? record.host_or_path : undefined,
         question: typeof record.question === "string" ? record.question : "",
         evidence: typeof record.evidence === "string" ? record.evidence : undefined,
         gold: typeof record.gold === "string" ? record.gold : "",
         prompt: typeof record.prompt === "string" ? record.prompt : "",
         pred: typeof record.pred === "string" ? record.pred : "",
-        labels,
+        labels: record.labels && typeof record.labels === "object" ? (record.labels as UploadRecord["labels"]) : undefined,
     };
 }
 
@@ -94,6 +92,19 @@ function inferDataset(results: UploadRecord[]) {
     return datasets.length === 1 ? datasets[0] : "";
 }
 
+function buildUploadPayload(parsedUpload: ParsedUpload, runOverrides: ModelRunUploadPayload["run"]): ModelRunUploadPayload {
+    return {
+        run: {
+            ...parsedUpload.run,
+            ...runOverrides,
+        },
+        results: parsedUpload.results.map((result) => ({
+            ...result,
+            dataset: result.dataset || runOverrides.dataset,
+        })),
+    };
+}
+
 export default function ModelRunUploadPage() {
     const params = useParams();
     const router = useRouter();
@@ -103,39 +114,67 @@ export default function ModelRunUploadPage() {
     const [modelName, setModelName] = useState("");
     const [datasetName, setDatasetName] = useState("");
     const [promptTemplate, setPromptTemplate] = useState("");
-    const [status, setStatus] = useState("completed");
+    const [status, setStatus] = useState("pending");
     const [fileName, setFileName] = useState("");
+    const [isDragging, setIsDragging] = useState(false);
     const [parsedUpload, setParsedUpload] = useState<ParsedUpload | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-    const previewSettings = useMemo(() => getSettingsForRows(parsedUpload?.results ?? []), [parsedUpload]);
+    const previewSettings = useMemo(() => getSettingsForRows((parsedUpload?.results ?? []).map((result) => ({ ...result, labels: result.labels ?? {} }))), [parsedUpload]);
     const previewDataset = useMemo(() => inferDataset(parsedUpload?.results ?? []), [parsedUpload]);
 
-    async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-        const file = event.target.files?.[0];
-        if (!file) return;
+    function applyParsedUpload(parsed: ParsedUpload, sourceLabel: string) {
+        const inferredDataset = parsed.run?.dataset || inferDataset(parsed.results);
 
+        setParsedUpload(parsed);
+        setFileName(sourceLabel);
+        setError(null);
+
+        if (!modelName.trim() && parsed.run?.model) setModelName(parsed.run.model);
+        if (!runName.trim() && parsed.run?.run) setRunName(parsed.run.run);
+        if (!promptTemplate.trim() && parsed.run?.promptTemplate) setPromptTemplate(parsed.run.promptTemplate);
+        if (!datasetName.trim() && inferredDataset) setDatasetName(inferredDataset);
+        if (parsed.run?.status) setStatus(parsed.run.status);
+    }
+
+    async function processFile(file: File) {
         try {
             const text = await file.text();
             const parsed = parseUploadText(text, datasetName.trim());
-            const inferredDataset = parsed.run?.dataset || inferDataset(parsed.results);
-
-            setParsedUpload(parsed);
-            setFileName(file.name);
-            setError(null);
-
-            if (!modelName.trim() && parsed.run?.model) setModelName(parsed.run.model);
-            if (!runName.trim() && parsed.run?.run) setRunName(parsed.run.run);
-            if (!promptTemplate.trim() && parsed.run?.promptTemplate) setPromptTemplate(parsed.run.promptTemplate);
-            if (!datasetName.trim() && inferredDataset) setDatasetName(inferredDataset);
-            if (parsed.run?.status) setStatus(parsed.run.status);
+            applyParsedUpload(parsed, file.name);
         } catch (err) {
             console.error(err);
             setParsedUpload(null);
             setFileName("");
             setError(err instanceof Error ? err.message : "Failed to parse upload file.");
         }
+    }
+
+    async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        await processFile(file);
+        event.target.value = "";
+    }
+
+    function handleDragOver(event: DragEvent<HTMLDivElement>) {
+        event.preventDefault();
+        setIsDragging(true);
+    }
+
+    function handleDragLeave(event: DragEvent<HTMLDivElement>) {
+        event.preventDefault();
+        setIsDragging(false);
+    }
+
+    async function handleDrop(event: DragEvent<HTMLDivElement>) {
+        event.preventDefault();
+        setIsDragging(false);
+        const file = event.dataTransfer.files?.[0];
+        if (!file) return;
+        await processFile(file);
     }
 
     async function handleSubmit() {
@@ -158,21 +197,14 @@ export default function ModelRunUploadPage() {
             return;
         }
 
-        const payload: ModelRunUploadPayload = {
-            run: {
-                model: modelName.trim(),
-                dataset: resolvedDataset,
-                run: runName.trim() || undefined,
-                promptTemplate: promptTemplate.trim() || undefined,
-                status,
-                ...(parsedUpload.run?.metric ? { metric: parsedUpload.run.metric } : {}),
-                ...(parsedUpload.run?.setting ? { setting: parsedUpload.run.setting } : {}),
-            },
-            results: parsedUpload.results.map((result) => ({
-                ...result,
-                dataset: result.dataset || resolvedDataset,
-            })),
-        };
+        const payload = buildUploadPayload(parsedUpload, {
+            model: modelName.trim(),
+            dataset: resolvedDataset,
+            run: runName.trim() || undefined,
+            promptTemplate: promptTemplate.trim() || undefined,
+            status,
+            ...(parsedUpload.run?.setting ? { setting: parsedUpload.run.setting } : {}),
+        });
 
         try {
             setSubmitting(true);
@@ -210,9 +242,9 @@ export default function ModelRunUploadPage() {
                         <label className="grid gap-2 text-sm text-slate-700">
                             <span className="font-medium">Status</span>
                             <select value={status} onChange={(event) => setStatus(event.target.value)} className="rounded-lg border border-slate-200 bg-white px-3 py-2 outline-none focus:border-slate-400">
-                                <option value="completed">Completed</option>
-                                <option value="running">Running</option>
                                 <option value="pending">Pending</option>
+                                <option value="running">Running</option>
+                                <option value="completed">Completed</option>
                                 <option value="failed">Failed</option>
                             </select>
                         </label>
@@ -223,12 +255,25 @@ export default function ModelRunUploadPage() {
                         <input value={promptTemplate} onChange={(event) => setPromptTemplate(event.target.value)} placeholder="standard_cot" className="rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-slate-400" />
                     </label>
 
-                    <div className="grid gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+                    <div
+                        className={"grid gap-3 rounded-xl border border-dashed p-5 transition-colors " + (isDragging ? "border-slate-900 bg-slate-100" : "border-slate-300 bg-slate-50")}
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                    >
                         <div>
                             <div className="text-sm font-medium text-slate-900">Result File</div>
-                            <div className="mt-1 text-sm text-slate-500">Upload a JSON or JSONL result file. Supported shapes: an array of eval records, or an object with `run` and `results` fields.</div>
+                            <div className="mt-1 text-sm text-slate-500">Upload or drag a raw Text-to-SQL result JSON or JSONL file here. Each row should include `dataset`, `schema`, `question`, `db_id`, `question_id`, `evidence`, `gold`, `pred`, and `prompt`.</div>
                         </div>
-                        <input type="file" accept=".json,.jsonl,application/json" onChange={handleFileChange} className="block text-sm text-slate-600 file:mr-4 file:rounded-md file:border-0 file:bg-slate-900 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-slate-700" />
+                        <input ref={fileInputRef} type="file" accept=".json,.jsonl,application/json" onChange={handleFileChange} className="hidden" />
+                        <button
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()}
+                            className={"rounded-xl border border-dashed px-4 py-8 text-left transition-colors " + (isDragging ? "border-slate-900 bg-white" : "border-slate-300 bg-white hover:border-slate-400")}
+                        >
+                            <div className="text-sm font-medium text-slate-900">Drop file here or click to browse</div>
+                            <div className="mt-1 text-sm text-slate-500">The backend will evaluate these raw predictions after upload.</div>
+                        </button>
                         {fileName ? <div className="text-sm text-slate-600">Loaded file: <span className="font-medium text-slate-900">{fileName}</span></div> : null}
                     </div>
 

@@ -5,6 +5,7 @@ from itertools import product
 if TYPE_CHECKING:
     from parseval.instance import Instance
     from parseval.dtype import DATATYPE
+    from .rex import Row
 
 
 class DerivedSchema:
@@ -13,9 +14,9 @@ class DerivedSchema:
         columns,
         rows=None,
         column_range=None,
-        datatypes: Dict[str, DATATYPE] = None,
-        nullables: Dict[str, bool] = None,
-        uniqueness: Dict[str, bool] = None,
+        datatypes: Optional[Dict[str, DATATYPE]] = None,
+        nullables: Optional[Dict[str, bool]] = None,
+        uniqueness: Optional[Dict[str, bool]] = None,
     ):
         self.columns = tuple(columns)
         self.column_range = column_range
@@ -129,16 +130,29 @@ class RowReader:
             for i, column in enumerate(columns)
             if not column_range or i in column_range
         }
-        self.row = None
+        self.row: Row | None = None
 
     def rowid(self):
-        return self.row.rowid
+        if self.row is not None:
+            return self.row.rowid
 
     def __getitem__(self, column):
-        return self.row[column]
+        if self.row is not None:
+            return self.row[column]
+
+    def get(self, table, column):
+        del table
+        if self.row is not None:
+            return self.row[column]
+
+    def items(self):
+        if self.row is not None:
+            return self.row.items()
+        return ()
 
     def get_cell(self, table, column):
-        return self.row[self.columns[column]]
+        if self.row is not None:
+            return self.row[self.columns[column]]
 
 
 class ProductReader:

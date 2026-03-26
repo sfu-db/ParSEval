@@ -1,363 +1,167 @@
-"""
-schemas.py — Marshmallow schemas for request validation and response serialisation.
+from __future__ import annotations
 
-Each schema mirrors a model but controls exactly what is exposed over the API:
-  • Input schemas (for POST/PATCH) validate and coerce incoming JSON.
-  • Response schemas serialise ORM objects to JSON-safe dicts.
+from datetime import datetime, timezone
+from typing import Any
 
-Naming convention: <Entity>Schema (full), <Entity>ListSchema (summary for list views).
-"""
-
-from marshmallow import (
-    Schema,
-    fields,
-    validate,
-    validates,
-    ValidationError,
-    pre_load,
-    post_load,
+from .models import (
+    CounterExample,
+    EvaluationJob,
+    ModelRun,
+    Project,
+    RelaxedEquivalence,
+    RunCase,
 )
+METRIC_KEYS = ("EXEC ACC", "EXACT MATCH")
 
 
-class EnumField(fields.Field):
-    """Serialises a str-Enum to its .value; deserialises as plain string."""
-
-    def _serialize(self, value, attr, obj, **kwargs):
-        if value is None:
-            return None
-        return value.value if hasattr(value, "value") else str(value)
-
-    def _deserialize(self, value, attr, data, **kwargs):
-        return value  # caller validates enum membership
+def isoformat(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-from .enums import DBLevel, QueryLevel, RunStatus, CounterExampleState
+def normalize_metric(metric: dict[str, Any] | None) -> dict[str, Any]:
+    metric = metric or {}
+    return {
+        "EXEC ACC": metric.get("EXEC ACC", metric.get("EXEC_ACC")),
+        "EXACT MATCH": metric.get("EXACT MATCH", metric.get("EXACT_MATCH")),
+    }
 
 
-# ─── Shared field types ───────────────────────────────────────────────────────
-
-_DB_LEVELS = [e.value for e in DBLevel]
-_QUERY_LEVELS = [e.value for e in QueryLevel]
-_RUN_STATUSES = [e.value for e in RunStatus]
-_CEX_STATES = [e.value for e in CounterExampleState]
-
-
-# ─── Project ──────────────────────────────────────────────────────────────────
+def serialize_project(project: Project) -> dict[str, Any]:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "settings": project.settings_json or {},
+    }
 
 
-class ProjectCreateSchema(Schema):
-    name = fields.Str(required=True, validate=validate.Length(min=1, max=255))
-    description = fields.Str(load_default=None)
+def serialize_model_run(run: ModelRun) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "projectId": run.project_id,
+        "model": run.model,
+        "status": run.status,
+        "createdAt": isoformat(run.created_at),
+        "run": run.run_name,
+        "dataset": run.dataset,
+        "promptTemplate": run.prompt_template,
+        "uploadedFilePath": run.uploaded_file_path,
+        "metric": normalize_metric(run.metric_json),
+        "setting": run.setting_json or {},
+    }
 
 
-class ProjectSchema(Schema):
-    id = fields.Int(dump_only=True)
-    name = fields.Str()
-    description = fields.Str(allow_none=True)
-    created_at = fields.DateTime(dump_only=True)
-    updated_at = fields.DateTime(dump_only=True)
-
-
-# ─── Dataset ──────────────────────────────────────────────────────────────────
-
-
-class DatasetSchema(Schema):
-    name = fields.Str()
-    saved_at = fields.DateTime()
-
-
-# ─── ModelRun ─────────────────────────────────────────────────────────────────
-
-
-class ModelRunCreateSchema(Schema):
-    """Validates POST /runs body."""
-
-    project_id = fields.Int(required=True)
-    model = fields.Str(required=True, validate=validate.Length(min=1, max=255))
-    dataset = fields.Str(required=True, validate=validate.Length(min=1, max=255))
-    run_name = fields.Str(load_default=None)
-    prompt_template = fields.Str(load_default=None)
-    setting = fields.Dict(load_default=None)
-
-
-class ModelRunMetricPatchSchema(Schema):
-    """Validates PATCH /runs/:id/metrics body."""
-
-    exec_acc = fields.Float(
-        load_default=None, validate=validate.Range(min=0.0, max=1.0)
+def serialize_run_case_as_eval_record(run_case: RunCase) -> dict[str, Any]:
+    latest_job = max(
+        run_case.evaluation_jobs,
+        key=lambda job: (job.finished_at or job.started_at or job.queued_at, job.id),
+        default=None,
     )
-    exact_match = fields.Float(
-        load_default=None, validate=validate.Range(min=0.0, max=1.0)
+    labels: dict[str, bool | None] = {}
+    if latest_job and isinstance(latest_job.result_json, dict):
+        results_by_settings = latest_job.result_json.get("resultsBySettings")
+        if isinstance(results_by_settings, dict):
+            for payload in results_by_settings.values():
+                if not isinstance(payload, dict):
+                    continue
+                db_level = payload.get("dbLevel")
+                query_level = payload.get("queryLevel")
+                state = payload.get("state")
+                if not isinstance(db_level, str) or not isinstance(query_level, str):
+                    continue
+                key = f"{db_level}_{query_level}"
+                if state == "equivalent":
+                    labels[key] = True
+                elif state == "witnessed":
+                    labels[key] = False
+                else:
+                    labels[key] = None
+
+    return {
+        "runId": run_case.run_id,
+        "question_id": run_case.question_id,
+        "db_id": run_case.db_id,
+        "dataset": run_case.dataset,
+        "host_or_path": run_case.host_or_path,
+        "question": run_case.question or "",
+        "evidence": run_case.evidence,
+        "gold": run_case.gold,
+        "prompt": run_case.prompt or "",
+        "pred": run_case.pred,
+        "labels": labels,
+    }
+
+
+def serialize_evaluation_job(job: EvaluationJob) -> dict[str, Any]:
+    run_case = job.run_case
+    return {
+        "id": job.id,
+        "projectId": job.run.project_id,
+        "runId": job.run_id,
+        "status": job.status,
+        "gold": run_case.gold,
+        "pred": run_case.pred,
+        "dbId": run_case.db_id,
+        "dataset": run_case.dataset,
+        "hostOrPath": run_case.host_or_path,
+        "schema": run_case.schema_json,
+        "questionId": run_case.question_id,
+        "question": run_case.question,
+        "evidence": run_case.evidence,
+        "error": job.error_message,
+        "result": job.result_json or {},
+        "artifactPath": job.artifact_path,
+        "queuedAt": isoformat(job.queued_at),
+        "startedAt": isoformat(job.started_at),
+        "finishedAt": isoformat(job.finished_at),
+    }
+
+
+def serialize_counterexample(counterexample: CounterExample) -> dict[str, Any]:
+    run_case = counterexample.equivalence.evaluation_job.run_case
+    database = run_case.db_id
+    if isinstance(counterexample.q1_result_json, dict):
+        database = counterexample.q1_result_json.get("db_id", database)
+    return {
+        "runId": counterexample.equivalence.evaluation_job.run_id,
+        "dataset": run_case.dataset,
+        "question_id": run_case.question_id,
+        "db_id": run_case.db_id,
+        "host_or_path": run_case.host_or_path,
+        "database": database,
+        "gold": run_case.gold,
+        "pred": run_case.pred,
+        "settings": [
+            {
+                "db_level": counterexample.db_level,
+                "query_level": counterexample.query_level,
+            }
+        ],
+        "witeness_db": counterexample.witness_db_json,
+        "q1_result": counterexample.q1_result_json,
+        "q2_result": counterexample.q2_result_json,
+        "state": counterexample.state,
+    }
+
+
+def serialize_relaxed_equivalence(record: RelaxedEquivalence) -> dict[str, Any]:
+    run_case = record.evaluation_job.run_case
+    counterexamples = sorted(
+        record.counterexamples,
+        key=lambda item: (item.db_level, item.query_level, item.id),
     )
-
-
-class ModelRunSchema(Schema):
-    """Full response schema for a single run."""
-
-    id = fields.Int(dump_only=True)
-    project_id = fields.Int()
-    model = fields.Str()
-    status = EnumField()
-    created_at = fields.DateTime()
-    updated_at = fields.DateTime()
-    run_name = fields.Str(allow_none=True)
-    dataset = fields.Str()
-    prompt_template = fields.Str(allow_none=True)
-    exec_acc = fields.Float(allow_none=True)
-    exact_match = fields.Float(allow_none=True)
-    setting = fields.Dict(allow_none=True)
-
-    # Computed convenience: expose metrics as the TypeScript `metric` shape
-    metric = fields.Method("get_metric")
-
-    def get_metric(self, obj) -> dict:
-        return {
-            "EXEC_ACC": obj.exec_acc,
-            "EXACT_MATCH": obj.exact_match,
-        }
-
-
-class ModelRunListSchema(Schema):
-    """Compact schema for list views (omits prompt_template and setting)."""
-
-    id = fields.Int()
-    model = fields.Str()
-    status = EnumField()
-    created_at = fields.DateTime()
-    run_name = fields.Str(allow_none=True)
-    dataset = fields.Str()
-    exec_acc = fields.Float(allow_none=True)
-    exact_match = fields.Float(allow_none=True)
-
-
-# ─── EvalRecord ───────────────────────────────────────────────────────────────
-
-
-class EquivalenceLabelSchema(Schema):
-    db_level = fields.Str()
-    query_level = fields.Str()
-    is_equivalent = fields.Bool()
-    level_key = fields.Str(dump_only=True)  # "PK_FK_SET" etc.
-
-
-class EvalRecordCreateSchema(Schema):
-    """Validates a single record in a bulk POST."""
-
-    question_id = fields.Int(required=True)
-    db_id = fields.Str(required=True)
-    dataset = fields.Str(required=True)
-    host_or_path = fields.Str(required=True)
-    question = fields.Str(required=True)
-    evidence = fields.Str(load_default=None)
-    gold = fields.Str(required=True)
-    prompt = fields.Str(required=True)
-    pred = fields.Str(required=True)
-
-
-class EvalRecordBulkCreateSchema(Schema):
-    """Wrapper for bulk insert endpoint."""
-
-    records = fields.List(
-        fields.Nested(EvalRecordCreateSchema),
-        required=True,
-        validate=validate.Length(min=1),
-    )
-
-
-class EvalRecordSchema(Schema):
-    """Full response including labels."""
-
-    id = fields.Int(dump_only=True)
-    run_id = fields.Int()
-    question_id = fields.Int()
-    db_id = fields.Str()
-    dataset = fields.Str()
-    host_or_path = fields.Str()
-    question = fields.Str()
-    evidence = fields.Str(allow_none=True)
-    gold = fields.Str()
-    prompt = fields.Str()
-    pred = fields.Str()
-
-    # Labels serialised as the TypeScript shape: { "PK_POSITIVE": true, … }
-    labels = fields.Method("get_labels")
-
-    def get_labels(self, obj) -> dict:
-        return {lbl.level_key: lbl.is_equivalent for lbl in obj.labels}
-
-
-class EquivalenceLabelPatchSchema(Schema):
-    """Validates PATCH /evals/:id/labels — adds or updates labels."""
-
-    labels = fields.Dict(
-        keys=fields.Str(),
-        values=fields.Bool(),
-        required=True,
-    )
-
-
-# ─── QueryExecution ───────────────────────────────────────────────────────────
-
-
-class QueryExecutionSchema(Schema):
-    id = fields.Int(dump_only=True)
-    run_id = fields.Int()
-    question_id = fields.Int()
-    role = fields.Str()  # 'gold' | 'pred'
-    db_id = fields.Str()
-    dataset = fields.Str()
-    host_or_path = fields.Str()
-    query = fields.Str()
-    dialect = fields.Str()
-    elapsed_ms = fields.Int(allow_none=True)
-    columns = fields.List(fields.Str(), allow_none=True)
-    rows = fields.List(fields.List(fields.Raw()), allow_none=True)
-    error_msg = fields.Str(allow_none=True)
-
-
-class QueryExecutionCreateSchema(Schema):
-    question_id = fields.Int(required=True)
-    role = fields.Str(required=True, validate=validate.OneOf(["gold", "pred"]))
-    db_id = fields.Str(required=True)
-    dataset = fields.Str(required=True)
-    host_or_path = fields.Str(required=True)
-    query = fields.Str(required=True)
-    dialect = fields.Str(load_default="sqlite")
-    elapsed_ms = fields.Int(load_default=None)
-    columns = fields.List(fields.Str(), load_default=None)
-    rows = fields.List(fields.List(fields.Raw()), load_default=None)
-    error_msg = fields.Str(load_default=None)
-
-
-# ─── Witness ──────────────────────────────────────────────────────────────────
-
-
-class WitnessTableSchema(Schema):
-    """Shape of each table inside a witness database (stored as JSON)."""
-
-    name = fields.Str(required=True)
-    columns = fields.List(fields.Str(), required=True)
-    rows = fields.List(fields.List(fields.Raw()), required=True)
-
-
-class WitnessDatabaseSchema(Schema):
-    """The synthesised counterexample database (stored as JSON in CounterExample)."""
-
-    db_id = fields.Str(required=True)
-    host_or_path = fields.Str(required=True)
-    database = fields.Str(required=True)
-    tables = fields.List(fields.Nested(WitnessTableSchema), required=True)
-
-
-# ─── CounterExample ───────────────────────────────────────────────────────────
-
-
-class CounterExampleSchema(Schema):
-    id = fields.Int(dump_only=True)
-    equivalence_id = fields.Int()
-    db_level = EnumField()
-    query_level = EnumField()
-    level_key = fields.Str(dump_only=True)
-    state = EnumField()
-    witness_db = fields.Nested(WitnessDatabaseSchema, allow_none=True)
-    gold_execution = fields.Nested(QueryExecutionSchema, allow_none=True)
-    pred_execution = fields.Nested(QueryExecutionSchema, allow_none=True)
-
-
-class CounterExampleCreateSchema(Schema):
-    """Validates POST /equivalences/:id/counterexamples."""
-
-    db_level = fields.Str(required=True, validate=validate.OneOf(_DB_LEVELS))
-    query_level = fields.Str(required=True, validate=validate.OneOf(_QUERY_LEVELS))
-    witness_db = fields.Nested(WitnessDatabaseSchema, load_default=None)
-    gold_execution_id = fields.Int(load_default=None)
-    pred_execution_id = fields.Int(load_default=None)
-
-
-class CounterExampleStatePatchSchema(Schema):
-    state = fields.Str(required=True, validate=validate.OneOf(_CEX_STATES))
-
-
-# ─── RelaxedEquivalence ───────────────────────────────────────────────────────
-
-
-class RelaxedEquivalenceSchema(Schema):
-    """Full response including nested counterexamples."""
-
-    id = fields.Int(dump_only=True)
-    run_id = fields.Int()
-    question_id = fields.Int()
-    db_id = fields.Str()
-    dataset = fields.Str()
-    host_or_path = fields.Str()
-    gold = fields.Str()
-    pred = fields.Str()
-    state = EnumField()
-    updated_at = fields.DateTime()
-    counterexamples = fields.List(fields.Nested(CounterExampleSchema))
-
-
-class RelaxedEquivalenceListSchema(Schema):
-    """Compact schema for list views — omits SQL text and nested counterexamples."""
-
-    id = fields.Int()
-    run_id = fields.Int()
-    question_id = fields.Int()
-    db_id = fields.Str()
-    dataset = fields.Str()
-    state = fields.Str()
-    updated_at = fields.DateTime()
-    # Summary: how many of the checked levels are witnessed (distinguishable)?
-    witnessed_count = fields.Method("get_witnessed_count")
-    equivalent_count = fields.Method("get_equivalent_count")
-
-    def get_witnessed_count(self, obj) -> int:
-        return sum(
-            1 for c in obj.counterexamples if c.state == CounterExampleState.WITNESSED
-        )
-
-    def get_equivalent_count(self, obj) -> int:
-        return sum(
-            1 for c in obj.counterexamples if c.state == CounterExampleState.EQUIVALENT
-        )
-
-
-class RelaxedEquivalenceCreateSchema(Schema):
-    question_id = fields.Int(required=True)
-    db_id = fields.Str(required=True)
-    dataset = fields.Str(required=True)
-    host_or_path = fields.Str(required=True)
-    gold = fields.Str(required=True)
-    pred = fields.Str(required=True)
-
-
-# ─── Pagination ───────────────────────────────────────────────────────────────
-
-
-class PaginationSchema(Schema):
-    """Query-string params for paginated list endpoints."""
-
-    page = fields.Int(load_default=1, validate=validate.Range(min=1))
-    per_page = fields.Int(load_default=50, validate=validate.Range(min=1, max=500))
-
-
-class PaginatedResponseSchema(Schema):
-    """Envelope for paginated list responses."""
-
-    items = fields.List(fields.Raw())
-    total = fields.Int()
-    page = fields.Int()
-    per_page = fields.Int()
-    pages = fields.Int()
-
-
-# ─── Standalone validators ────────────────────────────────────────────────────
-
-_VALID_LEVELS = frozenset(
-    f"{db.value}_{ql.value}" for db in DBLevel for ql in QueryLevel
-)
-
-
-def validate_label_keys(labels: dict) -> list[str]:
-    """Return list of invalid level keys (empty list = all valid)."""
-    return [k for k in labels if k not in _VALID_LEVELS]
+    return {
+        "runId": record.evaluation_job.run_id,
+        "dataset": run_case.dataset,
+        "db_id": run_case.db_id,
+        "question_id": run_case.question_id,
+        "host_or_path": run_case.host_or_path,
+        "gold": run_case.gold,
+        "pred": run_case.pred,
+        "counternexample": [serialize_counterexample(item) for item in counterexamples],
+        "state": record.state,
+    }
