@@ -18,13 +18,15 @@ except ModuleNotFoundError:
 
 
 def process_ddl_by_db_level(
-    ddls: dict[str, Any] | list[str] | str | None, dialect: str, db_level: str
+    ddls: dict[str, Any] | list[str] | str | None,
+    dialect: str,
+    db_level: str,
 ):
     db_level = DBLevel(db_level.upper()) if isinstance(db_level, str) else db_level
-    if ddls is None or db_level == DBLevel.FULL:
-        return _schema_to_ddl_text(ddls, dialect) if ddls is not None else None
-
     ddl_text = _schema_to_ddl_text(ddls, dialect)
+    if not ddl_text:
+        return ddl_text
+
     preprocessed_ddls: list[str] = []
     exprs = parse(ddl_text, read=dialect)
 
@@ -107,6 +109,7 @@ def build_parseval_config(
         global_timeout=_coerce_int(project_settings.get("global_timeout"), 360),
         set_semantic=set_semantic,
         generator=generator_config,
+        use_data_generator=False,
     )
 
 
@@ -248,6 +251,8 @@ def _schema_to_ddl_text(
         return ddls
     if isinstance(ddls, list):
         return ";".join(ddls)
+
+    return ddls
 
     statements = []
     for table_name, column_defs in ddls.items():

@@ -12,6 +12,7 @@ from parseval.instance import Instance
 from parseval.states import RunResult, ExecutionResult
 from parseval.configuration import DisproverConfig
 import tempfile
+import uuid
 
 
 class Disprover:
@@ -42,6 +43,9 @@ class Disprover:
         self.counterexamples = []
         self.witness = []
         self.existing_dbs = exisiting_dbs or []
+        self.last_q1_result = None
+        self.last_q2_result = None
+        self.last_checked_db = None
 
     def syntax_check(self):
         host_or_path = self.config.host_or_path
@@ -113,15 +117,54 @@ class Disprover:
                 self.q2, self.instance, dialect=self.dialect
             )
         except Exception as e:
-            return RunResult(
-                q1=self.q1,
-                q2=self.q2,
-                host_or_path="N/A",
-                db_id="N/A",
-                q1_result=None,
-                q2_result=None,
-                state="UNKNOWN/NEQ/SYN",
-                set_semantic=self.config.set_semantic,
+            if self.instance is None:
+                return RunResult(
+                    q1=self.q1,
+                    q2=self.q2,
+                    host_or_path="N/A",
+                    db_id="N/A",
+                    q1_result=None,
+                    q2_result=None,
+                    state="UNKNOWN/NEQ/SYN",
+                    set_semantic=self.config.set_semantic,
+                    error_msg=str(e),
+                )
+            syntax_db_id = f"{self.config.db_id}_syntax_check"
+            self.instance.to_db(
+                host_or_path=self.config.host_or_path,
+                database=syntax_db_id,
+                port=self.config.port,
+                username=self.config.username,
+                password=self.config.password,
+            )
+            q1_result = self._execute_query(
+                self.q1,
+                self.config.host_or_path,
+                syntax_db_id,
+                port=self.config.port,
+                username=self.config.username,
+                password=self.config.password,
+            )
+            q2_result = self._execute_query(
+                self.q2,
+                self.config.host_or_path,
+                syntax_db_id,
+                port=self.config.port,
+                username=self.config.username,
+                password=self.config.password,
+            )
+            self._record_results(
+                q1_result,
+                q2_result,
+                host_or_path=self.config.host_or_path,
+                db_id=syntax_db_id,
+            )
+            return self._build_result(
+                state="SYN",
+                q1_result=q1_result,
+                q2_result=q2_result,
+                host_or_path=self.config.host_or_path,
+                db_id=syntax_db_id,
                 error_msg=str(e),
             )
 
@@ -156,12 +199,31 @@ class Disprover:
                 dialect=self.dialect,
             )
 
+    def _record_results(
+        self,
+        q1_result: ExecutionResult | None,
+        q2_result: ExecutionResult | None,
+        *,
+        host_or_path: str | None = None,
+        db_id: str | None = None,
+    ) -> None:
+        if q1_result is not None:
+            self.last_q1_result = q1_result
+        if q2_result is not None:
+            self.last_q2_result = q2_result
+        if host_or_path is None and q1_result is not None:
+            host_or_path = q1_result.host_or_path
+        if db_id is None and q1_result is not None:
+            db_id = q1_result.db_id
+        if host_or_path is not None and db_id is not None:
+            self.last_checked_db = (host_or_path, db_id)
+
     def _generator(self, query, generator_id: str):
         if self.stop_event.is_set():
             return
         instance = Instance(
             ddls=self.schema,
-            name=f"{self.config.db_id}_{generator_id}",
+            name=f"{self.config.db_id}_{uuid.uuid4().hex[:6]}_{generator_id}",
             dialect=self.dialect,
         )
         try:
@@ -176,14 +238,15 @@ class Disprover:
             if self.stop_event.is_set():
                 return
 
-            generator = DataGenerator(
-                query,
-                instance,
-                verbose=False,
-                config=self.config.generator,
-            )
+            if getattr(self.config, "use_data_generator", True):
+                generator = DataGenerator(
+                    query,
+                    instance,
+                    verbose=False,
+                    config=self.config.generator,
+                )
 
-            generator.generate(early_stop=self.early_stop, stop_event=self.stop_event)
+                generator.generate(early_stop=self.early_stop, stop_event=self.stop_event)
 
         except Exception as e:
             import traceback
@@ -276,6 +339,12 @@ class Disprover:
                 username=username,
                 password=password,
             )
+            self._record_results(
+                q1_res,
+                q2_res,
+                host_or_path=host_or_path,
+                db_id=database,
+            )
 
             if not q1_res.is_equivalent(q2_res, set_semantic=self.config.set_semantic):
                 with self._lock:
@@ -317,6 +386,73 @@ class Disprover:
                 if self.stop_event.is_set():
                     break
 
+    def _fallback_execute_last_db(self) -> tuple[ExecutionResult | None, ExecutionResult | None]:
+        db_context = self.last_checked_db
+        if db_context is None and self.existing_dbs:
+            host_or_path, database, port, username, password = self.existing_dbs[0]
+        elif db_context is None:
+            syntax_db_id = f"{self.config.db_id}_syntax_check"
+            host_or_path = self.config.host_or_path
+            database = syntax_db_id
+            port = self.config.port
+            username = self.config.username
+            password = self.config.password
+        else:
+            host_or_path, database = db_context
+            port = self.config.port
+            username = self.config.username
+            password = self.config.password
+
+        q1_result = self.last_q1_result
+        q2_result = self.last_q2_result
+        if q1_result is None:
+            q1_result = self._execute_query(
+                self.q1,
+                host_or_path=host_or_path,
+                db_id=database,
+                port=port,
+                username=username,
+                password=password,
+            )
+        if q2_result is None:
+            q2_result = self._execute_query(
+                self.q2,
+                host_or_path=host_or_path,
+                db_id=database,
+                port=port,
+                username=username,
+                password=password,
+            )
+        self._record_results(
+            q1_result,
+            q2_result,
+            host_or_path=host_or_path,
+            db_id=database,
+        )
+        return q1_result, q2_result
+
+    def _build_result(
+        self,
+        *,
+        state: str,
+        q1_result: ExecutionResult | None,
+        q2_result: ExecutionResult | None,
+        host_or_path: str,
+        db_id: str,
+        error_msg: str = "",
+    ) -> RunResult:
+        return RunResult(
+            q1=self.q1,
+            q2=self.q2,
+            host_or_path=host_or_path,
+            db_id=db_id,
+            q1_result=q1_result,
+            q2_result=q2_result,
+            state=state,
+            set_semantic=self.config.set_semantic,
+            error_msg=error_msg,
+        )
+
     def run(self):
         for func in [self.exact_match_check, self.prepare, self.syntax_check]:
             result = func()
@@ -329,15 +465,12 @@ class Disprover:
                 q1_res,
                 q2_res,
             ) = self.counterexamples.pop()
-            return RunResult(
-                q1=self.q1,
-                q2=self.q2,
-                host_or_path=q1_res.host_or_path,
-                db_id=q1_res.db_id,
+            return self._build_result(
+                state="NEQ",
                 q1_result=q1_res,
                 q2_result=q2_res,
-                state="NEQ",
-                set_semantic=self.config.set_semantic,
+                host_or_path=q1_res.host_or_path,
+                db_id=q1_res.db_id,
             )
 
         total_workers = 2
@@ -371,36 +504,30 @@ class Disprover:
 
         if self.counterexamples:
             q1_res, q2_res = self.counterexamples.pop()
-            return RunResult(
-                q1=self.q1,
-                q2=self.q2,
-                host_or_path=q1_res.host_or_path,
-                db_id=q1_res.db_id,
+            return self._build_result(
+                state="NEQ",
                 q1_result=q1_res,
                 q2_result=q2_res,
-                state="NEQ",
-                set_semantic=self.config.set_semantic,
+                host_or_path=q1_res.host_or_path,
+                db_id=q1_res.db_id,
             )
         elif self.witness:
             q1_res, q2_res = self.witness.pop()
-            return RunResult(
-                q1=self.q1,
-                q2=self.q2,
-                host_or_path=q1_res.host_or_path,
-                db_id=q1_res.db_id,
+            return self._build_result(
+                state="EQ",
                 q1_result=q1_res,
                 q2_result=q2_res,
-                state="EQ",
-                set_semantic=self.config.set_semantic,
+                host_or_path=q1_res.host_or_path,
+                db_id=q1_res.db_id,
             )
         else:
-            return RunResult(
-                q1=self.q1,
-                q2=self.q2,
-                host_or_path="N/A",
-                db_id="N/A",
-                q1_result=None,
-                q2_result=None,
+            q1_res, q2_res = self._fallback_execute_last_db()
+            host_or_path = q1_res.host_or_path if q1_res is not None else "N/A"
+            db_id = q1_res.db_id if q1_res is not None else "N/A"
+            return self._build_result(
                 state="UNKNOWN",
-                set_semantic=self.config.set_semantic,
+                q1_result=q1_res,
+                q2_result=q2_res,
+                host_or_path=host_or_path,
+                db_id=db_id,
             )

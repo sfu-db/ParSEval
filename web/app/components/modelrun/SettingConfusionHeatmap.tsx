@@ -22,8 +22,6 @@ type MatrixCell = {
 const C = {
     border: "#dde1e7",
     text: "#1c2128",
-    success: "26,127,55",
-    danger: "207,34,46",
     activeRing: "#0f172a",
 };
 
@@ -35,6 +33,10 @@ const F = {
 function valueLabel(value: number | null) {
     if (value === null) return "--";
     return `${Math.round(value * 100)}%`;
+}
+
+function clamp(value: number, min: number, max: number) {
+    return Math.min(max, Math.max(min, value));
 }
 
 function jointRate(rows: EvalRecord[], left: SettingKey, right: SettingKey, mode: HeatmapViewMode) {
@@ -74,6 +76,15 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
             })
         );
     }, [results, settings, viewMode]);
+
+    const heatRange = useMemo(() => {
+        const values = matrix.flat().map((cell) => cell.value).filter((value): value is number => value !== null);
+        if (!values.length) return null;
+        return {
+            min: Math.min(...values),
+            max: Math.max(...values),
+        };
+    }, [matrix]);
 
     if (!results.length) {
         return <div className="flex h-full items-center justify-center text-sm text-slate-400">No data available.</div>;
@@ -156,17 +167,29 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                                     {row.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold text-slate-500" title={getSettingExplanation(row.key)}>?</span>
                                 </td>
                                 {matrix[rowIndex].map((cell) => {
-                                    const alpha = cell.value === null ? 0 : Math.max(0.08, cell.value * 0.82);
-                                    const background = cell.value === null
-                                        ? "transparent"
-                                        : `rgba(${viewMode === "joint_equiv" ? C.success : C.danger}, ${alpha.toFixed(2)})`;
-                                    const textColor = cell.value !== null && alpha > 0.45 ? "#ffffff" : C.text;
+                                    const normalized = (() => {
+                                        if (cell.value === null || !heatRange) return null;
+                                        if (heatRange.max === heatRange.min) return cell.value === 0 ? 0 : 1;
+                                        return clamp((cell.value - heatRange.min) / (heatRange.max - heatRange.min), 0, 1);
+                                    })();
+                                    const background = (() => {
+                                        if (normalized === null) return "transparent";
+                                        if (viewMode === "joint_equiv") {
+                                            const lightness = 96 - normalized * 54;
+                                            const saturation = 38 + normalized * 36;
+                                            return `hsl(142 ${saturation}% ${lightness}%)`;
+                                        }
+                                        const lightness = 97 - normalized * 50;
+                                        const saturation = 45 + normalized * 38;
+                                        return `hsl(7 ${saturation}% ${lightness}%)`;
+                                    })();
+                                    const textColor = normalized !== null && normalized > 0.58 ? "#ffffff" : C.text;
                                     const colLabel = settings.find((item) => item.key === cell.colKey)?.label ?? cell.colKey;
                                     const title = cell.value === null
                                         ? "No overlapping evaluations"
                                         : viewMode === "joint_equiv"
-                                            ? `${row.label} + ${colLabel}: ${valueLabel(cell.value)} both equivalent across ${cell.count} rows`
-                                            : `${row.label} + ${colLabel}: ${valueLabel(cell.value)} disagreement across ${cell.count} rows`;
+                                            ? `${row.label} + ${colLabel}: ${valueLabel(cell.value)} both equivalent across ${cell.count} rows (range ${valueLabel(heatRange?.min ?? null)} to ${valueLabel(heatRange?.max ?? null)})`
+                                            : `${row.label} + ${colLabel}: ${valueLabel(cell.value)} disagreement across ${cell.count} rows (range ${valueLabel(heatRange?.min ?? null)} to ${valueLabel(heatRange?.max ?? null)})`;
                                     const isSelected = selectedCell?.mode === viewMode && selectedCell.rowKey === cell.rowKey && selectedCell.colKey === cell.colKey;
                                     const isDisabled = cell.count === 0;
 
