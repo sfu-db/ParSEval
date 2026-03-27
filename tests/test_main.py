@@ -41,6 +41,11 @@ def reset_folder(folder_path):
     assert_folder(folder_path)
 
 
+logging.basicConfig(
+    level=logging.INFO,  # or DEBUG, WARNING, ERROR, etc.
+    format="[%(asctime)s] %(levelname)s [%(filename)s:%(lineno)d]: %(message)s",
+)
+
 logger = logging.getLogger("parseval.coverage")
 
 
@@ -59,14 +64,7 @@ class TestMain(unittest.TestCase):
         with open("dataset/schema.json") as f:
             cls.schema = json.load(f)
 
-    def _run_query(self, instance: Instance, sql: str):
-
-        # instance.to_db(self.workspace)
-        database = os.path.join(self.workspace, f"{instance.name}.sqlite")
-        with sqlite3.connect(database) as conn:
-            return conn.execute(sql).fetchall()
-
-    def _execute_sql(self, host_or_path: str, database: str, sql: str):
+    def _run_query(self, host_or_path: str, database: str, sql: str):
         database_path = os.path.join(host_or_path, f"{database}.sqlite")
         with sqlite3.connect(database_path) as conn:
             return conn.execute(sql).fetchall()
