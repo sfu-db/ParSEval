@@ -2,6 +2,7 @@ from __future__ import annotations
 from sqlglot import parse_one, exp, MappingSchema
 from sqlglot.optimizer import annotate_types, qualify
 from typing import Dict, Callable, Optional, Any
+import re
 from .states import raise_exception
 from .dtype import DataType
 
@@ -139,6 +140,7 @@ def preprocess_sql(
     """
     if type_inferencer is None:
         type_inferencer = TypeInferencer(mappingschema, dialect)
+    sql = re.sub(r'(?<!["\'])\bSEX\b(?!["\'])', '"SEX"', sql)
     parsed = parse_one(sql, dialect=dialect)
     tbls = list(parsed.find_all(exp.Table))
 
