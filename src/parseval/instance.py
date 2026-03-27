@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Set
+import datetime as dt
 from sqlglot import parse, exp, MappingSchema
 from sqlglot.schema import (
     MappingSchema,
@@ -20,6 +21,16 @@ from sqlglot.helper import name_sequence
 import random, logging
 
 logger = logging.getLogger("parseval.db")
+
+
+def _serialize_concrete(value: Any) -> Any:
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, dt.date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, dt.time):
+        return value.strftime("%H:%M:%S")
+    return value
 
 
 class Catalog(MappingSchema):
@@ -177,6 +188,7 @@ class Catalog(MappingSchema):
         column: exp.Column | str,
         normalize: Optional[bool] = None,
     ):
+        pk_columns = self.get_primary_key(table)
         for constraint in self.get_column_constraints(table, column):
             if isinstance(
                 constraint.kind,
@@ -186,7 +198,9 @@ class Catalog(MappingSchema):
                 ),
             ):
                 return True
-        for pk in self.get_primary_key(table):
+        if len(pk_columns) != 1:
+            return False
+        for pk in pk_columns:
             if pk.name == (column if isinstance(column, str) else column.this):
                 return True
 
@@ -371,9 +385,9 @@ class Instance(Catalog):
                     table_name=normalized_table_name, values=row_values, sync_db=sync_db
                 )
                 created[normalized_table_name].append(row)
-            logger.info(
-                f"Created row for table {normalized_table_name} with values {len(created[normalized_table_name])}"
-            )
+            # logger.info(
+            #     f"Created row for table {normalized_table_name} with values {len(created[normalized_table_name])}"
+            # )
         return created
 
     def create_row(
@@ -563,20 +577,51 @@ class Instance(Catalog):
             if not unique_columns:
                 continue
 
-            deduped = []
-            seen = {column_name: set() for column_name in unique_columns}
+            latest_by_key = {}
+            key_order = []
+            null_key_rows = []
             for row in self.get_rows(table_name):
-                is_duplicate = False
-                for index, column in enumerate(unique_columns):
-                    key = row[column].concrete
-                    if key in seen[column] or key is None:
-                        is_duplicate = True
-                        break
-                    seen[column].add(key)
-                if not is_duplicate:
-                    deduped.append(row)
-                    for column in unique_columns:
-                        seen[column].add(row[column].concrete)
+                key = tuple(row[column].concrete for column in unique_columns)
+                if any(value is None for value in key):
+                    null_key_rows.append(row)
+                    continue
+                if key not in latest_by_key:
+                    key_order.append(key)
+                latest_by_key[key] = row
+            deduped = [latest_by_key[key] for key in key_order]
+            deduped.extend(null_key_rows)
+            normalized_table_name = self._normalize_table(
+                table_name, dialect=self.dialect
+            )
+            self.data[normalized_table_name] = deduped
+
+    def _dedupe_primary_key_rows(self):
+        for table_name in self.tables:
+            pk_columns = [
+                self._normalize_name(
+                    pk.name if hasattr(pk, "name") else str(pk),
+                    dialect=self.dialect,
+                )
+                for pk in self.get_primary_key(table_name)
+            ]
+            if not pk_columns:
+                continue
+
+            latest_by_key = {}
+            key_order = []
+            null_key_rows = []
+            for row in self.get_rows(table_name):
+                key = tuple(row[column].concrete for column in pk_columns)
+                if any(value is None for value in key):
+                    null_key_rows.append(row)
+                    continue
+                if key not in latest_by_key:
+                    key_order.append(key)
+                latest_by_key[key] = row
+
+            deduped = [latest_by_key[key] for key in key_order]
+            deduped.extend(null_key_rows)
+
             normalized_table_name = self._normalize_table(
                 table_name, dialect=self.dialect
             )
@@ -685,7 +730,9 @@ class Instance(Catalog):
             mapped_data = []
             data = {}
             for column_name, column_value in zip(columns, row.columns):
-                data[normalize_name(column_name)] = column_value.concrete
+                data[normalize_name(column_name)] = _serialize_concrete(
+                    column_value.concrete
+                )
             mapped_data.append(data)
             if mapped_data:
                 column_list = ", ".join(columns)
@@ -711,6 +758,7 @@ class Instance(Catalog):
         inserts_str = []
         mapped_data = []
         try:
+            self._dedupe_primary_key_rows()
             self._dedupe_unique_rows()
             self._dedupe_null_rows()
         except Exception as e:
@@ -738,7 +786,9 @@ class Instance(Catalog):
                 mapped_data = []
                 for row in rows:
                     data = {
-                        normalize_name(column_name): column.concrete
+                        normalize_name(column_name): _serialize_concrete(
+                            column.concrete
+                        )
                         for column_name, column in row.items()
                     }
                     mapped_data.append(data)

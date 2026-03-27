@@ -149,6 +149,40 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+def _coerce_date(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            if _DATE_RE.match(value):
+                return datetime.strptime(value, "%Y-%m-%d").date()
+            if _DATETIME_RE.match(value):
+                return datetime.fromisoformat(value.replace(" ", "T")).date()
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_time(value: Any) -> Optional[time]:
+    if isinstance(value, datetime):
+        return value.time().replace(microsecond=0)
+    if isinstance(value, time):
+        return value.replace(microsecond=0)
+    if isinstance(value, str):
+        try:
+            if _TIME_RE.match(value):
+                return datetime.strptime(value[:8], "%H:%M:%S").time()
+            if _DATETIME_RE.match(value):
+                return datetime.fromisoformat(value.replace(" ", "T")).time().replace(
+                    microsecond=0
+                )
+        except ValueError:
+            return None
+    return None
+
+
 def _midpoint(low: Any, high: Any) -> Any:
     """Return a value between low and high (inclusive), type-aware."""
     if low is None:
@@ -865,40 +899,63 @@ class StringGenerator(ValueGenerator[str]):
         return True
 
 
-class DateGenerator(ValueGenerator[datetime]):
+class TemporalGenerator(ValueGenerator[ValueType], ABC):
+    default_start: ValueType
+    default_end: ValueType
+
+    @abstractmethod
+    def coerce_value(self, value: Any) -> Optional[ValueType]:
+        pass
+
+    @abstractmethod
+    def offset_value(self, value: ValueType, direction: int) -> ValueType:
+        pass
+
+    @abstractmethod
+    def random_value_between(self, start: ValueType, end: ValueType) -> ValueType:
+        pass
+
+    @abstractmethod
+    def widen_end(self, start: ValueType) -> ValueType:
+        pass
+
+    def _literal_value(self, literal: exp.Expression) -> Optional[ValueType]:
+        if isinstance(literal, exp.Literal):
+            return self.coerce_value(literal.name)
+        return None
+
     def satisfying_value(self, op, value):
         if isinstance(value, (list, tuple)):
-            # Between case
             if op == "BETWEEN":
                 lo, hi = value
-                lo_dt = _coerce_datetime(lo)
-                hi_dt = _coerce_datetime(hi)
-                if lo_dt is None or hi_dt is None:
+                lo_value = self.coerce_value(lo)
+                hi_value = self.coerce_value(hi)
+                if lo_value is None or hi_value is None:
                     return value
-                return lo_dt + (hi_dt - lo_dt) / 2
+                return _midpoint(lo_value, hi_value)
             if op == "IN":
                 candidates = [
                     candidate
-                    for candidate in (_coerce_datetime(v) for v in value)
+                    for candidate in (self.coerce_value(v) for v in value)
                     if candidate is not None
                 ]
                 return random.choice(candidates) if candidates else None
             return value
 
-        v = _coerce_datetime(value)
+        v = self.coerce_value(value)
         if v is None:
             return value
 
         if op == "EQ":
             return v
         if op == "NEQ":
-            return v + _ONE_DAY
+            return self.offset_value(v, 1)
         if op == "GT":
-            return v + _ONE_DAY
+            return self.offset_value(v, 1)
         if op == "GTE":
             return v
         if op == "LT":
-            return v - _ONE_DAY
+            return self.offset_value(v, -1)
         if op == "LTE":
             return v
         return value
@@ -908,63 +965,160 @@ class DateGenerator(ValueGenerator[datetime]):
             return self.satisfying_value(_NEG_OP[op], value)
         if op == "BETWEEN":
             lo, _ = value
-            lo_dt = _coerce_datetime(lo)
-            return lo_dt - timedelta(days=1) if lo_dt is not None else None
+            lo_value = self.coerce_value(lo)
+            return self.offset_value(lo_value, -1) if lo_value is not None else None
+        if op == "IN":
+            candidates = [
+                candidate
+                for candidate in (self.coerce_value(v) for v in value)
+                if candidate is not None
+            ]
+            return self.offset_value(candidates[0], 1) if candidates else None
         return None
 
     def propagate_constraints(self):
-        self.start_date = datetime(2000, 1, 1)
-        self.end_date = datetime(2020, 12, 31)
+        self.start_value = self.default_start
+        self.end_value = self.default_end
         self.fixed_value = None
+        self._in_values = None
+
         for c in self.pool.constraints:
             if isinstance(c, exp.Check):
                 expr = c.this
                 if isinstance(expr, exp.Between):
                     low, high = expr.args.get("low"), expr.args.get("high")
-                    if isinstance(low, exp.Literal):
-                        self.start_date = datetime.fromisoformat(low.name)
-                    if isinstance(high, exp.Literal):
-                        self.end_date = datetime.fromisoformat(high.name)
+                    low_value = self._literal_value(low)
+                    high_value = self._literal_value(high)
+                    if low_value is not None:
+                        self.start_value = low_value
+                    if high_value is not None:
+                        self.end_value = high_value
             elif isinstance(c, exp.Between):
                 low, high = c.args.get("low"), c.args.get("high")
-                if isinstance(low, exp.Literal):
-                    self.start_date = datetime.fromisoformat(low.name)
-                if isinstance(high, exp.Literal):
-                    self.end_date = datetime.fromisoformat(high.name)
+                low_value = self._literal_value(low)
+                high_value = self._literal_value(high)
+                if low_value is not None:
+                    self.start_value = low_value
+                if high_value is not None:
+                    self.end_value = high_value
+            elif isinstance(c, exp.In):
+                candidates = [
+                    candidate
+                    for candidate in (
+                        self._literal_value(expr) for expr in c.expressions
+                    )
+                    if candidate is not None
+                ]
+                if candidates:
+                    self._in_values = candidates
             elif isinstance(c, exp.Predicate):
                 left, right = c.args.get("this"), c.args.get("expression")
-                if isinstance(left, exp.Column) and isinstance(right, exp.Literal):
-                    dv = datetime.fromisoformat(right.name)
+                if isinstance(left, exp.Column):
+                    literal_value = self._literal_value(right)
+                    if literal_value is None:
+                        continue
                     if isinstance(c, exp.GT):
-                        self.start_date = max(self.start_date, dv + timedelta(days=1))
+                        self.start_value = max(
+                            self.start_value, self.offset_value(literal_value, 1)
+                        )
                     elif isinstance(c, exp.LT):
-                        self.end_date = min(self.end_date, dv - timedelta(days=1))
+                        self.end_value = min(
+                            self.end_value, self.offset_value(literal_value, -1)
+                        )
                     elif isinstance(c, exp.GTE):
-                        self.start_date = max(self.start_date, dv)
+                        self.start_value = max(self.start_value, literal_value)
                     elif isinstance(c, exp.LTE):
-                        self.end_date = min(self.end_date, dv)
+                        self.end_value = min(self.end_value, literal_value)
                     elif isinstance(c, exp.EQ):
-                        self.fixed_value = dv
+                        self.fixed_value = literal_value
 
-    def generate(self, skips) -> datetime:
+    def generate(self, skips=None):
         self.propagate_constraints()
-        if self.start_date > self.end_date:
-            self.end_date = self.start_date + timedelta(days=365)
+        if self._in_values:
+            candidates = [
+                v for v in self._in_values if skips is None or v not in skips
+            ]
+            if candidates:
+                return random.choice(candidates)
+        if self.start_value > self.end_value:
+            self.end_value = self.widen_end(self.start_value)
         if self.fixed_value is not None and self.validate(self.fixed_value, skips):
             return self.fixed_value
         for _ in range(_MAX_UNIQUE_ATTEMPTS):
-            delta = self.end_date - self.start_date
-            value = self.start_date + timedelta(
-                days=random.randint(0, max(0, delta.days))
-            )
+            value = self.random_value_between(self.start_value, self.end_value)
             if self.validate(value, skips):
                 return value
-        raise RuntimeError("DateGenerator exhausted its range")
+        raise RuntimeError(f"{self.__class__.__name__} exhausted its range")
 
-    def validate(self, value: datetime, skips=None) -> bool:
+    def validate(self, value, skips=None) -> bool:
         if skips:
             return value not in skips
         return True
+
+
+class DateGenerator(TemporalGenerator[date]):
+    default_start = date(2000, 1, 1)
+    default_end = date(2020, 12, 31)
+
+    def coerce_value(self, value: Any) -> Optional[date]:
+        return _coerce_date(value)
+
+    def offset_value(self, value: date, direction: int) -> date:
+        return value + timedelta(days=direction)
+
+    def random_value_between(self, start: date, end: date) -> date:
+        delta_days = max(0, (end - start).days)
+        return start + timedelta(days=random.randint(0, delta_days))
+
+    def widen_end(self, start: date) -> date:
+        return start + timedelta(days=365)
+
+
+class DatetimeGenerator(TemporalGenerator[datetime]):
+    default_start = datetime(2000, 1, 1)
+    default_end = datetime(2020, 12, 31, 23, 59, 59)
+
+    def coerce_value(self, value: Any) -> Optional[datetime]:
+        return _coerce_datetime(value)
+
+    def offset_value(self, value: datetime, direction: int) -> datetime:
+        return value + timedelta(seconds=direction)
+
+    def random_value_between(self, start: datetime, end: datetime) -> datetime:
+        delta_seconds = max(0, int((end - start).total_seconds()))
+        return start + timedelta(seconds=random.randint(0, delta_seconds))
+
+    def widen_end(self, start: datetime) -> datetime:
+        return start + timedelta(days=365)
+
+
+class TimeGenerator(TemporalGenerator[time]):
+    default_start = time(0, 0, 0)
+    default_end = time(23, 59, 59)
+
+    def coerce_value(self, value: Any) -> Optional[time]:
+        return _coerce_time(value)
+
+    def offset_value(self, value: time, direction: int) -> time:
+        total = (value.hour * 3600 + value.minute * 60 + value.second + direction) % (
+            24 * 3600
+        )
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return time(h, m, s)
+
+    def random_value_between(self, start: time, end: time) -> time:
+        start_seconds = start.hour * 3600 + start.minute * 60 + start.second
+        end_seconds = end.hour * 3600 + end.minute * 60 + end.second
+        if end_seconds < start_seconds:
+            end_seconds = start_seconds
+        value = random.randint(start_seconds, end_seconds)
+        h, rem = divmod(value, 3600)
+        m, s = divmod(rem, 60)
+        return time(h, m, s)
+
+    def widen_end(self, start: time) -> time:
+        return time(23, 59, 59)
 
 
 class DecimalGenerator(ValueGenerator[float]):
@@ -1116,8 +1270,19 @@ class ValueGeneratorFactory:
         **{DataType.build(dt): IntGenerator for dt in DataType.INTEGER_TYPES},
         **{DataType.build(dt): DecimalGenerator for dt in DataType.REAL_TYPES},
         **{DataType.build(dt): StringGenerator for dt in DataType.TEXT_TYPES},
-        **{DataType.build(dt): DateGenerator for dt in DataType.TEMPORAL_TYPES},
         DataType.Type.BOOLEAN: BooleanGenerator,
+        DataType.build(DataType.Type.DATE): DateGenerator,
+        DataType.build(DataType.Type.DATE32): DateGenerator,
+        DataType.build(DataType.Type.DATETIME): DatetimeGenerator,
+        DataType.build(DataType.Type.DATETIME64): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMP): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMP_S): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMP_MS): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMP_NS): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMPTZ): DatetimeGenerator,
+        DataType.build(DataType.Type.TIMESTAMPLTZ): DatetimeGenerator,
+        DataType.build(DataType.Type.TIME): TimeGenerator,
+        DataType.build(DataType.Type.TIMETZ): TimeGenerator,
     }
     _semantic_generators: Dict[str, Type[ValueGenerator]] = {}
 
