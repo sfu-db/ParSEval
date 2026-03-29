@@ -109,6 +109,7 @@ class PlausibleBranch(_Constraint):
         self.metadata = metadata or {}
         self.is_feasible: Optional[bool] = None
         self.plausible_type = plausible_type or PlausibleType.UNEXPLORED
+        self.coverage_snapshot: Optional[Dict[str, Any]] = None
 
     @property
     def branch(self) -> BranchType:
@@ -399,7 +400,7 @@ class UExprToConstraint:
                 positive_nodes.append((node, bit))
 
         if not starting_nodes:
-            starting_nodes = set()
+            starting_nodes = []
             q = deque(positive_nodes)
             while q:
                 node, bit = q.popleft()
@@ -410,23 +411,52 @@ class UExprToConstraint:
                     and node.step_type == step_type
                     and node.step_name == step_name
                 ):
-                    starting_nodes.add((node.parent, node.bit()))
+                    candidate = (node.parent, node.bit())
+                    if candidate not in starting_nodes:
+                        starting_nodes.append(candidate)
                 elif (
                     isinstance(plausible_child, PlausibleBranch)
                     and plausible_child.branch == BranchType.POSITIVE
                     and is_valid_path_bit(bit)
                 ):
-                    starting_nodes.add((node, bit))
+                    candidate = (node, bit)
+                    if candidate not in starting_nodes:
+                        starting_nodes.append(candidate)
 
                 for child_bit, child in node.children.items():
                     if isinstance(child, Constraint):
                         key = (child.scope_id, child.step_type, child.step_name)
                         if key in self.pnode_index:
                             q.append((child, child_bit))
-        assert (
-            starting_nodes
-        ), f"No attachment point found for step {step_type} {step_name} with rowids {rowids}. Positive nodes: {positive_nodes}, prev step: {prev_step}"
-        return starting_nodes
+        if not starting_nodes:
+            indexed = self.row_index.get(rowids, set())
+            for node, bit in indexed:
+                if isinstance(node, Constraint):
+                    candidate = (node, bit)
+                    if candidate not in starting_nodes:
+                        starting_nodes.append(candidate)
+        if not starting_nodes:
+            rowid_items = rowids if isinstance(rowids, tuple) else (rowids,)
+            for item in rowid_items:
+                for indexed_rowids, indexed_nodes in self.row_index.items():
+                    if item not in indexed_rowids:
+                        continue
+                    for node, bit in indexed_nodes:
+                        if isinstance(node, Constraint):
+                            candidate = (node, bit)
+                            if candidate not in starting_nodes:
+                                starting_nodes.append(candidate)
+        if not starting_nodes:
+            fallback = self._find_positive_branch()
+            logger.debug(
+                "Falling back to positive branch attachment for step %s %s with rowids %s; prev_step=%s",
+                step_type,
+                step_name,
+                rowids,
+                prev_step,
+            )
+            starting_nodes.extend(fallback)
+        return list(starting_nodes)
 
     def which_path(
         self,
@@ -553,9 +583,31 @@ class UExprToConstraint:
             # leaf.attempts = self.attempt_index[self.leaf_key(leaf)]
             if leaf.attempts >= config.max_tries:
                 leaf.mark_covered()
+                leaf.coverage_snapshot = {
+                    "pattern": pattern,
+                    "bit": int(leaf.bit()),
+                    "hits": leaf.parent.hits.get(leaf.bit(), 0),
+                    "threshold": 0,
+                    "decision": "covered",
+                    "positive_branch": leaf.branch == BranchType.POSITIVE,
+                    "attempts": leaf.attempts,
+                    "max_tries": config.max_tries,
+                }
                 continue
             coverage = calculator.evaluate_leaf(leaf)
             leaf.parent.hits[leaf.bit()] = coverage.hits
+            leaf.coverage_snapshot = {
+                "pattern": pattern,
+                "bit": int(coverage.bit),
+                "hits": coverage.hits,
+                "threshold": coverage.threshold,
+                "covered": coverage.covered,
+                "infeasible": coverage.infeasible,
+                "decision": coverage.decision,
+                "positive_branch": coverage.positive_branch,
+                "attempts": leaf.attempts,
+                "max_tries": config.max_tries,
+            }
             if coverage.forced_branch is not None:
                 leaf.branch = coverage.forced_branch
             if coverage.infeasible:
@@ -593,6 +645,10 @@ class UExprToConstraint:
                 continue
 
             if pattern in skips:
+                continue
+
+            snapshot = leaf.coverage_snapshot or {}
+            if snapshot.get("covered"):
                 continue
 
             candidates.append((pattern, leaf))

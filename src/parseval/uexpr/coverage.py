@@ -20,6 +20,8 @@ class LeafCoverage:
     covered: bool
     infeasible: bool = False
     forced_branch: BranchType | None = None
+    decision: str = "pending"
+    positive_branch: bool = False
 
 
 class CoverageCalculator:
@@ -37,6 +39,13 @@ class CoverageCalculator:
         threshold = self._threshold_for(leaf)
         hits = self._global_hits(node, bit)
         infeasible = self._is_structurally_infeasible(node, bit)
+        positive_branch = self._is_positive_branch(bit)
+        covered = hits >= threshold
+        decision = "pending"
+        if infeasible:
+            decision = "infeasible"
+        elif covered:
+            decision = "covered" if positive_branch else "skip"
         return LeafCoverage(
             bit=bit,
             hits=hits,
@@ -44,6 +53,8 @@ class CoverageCalculator:
             covered=hits >= threshold,
             infeasible=infeasible,
             forced_branch=self._forced_branch(bit, infeasible),
+            decision=decision,
+            positive_branch=positive_branch,
         )
 
     def to_dict(self, snapshot: List[NodeCoverage]) -> List[Dict[str, Any]]:
@@ -75,11 +86,32 @@ class CoverageCalculator:
             return 1
         return 1
 
+    def _is_positive_branch(self, bit: PBit) -> bool:
+        return bit in {
+            PBit.TRUE,
+            PBit.JOIN_TRUE,
+            PBit.HAVING_TRUE,
+            PBit.PROJECT,
+            PBit.AGGREGATE_SIZE,
+        }
+
     def _node_key(self, node, bit: PBit) -> Tuple[Any, ...]:
-        condition = (
-            node.sql_condition.sql() if getattr(node, "sql_condition", None) else "ROOT"
-        )
+        condition = self._condition_key(getattr(node, "sql_condition", None))
         return (node.scope_id, node.step_type, node.step_name, condition, bit)
+
+    def _condition_key(self, condition: Any) -> str:
+        if condition is None:
+            return "ROOT"
+        alias = getattr(condition, "alias_or_name", None)
+        if alias:
+            return str(alias)
+        try:
+            return condition.sql()
+        except Exception:
+            try:
+                return repr(condition)
+            except Exception:
+                return type(condition).__name__
 
     def _iter_constraints(self, root) -> Iterable[Any]:
         stack = [root]
@@ -238,4 +270,4 @@ class CoverageCalculator:
 
 CoverageTracker = CoverageCalculator
 
-__all__ = ["CoverageCalculator", "CoverageTracker", "LeafCoverage", "NodeCoverage"]
+__all__ = ["CoverageCalculator", "CoverageTracker", "LeafCoverage"]

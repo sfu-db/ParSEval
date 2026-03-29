@@ -5,6 +5,7 @@ from sqlglot.expressions import Expression, maybe_copy, Literal
 import math, numbers
 import datetime as dt
 from .dtype import DataType
+from sqlglot import exp
 
 if TYPE_CHECKING:
     from parseval.plan.rex import Symbol
@@ -70,20 +71,29 @@ def convert_to_literal(value, datatype=None, copy=False) -> Symbol:
         converted = Literal(this=value, is_string=True)
         srctype = "TEXT"
     elif isinstance(value, bool):
-        converted = Literal(this=value, is_string=False)
+        converted = exp.Boolean(this=value)
         srctype = "BOOLEAN"
     elif value is None or (isinstance(value, float) and math.isnan(value)):
-        converted = Literal(this=None, is_string=False)
+        converted = exp.Null()
     elif isinstance(value, numbers.Number):
         converted = Literal.number(value)
         srctype = "NUMERIC"
     elif isinstance(value, dt.datetime):
-        converted = Literal(this=value, is_string=False)
+        datetime_literal = Literal.string(
+            (
+                value
+                if value.tzinfo
+                else value.replace(tzinfo=dt.timezone.utc)
+            ).isoformat(sep=" ")
+        )
+        converted = exp.TimeStrToTime(this=datetime_literal)
         srctype = "DATETIME"
-
     elif isinstance(value, dt.date):
-        converted = Literal(this=value, is_string=False)
+        converted = exp.DateStrToDate(this=Literal.string(value.strftime("%Y-%m-%d")))
         srctype = "DATE"
+    elif isinstance(value, dt.time):
+        converted = exp.TimeStrToTime(this=Literal.string(value.strftime("%H:%M:%S")))
+        srctype = "TIME"
     else:
         raise ValueError(f"Unsupported literal type: {type(value)}")
     if datatype:

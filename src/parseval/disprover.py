@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, Sequence
+from func_timeout import func_timeout, FunctionTimedOut
 
 from parseval.configuration import DisproverConfig
 from parseval.data_generator import DataGenerator
@@ -80,8 +81,10 @@ class Disprover:
         self.last_result_pair: ResultPair | None = None
         self.counterexample: ResultPair | None = None
         self.witness: ResultPair | None = None
+        self._run_started_at: float | None = None
 
     def run(self) -> RunResult:
+        self._run_started_at = time.monotonic()
         exact_match = self._check_exact_match()
         if exact_match is not None:
             return exact_match
@@ -186,6 +189,7 @@ class Disprover:
 
     def _execute_query(self, query: str, context: DatabaseContext) -> ExecutionResult:
         database_name = self._normalize_database_name(context.database)
+        started_at = time.monotonic()
         with DBManager().get_connection(
             host_or_path=context.host_or_path,
             database=database_name,
@@ -215,7 +219,7 @@ class Disprover:
                 db_id=database_name,
                 query=query,
                 rows=results if results is not None else [],
-                elapsed_time=0.0,
+                elapsed_time=time.monotonic() - started_at,
                 error_msg=error,
                 dialect=self.dialect,
             )
@@ -293,18 +297,18 @@ class Disprover:
             dialect=self.dialect,
         )
         try:
-            speculative = SpeculativeGenerator(
-                query,
-                instance,
-                generator_config=self.config.generator,
-            )
-            speculative.generate(
-                early_stoper=self.early_stop,
-                stop_event=self.stop_event,
-                timeout=self.config.global_timeout,
-            )
-            if self.stop_event.is_set():
-                return
+            # speculative = SpeculativeGenerator(
+            #     query,
+            #     instance,
+            #     generator_config=self.config.generator,
+            # )
+            # speculative.generate(
+            #     early_stoper=self.early_stop,
+            #     stop_event=self.stop_event,
+            #     timeout=self.config.global_timeout,
+            # )
+            # if self.stop_event.is_set():
+            #     return
 
             if self.config.use_data_generator:
                 generator = DataGenerator(
@@ -313,13 +317,19 @@ class Disprover:
                     verbose=False,
                     config=self.config.generator,
                 )
-                generator.generate(
-                    early_stop=self.early_stop,
-                    stop_event=self.stop_event,
+                func_timeout(
+                    self.config.global_timeout,
+                    generator.generate,
+                    kwargs={
+                        "early_stop": self.early_stop,
+                        "stop_event": self.stop_event,
+                        "timeout": self.config.global_timeout,
+                    },
                 )
+        except FunctionTimedOut:
+            logger.warning("Generator %s timed out", generator_id)
         except Exception:
             logger.exception("Generator %s failed", generator_id)
-            self.stop_event.set()
 
     def early_stop(self, instance: Instance) -> bool:
         if self.stop_event.is_set():
@@ -392,7 +402,13 @@ class Disprover:
             state=state,
             set_semantic=self.config.set_semantic,
             error_msg=error_msg,
+            elapsed_time=self._run_elapsed_time(),
         )
+
+    def _run_elapsed_time(self) -> float:
+        if self._run_started_at is None:
+            return 0.0
+        return time.monotonic() - self._run_started_at
 
     def _default_db_context(self, database: str) -> DatabaseContext:
         return DatabaseContext(
