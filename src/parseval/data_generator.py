@@ -177,8 +177,33 @@ class OperatorRuleRegistry:
             return []
         columns: Dict[str, exp.Column] = {}
         for column in expression.find_all(exp.Column):
-            columns.setdefault(column.sql(), column)
+                columns.setdefault(column.sql(), column)
         return list(columns.values())
+
+    def _preferred_datatype(self, *candidates: Any) -> Optional[exp.DataType]:
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for attr in ("datatype", "type"):
+                try:
+                    datatype = getattr(candidate, attr, None)
+                except Exception:
+                    datatype = None
+                if datatype is not None:
+                    return datatype
+        return None
+
+    def _literal_for(self, value: Any, *type_candidates: Any) -> exp.Expression:
+        return to_literal(value, self._preferred_datatype(*type_candidates))
+
+    def _null_for(self, columnref: exp.Column) -> exp.Null:
+        kwargs = {}
+        datatype = self._preferred_datatype(columnref)
+        if getattr(columnref, "type", None) is not None:
+            kwargs["_type"] = columnref.type
+        if datatype is not None:
+            kwargs["datatype"] = datatype
+        return exp.Null(**kwargs)
 
     def _select_group(self, node: Constraint, context: Dict[str, Any]):
         agg_group = context.get("agg_group")
@@ -232,9 +257,7 @@ class OperatorRuleRegistry:
             constraints.append(
                 exp.Is(
                     this=columnref,
-                    expression=exp.Null(
-                        _type=columnref.type, datatype=columnref.datatype
-                    ),
+                    expression=self._null_for(columnref),
                 )
             )
         constraint = self._or_all(constraints)
@@ -260,7 +283,7 @@ class OperatorRuleRegistry:
             return self._result(request, referenced_columns=refs)
 
         _, symbols = sorted(value_counts.items(), key=lambda item: len(item[1]))[0]
-        literal = to_literal(symbols[0].concrete, sql_condition.datatype)
+        literal = self._literal_for(symbols[0].concrete, sql_condition)
         return self._result(request, sql_condition.eq(literal), referenced_columns=refs)
 
     def _group_count(
@@ -279,7 +302,10 @@ class OperatorRuleRegistry:
                 dtype = value.datatype
                 break
         constraints = [
-            exp.NEQ(this=node.sql_condition, expression=to_literal(value, dtype))
+            exp.NEQ(
+                this=node.sql_condition,
+                expression=self._literal_for(value, node.sql_condition, dtype),
+            )
             for value in values
         ]
         return self._result(request, self._and_all(constraints))
@@ -291,10 +317,7 @@ class OperatorRuleRegistry:
         if not agg_group:
             constraint = exp.Is(
                 this=request.node.sql_condition,
-                expression=exp.Null(
-                    _type=request.node.sql_condition.type,
-                    datatype=request.node.sql_condition.datatype,
-                ),
+                expression=self._null_for(request.node.sql_condition),
             ).not_()
             return self._result(request, constraint)
 
@@ -302,7 +325,9 @@ class OperatorRuleRegistry:
             value = row.get(
                 request.node.sql_condition.table, request.node.sql_condition.name
             )
-            literal = to_literal(value.concrete, request.node.sql_condition.datatype)
+            literal = self._literal_for(
+                value.concrete, request.node.sql_condition, value
+            )
             return self._result(
                 request, exp.EQ(this=request.node.sql_condition, expression=literal)
             )
@@ -326,9 +351,7 @@ class OperatorRuleRegistry:
             constraints.append(
                 exp.Is(
                     this=columnref,
-                    expression=exp.Null(
-                        _type=columnref.type, datatype=columnref.datatype
-                    ),
+                    expression=self._null_for(columnref),
                 )
             )
         return self._result(request, self._or_all(constraints), referenced_columns=refs)
@@ -357,7 +380,7 @@ class OperatorRuleRegistry:
             column_constraints = [
                 exp.EQ(
                     this=columnref,
-                    expression=to_literal(value.concrete, columnref.datatype),
+                    expression=self._literal_for(value.concrete, columnref, value),
                 )
                 for value in values
             ]
@@ -435,17 +458,17 @@ class OperatorRuleRegistry:
             if value.concrete is not None
         ]
         if not values:
-            return exp.Null(_type=column.type, datatype=column.datatype)
+            return self._null_for(column)
         if agg_func.find(exp.Distinct):
             values = list(dict.fromkeys(values))
         if isinstance(agg_func, exp.Sum):
-            return to_literal(sum(values), column.datatype)
+            return self._literal_for(sum(values), column)
         if isinstance(agg_func, exp.Max):
-            return to_literal(max(values), column.datatype)
+            return self._literal_for(max(values), column)
         if isinstance(agg_func, exp.Min):
-            return to_literal(min(values), column.datatype)
+            return self._literal_for(min(values), column)
         if isinstance(agg_func, exp.Avg):
-            return to_literal(sum(values) / len(values), column.datatype)
+            return self._literal_for(sum(values) / len(values), column)
         return None
 
     def _sort_extreme(
@@ -465,7 +488,7 @@ class OperatorRuleRegistry:
         target = max(values) if request.bit == PBit.MAX else min(values)
         return self._result(
             request,
-            exp.EQ(this=refs[0], expression=to_literal(target, refs[0].datatype)),
+            exp.EQ(this=refs[0], expression=self._literal_for(target, refs[0])),
             referenced_columns=refs,
         )
 
@@ -504,6 +527,208 @@ class DataGenerator(BaseGenerator):
         self.columnref_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {}
         self.scope_results: Dict[int, ScopeSolveResult] = {}
         self.operator_rules = OperatorRuleRegistry()
+
+    def _predicate_constraints(self) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        for predicate in self.expr.find_all(exp.Predicate):
+            normalized = self._normalize_predicate_constraint(predicate)
+            if normalized is not None:
+                constraints.append(normalized)
+        for between in self.expr.find_all(exp.Between):
+            normalized = self._normalize_predicate_constraint(between)
+            if normalized is not None:
+                constraints.append(normalized)
+        for in_expr in self.expr.find_all(exp.In):
+            normalized = self._normalize_predicate_constraint(in_expr)
+            if normalized is not None:
+                constraints.append(normalized)
+        return constraints
+
+    def _normalize_predicate_constraint(
+        self, predicate: exp.Expression
+    ) -> Optional[exp.Expression]:
+        if isinstance(predicate, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.ILike)):
+            left = predicate.args.get("this")
+            right = predicate.args.get("expression")
+            if isinstance(left, exp.Column) and isinstance(right, exp.Literal):
+                return predicate.copy()
+            if isinstance(right, exp.Column) and isinstance(left, exp.Literal):
+                swapped = predicate.copy()
+                swapped.set("this", right.copy())
+                swapped.set("expression", left.copy())
+                return swapped
+            return None
+        if isinstance(predicate, exp.Between):
+            if isinstance(predicate.this, exp.Column):
+                return predicate.copy()
+            return None
+        if isinstance(predicate, exp.In):
+            if isinstance(predicate.this, exp.Column) and all(
+                isinstance(item, exp.Literal) for item in predicate.expressions
+            ):
+                return predicate.copy()
+            return None
+        return None
+
+    def _propagate_query_constraints_to_domains(self) -> int:
+        applied = 0
+        for predicate in self._predicate_constraints():
+            columns = list(predicate.find_all(exp.Column))
+            if not columns:
+                continue
+            column = columns[0]
+            table_ref = self.get_tableref(column.table) or column.table
+            if not table_ref:
+                continue
+            try:
+                pool = self.instance.column_domains.get_or_create_pool(
+                    table_ref, column.name
+                )
+            except KeyError:
+                continue
+            pool.propagate_constraint(predicate)
+            applied += 1
+        return applied
+
+    def _fallback_random_witness_search(
+        self,
+        early_stop: Optional[Callable] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
+        if early_stop is None:
+            return
+        self._propagate_query_constraints_to_domains()
+        self._seed_literal_rows()
+        if early_stop(self.instance):
+            return
+        limit = self.expr.find(exp.Limit)
+        offset = self.expr.find(exp.Offset)
+        limit_value = int(limit.expression.this) if limit else 0
+        offset_value = int(offset.expression.this) if offset else 0
+        min_rows = max(limit_value + offset_value, self.generator_config.min_rows, 1)
+        table_refs = list(dict.fromkeys(self.table_alias.values()))
+        rounds = max(
+            1,
+            self.generator_config.positive_threshold
+            + self.generator_config.negative_threshold
+            + 2,
+        )
+        for _ in range(rounds):
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            for _ in range(min_rows):
+                for table_name in table_refs:
+                    try:
+                        self.instance.create_row(table_name)
+                    except Exception:
+                        logger.debug(
+                            "Fallback row generation skipped table %s due to generation error",
+                            table_name,
+                            exc_info=True,
+                        )
+            if early_stop(self.instance):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+
+    def _seed_literal_rows(self) -> None:
+        seeded_rows: Dict[str, Any] = {}
+        literal_values = self._literal_values_by_table()
+        join_hints = self._join_value_hints()
+        for table_name in dict.fromkeys(self.table_alias.values()):
+            if not table_name:
+                continue
+            values = dict(literal_values.get(table_name, {}))
+            for local_col, ref_table, ref_col in join_hints.get(table_name, []):
+                if local_col in values or ref_table not in seeded_rows:
+                    continue
+                try:
+                    values[local_col] = seeded_rows[ref_table][ref_col].concrete
+                except Exception:
+                    continue
+            for fk in self.instance.get_foreign_key(table_name):
+                local_col = self.instance._normalize_name(fk.expressions[0].name)
+                ref_table = self.instance._normalize_name(
+                    fk.args.get("reference").find(exp.Table).name, is_table=True
+                )
+                ref_col = self.instance._normalize_name(
+                    fk.args.get("reference").this.expressions[0].name
+                )
+                if local_col in values or ref_table not in seeded_rows:
+                    continue
+                values[local_col] = seeded_rows[ref_table][ref_col].concrete
+            try:
+                created = self.instance.create_row(table_name, values=values)
+            except Exception:
+                continue
+            pos = created["positions"].get(table_name)
+            if pos is None:
+                continue
+            seeded_rows[table_name] = self.instance.get_row(table_name, pos)
+
+    def _literal_values_by_table(self) -> Dict[str, Dict[str, Any]]:
+        values: Dict[str, Dict[str, Any]] = {}
+        for predicate in self._predicate_constraints():
+            columns = list(predicate.find_all(exp.Column))
+            if not columns:
+                continue
+            column = columns[0]
+            table_ref = self.get_tableref(column.table) or column.table
+            if not table_ref:
+                continue
+            try:
+                pool = self.instance.column_domains.get_or_create_pool(
+                    table_ref, column.name
+                )
+            except KeyError:
+                continue
+            concrete = None
+            try:
+                if isinstance(predicate, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.ILike)):
+                    rhs = predicate.args.get("expression")
+                    if isinstance(rhs, exp.Literal):
+                        concrete = pool.generate_for_spec(predicate.key.upper(), rhs.name)
+                elif isinstance(predicate, exp.Between):
+                    low = predicate.args.get("low")
+                    high = predicate.args.get("high")
+                    if isinstance(low, exp.Literal) and isinstance(high, exp.Literal):
+                        concrete = pool.generate_for_spec("BETWEEN", (low.name, high.name))
+                elif isinstance(predicate, exp.In):
+                    literals = [
+                        item.name
+                        for item in predicate.expressions
+                        if isinstance(item, exp.Literal)
+                    ]
+                    if literals:
+                        concrete = pool.generate_for_spec("IN", literals)
+            except Exception:
+                logger.debug(
+                    "Skipping literal seeding for predicate %s due to pool generation error",
+                    predicate,
+                    exc_info=True,
+                )
+            if concrete is not None:
+                values.setdefault(table_ref, {}).setdefault(column.name, concrete)
+        return values
+
+    def _join_value_hints(self) -> Dict[str, List[Tuple[str, str, str]]]:
+        hints: Dict[str, List[Tuple[str, str, str]]] = {}
+        for predicate in self.expr.find_all(exp.EQ):
+            left = predicate.args.get("this")
+            right = predicate.args.get("expression")
+            if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                continue
+            left_table = self.get_tableref(left.table) or left.table
+            right_table = self.get_tableref(right.table) or right.table
+            if not left_table or not right_table or left_table == right_table:
+                continue
+            hints.setdefault(left_table, []).append(
+                (self.instance._normalize_name(left.name), right_table, self.instance._normalize_name(right.name))
+            )
+            hints.setdefault(right_table, []).append(
+                (self.instance._normalize_name(right.name), left_table, self.instance._normalize_name(left.name))
+            )
+        return hints
 
     def get_tableref(self, alias_or_name: str) -> Optional[str]:
         if (
@@ -751,7 +976,14 @@ class DataGenerator(BaseGenerator):
     ) -> List[exp.Expression]:
         deduped: Dict[str, exp.Expression] = {}
         for expression in expressions:
-            deduped.setdefault(expression.sql(dialect=self.dialect), expression)
+            if expression is None:
+                continue
+            normalized = (
+                expression
+                if isinstance(expression, exp.Expression)
+                else convert_to_literal(expression)
+            )
+            deduped.setdefault(normalized.sql(dialect=self.dialect), normalized)
         return list(deduped.values())
 
     def _print_constraints(self, pattern: Tuple[PBit, ...]):
@@ -1001,25 +1233,9 @@ class DataGenerator(BaseGenerator):
         )
 
     def _dedupe_instance_rows(self):
-        for table_name in list(self.instance.tables.keys()):
-            unique_columns = [
-                self.instance._normalize_name(column_name, dialect=self.dialect)
-                for column_name in self.instance.tables[table_name]
-                if self.instance.is_unique(table_name, column_name)
-            ]
-            if not unique_columns:
-                continue
-            deduped = []
-            seen = set()
-            for row in self.instance.get_rows(table_name):
-                key = tuple(row[column].concrete for column in unique_columns)
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(row)
-            self.instance.data[
-                self.instance._normalize_table(table_name, dialect=self.dialect)
-            ] = deduped
+        self.instance._dedupe_primary_key_rows()
+        self.instance._dedupe_unique_rows()
+        self.instance._dedupe_null_rows()
 
     def _seed_correlated_exists_rows(
         self, scope_node: ScopeNode, external: Optional[Context]
@@ -1131,6 +1347,11 @@ class DataGenerator(BaseGenerator):
             )
             self.scope_results[node_id] = result
 
+        if not stop_event.is_set():
+            self._fallback_random_witness_search(
+                early_stop=early_stop,
+                deadline=deadline,
+            )
         return self.instance
 
     def _column_label(self, column: Any) -> str:

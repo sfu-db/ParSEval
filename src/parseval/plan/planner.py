@@ -466,6 +466,11 @@ class Planner:
 
         logger.info(f"start to processing inner join, {node.condition}")
         rows = []
+        if not join.get("source_key") or not join.get("join_key"):
+            for left_row in source_context.table:
+                for right_row in join_context.table:
+                    rows.append(left_row.row + right_row.row)
+            return rows
         for left_row in source_context.table:
             left_flag = False
             for right_row in join_context.table:
@@ -518,6 +523,20 @@ class Planner:
     ) -> List[Dict]:
 
         rows = []
+        if not join.get("source_key") or not join.get("join_key"):
+            for left_row in source_context.table:
+                matched = False
+                for right_row in join_context.table:
+                    rows.append(left_row.row + right_row.row)
+                    matched = True
+                if not matched:
+                    null_vlaues = {
+                        column: Const(None) for column in join_context.table.columns
+                    }
+                    new_row = {c: v for c, v in left_row.row.items()}
+                    new_row.update(null_vlaues)
+                    rows.append(Row(left_row.row.rowid, new_row))
+            return rows
         for left_row in source_context.table:
             smt_exprs = []
             sql_conditions = []
@@ -572,6 +591,20 @@ class Planner:
         self, node, join, source_context: Context, join_context: Context
     ) -> List[Dict]:
         rows = []
+        if not join.get("source_key") or not join.get("join_key"):
+            for right_row in join_context.table:
+                matched = False
+                for left_row in source_context.table:
+                    rows.append(left_row.row + right_row.row)
+                    matched = True
+                if not matched:
+                    null_values = {
+                        column: Const(None) for column in source_context.table.columns
+                    }
+                    new_row = dict(null_values)
+                    new_row.update({c: v for c, v in right_row.row.items()})
+                    rows.append(Row(right_row.row.rowid, new_row))
+            return rows
         for right_row in join_context.table:
             smt_exprs = []
             sql_conditions = []
@@ -960,12 +993,12 @@ class Planner:
                 return value
             if isinstance(func, exp.Max):
                 max_value = max(concrete_values) if concrete_values else None
-                value = Const(max_value, _type=func.type)
+                value = Const(this=max_value, _type=func.type)
                 value.type = value.type or func.type
                 return value
             if isinstance(func, exp.Min):
                 min_value = min(concrete_values) if concrete_values else None
-                value = Const(min_value, _type=func.type)
+                value = Const(this=min_value, _type=func.type)
                 value.type = value.type or func.type
                 return value
             if isinstance(func, exp.Avg):
@@ -974,7 +1007,7 @@ class Planner:
                     if concrete_values
                     else None
                 )
-                value = Const(avg_value, _type=DataType.build("REAL"))
+                value = Const(this=avg_value, _type=DataType.build("REAL"))
                 value.type = DataType.build("REAL")
                 return value
             if any(
@@ -1296,7 +1329,7 @@ class Planner:
                                 smt_expr = value
                                 break
                     if smt_expr is None:
-                        raise
+                        smt_expr = Const(this=None)
             ctx.setdefault("mappings", {})[smt_expr] = column
             return smt_expr
 
@@ -1320,7 +1353,8 @@ class Planner:
                     return when.args.get("true").transform(
                         self.transform, copy=True, ctx=ctx
                     )
-            return condition.args.get("default").transform(
-                self.transform, copy=True, ctx=ctx
-            )
+            default = condition.args.get("default")
+            if default is None:
+                return exp.Null()
+            return default.transform(self.transform, copy=True, ctx=ctx)
         return condition

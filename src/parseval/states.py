@@ -157,6 +157,7 @@ class RunResult:
     reuse_hit: bool = False
     database_source: str = "none"
     database_name: str | None = None
+    elapsed_time: float = 0.0
 
 
 @dataclass

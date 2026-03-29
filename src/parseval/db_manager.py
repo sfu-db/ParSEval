@@ -207,7 +207,10 @@ class Connect:
                 stmt,
             )
             try:
-                cursor_result = conn.execute(text(stmt), parameters or {})
+                if parameters is None:
+                    cursor_result = conn.exec_driver_sql(stmt)
+                else:
+                    cursor_result = conn.exec_driver_sql(stmt, parameters)
                 if (
                     fetch is not None
                     and cursor_result is not None

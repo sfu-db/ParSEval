@@ -705,6 +705,8 @@ class IntGenerator(ValueGenerator[int]):
             return value
         if op == "BETWEEN":
             lo, hi = value
+            if isinstance(lo, str) or isinstance(hi, str):
+                return lo
             return random.choice([lo + 1, hi - 1])
         if op == "IN":
             return random.choice(value) if isinstance(value, list) and value else value
@@ -840,7 +842,7 @@ class StringGenerator(ValueGenerator[str]):
                     if isinstance(p, exp.Literal):
                         self.pattern = p.name
             elif isinstance(c, exp.Like):
-                pattern_expr = expr.args.get("expression")
+                pattern_expr = c.args.get("expression")
                 if isinstance(pattern_expr, exp.Literal):
                     like_pattern = pattern_expr.name
                     self.pattern = like_to_pattern(like_pattern)

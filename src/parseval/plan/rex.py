@@ -7,7 +7,7 @@ from sqlglot import exp
 from sqlglot import generator, MappingSchema
 from sqlglot.executor.env import ENV
 from parseval.dtype import DataType
-from parseval.helper import normalize_name
+from parseval.helper import normalize_name, like_to_pattern
 from typing import TYPE_CHECKING, List, Optional, Dict, Any, Tuple, Type
 from sqlglot.optimizer.simplify import simplify
 from dateutil import parser as date_parser
@@ -166,6 +166,23 @@ OPS = {
     "NULLIF": _nullif,
     "BETWEEN": _between,
 }
+
+
+def _safe_like(this, pattern):
+    if this is None or pattern is None:
+        return None
+    try:
+        compiled = like_to_pattern(str(pattern))
+        return bool(compiled.match(str(this)))
+    except Exception:
+        return False
+
+
+OPS["LIKE"] = _safe_like
+OPS["ILIKE"] = lambda this, pattern: _safe_like(
+    None if this is None else str(this).lower(),
+    None if pattern is None else str(pattern).lower(),
+)
 
 
 def ref(self) -> int:

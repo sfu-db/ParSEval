@@ -527,6 +527,9 @@ class Instance(Catalog):
         existing_index = self._find_existing_row(table_name, concretes)
         if existing_index is not None:
             return existing_index
+        conflict_index = self._find_conflicting_unique_row(table_name, concretes)
+        if conflict_index is not None:
+            return conflict_index
 
         for _ in range(100):
             new_values = {}
@@ -547,6 +550,8 @@ class Instance(Catalog):
                 # new_values.append(z_value)
                 self.symbols[z_name] = z_value
                 self.symbol_to_table[z_name] = (table_name, column)
+            if self._row_violates_unique_constraints(table_name, new_values):
+                continue
             rowid = "%s_rowid_%d" % (table_name, tuple_index)
             row = Row(this=rowid, columns=new_values)
             if sync_db:
@@ -566,6 +571,36 @@ class Instance(Catalog):
         raise_exception(
             f"Failed to create row for table {table_name} after 100 attempts"
         )
+
+    def _find_conflicting_unique_row(
+        self, table_name: str, concretes: Dict[str, Any]
+    ) -> Optional[int]:
+        for column, concrete in concretes.items():
+            if concrete is None:
+                continue
+            if not self.is_unique(table_name, column):
+                continue
+            for idx, symbol in enumerate(self.get_column_data(table_name, column)):
+                if symbol.concrete == concrete:
+                    return idx
+        return None
+
+    def _row_violates_unique_constraints(
+        self, table_name: str, row_values: Dict[str, Variable]
+    ) -> bool:
+        unique_columns = [
+            column_name
+            for column_name in self.tables[table_name]
+            if self.is_unique(table_name, column_name)
+        ]
+        for column in unique_columns:
+            concrete = row_values[column].concrete
+            if concrete is None:
+                continue
+            for existing in self.get_column_data(table_name, column):
+                if existing.concrete == concrete:
+                    return True
+        return False
 
     def _dedupe_unique_rows(self):
         for table_name in self.tables:
