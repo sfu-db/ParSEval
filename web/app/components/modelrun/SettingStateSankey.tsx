@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { ResponsiveContainer, Sankey, Tooltip } from "recharts";
 import { getSettingsForRows, type SettingKey } from "@/lib/settings";
 import { EvalRecord } from "@/lib/types";
+import { ChartWrapper } from "./ChartWrapper";
 
 type SettingState = "equiv" | "diff";
 
@@ -21,8 +22,8 @@ type SankeyLink = {
 };
 
 const STATE_META: Record<SettingState, { label: string; fill: string }> = {
-    equiv: { label: "Equiv", fill: "#16a34a" },
-    diff: { label: "Diff", fill: "#dc2626" },
+    equiv: { label: "Equiv", fill: "#0b6e4f" },
+    diff: { label: "Diff", fill: "#b02e0c" },
 };
 
 function getRowState(result: EvalRecord, key: SettingKey): SettingState | null {
@@ -55,7 +56,7 @@ function CustomNode(props: CustomNodeProps) {
                 textAnchor="middle"
                 fontSize={11}
                 fontWeight={700}
-                fill="#334155"
+                fill="#1e293b"
             >
                 {payload.setting}
             </text>
@@ -117,38 +118,42 @@ export function SettingStateSankey({ results }: { results: EvalRecord[] }) {
     }, [results, settings]);
 
     if (!results.length || data.links.length === 0) {
-        return <div className="flex h-full items-center justify-center text-sm text-slate-400">No state flow available.</div>;
+        return <div className="flex h-full items-center justify-center text-sm text-muted-foreground">No state flow available.</div>;
     }
 
     return (
         <div className="space-y-3">
             <div>
-                <div className="text-lg font-semibold text-slate-900">Setting State Flow</div>
-                <div className="mt-1 text-sm text-slate-500">
+                <div className="text-lg font-semibold text-foreground">Setting State Flow</div>
+                <div className="mt-1 text-sm text-muted-foreground">
                     Flow of pair states across the ordered settings, from equivalent to different outcomes.
                 </div>
             </div>
-            <div className="h-[420px] rounded-xl border border-slate-200 bg-white p-3">
-                <ResponsiveContainer width="100%" height="100%">
-                    <Sankey
-                        data={data}
-                        node={<CustomNode />}
-                        nodePadding={28}
-                        nodeWidth={18}
-                        margin={{ top: 24, right: 24, bottom: 12, left: 24 }}
-                        link={{ stroke: "#94a3b8", strokeOpacity: 0.35 }}
-                    >
-                        <Tooltip
-                            formatter={(value: number) => [`${value} pairs`, "Flow"]}
-                            contentStyle={{
-                                borderRadius: 8,
-                                border: "1px solid #dde1e7",
-                                fontSize: 12,
-                                boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-                            }}
-                        />
-                    </Sankey>
-                </ResponsiveContainer>
+            <div className="h-[420px] rounded-xl border border-border bg-background/80 p-3 shadow-[0_1px_0_rgba(15,23,42,0.03)]">
+                <ChartWrapper>
+                    <ResponsiveContainer width="100%" height="100%">
+                        <Sankey
+                            data={data}
+                            node={<CustomNode />}
+                            nodePadding={28}
+                            nodeWidth={18}
+                            margin={{ top: 24, right: 24, bottom: 12, left: 24 }}
+                            link={{ stroke: "#64748b", strokeOpacity: 0.3 }}
+                        >
+                            <Tooltip
+                                formatter={(value: number) => [`${value} pairs`, "Flow"]}
+                                contentStyle={{
+                                    borderRadius: 8,
+                                    border: "1px solid #cbd5e1",
+                                    background: "#ffffff",
+                                    color: "#0f172a",
+                                    fontSize: 12,
+                                    boxShadow: "0 10px 30px rgba(15,23,42,0.12)",
+                                }}
+                            />
+                        </Sankey>
+                    </ResponsiveContainer>
+                </ChartWrapper>
             </div>
         </div>
     );

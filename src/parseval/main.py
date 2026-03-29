@@ -116,7 +116,7 @@ def instantiate_db(
             results = None
             try:
                 results = conn.execute(query, fetch="all", timeout=query_timeout)
-                return len(results) >= min_rows
+                return len(results) > 0
             except Exception as e:
                 return False
         return None
@@ -144,15 +144,15 @@ def instantiate_db(
         timeout=global_timeout,
     )
     # if early_stop(instance):
-    #     return
+    #     return instance
+    return instance
+    # generator = DataGenerator(
+    #     query,
+    #     instance,
+    #     verbose=False,
+    #     config=generator_config,
+    # )
 
-    generator = DataGenerator(
-        query,
-        instance,
-        verbose=False,
-        config=generator_config,
-    )
+    # generator.generate(early_stop=early_stop, stop_event=stop_event)
 
-    generator.generate(early_stop=early_stop, stop_event=stop_event)
-
-    early_stop(instance)
+    # early_stop(instance)

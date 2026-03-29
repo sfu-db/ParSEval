@@ -20,9 +20,9 @@ type MatrixCell = {
 };
 
 const C = {
-    border: "#dde1e7",
-    text: "#1c2128",
-    activeRing: "#0f172a",
+    border: "#cbd5e1",
+    text: "#0f172a",
+    activeRing: "#1d4ed8",
 };
 
 const F = {
@@ -87,15 +87,15 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
     }, [matrix]);
 
     if (!results.length) {
-        return <div className="flex h-full items-center justify-center text-sm text-slate-400">No data available.</div>;
+        return <div className="flex h-full items-center justify-center text-sm text-muted-foreground">No data available.</div>;
     }
 
     return (
         <div className="flex h-full min-h-0 flex-col gap-3" >
             <div className="flex flex-wrap items-start justify-between gap-2">
                 <div>
-                    <div className="text-lg font-semibold text-slate-900">Multi-Setting Confusion</div>
-                    <div className="mt-1 text-sm text-slate-500">
+                    <div className="text-lg font-semibold text-foreground">Multi-Setting Confusion</div>
+                    <div className="mt-1 text-sm text-muted-foreground">
                         {viewMode === "joint_equiv"
                             ? "Each cell shows how many pairs are equivalent under both settings at the same time. Click a cell to filter the table below."
                             : "Each cell shows how many pairs are not agreed upon by the two settings. Click a cell to filter the table below."}
@@ -105,16 +105,16 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                     {selectedCell ? (
                         <button
                             type="button"
-                            className="rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600"
+                            className="rounded-md border border-border px-2.5 py-1 text-xs font-medium text-foreground/80 hover:bg-accent"
                             onClick={() => onCellSelect(null)}
                         >
                             Clear Cell Filter
                         </button>
                     ) : null}
-                    <div className="inline-flex rounded-lg border border-slate-200 bg-white p-1">
+                    <div className="inline-flex rounded-lg border border-border bg-background p-1 shadow-sm">
                         <button
                             type="button"
-                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "joint_equiv" ? "bg-slate-900 text-white" : "text-slate-600"}`}
+                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "joint_equiv" ? "bg-primary text-primary-foreground" : "text-foreground/80"}`}
                             onClick={() => {
                                 setViewMode("joint_equiv");
                                 if (selectedCell?.mode !== "joint_equiv") onCellSelect(null);
@@ -124,7 +124,7 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                         </button>
                         <button
                             type="button"
-                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "disagree" ? "bg-slate-900 text-white" : "text-slate-600"}`}
+                            className={`rounded-md px-2.5 py-1 text-xs font-medium ${viewMode === "disagree" ? "bg-primary text-primary-foreground" : "text-foreground/80"}`}
                             onClick={() => {
                                 setViewMode("disagree");
                                 if (selectedCell?.mode !== "disagree") onCellSelect(null);
@@ -136,12 +136,12 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                 </div>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-slate-200 bg-white">
+            <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-card">
                 <table className="w-full border-collapse" style={{ fontFamily: F.mono, fontSize: 11 }}>
                     <thead>
                         <tr>
                             <th
-                                className="sticky left-0 top-0 z-20 bg-slate-50 px-2.5 py-1.5 text-left text-[10px] font-bold uppercase tracking-[0.06em] text-slate-500"
+                                className="sticky left-0 top-0 z-20 bg-muted/75 px-2.5 py-1.5 text-left text-[10px] font-bold uppercase tracking-[0.06em] text-muted-foreground"
                                 style={{ borderBottom: `1px solid ${C.border}`, fontFamily: F.body }}
                             >
                                 Setting
@@ -149,10 +149,10 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                             {settings.map((setting) => (
                                 <th
                                     key={setting.key}
-                                    className="sticky top-0 z-10 bg-slate-50 px-2 py-1.5 text-center text-[10px] font-bold"
+                                    className="sticky top-0 z-10 bg-muted/75 px-2 py-1.5 text-center text-[10px] font-bold"
                                     style={{ borderBottom: `1px solid ${C.border}`, color: setting.color, fontFamily: F.body }}
                                 >
-                                    {setting.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold text-slate-500" title={getSettingExplanation(setting.key)}>?</span>
+                                    {setting.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-border text-[10px] font-bold text-muted-foreground" title={getSettingExplanation(setting.key)}>?</span>
                                 </th>
                             ))}
                         </tr>
@@ -161,10 +161,10 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                         {settings.map((row, rowIndex) => (
                             <tr key={row.key}>
                                 <td
-                                    className="sticky left-0 z-10 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold text-slate-800"
+                                    className="sticky left-0 z-10 bg-muted/75 px-2.5 py-1.5 text-xs font-semibold text-foreground"
                                     style={{ borderBottom: `0.5px solid ${C.border}`, fontFamily: F.body }}
                                 >
-                                    {row.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold text-slate-500" title={getSettingExplanation(row.key)}>?</span>
+                                    {row.short}<span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-border text-[10px] font-bold text-muted-foreground" title={getSettingExplanation(row.key)}>?</span>
                                 </td>
                                 {matrix[rowIndex].map((cell) => {
                                     const normalized = (() => {
@@ -175,15 +175,15 @@ export function SettingConfusionHeatmap({ results, selectedCell, onCellSelect }:
                                     const background = (() => {
                                         if (normalized === null) return "transparent";
                                         if (viewMode === "joint_equiv") {
-                                            const lightness = 96 - normalized * 54;
-                                            const saturation = 38 + normalized * 36;
-                                            return `hsl(142 ${saturation}% ${lightness}%)`;
+                                            const lightness = 97 - normalized * 48;
+                                            const saturation = 44 + normalized * 26;
+                                            return `hsl(161 ${saturation}% ${lightness}%)`;
                                         }
-                                        const lightness = 97 - normalized * 50;
-                                        const saturation = 45 + normalized * 38;
-                                        return `hsl(7 ${saturation}% ${lightness}%)`;
+                                        const lightness = 97 - normalized * 44;
+                                        const saturation = 56 + normalized * 18;
+                                        return `hsl(14 ${saturation}% ${lightness}%)`;
                                     })();
-                                    const textColor = normalized !== null && normalized > 0.58 ? "#ffffff" : C.text;
+                                    const textColor = normalized !== null && normalized > 0.52 ? "#ffffff" : C.text;
                                     const colLabel = settings.find((item) => item.key === cell.colKey)?.label ?? cell.colKey;
                                     const title = cell.value === null
                                         ? "No overlapping evaluations"

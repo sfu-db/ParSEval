@@ -138,15 +138,15 @@ export default function ModelRunDetailPage() {
     }, [compareResults, compareRun, modelRun, results]);
 
     if (loading) {
-        return <div className="p-6 text-gray-400">Loading...</div>;
+        return <div className="p-6 text-muted-foreground">Loading...</div>;
     }
 
     if (error || !modelRun) {
-        return <div className="p-6 text-red-400">{error ?? "Model run not found"}</div>;
+        return <div className="p-6 text-destructive">{error ?? "Model run not found"}</div>;
     }
 
     return (
-        <div className="space-y-6 p-6">
+        <div className="space-y-6 bg-background p-6 text-foreground">
             <ModelRunSummary projectName={projectName} modelRun={modelRun} results={results} />
             <ModelRunChart
                 chartResults={chartResults}

@@ -17,6 +17,7 @@ import {
 } from "recharts";
 
 import { KPICard } from "@/components/projects/KPICard";
+import { ChartWrapper } from "@/components/modelrun/ChartWrapper";
 
 import {
     Card,
@@ -29,12 +30,18 @@ interface Props {
     experiments: ExperimentResult[];
 }
 
+type ChartDatum = {
+    name: string;
+    maxAcc: number;
+    [dataset: string]: string | number;
+};
+
 export default function ExperimentTrends({ experiments }: Props) {
     const datasets = useMemo(
         () => getDatasetsFromExperiments(experiments),
         [experiments]
     );
-    const [chartData, setChartData] = useState<any[]>([]);
+    const [chartData, setChartData] = useState<ChartDatum[]>([]);
     const numExperiments = experiments.length;
     const numDatasets = datasets.length;
     const [bestAccuracy, setBestAccuracy] = useState<number>(0);
@@ -46,7 +53,7 @@ export default function ExperimentTrends({ experiments }: Props) {
         async function load() {
             const data = await Promise.all(
                 experiments.map(async (exp) => {
-                    const entry: any = { name: exp.name };
+                    const entry: ChartDatum = { name: exp.name, maxAcc: 0 };
                     let maxAcc = 0;
                     await Promise.all(
                         datasets.map(async (dataset) => {
@@ -87,15 +94,15 @@ export default function ExperimentTrends({ experiments }: Props) {
             </div>
 
             {/* Dataset Info */}
-            <div className="text-sm text-gray-400 mb-2">
+            <div className="mb-2 text-sm text-muted-foreground">
                 <span>Datasets: </span>
                 {datasets.length === 0 ? (
-                    <span className="text-gray-500">None</span>
+                    <span className="text-muted-foreground">None</span>
                 ) : (
-                    datasets.map((ds, idx) => (
+                    datasets.map((ds) => (
                         <span
                             key={ds}
-                            className={`px-2 py-1 bg-gray-100 rounded text-xs text-gray-700 mr-2 cursor-pointer ${selectedDataset === ds ? "bg-blue-200 text-blue-700 font-bold" : ""}`}
+                            className={`mr-2 rounded px-2 py-1 text-xs transition ${selectedDataset === ds ? "bg-primary/15 text-primary font-bold" : "bg-muted text-foreground/80 hover:bg-accent"}`}
                             title={`Click to show only ${ds}`}
                             onClick={() => setSelectedDataset(selectedDataset === ds ? null : ds)}
                             style={{ cursor: 'pointer' }}
@@ -105,17 +112,17 @@ export default function ExperimentTrends({ experiments }: Props) {
                     ))
                 )}
                 {selectedDataset && (
-                    <span className="ml-2 text-xs text-blue-700">Showing only <b>{selectedDataset}</b></span>
+                    <span className="ml-2 text-xs text-primary">Showing only <b>{selectedDataset}</b></span>
                 )}
             </div>
 
             {/* Chart */}
-            <Card className="shadow-lg border border-blue-100">
+            <Card className="border-border shadow-sm">
                 <CardHeader>
-                    <CardTitle className="text-blue-700 text-xl">Experiment vs Dataset Accuracy</CardTitle>
+                    <CardTitle className="text-xl text-foreground">Experiment vs Dataset Accuracy</CardTitle>
                 </CardHeader>
                 <CardContent>
-                    <div className="w-full h-96">
+                    <ChartWrapper height={384}>
                         <ResponsiveContainer width="100%" height="100%">
                             <BarChart data={chartData}>
                                 <CartesianGrid strokeDasharray="3 3" />
@@ -123,7 +130,7 @@ export default function ExperimentTrends({ experiments }: Props) {
                                 <YAxis domain={[0, 100]} />
                                 <Tooltip />
                                 <Legend
-                                    onClick={(e: any) => {
+                                    onClick={(e: { dataKey?: string } | undefined) => {
                                         const ds = e && e.dataKey;
                                         if (ds && datasets.includes(ds)) {
                                             setSelectedDataset(selectedDataset === ds ? null : ds);
@@ -149,7 +156,7 @@ export default function ExperimentTrends({ experiments }: Props) {
                                 ))}
                             </BarChart>
                         </ResponsiveContainer>
-                    </div>
+                    </ChartWrapper>
                 </CardContent>
             </Card>
         </div>

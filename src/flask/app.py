@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 from flask import Flask, jsonify
 from flask_cors import CORS
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 from .evaluation_runtime import build_evaluation_runtime
+from . import models as flask_models
 from .models import db, migrate_legacy_flask_schema
 from .routes import api
+from .storage import backfill_storage_metadata
 
 import logging
 from parseval.utils import Logger
@@ -29,6 +34,7 @@ def default_database_uri() -> str:
 
 def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__)
+    default_artifact_root = Path(__file__).resolve().with_name("artifacts")
     app.config.update(
         SQLALCHEMY_DATABASE_URI=os.environ.get("DATABASE_URL", default_database_uri()),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
@@ -36,6 +42,9 @@ def create_app(config: dict | None = None) -> Flask:
         EVALUATION_WORKERS=1,
         EVALUATION_QUEUE_MAXSIZE=0,
         EVALUATION_WRITE_ARTIFACTS=True,
+        ARTIFACT_ROOT=str(default_artifact_root),
+        PROJECT_STORAGE_ROOT=str(default_artifact_root / "projects"),
+        DATASET_STORAGE_ROOT=str(default_artifact_root / "datasets"),
     )
     if config:
         app.config.update(config)
@@ -65,7 +74,21 @@ def create_app(config: dict | None = None) -> Flask:
 
     with app.app_context():
         db.create_all()
-        migrate_legacy_flask_schema(app.root_path)
+        migrate_legacy_flask_schema(app.config["ARTIFACT_ROOT"])
+        backfill_storage_metadata(app, models_module=flask_models)
 
     app.extensions["evaluation_runtime"] = build_evaluation_runtime(app)
     return app
+
+
+@event.listens_for(Engine, "connect", named=True)
+def set_sqlite_pragma(**kwargs):
+    dbapi_connection = kwargs.get("dbapi_connection")
+    if dbapi_connection is None or not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout = 30000")
+    finally:
+        cursor.close()

@@ -102,25 +102,25 @@ export default function ProjectPage() {
     }, [latestRuns, compareInitialized]);
 
     if (loading) {
-        return <div className="p-6 text-slate-400">Loading...</div>;
+        return <div className="p-6 text-muted-foreground">Loading...</div>;
     }
 
     if (error) {
-        return <div className="p-6 text-red-400">{error}</div>;
+        return <div className="p-6 text-destructive">{error}</div>;
     }
 
     if (!project) {
-        return <div className="p-6 text-red-400">Project not found</div>;
+        return <div className="p-6 text-destructive">Project not found</div>;
     }
 
     return (
-        <div className="flex h-full min-h-screen bg-slate-50 text-slate-900">
+        <div className="flex h-full min-h-screen bg-background text-foreground">
             <ModelRunSidebar
                 modelRuns={latestRuns}
                 selectedId={null}
                 onSelect={handleSelect}
                 onUpload={() => {
-                    router.push(`/projects/${project.id}/modelrun/upload`);
+                    router.push(`/projects/${project.id}/upload`);
                 }}
                 onDelete={handleDelete}
                 compareIds={compareRunIds}

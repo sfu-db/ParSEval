@@ -26,23 +26,23 @@ function formatStatus(status: string) {
 function getStatusClasses(status: string) {
     switch (status.toLowerCase()) {
         case "completed":
-            return "border-emerald-200 bg-emerald-50 text-emerald-700";
+            return "border-emerald-300 bg-emerald-100 text-emerald-900";
         case "running":
-            return "border-sky-200 bg-sky-50 text-sky-700";
+            return "border-sky-300 bg-sky-100 text-sky-900";
         case "pending":
-            return "border-amber-200 bg-amber-50 text-amber-700";
+            return "border-amber-300 bg-amber-100 text-amber-900";
         case "failed":
-            return "border-rose-200 bg-rose-50 text-rose-700";
+            return "border-rose-300 bg-rose-100 text-rose-900";
         default:
-            return "border-slate-200 bg-slate-100 text-slate-700";
+            return "border-border bg-muted text-foreground";
     }
 }
 
 function MetricTile({ title, value }: { title: string; value: string | number }) {
     return (
-        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{title}</div>
-            <div className="mt-2 text-sm font-semibold text-slate-900">{value}</div>
+        <div className="rounded-xl border border-border bg-background/75 px-4 py-3 shadow-[0_1px_0_rgba(15,23,42,0.04)]">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</div>
+            <div className="mt-2 text-sm font-semibold text-foreground">{value}</div>
         </div>
     );
 }
@@ -58,12 +58,12 @@ export function ModelRunSummary({ projectName, modelRun, results }: Props) {
 
             <CardContent className="flex flex-wrap items-start justify-start gap-2 p-6">
                 <div className="min-w-0 flex-[0.3] space-y-2">
-                    <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                    <div className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                         {projectName || "Project"}
                     </div>
                     <div>
-                        <h1 className="text-2xl font-semibold text-slate-900">{modelRun.run || `Run ${modelRun.id}`}</h1>
-                        <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                        <h1 className="text-2xl font-semibold text-foreground">{modelRun.run || `Run ${modelRun.id}`}</h1>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-foreground/78">
                             <p>
                                 {modelRun.model} on   {modelRun.dataset}
 
@@ -90,7 +90,7 @@ export function ModelRunSummary({ projectName, modelRun, results }: Props) {
                     <MetricTile title="Lowest Setting" value={metrics?.lowestSetting || "N/A"} />
                 </div>
 
-                {!metrics ? <div className="text-sm text-slate-400">No evaluation results available.</div> : null}
+                {!metrics ? <div className="text-sm text-muted-foreground">No evaluation results available.</div> : null}
             </CardContent>
         </Card>
     );

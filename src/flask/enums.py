@@ -4,7 +4,7 @@ enums.py — shared enum definitions for the QueryLens equivalence checking syst
 Design notes
 ------------
 DBLevel and QueryLevel form two independent orderings.  Their Cartesian product
-(DBLevel × QueryLevel) defines the 8 EquivalenceLevel combinations used as
+(DBLevel × QueryLevel) defines the EquivalenceLevel combinations used as
 labels in EvalRecord.  Storing them as separate columns (db_level, query_level)
 rather than a single string makes filtering and aggregation efficient.
 
@@ -22,14 +22,13 @@ class DBLevel(str, enum.Enum):
     Ordered from least to most restrictive.
     """
 
-    NONE = "NONE"  # no constraints — any database instance
     PK_FK = "PK_FK"  # PK + foreign key referential integrity
     PK_FK_NULL = "PK_FK_NULL"  # PK + FK + NOT NULL
     FULL = "FULL"  # all schema constraints (CHECK, UNIQUE, etc.)
 
     @classmethod
     def ordered(cls) -> list["DBLevel"]:
-        return [cls.NONE, cls.PK_FK, cls.PK_FK_NULL, cls.FULL]
+        return [cls.PK_FK, cls.PK_FK_NULL, cls.FULL]
 
 
 class QueryLevel(str, enum.Enum):

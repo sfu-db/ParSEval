@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,13 @@ db = SQLAlchemy()
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def fingerprint_text_payload(payload) -> str | None:
+    if payload is None:
+        return None
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class DBConnectionInfo(db.Model):
@@ -61,9 +69,15 @@ class Project(db.Model):
     name: Mapped[str] = mapped_column(db.String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(db.Text)
     settings_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    storage_slug: Mapped[str | None] = mapped_column(db.String(255))
+    storage_path: Mapped[str | None] = mapped_column(db.Text)
+    metadata_path: Mapped[str | None] = mapped_column(db.Text)
     created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
     runs: Mapped[list["ModelRun"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    dataset_links: Mapped[list["ProjectDataset"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
 
@@ -84,16 +98,109 @@ class ModelRun(db.Model):
     dataset: Mapped[str] = mapped_column(db.String(255), nullable=False)
     prompt_template: Mapped[str | None] = mapped_column(db.Text)
     uploaded_file_path: Mapped[str | None] = mapped_column(db.Text)
+    storage_slug: Mapped[str | None] = mapped_column(db.String(255))
+    storage_path: Mapped[str | None] = mapped_column(db.Text)
+    metadata_path: Mapped[str | None] = mapped_column(db.Text)
+    dataset_asset_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("dataset_assets.id")
+    )
     metric_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     setting_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="runs")
+    dataset_asset: Mapped["DatasetAsset | None"] = relationship(
+        back_populates="model_runs"
+    )
     run_cases: Mapped[list["RunCase"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
     evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+
+
+class DatasetAsset(db.Model):
+    __tablename__ = "dataset_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "dialect",
+            "source_type",
+            "source_fingerprint",
+            name="uq_dataset_asset_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    slug: Mapped[str | None] = mapped_column(db.String(255))
+    description: Mapped[str | None] = mapped_column(db.Text)
+    dialect: Mapped[str] = mapped_column(db.String(64), default="sqlite", nullable=False)
+    source_type: Mapped[str] = mapped_column(
+        db.String(64), default="uploaded_json", nullable=False
+    )
+    source_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
+    source_payload_path: Mapped[str | None] = mapped_column(db.Text)
+    storage_path: Mapped[str | None] = mapped_column(db.Text)
+    metadata_path: Mapped[str | None] = mapped_column(db.Text)
+    status: Mapped[str] = mapped_column(db.String(64), default="ready", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    variants: Mapped[list["DatasetVariant"]] = relationship(
+        back_populates="dataset_asset", cascade="all, delete-orphan"
+    )
+    project_links: Mapped[list["ProjectDataset"]] = relationship(
+        back_populates="dataset_asset", cascade="all, delete-orphan"
+    )
+    model_runs: Mapped[list[ModelRun]] = relationship(back_populates="dataset_asset")
+    run_cases: Mapped[list["RunCase"]] = relationship(
+        back_populates="default_dataset_asset"
+    )
+
+
+class DatasetVariant(db.Model):
+    __tablename__ = "dataset_variants"
+    __table_args__ = (
+        UniqueConstraint("dataset_asset_id", "variant_key", name="uq_dataset_variant"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_asset_id: Mapped[int] = mapped_column(
+        db.ForeignKey("dataset_assets.id"), nullable=False
+    )
+    variant_key: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    schema_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
+    workload_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
+    settings_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
+    storage_path: Mapped[str | None] = mapped_column(db.Text)
+    manifest_path: Mapped[str | None] = mapped_column(db.Text)
+    status: Mapped[str] = mapped_column(
+        db.String(64), default="generated", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    dataset_asset: Mapped[DatasetAsset] = relationship(back_populates="variants")
+    evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(
+        back_populates="dataset_variant"
+    )
+
+
+class ProjectDataset(db.Model):
+    __tablename__ = "project_datasets"
+    __table_args__ = (
+        UniqueConstraint("project_id", "dataset_asset_id", name="uq_project_dataset"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        db.ForeignKey("projects.id"), nullable=False
+    )
+    dataset_asset_id: Mapped[int] = mapped_column(
+        db.ForeignKey("dataset_assets.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="dataset_links")
+    dataset_asset: Mapped[DatasetAsset] = relationship(back_populates="project_links")
 
 
 class RunCase(db.Model):
@@ -107,6 +214,9 @@ class RunCase(db.Model):
     db_connection_id: Mapped[int | None] = mapped_column(
         db.ForeignKey("db_connection_info.id")
     )
+    default_dataset_asset_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("dataset_assets.id")
+    )
     question_id: Mapped[int | None] = mapped_column(nullable=True)
     db_id: Mapped[str] = mapped_column(db.String(255), nullable=False)
     dataset: Mapped[str] = mapped_column(db.String(255), nullable=False)
@@ -114,17 +224,22 @@ class RunCase(db.Model):
         "host_or_path", db.Text, nullable=False, default=""
     )
     dialect: Mapped[str | None] = mapped_column(db.String(255))
-    schema_json: Mapped[dict | list | str | None] = mapped_column(JSON)
+    schema_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
     question: Mapped[str | None] = mapped_column(db.Text)
     evidence: Mapped[str | None] = mapped_column(db.Text)
     prompt: Mapped[str | None] = mapped_column(db.Text)
     gold: Mapped[str] = mapped_column(db.Text, nullable=False)
     pred: Mapped[str] = mapped_column(db.Text, nullable=False)
+    gold_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
+    pred_fingerprint: Mapped[str | None] = mapped_column(db.String(128))
     source: Mapped[str] = mapped_column(db.String(64), default="upload", nullable=False)
     created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
     run: Mapped[ModelRun] = relationship(back_populates="run_cases")
     db_connection_info: Mapped[DBConnectionInfo | None] = relationship(
+        back_populates="run_cases"
+    )
+    default_dataset_asset: Mapped[DatasetAsset | None] = relationship(
         back_populates="run_cases"
     )
     evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(
@@ -146,6 +261,9 @@ class EvaluationJob(db.Model):
     run_case_id: Mapped[int] = mapped_column(
         db.ForeignKey("run_cases.id"), nullable=False
     )
+    dataset_variant_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("dataset_variants.id")
+    )
     status: Mapped[str] = mapped_column(
         db.String(64), default="pending", nullable=False
     )
@@ -158,8 +276,14 @@ class EvaluationJob(db.Model):
 
     run: Mapped[ModelRun] = relationship(back_populates="evaluation_jobs")
     run_case: Mapped[RunCase] = relationship(back_populates="evaluation_jobs")
+    dataset_variant: Mapped["DatasetVariant | None"] = relationship(
+        back_populates="evaluation_jobs"
+    )
     relaxed_equivalence: Mapped["RelaxedEquivalence | None"] = relationship(
         back_populates="evaluation_job", cascade="all, delete-orphan", uselist=False
+    )
+    cache_entries: Mapped[list["EvaluationCacheEntry"]] = relationship(
+        back_populates="latest_successful_job"
     )
 
 
@@ -202,12 +326,42 @@ class CounterExample(db.Model):
     db_level: Mapped[str] = mapped_column(db.String(64), nullable=False)
     query_level: Mapped[str] = mapped_column(db.String(64), nullable=False)
     state: Mapped[str] = mapped_column(db.String(64), default="pending", nullable=False)
-    witness_db_json: Mapped[dict | None] = mapped_column(JSON)
-    q1_result_json: Mapped[dict | None] = mapped_column(JSON)
-    q2_result_json: Mapped[dict | None] = mapped_column(JSON)
+    artifact_key: Mapped[str | None] = mapped_column(db.String(255))
+    error_message: Mapped[str | None] = mapped_column(db.Text)
 
     equivalence: Mapped[RelaxedEquivalence] = relationship(
         back_populates="counterexamples"
+    )
+
+
+class EvaluationCacheEntry(db.Model):
+    __tablename__ = "evaluation_cache_entries"
+    __table_args__ = (
+        UniqueConstraint("cache_key", name="uq_evaluation_cache_key"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_variant_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("dataset_variants.id")
+    )
+    latest_successful_job_id: Mapped[int | None] = mapped_column(
+        db.ForeignKey("evaluation_jobs.id")
+    )
+    cache_key: Mapped[str] = mapped_column(db.String(128), nullable=False)
+    gold_fingerprint: Mapped[str] = mapped_column(db.String(128), nullable=False)
+    pred_fingerprint: Mapped[str] = mapped_column(db.String(128), nullable=False)
+    settings_fingerprint: Mapped[str] = mapped_column(db.String(128), nullable=False)
+    state: Mapped[str] = mapped_column(db.String(64), nullable=False)
+    result_summary_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    artifact_path: Mapped[str | None] = mapped_column(db.Text)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    dataset_variant: Mapped["DatasetVariant | None"] = relationship()
+    latest_successful_job: Mapped["EvaluationJob | None"] = relationship(
+        back_populates="cache_entries"
     )
 
 
@@ -216,6 +370,26 @@ def migrate_legacy_flask_schema(root_path: str) -> None:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     with engine.begin() as conn:
+        if "projects" in tables:
+            _maybe_add_column(conn, inspector, "projects", "storage_slug", "TEXT")
+            _maybe_add_column(conn, inspector, "projects", "storage_path", "TEXT")
+            _maybe_add_column(conn, inspector, "projects", "metadata_path", "TEXT")
+        if "model_runs" in tables:
+            _maybe_add_column(conn, inspector, "model_runs", "storage_slug", "TEXT")
+            _maybe_add_column(conn, inspector, "model_runs", "storage_path", "TEXT")
+            _maybe_add_column(conn, inspector, "model_runs", "metadata_path", "TEXT")
+            _maybe_add_column(conn, inspector, "model_runs", "dataset_asset_id", "INTEGER")
+        if "run_cases" in tables:
+            _maybe_add_column(
+                conn, inspector, "run_cases", "default_dataset_asset_id", "INTEGER"
+            )
+            _maybe_add_column(conn, inspector, "run_cases", "schema_fingerprint", "TEXT")
+            _maybe_add_column(conn, inspector, "run_cases", "gold_fingerprint", "TEXT")
+            _maybe_add_column(conn, inspector, "run_cases", "pred_fingerprint", "TEXT")
+        if "evaluation_jobs" in tables:
+            _maybe_add_column(
+                conn, inspector, "evaluation_jobs", "dataset_variant_id", "INTEGER"
+            )
         if "db_connection_info" in tables:
             _maybe_add_column(conn, inspector, "db_connection_info", "dataset", "TEXT")
             _maybe_add_column(conn, inspector, "db_connection_info", "db_id", "TEXT")
@@ -234,6 +408,10 @@ def migrate_legacy_flask_schema(root_path: str) -> None:
         if "counterexamples" in tables:
             _maybe_add_column(conn, inspector, "counterexamples", "db_level", "TEXT")
             _maybe_add_column(conn, inspector, "counterexamples", "query_level", "TEXT")
+            _maybe_add_column(
+                conn, inspector, "counterexamples", "error_message", "TEXT"
+            )
+            _maybe_add_column(conn, inspector, "counterexamples", "artifact_key", "TEXT")
 
         if "eval_records" in tables:
             rows = conn.execute(
@@ -438,7 +616,7 @@ def migrate_legacy_flask_schema(root_path: str) -> None:
                         "UPDATE counterexamples SET db_level = :db_level, query_level = :query_level WHERE id = :id"
                     ),
                     {
-                        "db_level": first.get("db_level", "NONE"),
+                        "db_level": first.get("db_level", "PK_FK"),
                         "query_level": first.get("query_level", "BAG"),
                         "id": row["id"],
                     },
@@ -499,11 +677,11 @@ def _ensure_run_case(
         text(
             """
             INSERT INTO run_cases (
-                run_id, db_connection_id, question_id, db_id, dataset, host_or_path, dialect, schema_json,
-                question, evidence, prompt, gold, pred, source, created_at
+                run_id, db_connection_id, question_id, db_id, dataset, host_or_path, dialect, schema_fingerprint,
+                question, evidence, prompt, gold, pred, gold_fingerprint, pred_fingerprint, source, created_at
             ) VALUES (
-                :run_id, :db_connection_id, :question_id, :db_id, :dataset, :host_or_path, :dialect, :schema_json,
-                :question, :evidence, :prompt, :gold, :pred, :source, :created_at
+                :run_id, :db_connection_id, :question_id, :db_id, :dataset, :host_or_path, :dialect, :schema_fingerprint,
+                :question, :evidence, :prompt, :gold, :pred, :gold_fingerprint, :pred_fingerprint, :source, :created_at
             )
             """
         ),
@@ -528,16 +706,14 @@ def _ensure_run_case(
             "db_id": db_id,
             "dataset": dataset,
             "dialect": dialect,
-            "schema_json": (
-                json.dumps(schema_json)
-                if isinstance(schema_json, (dict, list))
-                else schema_json
-            ),
+            "schema_fingerprint": fingerprint_text_payload(schema_json),
             "question": question,
             "evidence": evidence,
             "prompt": prompt,
             "gold": gold,
             "pred": pred,
+            "gold_fingerprint": fingerprint_text_payload(gold),
+            "pred_fingerprint": fingerprint_text_payload(pred),
             "source": source,
             "created_at": utcnow(),
         },
@@ -656,7 +832,7 @@ def _normalize_connection_fields(
 ) -> dict[str, object]:
     normalized_dialect = (dialect or "sqlite").strip().lower()
     if normalized_dialect == "sqlite":
-        host = str(Path(root_path) / "static" / dataset)
+        host = str(Path(root_path) / "_connections" / dataset)
         database = f"{db_id}.sqlite"
     else:
         host = host_or_path.strip()

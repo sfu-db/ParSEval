@@ -6,6 +6,8 @@ import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, X
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ModelRun } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { ChartWrapper } from '@/components/modelrun/ChartWrapper';
+
 import { MODEL_DOT_COLORS, MODEL_LINE_COLORS } from "@/lib/settings";
 interface Props {
     projectName: string;
@@ -69,15 +71,15 @@ function formatSecondsAgo(value: Date | string | undefined) {
 function getStatusClasses(status: string | undefined) {
     switch (status?.toLowerCase()) {
         case "completed":
-            return "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200";
+            return "bg-emerald-100 text-emerald-900 ring-1 ring-emerald-300";
         case "running":
-            return "bg-amber-50 text-amber-700 ring-1 ring-amber-200";
+            return "bg-amber-100 text-amber-900 ring-1 ring-amber-300";
         case "pending":
-            return "bg-sky-50 text-sky-700 ring-1 ring-sky-200";
+            return "bg-sky-100 text-sky-900 ring-1 ring-sky-300";
         case "failed":
-            return "bg-rose-50 text-rose-700 ring-1 ring-rose-200";
+            return "bg-rose-100 text-rose-900 ring-1 ring-rose-300";
         default:
-            return "bg-slate-100 text-slate-600 ring-1 ring-slate-200";
+            return "bg-muted text-foreground/80 ring-1 ring-border";
     }
 }
 
@@ -122,8 +124,8 @@ function SortHeader({
             type="button"
             onClick={() => onSort(column)}
             className={cn(
-                "inline-flex items-center gap-1 font-medium transition hover:text-slate-700",
-                active ? "text-slate-800" : "text-slate-500"
+                "inline-flex items-center gap-1 font-medium transition hover:text-foreground",
+                active ? "text-foreground" : "text-muted-foreground"
             )}
         >
             <span>{label}</span>
@@ -134,13 +136,13 @@ function SortHeader({
 
 function ViewModeToggle({ viewMode, onChange }: { viewMode: ViewMode; onChange: (mode: ViewMode) => void }) {
     return (
-        <div className="inline-flex items-center rounded-md bg-white p-1 py-1.5">
+        <div className="inline-flex items-center rounded-lg border border-border bg-background/95 p-1 py-1.5 shadow-sm">
             <button
                 type="button"
                 onClick={() => onChange("table")}
                 className={cn(
-                    "inline-flex size-9 items-center justify-center rounded text-slate-500 transition cursor-pointer hover:opacity-80 ",
-                    viewMode === "table" && "bg-slate-100 text-slate-900 border"
+                    "inline-flex size-9 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition hover:bg-accent hover:text-foreground",
+                    viewMode === "table" && "border border-border bg-accent text-foreground shadow-sm"
                 )}
                 title="Table view"
                 aria-label="Table view"
@@ -154,8 +156,8 @@ function ViewModeToggle({ viewMode, onChange }: { viewMode: ViewMode; onChange: 
                 type="button"
                 onClick={() => onChange("chart")}
                 className={cn(
-                    "inline-flex size-9 items-center justify-center rounded text-slate-500 transition cursor-pointer hover:opacity-80",
-                    viewMode === "chart" && "bg-slate-100 text-slate-900 border"
+                    "inline-flex size-9 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition hover:bg-accent hover:text-foreground",
+                    viewMode === "chart" && "border border-border bg-accent text-foreground shadow-sm"
                 )}
                 title="Chart view"
                 aria-label="Chart view"
@@ -330,65 +332,65 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
 
     return (
         <div className="flex flex-col gap-6">
-            <section className="rounded-2xl border border-slate-200 bg-white">
-                <div className="border-b border-slate-200 px-6 py-3.5">
-                    <h1 className="text-xl font-semibold text-slate-900">{projectName}</h1>
-                    <p className="mt-0.5 text-sm text-slate-600">
+            <section className="rounded-2xl border border-border bg-card shadow-sm">
+                <div className="border-b border-border px-6 py-3.5">
+                    <h1 className="text-xl font-semibold text-foreground">{projectName}</h1>
+                    <p className="mt-0.5 text-sm text-muted-foreground">
                         Comparing {selectedRuns.length} selected run{selectedRuns.length === 1 ? "" : "s"} from the sidebar.
                     </p>
                 </div>
 
                 <div className="grid gap-4 p-6 md:grid-cols-3">
-                    <Card className="gap-0 border-slate-200 py-0 shadow-none">
+                    <Card className="gap-0 border-border bg-background/70 py-0 shadow-none">
                         <CardContent className="px-4 py-4">
-                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-slate-500">Active Datasets</p>
-                            <p className="mt-2 text-3xl font-semibold text-slate-900">{datasets}</p>
+                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Active Datasets</p>
+                            <p className="mt-2 text-3xl font-semibold text-foreground">{datasets}</p>
                         </CardContent>
                     </Card>
-                    <Card className="gap-0 border-slate-200 py-0 shadow-none">
+                    <Card className="gap-0 border-border bg-background/70 py-0 shadow-none">
                         <CardContent className="px-4 py-4">
-                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-slate-500">Best Accuracy</p>
-                            <p className="mt-2 text-3xl font-semibold text-slate-900">
+                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Best Accuracy</p>
+                            <p className="mt-2 text-3xl font-semibold text-foreground">
                                 {bestRun ? formatMetric(bestRun.metric?.["EXEC ACC"]) : "--"}
                             </p>
                         </CardContent>
                     </Card>
-                    <Card className="gap-0 border-slate-200 py-0 shadow-none">
+                    <Card className="gap-0 border-border bg-background/70 py-0 shadow-none">
                         <CardContent className="px-4 py-4">
-                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-slate-500">Best Run</p>
-                            <p className="mt-2 truncate text-lg font-semibold text-slate-900">
+                            <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Best Run</p>
+                            <p className="mt-2 truncate text-lg font-semibold text-foreground">
                                 {bestRun ? bestRun.run || `run-${bestRun.id}` : "--"}
                             </p>
-                            {bestRun ? <p className="mt-1 text-sm text-slate-500">{bestRun.model}</p> : null}
+                            {bestRun ? <p className="mt-1 text-sm text-muted-foreground">{bestRun.model}</p> : null}
                         </CardContent>
                     </Card>
                 </div>
             </section>
 
-            <Card className="gap-0 border-slate-200 bg-white py-0 shadow-none">
-                <CardHeader className="border-b border-slate-200 py-5">
-                    <CardTitle className="text-slate-900">Selected Run Details</CardTitle>
+            <Card className="gap-0 border-border bg-card py-0 shadow-sm">
+                <CardHeader className="border-b border-border py-5">
+                    <CardTitle className="text-foreground">Selected Run Details</CardTitle>
                     <CardDescription>
                         Detailed metadata for each run currently selected in the sidebar.
                     </CardDescription>
                 </CardHeader>
                 <CardContent className="px-0 py-0">
                     {selectedRuns.length === 0 ? (
-                        <div className="px-6 py-16 text-center text-sm text-slate-500">
+                        <div className="px-6 py-16 text-center text-sm text-muted-foreground">
                             No runs selected yet. Use the eye controls in the sidebar to hide runs you want to ignore.
                         </div>
                     ) : (
                         <>
-                            <div className="flex flex-col gap-3 border-b border-slate-200 px-6 py-4 lg:flex-row lg:items-end lg:justify-between">
+                            <div className="flex flex-col gap-3 border-b border-border px-6 py-4 lg:flex-row lg:items-end lg:justify-between">
                                 <div className="grid gap-3 lg:grid-cols-[auto_minmax(0,3fr)_minmax(220px,1fr)_minmax(220px,1fr)] lg:items-end">
-                                    <div className="flex flex-col gap-1.5 text-sm text-slate-600">
+                                    <div className="flex flex-col gap-1.5 text-sm text-foreground/80">
                                         <ViewModeToggle viewMode={viewMode} onChange={setViewMode} />
                                     </div>
 
-                                    <label className="flex flex-col gap-1.5 text-sm text-slate-600">
-                                        <span className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">Min Exec Acc</span>
-                                        <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-1.5 focus-within:border-slate-300">
-                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="size-4 shrink-0 text-slate-400" aria-hidden="true">
+                                    <label className="flex flex-col gap-1.5 text-sm text-foreground/80">
+                                        <span className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">Min Exec Acc</span>
+                                        <div className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/10">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="size-4 shrink-0 text-muted-foreground" aria-hidden="true">
                                                 <circle cx="11" cy="11" r="6.5" />
                                                 <path d="M16 16l4 4" strokeLinecap="round" />
                                             </svg>
@@ -400,10 +402,10 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                                 value={minExecAccuracyInput}
                                                 onChange={(event) => setMinExecAccuracyInput(event.target.value)}
                                                 placeholder="Filter by execution accuracy, e.g. 80"
-                                                className="min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                                                className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
                                             />
                                             <span
-                                                className="inline-flex size-5 shrink-0 items-center justify-center rounded-full border border-slate-200 text-[11px] font-medium text-slate-400"
+                                                className="inline-flex size-5 shrink-0 items-center justify-center rounded-full border border-border text-[11px] font-medium text-muted-foreground"
                                                 title="Only show runs whose execution accuracy is greater than or equal to this value."
                                                 aria-label="Execution accuracy filter help"
                                             >
@@ -413,12 +415,12 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                     </label>
 
                                     {viewMode === "table" ? (
-                                        <label className="flex flex-col gap-1.5 text-sm text-slate-600">
-                                            <span className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">Dataset</span>
+                                        <label className="flex flex-col gap-1.5 text-sm text-foreground/80">
+                                            <span className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">Dataset</span>
                                             <select
                                                 value={selectedDataset}
                                                 onChange={(event) => setSelectedDataset(event.target.value)}
-                                                className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 outline-none focus:border-slate-300"
+                                                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
                                             >
                                                 <option value="all">All datasets</option>
                                                 {datasetOptions.map((dataset) => (
@@ -430,12 +432,12 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                         </label>
                                     ) : null}
 
-                                    <label className="flex flex-col gap-1.5 text-sm text-slate-600">
-                                        <span className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">Model</span>
+                                    <label className="flex flex-col gap-1.5 text-sm text-foreground/80">
+                                        <span className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">Model</span>
                                         <select
                                             value={selectedModel}
                                             onChange={(event) => setSelectedModel(event.target.value)}
-                                            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 outline-none focus:border-slate-300"
+                                            className="rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
                                         >
                                             <option value="all">All models</option>
                                             {modelOptions.map((model) => (
@@ -447,14 +449,14 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                     </label>
                                 </div>
 
-                                <div className="flex flex-col items-start gap-1 text-sm text-slate-500 lg:items-end">
+                                <div className="flex flex-col items-start gap-1 text-sm text-muted-foreground lg:items-end">
                                     {viewMode === "chart" ? (
-                                        <label className="flex items-center gap-2 text-sm text-slate-600">
-                                            <span className="text-xs font-medium uppercase tracking-[0.14em] text-slate-500">Trend Dataset</span>
+                                        <label className="flex items-center gap-2 text-sm text-foreground/80">
+                                            <span className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">Trend Dataset</span>
                                             <select
                                                 value={effectiveChartDataset}
                                                 onChange={(event) => setChartDataset(event.target.value)}
-                                                className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 outline-none focus:border-slate-300"
+                                                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
                                             >
                                                 {datasetOptions.map((dataset) => (
                                                     <option key={dataset} value={dataset}>
@@ -469,53 +471,62 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                             </div>
 
                             {displayedRuns.length === 0 ? (
-                                <div className="px-6 py-16 text-center text-sm text-slate-500">
+                                <div className="px-6 py-16 text-center text-sm text-muted-foreground">
                                     No runs match the current filters.
                                 </div>
                             ) : viewMode === "chart" ? (
                                 <div className="px-6 py-6">
                                     {!datasetOptions.length ? (
-                                        <div className="py-12 text-center text-sm text-slate-500">
+                                        <div className="py-12 text-center text-sm text-muted-foreground">
                                             No dataset is available for the selected runs.
                                         </div>
                                     ) : !chartData.length ? (
-                                        <div className="py-12 text-center text-sm text-slate-500">
-                                            No execution-accuracy trend data is available for dataset <span className="font-medium text-slate-700">{effectiveChartDataset}</span>.
+                                        <div className="py-12 text-center text-sm text-muted-foreground">
+                                            No execution-accuracy trend data is available for dataset <span className="font-medium text-foreground">{effectiveChartDataset}</span>.
                                         </div>
                                     ) : (
                                         <>
-                                            <div className="mb-4 text-sm text-slate-500">
-                                                X-axis shows run names. Each line tracks execution accuracy for one model on <span className="font-medium text-slate-700">{effectiveChartDataset}</span>.
+                                            <div className="mb-4 text-sm text-muted-foreground">
+                                                X-axis shows run names. Each line tracks execution accuracy for one model on <span className="font-medium text-foreground">{effectiveChartDataset}</span>.
                                             </div>
                                             <div className="h-[420px] w-full">
-                                                <ResponsiveContainer width="100%" height="100%">
-                                                    <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 24, left: 0 }}>
-                                                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                                                        <XAxis dataKey="name" tick={{ fill: "#64748b", fontSize: 12 }} angle={-20} textAnchor="end" height={64} interval={0} />
-                                                        <YAxis domain={[0, 100]} tick={{ fill: "#64748b", fontSize: 12 }} />
-                                                        <Tooltip
-                                                            formatter={(value: number | null, name: string) => {
-                                                                if (typeof value !== "number" || Number.isNaN(value)) return ["--", name];
-                                                                return [`${value.toFixed(1)}%`, name];
-                                                            }}
-                                                            labelFormatter={(label: string) => `${label} | ${effectiveChartDataset}`}
-                                                        />
-                                                        <Legend wrapperStyle={{ paddingTop: 8 }} />
-                                                        {chartModelKeys.map((model, index) => (
-                                                            <Line
-                                                                key={model}
-                                                                type="monotone"
-                                                                dataKey={model}
-                                                                name={model}
-                                                                stroke={modelLineColorMap[model] || MODEL_LINE_COLORS[index % MODEL_LINE_COLORS.length]}
-                                                                strokeWidth={2.5}
-                                                                dot={{ r: 3 }}
-                                                                activeDot={{ r: 5 }}
-                                                                connectNulls
+                                                <ChartWrapper>
+                                                    <ResponsiveContainer width="100%" height="100%">
+                                                        <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 24, left: 0 }}>
+                                                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+                                                            <XAxis dataKey="name" tick={{ fill: "#475569", fontSize: 12 }} angle={-20} textAnchor="end" height={64} interval={0} />
+                                                            <YAxis domain={[0, 100]} tick={{ fill: "#475569", fontSize: 12 }} />
+                                                            <Tooltip
+                                                                formatter={(value: number | null, name: string) => {
+                                                                    if (typeof value !== "number" || Number.isNaN(value)) return ["--", name];
+                                                                    return [`${value.toFixed(1)}%`, name];
+                                                                }}
+                                                                labelFormatter={(label: string) => `${label} | ${effectiveChartDataset}`}
+                                                                contentStyle={{
+                                                                    borderRadius: 10,
+                                                                    border: "1px solid #cbd5e1",
+                                                                    background: "#ffffff",
+                                                                    color: "#0f172a",
+                                                                    boxShadow: "0 14px 32px rgba(15, 23, 42, 0.12)",
+                                                                }}
                                                             />
-                                                        ))}
-                                                    </LineChart>
-                                                </ResponsiveContainer>
+                                                            <Legend wrapperStyle={{ paddingTop: 8, color: "#475569" }} />
+                                                            {chartModelKeys.map((model, index) => (
+                                                                <Line
+                                                                    key={model}
+                                                                    type="monotone"
+                                                                    dataKey={model}
+                                                                    name={model}
+                                                                    stroke={modelLineColorMap[model] || MODEL_LINE_COLORS[index % MODEL_LINE_COLORS.length]}
+                                                                    strokeWidth={2.5}
+                                                                    dot={{ r: 3 }}
+                                                                    activeDot={{ r: 5 }}
+                                                                    connectNulls
+                                                                />
+                                                            ))}
+                                                        </LineChart>
+                                                    </ResponsiveContainer>
+                                                </ChartWrapper>
                                             </div>
                                         </>
                                     )}
@@ -523,7 +534,7 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                             ) : (
                                 <div className="overflow-x-auto">
                                     <table className="min-w-full text-sm">
-                                        <thead className="bg-slate-50 text-left text-xs uppercase tracking-[0.16em] text-slate-500">
+                                        <thead className="bg-muted/65 text-left text-xs uppercase tracking-[0.16em] text-muted-foreground">
                                             <tr>
                                                 <th className="px-6 py-4 font-medium"><SortHeader label="Run" column="run" sortKey={sortKey} sortDirection={sortDirection} onSort={handleSort} /></th>
                                                 <th className="px-6 py-4 font-medium"><SortHeader label="Model" column="model" sortKey={sortKey} sortDirection={sortDirection} onSort={handleSort} /></th>
@@ -539,30 +550,30 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                             {displayedRuns.map((run) => (
                                                 <tr
                                                     key={run.id}
-                                                    className="cursor-pointer border-t border-slate-100 align-top transition hover:bg-slate-50"
+                                                    className="cursor-pointer border-t border-border/70 align-top transition hover:bg-accent/35"
                                                     onClick={() => onRunSelect(run)}
                                                 >
-                                                    <td className="px-6 py-4 font-medium text-slate-900">
-                                                        <span className="truncate text-left text-sky-700 transition hover:text-sky-900 hover:underline">
+                                                    <td className="px-6 py-4 font-medium text-foreground">
+                                                        <span className="truncate text-left text-primary transition hover:text-primary/80 hover:underline">
                                                             {run.run || `run-${run.id}`}
                                                         </span>
                                                     </td>
-                                                    <td className="px-6 py-4 text-slate-700">
+                                                    <td className="px-6 py-4 text-foreground/88">
                                                         <span className="inline-flex items-center gap-2">
                                                             <span className={cn("size-2.5 rounded-full", modelDotColorMap[run.model] || MODEL_DOT_COLORS[0])} />
                                                             <span>{run.model}</span>
                                                         </span>
                                                     </td>
-                                                    <td className="px-6 py-4 text-slate-700">{run.dataset}</td>
+                                                    <td className="px-6 py-4 text-foreground/88">{run.dataset}</td>
                                                     <td className="px-6 py-4">
                                                         <span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-medium capitalize", getStatusClasses(run.status))}>
                                                             {run.status || "unknown"}
                                                         </span>
                                                     </td>
-                                                    <td className="px-6 py-4 text-slate-700">{formatMetric(run.metric?.["EXACT MATCH"])}</td>
-                                                    <td className="px-6 py-4 text-slate-700">{formatMetric(run.metric?.["EXEC ACC"])}</td>
-                                                    <td className="px-6 py-4 text-slate-500">{formatSecondsAgo(run.createdAt)}</td>
-                                                    <td className="max-w-xs px-6 py-4 text-slate-500">
+                                                    <td className="px-6 py-4 text-foreground/88">{formatMetric(run.metric?.["EXACT MATCH"])}</td>
+                                                    <td className="px-6 py-4 text-foreground/88">{formatMetric(run.metric?.["EXEC ACC"])}</td>
+                                                    <td className="px-6 py-4 text-muted-foreground">{formatSecondsAgo(run.createdAt)}</td>
+                                                    <td className="max-w-xs px-6 py-4 text-muted-foreground">
                                                         <button
                                                             type="button"
                                                             onClick={(event) => {
@@ -572,7 +583,7 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
                                                                     prompt: run.promptTemplate || "No prompt template available.",
                                                                 });
                                                             }}
-                                                            className="block truncate text-left text-sky-700 transition hover:text-sky-900 hover:underline cursor-pointer hover:opacity-80"
+                                                            className="block cursor-pointer truncate text-left text-primary transition hover:text-primary/80 hover:underline"
                                                         >
                                                             {run.promptTemplate || "--"}
                                                         </button>
@@ -589,23 +600,23 @@ export default function ModelRunComparision({ projectName, modelRuns, compareIds
             </Card>
 
             {promptDetail ? (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-6">
-                    <div className="w-full max-w-3xl rounded-2xl border border-slate-200 bg-white shadow-xl">
-                        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-4">
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-6 backdrop-blur-sm">
+                    <div className="w-full max-w-3xl rounded-2xl border border-border bg-card shadow-xl">
+                        <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-4">
                             <div>
-                                <h2 className="text-lg font-semibold text-slate-900">Prompt Template</h2>
-                                <p className="mt-1 text-sm text-slate-500">{promptDetail.runName}</p>
+                                <h2 className="text-lg font-semibold text-foreground">Prompt Template</h2>
+                                <p className="mt-1 text-sm text-muted-foreground">{promptDetail.runName}</p>
                             </div>
                             <button
                                 type="button"
                                 onClick={() => setPromptDetail(null)}
-                                className="rounded-md border border-slate-200 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
+                                className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground/80 transition hover:bg-accent"
                             >
                                 Close
                             </button>
                         </div>
                         <div className="max-h-[70vh] overflow-y-auto px-6 py-5">
-                            <pre className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
+                            <pre className="whitespace-pre-wrap break-words text-sm leading-6 text-foreground/88">
                                 {promptDetail.prompt}
                             </pre>
                         </div>

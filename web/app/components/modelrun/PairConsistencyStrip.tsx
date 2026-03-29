@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { type HeatmapSelection } from "@/components/modelrun/SettingConfusionHeatmap";
 import { EvalRecordAPI } from "@/lib/api/evalRecord";
 import { getSettingExplanation, getSettingsForRows, type SettingKey, type SettingMeta } from "@/lib/settings";
-import { type EvalRecord, type QueryResult, type RelaxedEquivalenceRecord, type WitenessDatabase } from "@/lib/types";
+import { type CounterExampleRecord, type EvalRecord, type QueryResult, type RelaxedEquivalenceRecord, type WitenessDatabase } from "@/lib/types";
 
 const C = {
     panel: "#ffffff",
@@ -284,6 +284,23 @@ function WitnessDatabaseCard({ database }: { database: WitenessDatabase | undefi
     );
 }
 
+function getCounterExamples(detail: RelaxedEquivalenceRecord | null): CounterExampleRecord[] {
+    if (!detail) return [];
+    return detail.counterexamples ?? detail.counternexample ?? [];
+}
+
+function getWitnessDatabase(counterexample: CounterExampleRecord | undefined): WitenessDatabase | undefined {
+    return counterexample?.witnessDb ?? counterexample?.witeness_db;
+}
+
+function getQ1Result(counterexample: CounterExampleRecord | undefined): QueryResult | undefined {
+    return counterexample?.q1Result ?? counterexample?.q1_result;
+}
+
+function getQ2Result(counterexample: CounterExampleRecord | undefined): QueryResult | undefined {
+    return counterexample?.q2Result ?? counterexample?.q2_result;
+}
+
 function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow; visibleSettings: SettingMeta[]; onClose: () => void }) {
     const [detail, setDetail] = useState<RelaxedEquivalenceRecord | null>(null);
     const [loadingDetail, setLoadingDetail] = useState(false);
@@ -329,9 +346,10 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
     const equivSettings = visibleSettings.filter((setting) => row.labels[setting.key] === true);
     const naSettings = visibleSettings.filter((setting) => row.labels[setting.key] === null || row.labels[setting.key] === undefined);
     const selectedSetting = visibleSettings.find((setting) => setting.key === selectedSettingKey) ?? visibleSettings[0] ?? null;
-    const selectedCounterExample = detail?.counternexample?.find((item) =>
+    const selectedCounterExample = getCounterExamples(detail).find((item) =>
         item.settings.some((setting) => `${setting.db_level}_${setting.query_level}` === selectedSetting?.key)
     );
+    const detailErrorMessage = selectedCounterExample?.error || detail?.error || detailError;
 
     return (
         <div onClick={(event) => { if (event.target === event.currentTarget) onClose(); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
@@ -415,8 +433,8 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
                     <div>
                         <h4 style={{ margin: "0 0 10px", fontFamily: F.display, fontSize: 14, fontWeight: 700, color: C.text }}>Witness Database and Query Results</h4>
                         {loadingDetail ? <div style={{ color: C.muted, fontSize: 12, fontFamily: F.body }}>Loading witness details...</div> : null}
-                        {detailError ? <div style={{ color: C.nequiv, fontSize: 12, fontFamily: F.body }}>{detailError}</div> : null}
-                        {!loadingDetail && !detailError ? (
+                        {detailErrorMessage ? <div style={{ color: C.nequiv, fontSize: 12, fontFamily: F.body }}>{detailErrorMessage}</div> : null}
+                        {!loadingDetail && !detailErrorMessage ? (
                             <div style={{ display: "grid", gap: 16 }}>
                                 {selectedSetting ? (
                                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -436,17 +454,19 @@ function PairDetailModal({ row, visibleSettings, onClose }: { row: AnnotatedRow;
                                             ))}
                                         </div>
                                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                                            <QueryResultCard title="Gold Query Result" result={selectedCounterExample.q1_result} accent="#0550ae" />
-                                            <QueryResultCard title="Pred Query Result" result={selectedCounterExample.q2_result} accent="#6d28d9" />
+                                            <QueryResultCard title="Gold Query Result" result={getQ1Result(selectedCounterExample)} accent="#0550ae" />
+                                            <QueryResultCard title="Pred Query Result" result={getQ2Result(selectedCounterExample)} accent="#6d28d9" />
                                         </div>
                                         <div>
                                             <div style={{ marginBottom: 10, fontFamily: F.body, fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Witness Database</div>
-                                            <WitnessDatabaseCard database={selectedCounterExample.witeness_db} />
+                                            <WitnessDatabaseCard database={getWitnessDatabase(selectedCounterExample)} />
                                         </div>
                                     </div>
                                 ) : (
                                     <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px", background: C.faint, color: C.muted, fontSize: 12, fontFamily: F.body }}>
-                                        No witness database or query results are available for the selected setting.
+                                        {detail?.state === "error"
+                                            ? "The backend reported an evaluation failure for this query pair."
+                                            : "No witness database or query results are available for the selected setting."}
                                     </div>
                                 )}
                             </div>

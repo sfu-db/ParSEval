@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import traceback
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from sqlglot import exp, parse
 from .utils import unique_path
 from .enums import DBLevel, QueryLevel
+from .storage import list_reusable_sqlite_database_files
 
 try:
     from parseval.configuration import DisproverConfig, GeneratorConfig
@@ -31,11 +33,6 @@ def process_ddl_by_db_level(
     exprs = parse(ddl_text, read=dialect)
 
     def transform(node):
-        if db_level == DBLevel.NONE:
-            if isinstance(node, exp.ColumnConstraint):
-                return None
-            if isinstance(node, (exp.PrimaryKey, exp.ForeignKey)):
-                return None
         if db_level == DBLevel.PK_FK:
             if isinstance(node, exp.ColumnConstraint) and not isinstance(
                 node.kind, exp.PrimaryKeyColumnConstraint
@@ -106,7 +103,7 @@ def build_parseval_config(
         username=username,
         password=password,
         query_timeout=_coerce_int(project_settings.get("query_timeout"), 10),
-        global_timeout=_coerce_int(project_settings.get("global_timeout"), 360),
+        global_timeout=_coerce_int(project_settings.get("global_timeout"), 60),
         set_semantic=set_semantic,
         generator=generator_config,
         use_data_generator=False,
@@ -124,24 +121,21 @@ def disprove_queries(
     query_level: str,
     project_settings: dict[str, Any],
     host_or_path: str,
+    generation_root: str | None,
     db_id: str,
     port: int | None = None,
     username: str | None = None,
     password: str | None = None,
 ) -> RunResult:
     existing_dbs = []
+    reusable_database_names: set[str] = set()
     if dialect.lower() == "sqlite":
-        from pathlib import Path
-
-        host_or_path = Path(host_or_path) / dataset / db_id / db_level / query_level
+        host_or_path = Path(generation_root or host_or_path)
         host_or_path.mkdir(parents=True, exist_ok=True)
         host_or_path = str(host_or_path)
-
-        def find_sqlite_files(root_dir):
-            return list(Path(root_dir).rglob("*.sqlite"))
-
-        files = find_sqlite_files(host_or_path)
+        files = list_reusable_sqlite_database_files(Path(host_or_path))
         for f in files:
+            reusable_database_names.add(f.name)
             existing_dbs.append((str(f.parent), f.name, None, None, None))
 
     config = build_parseval_config(
@@ -155,7 +149,7 @@ def disprove_queries(
         password=password,
     )
 
-    return _run_disprover_isolated(
+    result = _run_disprover_isolated(
         q1=q1,
         q2=q2,
         schema=process_ddl_by_db_level(schema, dialect, db_level),
@@ -163,6 +157,24 @@ def disprove_queries(
         config=config,
         existing_dbs=existing_dbs,
     )
+    result.database_name = (
+        Path(str(result.db_id)).name if getattr(result, "db_id", None) else None
+    )
+    if result.database_name is None:
+        result.database_source = "none"
+        result.reuse_hit = False
+        return result
+
+    if result.database_name in reusable_database_names:
+        result.database_source = "reused"
+        result.reuse_hit = True
+    elif dialect.lower() == "sqlite" and result.state in {"NEQ", "EQ", "UNKNOWN"}:
+        result.database_source = "generated"
+        result.reuse_hit = False
+    else:
+        result.database_source = "none"
+        result.reuse_hit = False
+    return result
 
 
 def execution_result_to_payload(
@@ -252,8 +264,6 @@ def _schema_to_ddl_text(
     if isinstance(ddls, list):
         return ";".join(ddls)
 
-    return ddls
-
     statements = []
     for table_name, column_defs in ddls.items():
         columns = [
@@ -314,14 +324,24 @@ def _run_disprover_isolated(
     config: DisproverConfig,
     existing_dbs: list[tuple[str, str, int | None, str | None, str | None]],
 ) -> RunResult:
-    ctx = multiprocessing.get_context("spawn")
+    ctx = _disprover_context()
     result_queue = ctx.Queue(maxsize=1)
     process = ctx.Process(
         target=_disprover_worker,
         args=(result_queue, q1, q2, schema, dialect, config, existing_dbs),
         daemon=True,
     )
-    process.start()
+    try:
+        process.start()
+    except Exception:
+        return _solver_failure_result(
+            q1=q1,
+            q2=q2,
+            host_or_path=config.host_or_path,
+            db_id=config.db_id,
+            set_semantic=config.set_semantic,
+            error_msg=traceback.format_exc(),
+        )
     process.join(timeout=max(config.global_timeout + 5, 5))
 
     if process.is_alive():
@@ -406,3 +426,12 @@ def _solver_failure_result(
         set_semantic=set_semantic,
         error_msg=error_msg,
     )
+
+
+def _disprover_context():
+    available = multiprocessing.get_all_start_methods()
+    if os.name == "posix" and "fork" in available:
+        return multiprocessing.get_context("fork")
+    if "spawn" in available:
+        return multiprocessing.get_context("spawn")
+    return multiprocessing.get_context()

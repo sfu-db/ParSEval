@@ -93,14 +93,14 @@ export default function ModelRunSidebar({
     }
 
     return (
-        <aside className="flex h-full w-full max-w-sm flex-col border-r border-slate-200 bg-slate-50 xl:max-w-md">
-            <div className="border-b border-slate-200 bg-white px-5 py-5">
+        <aside className="flex h-full w-full max-w-sm flex-col border-r border-border/90 bg-sidebar text-sidebar-foreground shadow-[inset_-1px_0_0_rgba(148,163,184,0.16)] xl:max-w-md">
+            <div className="border-b border-border/80 bg-sidebar/95 px-5 py-5 backdrop-blur">
                 <div className="mb-4 flex items-center justify-between gap-3">
                     <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-muted-foreground">
                             Model Runs
                         </p>
-                        <p className="mt-1 text-sm text-slate-600">
+                        <p className="mt-1 text-sm text-foreground/80">
                             {activeCompareIds.length} of {modelRuns.length} visible
                         </p>
                     </div>
@@ -109,19 +109,19 @@ export default function ModelRunSidebar({
                     </Button>
                 </div>
 
-                <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+                <div className="rounded-lg border border-border bg-background/90 px-3 py-2 shadow-sm">
                     <input
                         value={query}
                         onChange={(event) => setQuery(event.target.value)}
                         placeholder="Search model runs..."
-                        className="w-full bg-transparent text-sm text-slate-700 outline-none placeholder:text-slate-400"
+                        className="w-full bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
                     />
                 </div>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto bg-white">
+            <div className="min-h-0 flex-1 overflow-y-auto bg-background/80">
                 {filteredRuns.length === 0 ? (
-                    <div className="px-4 py-10 text-center text-sm text-slate-500">
+                    <div className="px-4 py-10 text-center text-sm text-muted-foreground">
                         No matching model runs
                     </div>
                 ) : (
@@ -135,9 +135,9 @@ export default function ModelRunSidebar({
                                 <div
                                     key={run.id}
                                     className={cn(
-                                        "flex items-center gap-3 border-b border-slate-100 px-4 py-3 last:border-b-0",
-                                        isActive ? "bg-slate-100" : "hover:bg-slate-50",
-                                        !isVisible && "text-slate-400"
+                                        "flex items-center gap-3 border-b border-border/55 px-4 py-3 last:border-b-0 transition-colors",
+                                        isActive ? "bg-accent/90" : "hover:bg-accent/45",
+                                        !isVisible && "text-muted-foreground"
                                     )}
                                 >
                                     <button
@@ -146,8 +146,8 @@ export default function ModelRunSidebar({
                                         className={cn(
                                             "inline-flex size-7 items-center justify-center rounded-md border transition",
                                             isVisible
-                                                ? "border-slate-300 text-slate-700 hover:bg-slate-100"
-                                                : "border-slate-200 text-slate-400 hover:bg-slate-50"
+                                                ? "border-border bg-background/80 text-foreground hover:bg-accent"
+                                                : "border-border/80 bg-transparent text-muted-foreground hover:bg-accent/60"
                                         )}
                                         aria-label={`${isVisible ? "Hide" : "Show"} ${run.run || `run-${run.id}`}`}
                                         title={isVisible ? "Visible" : "Hidden"}
@@ -158,8 +158,8 @@ export default function ModelRunSidebar({
                                         onClick={() => onSelect(run)}
                                         className={cn(
                                             "min-w-0 flex-1 text-left text-sm transition",
-                                            isActive ? "font-medium text-slate-900" : "text-slate-700",
-                                            !isVisible && "text-slate-400"
+                                            isActive ? "font-semibold text-foreground" : "text-foreground/88",
+                                            !isVisible && "text-muted-foreground"
                                         )}
                                     >
                                         <span className="block truncate">{run.run || `run-${run.id}`}</span>
@@ -167,7 +167,7 @@ export default function ModelRunSidebar({
                                     <button
                                         type="button"
                                         onClick={() => onDelete(run)}
-                                        className="inline-flex size-7 items-center justify-center rounded-md border border-slate-200 text-slate-400 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
+                                        className="inline-flex size-7 items-center justify-center rounded-md border border-border/80 text-muted-foreground transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-700"
                                         aria-label={`Delete ${run.run || `run-${run.id}`}`}
                                         title="Delete run"
                                     >
