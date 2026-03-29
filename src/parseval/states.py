@@ -154,6 +154,9 @@ class RunResult:
     state: str
     set_semantic: bool
     error_msg: str = ""
+    reuse_hit: bool = False
+    database_source: str = "none"
+    database_name: str | None = None
 
 
 @dataclass

@@ -24,7 +24,7 @@ def disprove(
     min_rows=3,
     max_tries=2,
     dialect="sqlite",
-    exising_dbs: Optional[List] = None,
+    existing_dbs: Optional[List] = None,
 ):
     from parseval.disprover import Disprover
     from parseval.configuration import DisproverConfig, GeneratorConfig
@@ -59,7 +59,7 @@ def disprove(
         schema=schema,
         dialect=dialect,
         config=config,
-        exisiting_dbs=exising_dbs,
+        existing_dbs=existing_dbs,
     )
     result = klass.run()
     return result
