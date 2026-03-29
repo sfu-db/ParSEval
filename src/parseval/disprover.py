@@ -297,18 +297,18 @@ class Disprover:
             dialect=self.dialect,
         )
         try:
-            # speculative = SpeculativeGenerator(
-            #     query,
-            #     instance,
-            #     generator_config=self.config.generator,
-            # )
-            # speculative.generate(
-            #     early_stoper=self.early_stop,
-            #     stop_event=self.stop_event,
-            #     timeout=self.config.global_timeout,
-            # )
-            # if self.stop_event.is_set():
-            #     return
+            speculative = SpeculativeGenerator(
+                query,
+                instance,
+                generator_config=self.config.generator,
+            )
+            speculative.generate(
+                early_stoper=self.early_stop,
+                stop_event=self.stop_event,
+                timeout=self.config.global_timeout,
+            )
+            if self.stop_event.is_set():
+                return
 
             if self.config.use_data_generator:
                 generator = DataGenerator(
