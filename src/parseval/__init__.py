@@ -1,7 +1,16 @@
 from .utils import Logger
+from .datasets import get_schema_ddl, iter_examples, load_dev_examples, load_schema_map
 from .main import disprove, instantiate_db
 
-__all__ = ["disprove", "instantiate_db", "Logger"]
+__all__ = [
+    "disprove",
+    "instantiate_db",
+    "Logger",
+    "load_dev_examples",
+    "load_schema_map",
+    "get_schema_ddl",
+    "iter_examples",
+]
 
 
 # import os, re

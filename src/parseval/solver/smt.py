@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import z3
@@ -262,7 +262,7 @@ def _from_seconds(seconds: int) -> time:
 
 
 def _from_epoch_second(value: int) -> datetime:
-    return datetime.utcfromtimestamp(value)
+    return datetime.fromtimestamp(value, tz=UTC).replace(tzinfo=None)
 
 
 def normalize_dtype(
@@ -564,6 +564,11 @@ class SMTSolver:
             "NULLIF": self._translate_nullif,
             "BETWEEN": self._translate_between,
             "IN": self._translate_in,
+            "CASE": self._translate_case,
+            "IF": self._translate_if,
+            "COALESCE": self._translate_coalesce,
+            "NEG": self._translate_neg,
+            "DPIPE": self._translate_dpipe,
         }
 
     def add(self, constraint, track_vars: bool = True):
@@ -646,6 +651,66 @@ class SMTSolver:
         typeinfo = normalize_dtype(dtype, self.z3ctx)
         option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, self.z3ctx)
         return SMTValue(option_sort.Some(payload), typeinfo)
+
+    def _wrap_nullable_payload(self, source: SMTValue, payload: z3.ExprRef, dtype: DataType) -> SMTValue:
+        typeinfo = normalize_dtype(dtype, self.z3ctx)
+        option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(_value_some(source), option_sort.Some(payload), option_sort.NULL),
+            typeinfo,
+        )
+
+    def _coerce_value_to_type(self, value: SMTValue, target_dtype: DataType) -> SMTValue:
+        target_type = normalize_dtype(target_dtype, self.z3ctx)
+        if value.typeinfo.family == target_type.family:
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        if value.is_null_literal:
+            return _null_value(target_type, self.z3ctx)
+        raw = _value_payload(value)
+        if target_type.family == "real" and value.typeinfo.family == "int":
+            return self._wrap_payload(z3.ToReal(raw), target_type.dtype)
+        if target_type.family == "int" and value.typeinfo.family == "real":
+            return self._wrap_payload(z3.ToInt(raw), target_type.dtype)
+        if target_type.family == "text":
+            if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"}:
+                return self._wrap_payload(z3.IntToStr(raw), target_type.dtype)
+            if value.typeinfo.family == "bool":
+                return self._wrap_payload(
+                    z3.If(
+                        raw,
+                        z3.StringVal("TRUE", ctx=self.z3ctx),
+                        z3.StringVal("FALSE", ctx=self.z3ctx),
+                    ),
+                    target_type.dtype,
+                )
+        if target_type.family == "int" and value.typeinfo.family == "text":
+            return self._wrap_payload(z3.StrToInt(raw), target_type.dtype)
+        raise UnsupportedSMTError(
+            f"Unsupported conversion from {value.typeinfo.logical_name} to {target_type.logical_name}"
+        )
+
+    def _common_case_dtype(self, expression: exp.Expression, branches: Sequence[SMTValue]) -> DataType:
+        annotated = getattr(expression, "type", None)
+        if annotated is not None and not DataType.build(annotated).is_type(DataType.Type.UNKNOWN):
+            return annotated
+        families = {branch.typeinfo.family for branch in branches}
+        if "text" in families:
+            return DataType.build("TEXT")
+        if "real" in families:
+            return DataType.build("FLOAT")
+        if "int" in families:
+            return DataType.build("INT")
+        if "bool" in families:
+            return DataType.build("BOOLEAN")
+        if "datetime" in families:
+            return DataType.build("DATETIME")
+        if "timestamp" in families:
+            return DataType.build("TIMESTAMP")
+        if "date" in families:
+            return DataType.build("DATE")
+        if "time" in families:
+            return DataType.build("TIME")
+        return branches[0].typeinfo.dtype
 
     def _nullable_numeric_binary(
         self,
@@ -830,11 +895,25 @@ class SMTSolver:
         if value.is_null_literal:
             return _null_value(to_type, self.z3ctx)
         raw = _value_payload(value)
+        if value.typeinfo.family in {"date", "time", "datetime", "timestamp"} and to_type.family in {
+            "date",
+            "time",
+            "datetime",
+            "timestamp",
+        }:
+            if value.typeinfo.family == "date" and to_type.family in {"datetime", "timestamp"}:
+                return self._wrap_nullable_payload(value, raw * 86400, to_type.dtype)
+            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "date":
+                return self._wrap_nullable_payload(value, raw / 86400, to_type.dtype)
+            if value.typeinfo.family == "time" and to_type.family in {"datetime", "timestamp"}:
+                return self._wrap_nullable_payload(value, raw, to_type.dtype)
+            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "time":
+                return self._wrap_nullable_payload(value, raw % 86400, to_type.dtype)
         if to_type.family == "text":
             converted = z3.IntToStr(raw) if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"} else raw
-            return self._wrap_payload(converted, to_type.dtype)
+            return self._wrap_nullable_payload(value, converted, to_type.dtype)
         if to_type.family == "int" and value.typeinfo.family == "text":
-            return self._wrap_payload(z3.StrToInt(raw), to_type.dtype)
+            return self._wrap_nullable_payload(value, z3.StrToInt(raw), to_type.dtype)
         raise UnsupportedSMTError(
             f"Unsupported CAST from {value.typeinfo.logical_name} to {to_type.logical_name}"
         )
@@ -883,6 +962,87 @@ class SMTSolver:
             candidate = self._as_value(self._to_z3_expr(candidate_expr))
             clauses.append(self._compare_values(needle, candidate, lambda a, b: a == b))
         return z3.Or(*clauses) if clauses else z3.BoolVal(False, ctx=self.z3ctx)
+
+    def _translate_neg(self, expression: exp.Expression) -> SMTValue:
+        value = self._as_value(self._to_z3_expr(expression.this))
+        return self._nullable_unary(value, lambda raw: -raw, value.typeinfo.dtype)
+
+    def _translate_dpipe(self, expression: exp.Expression) -> SMTValue:
+        left = self._coerce_value_to_type(
+            self._as_value(self._to_z3_expr(expression.this)),
+            DataType.build("TEXT"),
+        )
+        right = self._coerce_value_to_type(
+            self._as_value(self._to_z3_expr(expression.expression)),
+            DataType.build("TEXT"),
+        )
+        result_type = normalize_dtype(DataType.build("TEXT"), self.z3ctx)
+        option_sort = OptionTypeRegistry.get(result_type.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(
+                z3.And(_value_some(left), _value_some(right)),
+                option_sort.Some(z3.Concat(_value_payload(left), _value_payload(right))),
+                option_sort.NULL,
+            ),
+            result_type,
+        )
+
+    def _translate_if(self, expression: exp.Expression) -> SMTValue:
+        condition = self._as_predicate(self._to_z3_expr(expression.this))
+        true_value = self._as_value(self._to_z3_expr(expression.args["true"]))
+        false_expr = expression.args.get("false")
+        false_value = (
+            self._as_value(self._to_z3_expr(false_expr))
+            if false_expr is not None
+            else _null_value(normalize_dtype(true_value.typeinfo.dtype, self.z3ctx), self.z3ctx)
+        )
+        result_dtype = self._common_case_dtype(expression, [true_value, false_value])
+        true_value = self._coerce_value_to_type(true_value, result_dtype)
+        false_value = self._coerce_value_to_type(false_value, result_dtype)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        option_sort = OptionTypeRegistry.get(result_type.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(condition, true_value.expr, false_value.expr),
+            result_type,
+        )
+
+    def _translate_case(self, expression: exp.Expression) -> SMTValue:
+        branches: List[Tuple[z3.BoolRef, SMTValue]] = []
+        for when in expression.args.get("ifs") or []:
+            predicate = self._as_predicate(self._to_z3_expr(when.this))
+            branch_value = self._as_value(self._to_z3_expr(when.args["true"]))
+            branches.append((predicate, branch_value))
+        default_expr = expression.args.get("default")
+        if default_expr is not None:
+            default_value = self._as_value(self._to_z3_expr(default_expr))
+        elif branches:
+            default_value = _null_value(
+                normalize_dtype(branches[0][1].typeinfo.dtype, self.z3ctx), self.z3ctx
+            )
+        else:
+            default_value = encode_literal(DataType.build("NULL"), None, self.z3ctx)
+        all_values = [value for _, value in branches] + [default_value]
+        result_dtype = self._common_case_dtype(expression, all_values)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        default_value = self._coerce_value_to_type(default_value, result_dtype)
+        branch_expr = default_value.expr
+        for predicate, value in reversed(branches):
+            coerced = self._coerce_value_to_type(value, result_dtype)
+            branch_expr = z3.If(predicate, coerced.expr, branch_expr)
+        return SMTValue(branch_expr, result_type)
+
+    def _translate_coalesce(self, expression: exp.Expression) -> SMTValue:
+        args = [self._as_value(self._to_z3_expr(arg)) for arg in expression.expressions]
+        if not args:
+            return encode_literal(DataType.build("NULL"), None, self.z3ctx)
+        result_dtype = self._common_case_dtype(expression, args)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        fallback = _null_value(result_type, self.z3ctx)
+        expr = fallback.expr
+        for arg in reversed(args):
+            coerced = self._coerce_value_to_type(arg, result_dtype)
+            expr = z3.If(_value_some(coerced), coerced.expr, expr)
+        return SMTValue(expr, result_type)
 
     def _function_name(self, expression: exp.Expression) -> Optional[str]:
         if isinstance(expression, exp.Anonymous):
@@ -1098,14 +1258,22 @@ def _translate_substr(
     length = solver._as_value(args[2]) if len(args) > 2 else None
     result_type = normalize_dtype(DataType.build("TEXT"), solver.z3ctx)
     option_sort = OptionTypeRegistry.get(result_type.payload_sort, solver.z3ctx)
-    start_payload = z3.If(_value_payload(start) >= 1, _value_payload(start) - 1, 0)
+    raw_source = _value_payload(source)
+    raw_start = _value_payload(start)
+    source_len = z3.Length(raw_source)
+    start_payload = z3.If(
+        raw_start >= 1,
+        raw_start - 1,
+        z3.If(raw_start < 0, source_len + raw_start, 0),
+    )
+    start_payload = z3.If(start_payload >= 0, start_payload, 0)
     if length is None:
         body = z3.SubString(
-            _value_payload(source), start_payload, z3.Length(_value_payload(source))
+            raw_source, start_payload, source_len
         )
         some = z3.And(_value_some(source), _value_some(start))
     else:
-        body = z3.SubString(_value_payload(source), start_payload, _value_payload(length))
+        body = z3.SubString(raw_source, start_payload, _value_payload(length))
         some = z3.And(_value_some(source), _value_some(start), _value_some(length))
     return SMTValue(z3.If(some, option_sort.Some(body), option_sort.NULL), result_type)
 

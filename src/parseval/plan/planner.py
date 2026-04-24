@@ -26,6 +26,7 @@ class ScopeNode:
     dependencies: Set[int] = field(default_factory=set)
     dependents: Set[int] = field(default_factory=set)
     outputs: List[Tuple] = field(default_factory=list)
+    is_correlated_dependency: bool = False
 
     def add_dependency(self, node_id: int):
         self.dependencies.add(node_id)
@@ -65,10 +66,6 @@ class Graph:
             node: GraphNode to add
         """
         self.nodes[node.node_id] = node
-
-        # Set root if this is the first node
-        if self.root_node_id is None:
-            self.root_node_id = node.node_id
 
     def add_edge(self, from_node_id: int, to_node_id: int) -> None:
         """Add a dependency edge between nodes.
@@ -176,6 +173,78 @@ class Graph:
         return descendants
 
 
+def _scope_local_base_tables(scope: Scope) -> Set[str]:
+    names = set()
+    for table in scope.expression.find_all(exp.Table):
+        names.add(normalize_name(table.name))
+    return names
+
+
+def _parent_alias_base_tables(scope: Scope) -> Dict[str, str]:
+    if scope.parent is None:
+        return {}
+    alias_to_table: Dict[str, str] = {}
+    for source in scope.parent.expression.find_all(exp.Table):
+        alias = source.alias_or_name
+        if not alias:
+            continue
+        alias_to_table[normalize_name(alias)] = normalize_name(source.name)
+    return alias_to_table
+
+
+def _projection_column_keys(scope: Scope) -> Set[Tuple[str, str]]:
+    if not isinstance(scope.expression, exp.Select):
+        return set()
+    keys = set()
+    for projection in scope.expression.expressions:
+        for column in projection.find_all(exp.Column):
+            keys.add((normalize_name(column.table or ""), normalize_name(column.name)))
+    return keys
+
+
+def _non_projection_column_keys(scope: Scope) -> Set[Tuple[str, str]]:
+    if not isinstance(scope.expression, exp.Select):
+        return set()
+    keys = set()
+    for arg_name, arg_value in scope.expression.args.items():
+        if arg_name == "expressions" or arg_value is None:
+            continue
+        if isinstance(arg_value, list):
+            items = arg_value
+        else:
+            items = [arg_value]
+        for item in items:
+            if not isinstance(item, exp.Expression):
+                continue
+            for column in item.find_all(exp.Column):
+                keys.add((normalize_name(column.table or ""), normalize_name(column.name)))
+    return keys
+
+
+def _has_true_parent_correlation(scope: Scope) -> bool:
+    external_columns = list(getattr(scope, "external_columns", []) or [])
+    if not external_columns or scope.parent is None:
+        return False
+
+    local_base_tables = _scope_local_base_tables(scope)
+    parent_alias_to_base = _parent_alias_base_tables(scope)
+    projection_keys = _projection_column_keys(scope)
+    non_projection_keys = _non_projection_column_keys(scope)
+
+    for column in external_columns:
+        table_name = normalize_name(column.table) if column.table else None
+        column_key = (normalize_name(column.table or ""), normalize_name(column.name))
+        if column_key in projection_keys and column_key not in non_projection_keys:
+            continue
+        if not table_name:
+            return True
+        parent_base = parent_alias_to_base.get(table_name)
+        if parent_base is not None and parent_base in local_base_tables:
+            continue
+        return True
+    return False
+
+
 def build_graph_from_scopes(expr: exp.Expression) -> Graph:
     """Build a dependency graph from a list of scopes.
 
@@ -191,15 +260,23 @@ def build_graph_from_scopes(expr: exp.Expression) -> Graph:
         node = ScopeNode(node_id=index, scope=scope)
         mappings[scope.expression] = index
         graph.add_node(node)
+        if scope.parent is None:
+            graph.root_node_id = index
 
     for index, scope in enumerate(scopes):
         node = graph.get_node(index)
         if not node or scope.parent is None:
             continue
         parent_id = mappings[scope.parent.expression]
-        if scope.is_correlated_subquery:
+        if _has_true_parent_correlation(scope):
+            node.is_correlated_dependency = True
             graph.add_edge(from_node_id=index, to_node_id=parent_id)
-        elif scope.is_subquery or scope.is_cte or scope.is_union:
+        elif (
+            isinstance(scope.expression.parent, exp.Subquery)
+            or scope.is_subquery
+            or scope.is_cte
+            or scope.is_union
+        ):
             graph.add_edge(from_node_id=parent_id, to_node_id=index)
     return graph
 
@@ -249,7 +326,7 @@ class Planner:
         return self._scope.node_id
 
     def context(self, tables):
-        return Context(tables=tables)
+        return Context(tables=tables, external=self.ctx)
 
     def _expression_label(self, expression: Any) -> str:
         if isinstance(expression, exp.Expression):
@@ -708,7 +785,7 @@ class Planner:
 
     def join(self, node: Join, context):
         source = node.source_name
-        source_table = context.tables[source]
+        source_table = context.resolve_table(source)
         source_context = self.context({source: source_table})
         column_ranges = {source: range(0, len(source_table.columns))}
 
@@ -725,7 +802,7 @@ class Planner:
 
         # logger.info(f"column ranges: {column_ranges}")
         for name, join in node.joins.items():
-            table = context.tables[name]
+            table = context.resolve_table(name)
             join_context = self.context({name: table})
             kind = join["side"]
 
@@ -743,7 +820,7 @@ class Planner:
             cursor = 0
             for table_name in [source] + list(node.joins.keys()):
                 table_columns = []
-                for col in context.tables[table_name].columns:
+                for col in context.resolve_table(table_name).columns:
                     col_key = normalize_name(col)
                     if col_key in offsets:
                         continue
@@ -1238,12 +1315,35 @@ class Planner:
 
         sink = self.derived_schema(left.columns)
 
+        def row_signature(row):
+            return tuple(
+                row[column].concrete if column in row else None for column in sink.columns
+            )
+
+        def unique_rows(rows):
+            seen = {}
+            for row in rows:
+                seen.setdefault(row_signature(row), row)
+            return seen
+
+        left_unique = unique_rows(left.rows)
+        right_unique = unique_rows(right.rows)
+
         if issubclass(node.op, exp.Intersect):
-            sink.rows = list(set(left.rows).intersection(set(right.rows)))
+            sink.rows = [
+                left_unique[key]
+                for key in left_unique.keys() & right_unique.keys()
+            ]
         elif issubclass(node.op, exp.Except):
-            sink.rows = list(set(left.rows).difference(set(right.rows)))
+            sink.rows = [
+                left_unique[key]
+                for key in left_unique.keys() - right_unique.keys()
+            ]
         elif issubclass(node.op, exp.Union) and node.distinct:
-            sink.rows = list(set(left.rows).union(set(right.rows)))
+            merged = dict(left_unique)
+            for key, row in right_unique.items():
+                merged.setdefault(key, row)
+            sink.rows = list(merged.values())
         else:
             sink.rows = left.rows + right.rows
         if not math.isinf(node.limit):
