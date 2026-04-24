@@ -135,6 +135,71 @@ class TestSMTSolverSupportedConstraints(SMTSolverTestCase):
 
 
 class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
+    def test_case_can_drive_integer_model_generation(self):
+        predicate = exp.EQ(
+            this=exp.Case(
+                ifs=[
+                    exp.If(
+                        this=exp.GT(
+                            this=column("users", "age", "INT"),
+                            expression=number(18),
+                        ),
+                        true=number(1),
+                    )
+                ],
+                default=number(0),
+            ),
+            expression=number(1),
+        )
+
+        sat, model = self.solve_expr(predicate)
+
+        self.assertEqual("sat", sat)
+        self.assertGreater(model["users.age"], 18)
+
+    def test_case_preserves_text_branch_values(self):
+        predicate = exp.EQ(
+            this=exp.Case(
+                ifs=[
+                    exp.If(
+                        this=exp.EQ(
+                            this=column("users", "age", "INT"),
+                            expression=number(7),
+                        ),
+                        true=text("seven"),
+                    )
+                ],
+                default=text("other"),
+            ),
+            expression=text("seven"),
+        )
+
+        sat, model = self.solve_expr(predicate)
+
+        self.assertEqual("sat", sat)
+        self.assertEqual(7, model["users.age"])
+
+    def test_coalesce_prefers_first_non_null_value(self):
+        predicate = exp.And(
+            this=exp.Is(
+                this=column("users", "nickname", "TEXT"),
+                expression=exp.Null(),
+            ),
+            expression=exp.EQ(
+                this=exp.Coalesce(
+                    this=column("users", "nickname", "TEXT"),
+                    expressions=[column("users", "name", "TEXT"), text("fallback")],
+                ),
+                expression=text("chosen"),
+            ),
+        )
+
+        sat, model = self.solve_expr(predicate)
+
+        self.assertEqual("sat", sat)
+        self.assertIsNone(model["users.nickname"])
+        self.assertEqual("chosen", model["users.name"])
+
     def test_like_translation_supports_literal_patterns(self):
         sat, model = self.solve_expr(
             exp.Like(
@@ -280,6 +345,19 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
         self.assertEqual("sat", sat)
         self.assertEqual("ab", model["users.name"][:2])
 
+    def test_substr_with_negative_start_is_supported(self):
+        expr = exp.EQ(
+            this=exp.Anonymous(
+                this="SUBSTR",
+                expressions=[column("users", "name", "TEXT"), exp.Neg(this=number(2))],
+            ),
+            expression=text("yz"),
+        )
+        sat, model = self.solve_expr(expr)
+
+        self.assertEqual("sat", sat)
+        self.assertTrue(model["users.name"].endswith("yz"))
+
     def test_instr_is_supported(self):
         expr = exp.EQ(
             this=exp.Anonymous(
@@ -293,6 +371,19 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
         self.assertEqual("sat", sat)
         self.assertEqual(1, model["users.name"].find("x"))
 
+    def test_string_concatenation_operator_is_supported(self):
+        expr = exp.EQ(
+            this=exp.DPipe(
+                this=column("users", "prefix", "TEXT"),
+                expression=column("users", "suffix", "TEXT"),
+            ),
+            expression=text("abcdef"),
+        )
+        sat, model = self.solve_expr(expr)
+
+        self.assertEqual("sat", sat)
+        self.assertEqual("abcdef", model["users.prefix"] + model["users.suffix"])
+
     def test_strftime_year_is_supported(self):
         expr = exp.EQ(
             this=exp.TimeToStr(
@@ -305,6 +396,23 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
 
         self.assertEqual("sat", sat)
         self.assertEqual(2024, model["events.created_at"].year)
+
+    def test_strftime_after_date_to_timestamp_cast_is_supported(self):
+        expr = exp.GT(
+            this=exp.TimeToStr(
+                this=exp.Cast(
+                    this=column("events", "opened_on", "DATE"),
+                    to=DataType.build("TIMESTAMP"),
+                ),
+                format=text("%Y"),
+            ),
+            expression=text("1991"),
+        )
+
+        sat, model = self.solve_expr(expr)
+
+        self.assertEqual("sat", sat)
+        self.assertGreater(model["events.opened_on"].year, 1991)
 
 
 class TestSMTSolverDatatypeBehavior(SMTSolverTestCase):

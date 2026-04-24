@@ -16,6 +16,7 @@ from parseval.db_manager import DBManager
 from parseval.instance import Instance
 from parseval.query import preprocess_sql
 from parseval.speculative import SpeculativeGenerator
+from parseval.generation_policy import analyze_smt_generation_support
 from parseval.states import ExecutionResult, RunResult
 
 logger = logging.getLogger("parseval.eq")
@@ -297,20 +298,8 @@ class Disprover:
             dialect=self.dialect,
         )
         try:
-            speculative = SpeculativeGenerator(
-                query,
-                instance,
-                generator_config=self.config.generator,
-            )
-            speculative.generate(
-                early_stoper=self.early_stop,
-                stop_event=self.stop_event,
-                timeout=self.config.global_timeout,
-            )
-            if self.stop_event.is_set():
-                return
-
-            if self.config.use_data_generator:
+            capability = analyze_smt_generation_support(query)
+            if self.config.use_data_generator and capability.can_use_smt:
                 generator = DataGenerator(
                     query,
                     instance,
@@ -325,6 +314,24 @@ class Disprover:
                         "stop_event": self.stop_event,
                         "timeout": self.config.global_timeout,
                     },
+                )
+                if self.stop_event.is_set():
+                    return
+            elif not capability.can_use_smt:
+                logger.info(
+                    "Using speculative generation for %s because SMT support is incomplete: %s",
+                    generator_id,
+                    ", ".join(capability.reasons),
+                )
+                speculative = SpeculativeGenerator(
+                    query,
+                    instance,
+                    generator_config=self.config.generator,
+                )
+                speculative.generate(
+                    early_stoper=self.early_stop,
+                    stop_event=self.stop_event,
+                    timeout=self.config.global_timeout,
                 )
         except FunctionTimedOut:
             logger.warning("Generator %s timed out", generator_id)

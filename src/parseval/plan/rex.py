@@ -162,6 +162,7 @@ OPS = {
     "CASE": _case_op,
     "IF": _case_op,
     "CAST": lambda value: value,
+    "ORDERED": lambda value, desc=None, nulls_first=False: value,
     "DIV": _safe_div,
     "NULLIF": _nullif,
     "BETWEEN": _between,

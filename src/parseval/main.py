@@ -1,5 +1,8 @@
 from typing import List, Optional
 from parseval.query import preprocess_sql
+import logging
+
+logger = logging.getLogger("parseval.coverage")
 
 
 def disprove(
@@ -85,10 +88,11 @@ def instantiate_db(
     min_rows=3,
     max_tries=2,
     dialect="sqlite",
+    allow_speculative_fallback=True,
 ):
-    from parseval.speculative import SpeculativeGenerator
     from parseval.data_generator import DataGenerator
     from parseval.configuration import GeneratorConfig
+    from parseval.generation_policy import analyze_smt_generation_support
     from parseval.instance import Instance
     from parseval.db_manager import DBManager
     import threading
@@ -136,23 +140,40 @@ def instantiate_db(
     )
 
     expr = preprocess_sql(query, instance, dialect=dialect)
+    capability = analyze_smt_generation_support(expr)
 
-    spec = SpeculativeGenerator(expr, instance, generator_config=generator_config)
-    spec.generate(
-        early_stoper=early_stop,
-        stop_event=stop_event,
-        timeout=global_timeout,
-    )
-    # if early_stop(instance):
-    #     return instance
+    if capability.can_use_smt:
+        generator = DataGenerator(
+            expr=expr,
+            instance=instance,
+            verbose=False,
+            config=generator_config,
+        )
+        generator.generate(
+            early_stop=early_stop,
+            stop_event=stop_event,
+            timeout=global_timeout,
+        )
+        if early_stop(instance):
+            return instance
+        logger.info(
+            "SMT generator did not produce a witness for %s; returning the SMT-built instance without speculative fallback.",
+            db_id,
+        )
+        return instance
+
+    if allow_speculative_fallback:
+        from parseval.speculative import SpeculativeGenerator
+
+        logger.info(
+            "Falling back to speculative generation for %s because SMT support is incomplete: %s",
+            db_id,
+            ", ".join(capability.reasons),
+        )
+        spec = SpeculativeGenerator(expr, instance, generator_config=generator_config)
+        spec.generate(
+            early_stoper=early_stop,
+            stop_event=stop_event,
+            timeout=global_timeout,
+        )
     return instance
-    # generator = DataGenerator(
-    #     query,
-    #     instance,
-    #     verbose=False,
-    #     config=generator_config,
-    # )
-
-    # generator.generate(early_stop=early_stop, stop_event=stop_event)
-
-    # early_stop(instance)

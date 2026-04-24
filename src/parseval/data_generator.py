@@ -3,8 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from functools import reduce
 import time, threading
+import random
 from typing import (
     Any,
     Callable,
@@ -26,13 +28,15 @@ from parseval.instance import Instance
 from parseval.plan import (
     Planner,
     Context,
+    DerivedSchema,
     build_context_from_instance,
     build_graph_from_scopes,
 )
 from parseval.plan.helper import to_literal
-from parseval.plan.rex import Symbol, negate_predicate
+from parseval.plan.rex import Const, Row, Symbol, negate_predicate
 from parseval.solver.smt import SMTSolver
 from parseval.uexpr.uexprs import Constraint, UExprToConstraint
+from parseval.dtype import DataType
 
 from .configuration import Config
 
@@ -402,19 +406,13 @@ class OperatorRuleRegistry:
             return self._result(request, sql_condition)
 
         refs = self._columns_from_expr(sql_condition)
-        concretes: Dict[str, List[Any]] = {}
-        for column in refs:
-            values = []
-            for row in getattr(agg_group, "group_values", []):
-                values.append(row[column.name])
-            concretes[column.sql()] = values
+        group_rows = list(getattr(agg_group, "group_values", []))
 
         replacements: Dict[int, exp.Expression] = {}
         for agg_func in sql_condition.find_all(exp.AggFunc):
             replacement = self._aggregate_replacement(
                 agg_func=agg_func,
-                concretes=concretes,
-                group_size=len(getattr(agg_group, "group_values", [])),
+                group_rows=group_rows,
             )
             if replacement is not None:
                 replacements[id(agg_func)] = replacement
@@ -432,43 +430,79 @@ class OperatorRuleRegistry:
     def _aggregate_replacement(
         self,
         agg_func: exp.AggFunc,
-        concretes: Dict[str, List[Any]],
-        group_size: int,
+        group_rows: Sequence[Row],
     ) -> Optional[exp.Expression]:
-        columns = list(agg_func.find_all(exp.Column))
-        if isinstance(agg_func, exp.Count):
-            if not columns:
-                return to_literal(group_size, exp.DataType.build("INT"))
-            key = columns[0].sql()
-            values = [
-                value.concrete
-                for value in concretes.get(key, [])
-                if value.concrete is not None
-            ]
-            if agg_func.find(exp.Distinct):
-                values = list(dict.fromkeys(values))
-            return to_literal(len(values), exp.DataType.build("INT"))
-        if not columns:
+        def operand_expressions() -> List[exp.Expression]:
+            distinct = agg_func.find(exp.Distinct)
+            if distinct is not None:
+                return list(distinct.expressions)
+            if agg_func.this is None:
+                return []
+            return [agg_func.this]
+
+        def evaluate_expression(expression: exp.Expression, row: Row) -> Any:
+            transformed = expression.transform(
+                lambda node: row[node.name] if isinstance(node, exp.Column) else node,
+                copy=True,
+            )
+            if isinstance(transformed, Symbol):
+                return transformed.concrete
+            return getattr(transformed, "concrete", None)
+
+        def expression_datatype(expression: exp.Expression) -> Optional[exp.DataType]:
+            datatype = getattr(expression, "type", None)
+            if datatype is not None:
+                return datatype
+            for column in expression.find_all(exp.Column):
+                dtype = getattr(column, "type", None)
+                if dtype is not None:
+                    return dtype
             return None
-        column = columns[0]
-        key = column.sql()
-        values = [
-            value.concrete
-            for value in concretes.get(key, [])
-            if value.concrete is not None
-        ]
+
+        operands = operand_expressions()
+        columns = list(agg_func.find_all(exp.Column))
+        operand_dtype = expression_datatype(operands[0]) if operands else None
+
+        if isinstance(agg_func, exp.Count):
+            if not operands:
+                return to_literal(len(group_rows), exp.DataType.build("INT"))
+            if agg_func.find(exp.Distinct):
+                values = []
+                for row in group_rows:
+                    evaluated = tuple(evaluate_expression(expr, row) for expr in operands)
+                    if any(value is None for value in evaluated):
+                        continue
+                    values.append(evaluated)
+                distinct_values = list(dict.fromkeys(values))
+                return to_literal(len(distinct_values), exp.DataType.build("INT"))
+            values = [
+                evaluate_expression(operands[0], row)
+                for row in group_rows
+            ]
+            return to_literal(
+                len([value for value in values if value is not None]),
+                exp.DataType.build("INT"),
+            )
+        if not operands:
+            return None
+        column = columns[0] if columns else None
+        values = [evaluate_expression(operands[0], row) for row in group_rows]
+        values = [value for value in values if value is not None]
         if not values:
-            return self._null_for(column)
+            return self._null_for(column or exp.Column(this="expr", _type=operand_dtype))
         if agg_func.find(exp.Distinct):
             values = list(dict.fromkeys(values))
         if isinstance(agg_func, exp.Sum):
-            return self._literal_for(sum(values), column)
+            return to_literal(sum(values), operand_dtype or getattr(column, "type", None))
         if isinstance(agg_func, exp.Max):
-            return self._literal_for(max(values), column)
+            return to_literal(max(values), operand_dtype or getattr(column, "type", None))
         if isinstance(agg_func, exp.Min):
-            return self._literal_for(min(values), column)
+            return to_literal(min(values), operand_dtype or getattr(column, "type", None))
         if isinstance(agg_func, exp.Avg):
-            return self._literal_for(sum(values) / len(values), column)
+            return to_literal(
+                sum(values) / len(values),
+                operand_dtype or getattr(column, "type", None),
+            )
         return None
 
     def _sort_extreme(
@@ -525,24 +559,49 @@ class DataGenerator(BaseGenerator):
         self.table_to_vars: Dict[str, List[exp.Column]] = {}
         self.table_column_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {}
         self.columnref_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {}
+        self.bound_column_to_vars: Dict[Tuple[str, str], List[exp.Column]] = {}
+        self.active_bound_tables: Dict[str, DerivedSchema] = {}
         self.scope_results: Dict[int, ScopeSolveResult] = {}
         self.operator_rules = OperatorRuleRegistry()
 
-    def _predicate_constraints(self) -> List[exp.Expression]:
+    def _predicate_constraints_for(
+        self, expression: exp.Expression
+    ) -> List[exp.Expression]:
         constraints: List[exp.Expression] = []
-        for predicate in self.expr.find_all(exp.Predicate):
-            normalized = self._normalize_predicate_constraint(predicate)
-            if normalized is not None:
-                constraints.append(normalized)
-        for between in self.expr.find_all(exp.Between):
-            normalized = self._normalize_predicate_constraint(between)
-            if normalized is not None:
-                constraints.append(normalized)
-        for in_expr in self.expr.find_all(exp.In):
-            normalized = self._normalize_predicate_constraint(in_expr)
-            if normalized is not None:
-                constraints.append(normalized)
+        seen = set()
+        predicate_types = (
+            exp.EQ,
+            exp.NEQ,
+            exp.GT,
+            exp.GTE,
+            exp.LT,
+            exp.LTE,
+            exp.Like,
+            exp.ILike,
+            exp.Between,
+            exp.In,
+        )
+        for predicate_type in predicate_types:
+            for predicate in expression.find_all(predicate_type):
+                normalized = self._normalize_predicate_constraint(predicate)
+                candidate = normalized
+                if (
+                    candidate is None
+                    and self._extract_seedable_predicate(predicate) is None
+                    and self._extract_text_seedable_predicate(predicate) is None
+                ):
+                    continue
+                if candidate is None:
+                    candidate = predicate.copy()
+                sql = candidate.sql(dialect=self.dialect)
+                if sql in seen:
+                    continue
+                seen.add(sql)
+                constraints.append(candidate)
         return constraints
+
+    def _predicate_constraints(self) -> List[exp.Expression]:
+        return self._predicate_constraints_for(self.expr)
 
     def _normalize_predicate_constraint(
         self, predicate: exp.Expression
@@ -570,9 +629,413 @@ class DataGenerator(BaseGenerator):
             return None
         return None
 
-    def _propagate_query_constraints_to_domains(self) -> int:
+    def _extract_seed_target(
+        self, expression: exp.Expression
+    ) -> Optional[Tuple[str, exp.Column]]:
+        if isinstance(expression, exp.Column):
+            return "raw", expression
+
+        if isinstance(expression, (exp.Cast, exp.TsOrDsToTimestamp)):
+            inner = expression.this
+            if isinstance(inner, exp.Column):
+                return self._extract_seed_target(inner)
+
+        is_strftime = isinstance(expression, exp.TimeToStr) or (
+            isinstance(expression, exp.Anonymous)
+            and (expression.name or "").upper() == "STRFTIME"
+        )
+        if not is_strftime:
+            return None
+
+        if isinstance(expression, exp.TimeToStr):
+            fmt_expr = expression.args.get("format")
+            value_expr = expression.this
+        else:
+            args = list(expression.expressions)
+            if len(args) != 2:
+                return None
+            fmt_expr, value_expr = args
+
+        if not isinstance(fmt_expr, exp.Literal) or fmt_expr.name != "%Y":
+            return None
+
+        if isinstance(value_expr, (exp.Cast, exp.TsOrDsToTimestamp)):
+            value_expr = value_expr.this
+        if isinstance(value_expr, exp.Column):
+            return "strftime_year", value_expr
+        return None
+
+    def _extract_text_seed_target(
+        self, expression: exp.Expression
+    ) -> Optional[Tuple[str, exp.Column, Dict[str, Any]]]:
+        if isinstance(expression, exp.Length):
+            column = expression.this
+            if isinstance(column, exp.Column):
+                return "length", column, {}
+
+        is_substr = isinstance(expression, exp.Substring) or (
+            isinstance(expression, exp.Anonymous)
+            and (expression.name or "").upper() in {"SUBSTR", "SUBSTRING"}
+        )
+        if not is_substr:
+            return None
+
+        if isinstance(expression, exp.Substring):
+            source = expression.this
+            start_expr = expression.args.get("start")
+            length_expr = expression.args.get("length")
+        else:
+            args = list(expression.expressions)
+            if len(args) < 2:
+                return None
+            source = args[0]
+            start_expr = args[1]
+            length_expr = args[2] if len(args) > 2 else None
+
+        if not isinstance(source, exp.Column):
+            return None
+
+        def to_int(expr):
+            if isinstance(expr, exp.Literal):
+                return int(expr.this)
+            if isinstance(expr, exp.Neg) and isinstance(expr.this, exp.Literal):
+                return -int(expr.this.this)
+            return None
+
+        start = to_int(start_expr)
+        length = to_int(length_expr) if length_expr is not None else None
+        if start is None:
+            return None
+        return "substr", source, {"start": start, "length": length}
+
+    def _extract_seedable_predicate(
+        self, predicate: exp.Expression
+    ) -> Optional[Tuple[str, exp.Column, str, object]]:
+        if isinstance(predicate, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            left = predicate.args.get("this")
+            right = predicate.args.get("expression")
+            if isinstance(right, exp.Literal):
+                target = self._extract_seed_target(left)
+                if target is not None:
+                    kind, column = target
+                    return kind, column, predicate.key.upper(), right.name
+            if isinstance(left, exp.Literal):
+                target = self._extract_seed_target(right)
+                if target is not None:
+                    kind, column = target
+                    flipped = {
+                        "GT": "LT",
+                        "GTE": "LTE",
+                        "LT": "GT",
+                        "LTE": "GTE",
+                    }.get(predicate.key.upper(), predicate.key.upper())
+                    return kind, column, flipped, left.name
+            return None
+
+        if isinstance(predicate, exp.Between):
+            target = self._extract_seed_target(predicate.this)
+            if (
+                target is not None
+                and isinstance(predicate.args.get("low"), exp.Literal)
+                and isinstance(predicate.args.get("high"), exp.Literal)
+            ):
+                kind, column = target
+                return (
+                    kind,
+                    column,
+                    "BETWEEN",
+                    (predicate.args["low"].name, predicate.args["high"].name),
+                )
+            return None
+
+        if isinstance(predicate, exp.In):
+            target = self._extract_seed_target(predicate.this)
+            if target is not None and all(
+                isinstance(item, exp.Literal) for item in predicate.expressions
+            ):
+                kind, column = target
+                return kind, column, "IN", [item.name for item in predicate.expressions]
+            return None
+        return None
+
+    def _extract_text_seedable_predicate(
+        self, predicate: exp.Expression
+    ) -> Optional[Tuple[str, exp.Column, Dict[str, Any], str, object]]:
+        if isinstance(predicate, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            left = predicate.args.get("this")
+            right = predicate.args.get("expression")
+            if isinstance(right, exp.Literal):
+                target = self._extract_text_seed_target(left)
+                if target is not None:
+                    kind, column, meta = target
+                    return kind, column, meta, predicate.key.upper(), right.name
+            if isinstance(left, exp.Literal):
+                target = self._extract_text_seed_target(right)
+                if target is not None:
+                    kind, column, meta = target
+                    flipped = {
+                        "GT": "LT",
+                        "GTE": "LTE",
+                        "LT": "GT",
+                        "LTE": "GTE",
+                    }.get(predicate.key.upper(), predicate.key.upper())
+                    return kind, column, meta, flipped, left.name
+            return None
+
+        if isinstance(predicate, exp.Between):
+            target = self._extract_text_seed_target(predicate.this)
+            if (
+                target is not None
+                and isinstance(predicate.args.get("low"), exp.Literal)
+                and isinstance(predicate.args.get("high"), exp.Literal)
+            ):
+                kind, column, meta = target
+                return (
+                    kind,
+                    column,
+                    meta,
+                    "BETWEEN",
+                    (predicate.args["low"].name, predicate.args["high"].name),
+                )
+            return None
+
+        if isinstance(predicate, exp.In):
+            target = self._extract_text_seed_target(predicate.this)
+            if target is not None and all(
+                isinstance(item, exp.Literal) for item in predicate.expressions
+            ):
+                kind, column, meta = target
+                return (
+                    kind,
+                    column,
+                    meta,
+                    "IN",
+                    [item.name for item in predicate.expressions],
+                )
+        return None
+
+    def _seed_text_of_length(self, length: int) -> str:
+        return "a" * max(1, length)
+
+    def _apply_length_seed(self, existing: Optional[str], op: str, value) -> str:
+        if op == "IN":
+            target = int(value[0])
+        elif op == "BETWEEN":
+            low, high = value
+            target = max(int(low), 1)
+            target = min(target, int(high))
+        else:
+            target = int(value)
+            if op == "GT":
+                target += 1
+            elif op == "LT":
+                target = max(target - 1, 1)
+        if op == "GTE":
+            target = int(value)
+        if op == "LTE":
+            target = int(value)
+
+        current = existing or ""
+        if len(current) < target:
+            current = current + ("a" * (target - len(current)))
+        elif len(current) > target:
+            current = current[:target]
+        if not current:
+            current = self._seed_text_of_length(target)
+        return current
+
+    def _apply_substr_seed(
+        self,
+        existing: Optional[str],
+        start: int,
+        length: Optional[int],
+        op: str,
+        value,
+    ) -> str:
+        target = value
+        if op == "IN":
+            target = value[0]
+        elif op == "BETWEEN":
+            target = value[0]
+        elif op == "NEQ":
+            target = f"{value}x"
+
+        target = str(target)
+        length = length or len(target)
+        base = existing or ""
+
+        if start > 0:
+            min_len = start - 1 + max(length, len(target))
+            if len(base) < min_len:
+                base = base + ("a" * (min_len - len(base)))
+            index = start - 1
+        else:
+            min_len = max(abs(start), len(target))
+            if len(base) < min_len:
+                base = ("a" * (min_len - len(base))) + base
+            index = len(base) + start
+            if index < 0:
+                base = ("a" * (-index)) + base
+                index = 0
+
+        segment = target[:length].ljust(length, "a")
+        chars = list(base)
+        for offset, ch in enumerate(segment):
+            pos = index + offset
+            if pos >= len(chars):
+                chars.extend("a" * (pos - len(chars) + 1))
+            chars[pos] = ch
+        return "".join(chars)
+
+    def _generate_temporal_seed_value(self, pool, op: str, value):
+        def year_value(year: int, month: int, day: int):
+            if pool.datatype.is_type(exp.DataType.Type.DATE):
+                return date(year, month, day)
+            return datetime(year, month, day)
+
+        def parse_year(raw) -> int:
+            return int(str(raw)[:4])
+
+        if op == "IN":
+            candidates = value if isinstance(value, list) else [value]
+            return year_value(parse_year(candidates[0]), 1, 1)
+        if op == "BETWEEN":
+            low, high = value
+            low_year = parse_year(low)
+            high_year = parse_year(high)
+            return year_value((low_year + high_year) // 2, 1, 1)
+
+        year = parse_year(value)
+        if op == "EQ":
+            return year_value(year, 1, 1)
+        if op == "NEQ":
+            return year_value(year + 1, 1, 1)
+        if op == "GT":
+            return year_value(year + 1, 1, 1)
+        if op == "GTE":
+            return year_value(year, 1, 1)
+        if op == "LT":
+            return year_value(year - 1, 12, 31)
+        if op == "LTE":
+            return year_value(year, 12, 31)
+        return None
+
+    def _coerce_seed_value(self, pool, value):
+        datatype = getattr(pool, "datatype", None)
+        if datatype is None or value is None:
+            return value
+        text = value if isinstance(value, str) else str(value)
+        try:
+            if datatype.is_type(*exp.DataType.INTEGER_TYPES):
+                return int(text)
+            if datatype.is_type(*exp.DataType.REAL_TYPES):
+                return float(text)
+            if datatype.is_type(exp.DataType.Type.BOOLEAN):
+                lowered = text.lower()
+                if lowered in {"true", "1"}:
+                    return True
+                if lowered in {"false", "0"}:
+                    return False
+        except Exception:
+            return value
+        return value
+
+    def _generate_raw_seed_value(self, pool, op: str, value):
+        if op == "EQ":
+            return self._coerce_seed_value(pool, value)
+        if op == "IN":
+            candidates = value if isinstance(value, list) else [value]
+            return self._coerce_seed_value(pool, candidates[0]) if candidates else None
+        if op == "BETWEEN":
+            low, high = value
+            low = self._coerce_seed_value(pool, low)
+            high = self._coerce_seed_value(pool, high)
+            if isinstance(low, int) and isinstance(high, int):
+                return (low + high) // 2
+            if isinstance(low, float) and isinstance(high, float):
+                return (low + high) / 2.0
+            return low
+        return pool.generate_for_spec(op, value)
+
+    def _seed_structured_scalar_rows(
+        self, expression: Optional[exp.Expression] = None
+    ) -> None:
+        target = expression or self.expr
+        parent: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        literals: Dict[Tuple[str, str], Any] = {}
+
+        def find(key: Tuple[str, str]) -> Tuple[str, str]:
+            parent.setdefault(key, key)
+            if parent[key] != key:
+                parent[key] = find(parent[key])
+            return parent[key]
+
+        def union(left: Tuple[str, str], right: Tuple[str, str]) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        def column_key(column: exp.Column) -> Optional[Tuple[str, str]]:
+            table_ref = self.get_tableref(column.table) or column.table
+            if not table_ref:
+                return None
+            return (table_ref, self.instance._normalize_name(column.name))
+
+        def literal_value(column: exp.Column, literal: exp.Literal) -> Any:
+            table_ref = self.get_tableref(column.table) or column.table
+            if not table_ref:
+                return literal.name
+            try:
+                pool = self.instance.column_domains.get_or_create_pool(
+                    table_ref, column.name
+                )
+            except KeyError:
+                return literal.name
+            return self._generate_raw_seed_value(pool, "EQ", literal.name)
+
+        for predicate in target.find_all(exp.EQ):
+            left = predicate.args.get("this")
+            right = predicate.args.get("expression")
+            if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                left_key = column_key(left)
+                right_key = column_key(right)
+                if left_key is not None and right_key is not None:
+                    union(left_key, right_key)
+            elif isinstance(left, exp.Column) and isinstance(right, exp.Literal):
+                key = column_key(left)
+                if key is not None:
+                    literals[key] = literal_value(left, right)
+            elif isinstance(right, exp.Column) and isinstance(left, exp.Literal):
+                key = column_key(right)
+                if key is not None:
+                    literals[key] = literal_value(right, left)
+
+        component_values: Dict[Tuple[str, str], Any] = {}
+        for key, value in literals.items():
+            root = find(key)
+            component_values.setdefault(root, value)
+
+        values_by_table: Dict[str, Dict[str, Any]] = {}
+        for key in list(parent) + list(literals):
+            root = find(key)
+            if root not in component_values:
+                continue
+            table_name, column_name = key
+            values_by_table.setdefault(table_name, {})[column_name] = component_values[
+                root
+            ]
+
+        for table_name, values in values_by_table.items():
+            if values:
+                self.instance.create_row(table_name, values=values)
+
+    def _propagate_query_constraints_to_domains(
+        self, expression: Optional[exp.Expression] = None
+    ) -> int:
         applied = 0
-        for predicate in self._predicate_constraints():
+        target = expression or self.expr
+        for predicate in self._predicate_constraints_for(target):
             columns = list(predicate.find_all(exp.Column))
             if not columns:
                 continue
@@ -631,48 +1094,82 @@ class DataGenerator(BaseGenerator):
             if deadline is not None and time.monotonic() >= deadline:
                 return
 
-    def _seed_literal_rows(self) -> None:
+    def _seed_literal_rows(self, expression: Optional[exp.Expression] = None) -> None:
         seeded_rows: Dict[str, Any] = {}
-        literal_values = self._literal_values_by_table()
+        literal_values = self._literal_values_by_table(expression)
         join_hints = self._join_value_hints()
-        for table_name in dict.fromkeys(self.table_alias.values()):
-            if not table_name:
-                continue
-            values = dict(literal_values.get(table_name, {}))
-            for local_col, ref_table, ref_col in join_hints.get(table_name, []):
-                if local_col in values or ref_table not in seeded_rows:
-                    continue
-                try:
-                    values[local_col] = seeded_rows[ref_table][ref_col].concrete
-                except Exception:
-                    continue
-            for fk in self.instance.get_foreign_key(table_name):
-                local_col = self.instance._normalize_name(fk.expressions[0].name)
-                ref_table = self.instance._normalize_name(
-                    fk.args.get("reference").find(exp.Table).name, is_table=True
-                )
-                ref_col = self.instance._normalize_name(
-                    fk.args.get("reference").this.expressions[0].name
-                )
-                if local_col in values or ref_table not in seeded_rows:
-                    continue
-                values[local_col] = seeded_rows[ref_table][ref_col].concrete
-            try:
-                created = self.instance.create_row(table_name, values=values)
-            except Exception:
-                continue
-            pos = created["positions"].get(table_name)
-            if pos is None:
-                continue
-            seeded_rows[table_name] = self.instance.get_row(table_name, pos)
+        pending = [table_name for table_name in dict.fromkeys(self.table_alias.values()) if table_name]
+        stalled = set()
 
-    def _literal_values_by_table(self) -> Dict[str, Dict[str, Any]]:
+        while pending:
+            next_pending = []
+            progress = False
+            for table_name in pending:
+                values = dict(literal_values.get(table_name, {}))
+                unresolved_dependency = False
+
+                for local_col, ref_table, ref_col in join_hints.get(table_name, []):
+                    if local_col in values:
+                        continue
+                    if ref_table not in seeded_rows:
+                        unresolved_dependency = True
+                        continue
+                    try:
+                        values[local_col] = seeded_rows[ref_table][ref_col].concrete
+                    except Exception:
+                        continue
+
+                for fk in self.instance.get_foreign_key(table_name):
+                    local_col = self.instance._normalize_name(fk.expressions[0].name)
+                    ref_table = self.instance._normalize_name(
+                        fk.args.get("reference").find(exp.Table).name, is_table=True
+                    )
+                    ref_col = self.instance._normalize_name(
+                        fk.args.get("reference").this.expressions[0].name
+                    )
+                    if local_col in values:
+                        continue
+                    if ref_table not in seeded_rows:
+                        unresolved_dependency = True
+                        continue
+                    values[local_col] = seeded_rows[ref_table][ref_col].concrete
+
+                if unresolved_dependency and table_name not in stalled:
+                    next_pending.append(table_name)
+                    continue
+
+                try:
+                    created = self.instance.create_row(table_name, values=values)
+                except Exception:
+                    stalled.add(table_name)
+                    next_pending.append(table_name)
+                    continue
+                pos = created["positions"].get(table_name)
+                if pos is None:
+                    continue
+                seeded_rows[table_name] = self.instance.get_row(table_name, pos)
+                progress = True
+
+            if not next_pending:
+                break
+            if not progress:
+                stalled.update(next_pending)
+            pending = next_pending
+
+    def _literal_values_by_table(
+        self, expression: Optional[exp.Expression] = None
+    ) -> Dict[str, Dict[str, Any]]:
         values: Dict[str, Dict[str, Any]] = {}
-        for predicate in self._predicate_constraints():
-            columns = list(predicate.find_all(exp.Column))
-            if not columns:
+        target = expression or self.expr
+        for predicate in self._predicate_constraints_for(target):
+            seed_target = self._extract_seedable_predicate(predicate)
+            text_seed_target = self._extract_text_seedable_predicate(predicate)
+            if seed_target is None and text_seed_target is None:
                 continue
-            column = columns[0]
+            if seed_target is not None:
+                kind, column, op, seed_value = seed_target
+            else:
+                kind, column, meta, op, seed_value = text_seed_target
             table_ref = self.get_tableref(column.table) or column.table
             if not table_ref:
                 continue
@@ -684,23 +1181,24 @@ class DataGenerator(BaseGenerator):
                 continue
             concrete = None
             try:
-                if isinstance(predicate, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.ILike)):
-                    rhs = predicate.args.get("expression")
-                    if isinstance(rhs, exp.Literal):
-                        concrete = pool.generate_for_spec(predicate.key.upper(), rhs.name)
-                elif isinstance(predicate, exp.Between):
-                    low = predicate.args.get("low")
-                    high = predicate.args.get("high")
-                    if isinstance(low, exp.Literal) and isinstance(high, exp.Literal):
-                        concrete = pool.generate_for_spec("BETWEEN", (low.name, high.name))
-                elif isinstance(predicate, exp.In):
-                    literals = [
-                        item.name
-                        for item in predicate.expressions
-                        if isinstance(item, exp.Literal)
-                    ]
-                    if literals:
-                        concrete = pool.generate_for_spec("IN", literals)
+                if kind == "raw":
+                    concrete = self._generate_raw_seed_value(pool, op, seed_value)
+                elif kind == "strftime_year":
+                    concrete = self._generate_temporal_seed_value(
+                        pool, op, seed_value
+                    )
+                elif kind == "length":
+                    current = values.setdefault(table_ref, {}).get(column.name)
+                    concrete = self._apply_length_seed(current, op, seed_value)
+                elif kind == "substr":
+                    current = values.setdefault(table_ref, {}).get(column.name)
+                    concrete = self._apply_substr_seed(
+                        current,
+                        meta["start"],
+                        meta["length"],
+                        op,
+                        seed_value,
+                    )
             except Exception:
                 logger.debug(
                     "Skipping literal seeding for predicate %s due to pool generation error",
@@ -708,7 +1206,7 @@ class DataGenerator(BaseGenerator):
                     exc_info=True,
                 )
             if concrete is not None:
-                values.setdefault(table_ref, {}).setdefault(column.name, concrete)
+                values.setdefault(table_ref, {})[column.name] = concrete
         return values
 
     def _join_value_hints(self) -> Dict[str, List[Tuple[str, str, str]]]:
@@ -753,9 +1251,32 @@ class DataGenerator(BaseGenerator):
         key = (columnref.table, columnref.name)
         if reuse and key in self.variables:
             return key
+
+        def declare_synthetic(dtype=None):
+            variable = exp.Column(this=key[1], table=key[0])
+            variable.type = dtype or columnref.type or DataType.build("UNKNOWN")
+            self.variables[key] = variable
+            self.var_to_columnref[key] = columnref
+            return key
+
         table_ref = self.get_tableref(columnref.table)
+        if table_ref is None and columnref.table in self.active_bound_tables:
+            variable = exp.Column(this=key[1], table=key[0])
+            variable.type = (
+                columnref.type
+                or self.active_bound_tables[columnref.table].get_column_type(columnref.name)
+                or DataType.build("UNKNOWN")
+            )
+            self.variables[key] = variable
+            self.var_to_columnref[key] = columnref
+            self.bound_column_to_vars.setdefault((columnref.table, columnref.name), []).append(
+                variable
+            )
+            return key
         if table_ref is None:
             return ()
+        if columnref.name not in self.instance.tables.get(table_ref, {}):
+            return declare_synthetic()
         if not reuse:
             suffix = len(self.columnref_to_vars.get(key, []))
             while (columnref.table, f"{columnref.name}_{suffix}") in self.variables:
@@ -877,6 +1398,28 @@ class DataGenerator(BaseGenerator):
         self._declare_fk_constraints()
         self._declare_column_constraints()
 
+    def _declare_bound_table_constraints(self):
+        for (alias, column_name), variables in self.bound_column_to_vars.items():
+            table = self.active_bound_tables.get(alias)
+            if table is None:
+                continue
+            datatype = table.get_column_type(column_name)
+            literals = self._dedupe_literal_expressions(
+                [
+                    to_literal(row[column_name].concrete, datatype)
+                    for row in table.rows
+                    if column_name in row
+                ]
+            )
+            if not literals:
+                continue
+            for variable in variables:
+                clauses = [variable.eq(literal) for literal in literals]
+                self.declare_constraint(
+                    "bound_table",
+                    reduce(lambda left, right: left.or_(right), clauses),
+                )
+
     def _reset_generation_state(self):
         self.variables.clear()
         self.constraints.clear()
@@ -884,6 +1427,7 @@ class DataGenerator(BaseGenerator):
         self.table_to_vars.clear()
         self.table_column_to_vars.clear()
         self.columnref_to_vars.clear()
+        self.bound_column_to_vars.clear()
 
     def _path_to_root(
         self, plausible: PlausibleBranch
@@ -964,6 +1508,8 @@ class DataGenerator(BaseGenerator):
             table_name = self.get_tableref(columnref.table)
             if table_name is None:
                 continue
+            if columnref.name not in self.instance.tables.get(table_name, {}):
+                continue
             if table_name not in concretes:
                 concretes[table_name] = {}
             concretes[table_name].setdefault(columnref.name, []).append(value)
@@ -997,20 +1543,82 @@ class DataGenerator(BaseGenerator):
                 lines.append(f"[{label}] {constraint}")
         logger.info("\n".join(lines))
 
-    def _planner_context(self, external: Optional[Context] = None) -> Context:
-        context = build_context_from_instance(self.instance)
-        context.external = external
-        return context
+    def _const_from_value(self, value: Any, dtype=None) -> Const:
+        if dtype is None or DataType.build(dtype).is_type(DataType.Type.UNKNOWN):
+            if value is None:
+                dtype = DataType.build("NULL")
+            elif isinstance(value, bool):
+                dtype = DataType.build("BOOLEAN")
+            elif isinstance(value, int):
+                dtype = DataType.build("INT")
+            elif isinstance(value, float):
+                dtype = DataType.build("FLOAT")
+            elif isinstance(value, datetime):
+                dtype = DataType.build("DATETIME")
+            elif isinstance(value, date):
+                dtype = DataType.build("DATE")
+            else:
+                dtype = DataType.build("TEXT")
+        const = Const(this=value, _type=dtype)
+        const.type = dtype
+        return const
+
+    def _binding_tables(
+        self, scope_node: ScopeNode, binding: Optional[SubqueryBinding]
+    ) -> Dict[str, DerivedSchema]:
+        if binding is None or binding.correlated:
+            return {}
+        wrapper = self._find_subquery_wrapper(scope_node.scope.expression, binding.expression)
+        if wrapper is None or not isinstance(wrapper, exp.Subquery):
+            return {}
+        if not isinstance(wrapper.parent, (exp.From, exp.Join)):
+            return {}
+        alias = wrapper.alias_or_name
+        if not alias or not binding.output_columns:
+            return {}
+
+        datatypes = {}
+        if isinstance(binding.expression, exp.Select):
+            for project, label in zip(binding.expression.expressions, binding.output_columns):
+                expr = project.this if isinstance(project, exp.Alias) else project
+                datatypes[label] = expr.type or DataType.build("UNKNOWN")
+
+        rows = []
+        for index, values in enumerate(binding.rows):
+            columns = {}
+            for label, value in zip(binding.output_columns, values):
+                columns[label] = self._const_from_value(value, datatypes.get(label))
+            rows.append(Row(this=(f"{alias}_{index}",), columns=columns))
+
+        return {
+            alias: DerivedSchema(
+                columns=binding.output_columns,
+                rows=rows,
+                datatypes=datatypes,
+            )
+        }
+
+    def _planner_context(
+        self,
+        external: Optional[Context] = None,
+        bound_tables: Optional[Dict[str, DerivedSchema]] = None,
+    ) -> Context:
+        base = build_context_from_instance(self.instance)
+        tables = dict(base.tables)
+        if bound_tables:
+            tables.update(bound_tables)
+        return Context(tables=tables, external=external)
 
     def _encode_scope(
         self,
         scope_node: ScopeNode,
         tracer: UExprToConstraint,
         external: Optional[Context] = None,
+        bound_tables: Optional[Dict[str, DerivedSchema]] = None,
     ) -> Optional[Context]:
         tracer.reset()
         planner = Planner(
-            ctx=self._planner_context(external=external),
+            ctx=self._planner_context(external=external, bound_tables=bound_tables),
             scope_node=scope_node,
             tracer=tracer,
             dialect=self.dialect,
@@ -1041,7 +1649,7 @@ class DataGenerator(BaseGenerator):
                 exists=False,
                 scalar_value=None,
                 values=[],
-                correlated=scope_node.scope.is_correlated_subquery,
+                correlated=scope_node.is_correlated_dependency,
             )
 
         if context is None or not context.tables:
@@ -1106,7 +1714,7 @@ class DataGenerator(BaseGenerator):
             exists=bool(rows),
             scalar_value=scalar_value,
             values=values,
-            correlated=scope_node.scope.is_correlated_subquery,
+            correlated=scope_node.is_correlated_dependency,
         )
 
     def _binding_literal(
@@ -1115,6 +1723,73 @@ class DataGenerator(BaseGenerator):
         if binding.scalar_value is None:
             return None
         return to_literal(binding.scalar_value, datatype)
+
+    def _projected_source_column(
+        self, expression: exp.Expression
+    ) -> Optional[exp.Column]:
+        target = expression.this if isinstance(expression, exp.Alias) else expression
+        while isinstance(target, (exp.Cast, exp.TsOrDsToTimestamp)):
+            target = target.this
+        return target if isinstance(target, exp.Column) else None
+
+    def _required_non_null_output_columns(
+        self, scope_graph, scope_node: ScopeNode
+    ) -> List[exp.Column]:
+        required: Dict[str, exp.Column] = {}
+        for dependent_id in scope_node.dependents:
+            dependent = scope_graph.get_node(dependent_id)
+            if dependent is None:
+                continue
+            wrapper = self._find_subquery_wrapper(
+                dependent.scope.expression, scope_node.scope.expression
+            )
+            if wrapper is None or not isinstance(wrapper.parent, exp.In):
+                continue
+            if not isinstance(scope_node.scope.expression, exp.Select):
+                continue
+            for projection in scope_node.scope.expression.expressions:
+                column = self._projected_source_column(projection)
+                if column is None:
+                    continue
+                required.setdefault(column.sql(dialect=self.dialect), column)
+        return list(required.values())
+
+    def _repair_null_output_columns(
+        self, columns: Optional[Sequence[exp.Column]]
+    ) -> bool:
+        if not columns:
+            return False
+        changed = False
+        for columnref in columns:
+            table_ref = self.get_tableref(columnref.table) or columnref.table
+            if table_ref is None:
+                continue
+            try:
+                pool = self.instance.column_domains.get_or_create_pool(
+                    table_ref, columnref.name
+                )
+            except Exception:
+                continue
+            for row in self.instance.get_rows(table_ref):
+                try:
+                    current = row[columnref.name]
+                except KeyError:
+                    continue
+                if current.concrete is not None:
+                    continue
+                replacement = None
+                for _ in range(16):
+                    candidate = pool.generate()
+                    if candidate is not None:
+                        replacement = candidate
+                        break
+                if replacement is None:
+                    continue
+                row.args.setdefault("columns", {})[
+                    self.instance._normalize_name(columnref.name, dialect=self.dialect)
+                ] = convert_to_literal(replacement, current.datatype)
+                changed = True
+        return changed
 
     def _find_subquery_wrapper(
         self, scope_expression: exp.Expression, child_expression: exp.Expression
@@ -1142,16 +1817,25 @@ class DataGenerator(BaseGenerator):
             parent.replace(to_literal(binding.exists, exp.DataType.build("BOOLEAN")))
             return
         if isinstance(parent, exp.In):
-            values = [to_literal(value, None) for value in binding.values]
+            values = [to_literal(value, None) for value in binding.values if value is not None]
             lhs = parent.this.copy()
+            negate = isinstance(parent.parent, exp.Not) and parent.parent.this is parent
             if not values:
-                parent.replace(exp.Boolean(this=False))
+                replacement = exp.Boolean(this=negate)
+                if negate and isinstance(parent.parent, exp.Not):
+                    parent.parent.replace(replacement)
+                else:
+                    parent.replace(replacement)
                 return
             predicates = [exp.EQ(this=lhs.copy(), expression=value) for value in values]
             constraint = predicates[0]
             for predicate in predicates[1:]:
                 constraint = exp.Or(this=constraint, expression=predicate)
-            parent.replace(constraint)
+            replacement = constraint.not_() if negate else constraint
+            if negate and isinstance(parent.parent, exp.Not):
+                parent.parent.replace(replacement)
+            else:
+                parent.replace(replacement)
             return
         literal = self._binding_literal(binding, datatype=getattr(parent, "type", None))
         if literal is not None:
@@ -1169,6 +1853,7 @@ class DataGenerator(BaseGenerator):
             extra_columns=extra_columns,
         )
         self._declare_db_constraints()
+        self._declare_bound_table_constraints()
         self._print_constraints(plausible.pattern())
 
         solver = SMTSolver(self.variables, verbose=self.verbose)
@@ -1192,17 +1877,24 @@ class DataGenerator(BaseGenerator):
         skips: Optional[Set[StepType]] = None,
         early_stop: Optional[Callable] = None,
         external: Optional[Context] = None,
+        bound_tables: Optional[Dict[str, DerivedSchema]] = None,
+        required_non_null_columns: Optional[Sequence[exp.Column]] = None,
         deadline: Optional[float] = None,
     ) -> ScopeSolveResult:
         skips = skips or set()
         tracer = UExprToConstraint()
-        context = self._encode_scope(scope_node, tracer, external=external)
+        self.active_bound_tables = bound_tables or {}
+        context = self._encode_scope(
+            scope_node, tracer, external=external, bound_tables=bound_tables
+        )
         if not tracer.leaves:
             self._bootstrap_scope_rows(
                 scope_node,
                 min_rows=max(1, self.generator_config.group_size_threshold),
             )
-            context = self._encode_scope(scope_node, tracer, external=external)
+            context = self._encode_scope(
+                scope_node, tracer, external=external, bound_tables=bound_tables
+            )
 
         while True:
             if deadline is not None and time.monotonic() >= deadline:
@@ -1215,13 +1907,31 @@ class DataGenerator(BaseGenerator):
                 break
             if plausible.plausible_type == PlausibleType.INFEASIBLE:
                 continue
+            if required_non_null_columns:
+                for columnref in required_non_null_columns:
+                    self.declare_variable(columnref)
+                    key = (columnref.table, columnref.name)
+                    variable = self.variables.get(key)
+                    if variable is None:
+                        continue
+                    self.declare_constraint(
+                        "subquery_output_not_null",
+                        variable.is_(exp.Null(_type=variable.type)).not_(),
+                    )
             if self._solve_plausible(scope_node, plausible) == "unsat":
                 plausible.mark_infeasible()
             self._reset_generation_state()
 
-            context = self._encode_scope(scope_node, tracer, external=external)
+            context = self._encode_scope(
+                scope_node, tracer, external=external, bound_tables=bound_tables
+            )
             if early_stop is not None and early_stop(self.instance):
                 break
+
+        if self._repair_null_output_columns(required_non_null_columns):
+            context = self._encode_scope(
+                scope_node, tracer, external=external, bound_tables=bound_tables
+            )
 
         binding = self._materialize_binding(scope_node, context)
         return ScopeSolveResult(
@@ -1296,6 +2006,7 @@ class DataGenerator(BaseGenerator):
         timeout: Optional[float] = None,
         skips: Optional[Set[StepType]] = None,
     ):
+        random.seed(142)
         deadline = None
         if timeout is not None and timeout > 0:
             deadline = time.monotonic() + timeout
@@ -1308,15 +2019,20 @@ class DataGenerator(BaseGenerator):
             scope_node = scope_graph.get_node(node_id)
             if scope_node is None:
                 continue
+            bound_tables: Dict[str, DerivedSchema] = {}
+            has_scalar_dependency = False
             for dep_id in scope_node.dependencies:
                 dep_result = self.scope_results.get(dep_id)
                 if dep_result is None or dep_result.binding is None:
                     continue
+                if dep_result.binding.scalar_value is not None:
+                    has_scalar_dependency = True
                 self._apply_subquery_binding(scope_node, dep_result.binding)
+                bound_tables.update(self._binding_tables(scope_node, dep_result.binding))
 
             external = None
-            if scope_node.scope.is_correlated_subquery:
-                external = self._planner_context()
+            if scope_node.is_correlated_dependency:
+                external = self._planner_context(bound_tables=bound_tables)
                 if self._seed_correlated_exists_rows(scope_node, external):
                     result = ScopeSolveResult(
                         scope_id=scope_node.node_id,
@@ -1338,14 +2054,25 @@ class DataGenerator(BaseGenerator):
                     continue
             if stop_event.is_set():
                 break
+            if has_scalar_dependency:
+                self._seed_structured_scalar_rows(scope_node.scope.expression)
+                self._propagate_query_constraints_to_domains(scope_node.scope.expression)
+                self._seed_literal_rows(scope_node.scope.expression)
+            required_non_null_columns = self._required_non_null_output_columns(
+                scope_graph, scope_node
+            )
             result = self._solve_scope(
                 scope_node,
                 skips=skips,
-                early_stop=early_stop,
+                early_stop=None,
                 external=external,
+                bound_tables=bound_tables,
+                required_non_null_columns=required_non_null_columns,
                 deadline=deadline,
             )
             self.scope_results[node_id] = result
+            if early_stop is not None and early_stop(self.instance):
+                break
 
         if not stop_event.is_set():
             self._fallback_random_witness_search(
