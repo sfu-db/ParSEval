@@ -14,74 +14,61 @@ The repo contains following supplemental materials:
 └── README.md
 ```
 
-## Get started 
 
-### Install the Query Parser
-Please download and set up the query parser from the [repository](https://github.com/sfu-db/qParser).
-### Set Up the Python Environment
-1. Please use conda or venv to create a virtual environment. Run following command to install requirements.
+## Getting Started
+
+### Environment Setup with uv
+To set up your environment:
 
 ```bash
-# Example with venv
-python -m venv venv
-source venv/bin/activate
-# Or with conda
-conda create -n parseval-dev python=3.8
-conda activate parseval-dev
+# Create a virtual environment (if you don't have one)
+uv venv
+
+# Install all dependencies from requirements.txt or pyproject.toml
+uv sync
+
+# Install ParSEval in editable mode
+uv pip install -e .
 ```
-2. Install the required dependencies:
-```bash
-poetry install
-```
+
+If you prefer, you can use `python -m venv` or conda.
+
 
 ### Usage
 
-Normally, one invoke the tool as 
-```bash
-from parseval import instantiate_db
-instantiate_db(sql, schema, host_or_path, db_id, dialect, **kwargs):
-```
-to generate test database instances for input query SQL1.
-To test the equivalence of two queries:
-```bash
-from parseval import disprove
-disprove(sql1, sql2, schema, host_or_path = "/tmp", dialect = "sqlite", **kwargs)
-```
-
-One can enhance the readability of generated data for common column types by customizing the data generation strategy in the `register_default_generators` function.
+#### As a Library
+To generate test database instances for an input query:
 
 ```python
-# Integer generator
-def int_generator(existing_values: Optional[Set[Any]] = None, is_unique: bool = False) -> int:
-    """
-    Generate a random integer value.        
-    Args:
-        existing_values: Set of existing values to avoid duplicates if is_unique is True
-        is_unique: Whether the value should be unique
-        
-    Returns:
-        int: A random integer value
-    """
-    value = random.randint(1, 100)
-    if is_unique and existing_values:
-        while value in existing_values:
-            value = random.randint(1, 100)
-    return value
-from .registry import ValueGeneratorRegistry
-ValueGeneratorRegistry.register('int', int_generator)
+from parseval import instantiate_db
+instantiate_db(sql, schema, host_or_path, db_id, dialect, **kwargs)
 ```
 
-## updates
-1. Replace Calcite with SQLGlot.
-2. Integrate symbolic expressions with SQLGlot classes
-4. handle special functions from SQLite and MySQL
-5. For simple queries, (e.g., select count(*) from singers), randomly generate a database instance.
-    
+To test the equivalence of two queries:
+
+```python
+from parseval import disprove
+disprove(sql1, sql2, schema, host_or_path="/tmp", dialect="sqlite", **kwargs)
+```
+
+
+## Updates
+- Replaced Calcite with SQLGlot.
+- Integrated symbolic expressions with SQLGlot classes.
+- Handled special functions from SQLite and MySQL.
+- For simple queries (e.g., `SELECT count(*) FROM singers`), randomly generate a database instance.
+
+## To Be Done (TBD)
+- Refactor the database manager to support more database backends.
+- Load existing data first when using non-SQLite databases (e.g., Postgres, MySQL) to avoid wiping all existing data.
+- Model more dialect-specific functions and keywords with symbolic expressions.
+
+
 ### Experiment Setup
 - [Install Docker](https://docs.docker.com/engine/install/)
-- Dataset
+- Datasets:
     - Download Leetcode/Literature/Bird/Spider datasets [here](https://drive.google.com/drive/folders/12y5tR2JeSf2cVpp_woHn6CiQ9YiY7J25?usp=drive_link).
-    - Could also download official database instances for [bird](https://bird-bench.github.io/) and [spider](https://yale-lily.github.io/spider).
+    - You can also download official database instances for [Bird](https://bird-bench.github.io/) and [Spider](https://yale-lily.github.io/spider).
 
 
 
