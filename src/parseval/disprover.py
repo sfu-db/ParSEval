@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import threading
 import time
@@ -56,6 +57,7 @@ class Disprover:
         dialect: str = "sqlite",
         config: DisproverConfig | None = None,
         existing_dbs: Optional[Sequence[Sequence[object]]] = None,
+        schema_db_id: Optional[str] = None,
     ) -> None:
         self.q1 = q1
         self.q2 = q2
@@ -65,6 +67,11 @@ class Disprover:
             host_or_path=tempfile.mkdtemp(prefix="parseval-disprover-"),
             db_id="default",
         )
+
+        # Original db_id (before any run_id suffix) used to strip schema qualifiers
+        # from queries, e.g. FIBEN."TABLE" -> "TABLE". Falls back to config.db_id
+        # when callers don't separate schema from per-run identifiers.
+        self._schema_db_id = schema_db_id or self.config.db_id
 
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -177,7 +184,18 @@ class Disprover:
         )
 
         pair = self._execute_pair(syntax_context)
-        if pair.q1.error_msg or pair.q2.error_msg:
+
+        # Only treat errors as syntax failures if they are NOT about missing
+        # tables/relations — those are expected when the syntax-check DB is empty.
+        def _is_syntax_error(err: str) -> bool:
+            if not err:
+                return False
+            lower = err.lower()
+            if "does not exist" in lower or "no such table" in lower:
+                return False
+            return True
+
+        if _is_syntax_error(pair.q1.error_msg) or _is_syntax_error(pair.q2.error_msg):
             return self._build_result(
                 state="SYN",
                 q1_result=pair.q1,
@@ -189,6 +207,12 @@ class Disprover:
 
     def _execute_query(self, query: str, context: DatabaseContext) -> ExecutionResult:
         database_name = self._normalize_database_name(context.database)
+        # Strip schema qualifiers matching the schema db_id (e.g. FIBEN."T" -> "T")
+        # but leave alias.column references (e.g. alias."col") intact. Needed when
+        # the per-run database has a different name than the schema namespace.
+        if self._schema_db_id:
+            schema_name = re.escape(self._schema_db_id)
+            query = re.sub(rf'\b{schema_name}\.\s*', '', query, flags=re.IGNORECASE)
         started_at = time.monotonic()
         with DBManager().get_connection(
             host_or_path=context.host_or_path,

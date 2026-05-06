@@ -214,8 +214,9 @@ class Context:
         """
         Resolve table through lexical scope chain.
         """
-        if name in self.tables:
-            return self.tables[name]
+        key = name.lower()
+        if key in self.tables:
+            return self.tables[key]
         if self.external:
             return self.external.resolve_table(name)
         raise KeyError(f"Table '{name}' not found in scope chain.")
@@ -224,14 +225,15 @@ class Context:
         """
         Resolve row reader for correlated access.
         """
-        if name in self.row_readers:
-            return self.row_readers[name]
+        key = name.lower()
+        if key in self.row_readers:
+            return self.row_readers[key]
         if self.external:
             return self.external.resolve_reader(name)
         raise KeyError(f"Reader '{name}' not found.")
 
     def __contains__(self, table: str) -> bool:
-        return table in self.tables
+        return table.lower() in self.tables
 
     def __iter__(self):
         # self.env["scope"] = self.row_readers
@@ -241,7 +243,7 @@ class Context:
             yield reader, self
 
     def table_iter(self, table: str) -> TableIter:
-        return iter(self.tables[table])
+        return iter(self.tables[table.lower()])
 
     def set_mask(self, rowid) -> None:
         self.masks.add(rowid)

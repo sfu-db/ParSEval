@@ -369,7 +369,9 @@ def _min_rows_per_group(having: exp.Expression, min_rows=3) -> int:
     for agg_func in having.find_all(exp.Count):
         parent = agg_func.parent
         if isinstance(parent, exp.Predicate) and isinstance(parent.right, exp.Literal):
-            n = int(parent.right.this)
+            # Defensive int(float(...)) — sqlglot may emit "5.0" string literals
+            # for HAVING COUNT predicates from non-SQLite dialects.
+            n = int(float(parent.right.this))
             if isinstance(parent, (exp.GT, exp.GTE)):
                 values.append(n + 1)
             elif isinstance(parent, exp.EQ):
