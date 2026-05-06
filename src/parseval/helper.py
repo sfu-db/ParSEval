@@ -155,7 +155,10 @@ def to_concrete(value, datatype=None):
             return 1
         return int(value)
     elif datatype.is_type(*DataType.REAL_TYPES):
-        return float(value)
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
     elif datatype.is_type(DataType.Type.BOOLEAN):
         return bool(value)
     elif datatype.is_type(*DataType.TEMPORAL_TYPES):

@@ -142,6 +142,10 @@ def preprocess_sql(
         type_inferencer = TypeInferencer(mappingschema, dialect)
     sql = re.sub(r'(?<!["\'])\bSEX\b(?!["\'])', '"SEX"', sql)
     parsed = parse_one(sql, dialect=dialect)
+    # Convert FETCH FIRST N ROWS ONLY to LIMIT N (sqlglot planner bug workaround).
+    fetch = parsed.find(exp.Fetch)
+    if fetch and fetch.args.get("count"):
+        parsed.set("limit", exp.Limit(expression=fetch.args["count"]))
     tbls = list(parsed.find_all(exp.Table))
 
     def transform(node, tables):

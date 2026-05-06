@@ -213,6 +213,11 @@ class Instance(Catalog):
         self.ddls = ddls
         self.name = name
         self.column_domains = ColumnDomainPool()
+        # Maps normalized (lowercase) table/column names to their original case from DDL.
+        # Needed to emit correctly-quoted INSERT/DROP statements against case-sensitive
+        # Postgres schemas (e.g. FIBEN's "FINANCIALSERVICEACCOUNT").
+        self._original_table_names: Dict[str, str] = {}
+        self._original_column_names: Dict[str, Dict[str, str]] = {}
         self._build_catalog2(ddls, dialect)
         # initialize column domain pool and register domain specs
         self.data: Dict[str, List[Row]] = defaultdict(list)  # table_name -> List[Row]
@@ -274,6 +279,14 @@ class Instance(Catalog):
             }
         )
         for tbl_name, table_columns in sorted_table.items():
+            # Store original-case names before add_table normalizes them.
+            norm_tbl = tbl_name.lower()
+            self._original_table_names[norm_tbl] = tbl_name
+            col_map = {}
+            for col_name in table_columns:
+                col_map[col_name.lower()] = col_name
+            self._original_column_names[norm_tbl] = col_map
+
             self.add_table(tbl_name, table_columns, dialect=dialect)
             self.add_primary_key(tbl_name, primary_keys.get(tbl_name, set()))
             self.add_foreign_key(tbl_name, foreign_keys.get(tbl_name, []))
@@ -809,30 +822,72 @@ class Instance(Catalog):
         ) as conn:
             if truncate_first:
                 for table_name in self.tables:
-                    conn.drop_table(table_name)
+                    orig_tbl = self._original_table_names.get(table_name, table_name)
+                    conn.drop_table(orig_tbl)
             conn.create_tables(*self.ddls.split(";"))
             for table_name in self.tables:
                 rows = self.get_rows(table_name)
+                orig_tbl = self._original_table_names.get(table_name, table_name)
+                col_map = self._original_column_names.get(table_name, {})
                 columns = []
                 parameters = []
                 for column_name in self.column_names(table_name):
-                    columns.append(f'"{column_name}"')
+                    orig_col = col_map.get(column_name, column_name)
+                    columns.append(f'"{orig_col}"')
                     parameters.append(f":{normalize_name(column_name)}")
+                # Build maps of column types and max lengths for per-row sanitization.
+                col_types: Dict[str, Any] = {}
+                col_max_lengths: Dict[str, int] = {}
+                for cn in self.column_names(table_name):
+                    try:
+                        ctype = self.get_column_type(table_name, cn)
+                        dt_obj = exp.DataType.build(ctype) if isinstance(ctype, str) else ctype
+                        col_types[normalize_name(cn)] = dt_obj
+                        if dt_obj and dt_obj.expressions:
+                            col_max_lengths[normalize_name(cn)] = int(
+                                dt_obj.expressions[0].this.this
+                            )
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                _NUMERIC_TYPES = {
+                    exp.DataType.Type.BIGINT, exp.DataType.Type.INT,
+                    exp.DataType.Type.SMALLINT, exp.DataType.Type.TINYINT,
+                    exp.DataType.Type.FLOAT, exp.DataType.Type.DOUBLE,
+                    exp.DataType.Type.DECIMAL,
+                }
+                _TEMPORAL_TYPES = set(exp.DataType.TEMPORAL_TYPES)
                 mapped_data = []
                 for row in rows:
-                    data = {
-                        normalize_name(column_name): _serialize_concrete(
-                            column.concrete
-                        )
-                        for column_name, column in row.items()
-                    }
+                    data: Dict[str, Any] = {}
+                    for column_name, column in row.items():
+                        val = _serialize_concrete(column.concrete)
+                        norm_cn = normalize_name(column_name)
+                        # Sanitize: if column is numeric/temporal but value is
+                        # an unresolved string (symbolic alias, CTE ref, etc.),
+                        # replace with None to avoid Postgres type errors.
+                        if isinstance(val, str) and norm_cn in col_types:
+                            ctype = col_types[norm_cn]
+                            if ctype and ctype.this in _NUMERIC_TYPES:
+                                try:
+                                    float(val)
+                                except (ValueError, TypeError):
+                                    val = None
+                            elif ctype and ctype.this in _TEMPORAL_TYPES:
+                                try:
+                                    dt.datetime.fromisoformat(val)
+                                except (ValueError, TypeError):
+                                    val = None
+                        # Truncate strings that exceed declared max length.
+                        if isinstance(val, str) and norm_cn in col_max_lengths:
+                            val = val[:col_max_lengths[norm_cn]]
+                        data[norm_cn] = val
                     mapped_data.append(data)
                 if mapped_data:
 
                     column_list = ", ".join(columns)
-                    stmt = f"""INSERT INTO "{table_name}" ({column_list}) VALUES ({', '.join(parameters)})"""
+                    stmt = f"""INSERT INTO "{orig_tbl}" ({column_list}) VALUES ({', '.join(parameters)})"""
                     if return_inserted:
-                        inserts_str.append(f"-- Inserting into table: {table_name} --")
+                        inserts_str.append(f"-- Inserting into table: {orig_tbl} --")
                         for data in mapped_data:
                             cols = ", ".join(data.keys())
                             vals = ", ".join(
@@ -842,7 +897,7 @@ class Instance(Catalog):
                                 ]
                             )
                             inserts_str.append(
-                                f"INSERT INTO {table_name} ({cols}) VALUES ({vals});\n"
+                                f"INSERT INTO {orig_tbl} ({cols}) VALUES ({vals});\n"
                             )
                     conn.insert(stmt, mapped_data)
         if return_inserted:

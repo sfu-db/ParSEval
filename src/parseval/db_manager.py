@@ -31,8 +31,8 @@ from typing import (
     Callable,
     Generator,
 )
-from collections import defaultdict
-import random, logging, os
+from collections import defaultdict, deque
+import re, random, logging, os
 from contextlib import contextmanager
 import time, threading
 import atexit
@@ -348,9 +348,98 @@ class Connect:
 
         return records
 
-    def create_tables(self, *ddls: str) -> None:
-        """Execute one or more DDL statements (CREATE TABLE …)."""
+    @staticmethod
+    def _topological_sort_ddls(ddls: tuple[str, ...]) -> list[str]:
+        """Sort CREATE TABLE DDLs so that referenced tables are created first."""
+        _CREATE_RE = re.compile(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["\']?(\w+)["\']?',
+            re.IGNORECASE,
+        )
+        _FK_REF_RE = re.compile(
+            r'REFERENCES\s+["\']?(\w+)["\']?',
+            re.IGNORECASE,
+        )
+
+        table_to_ddl: dict[str, str] = {}
+        deps: dict[str, set[str]] = {}
+        ordered_non_create: list[str] = []
+
         for ddl in ddls:
+            stripped = ddl.strip()
+            if not stripped:
+                continue
+            m = _CREATE_RE.search(stripped)
+            if not m:
+                ordered_non_create.append(stripped)
+                continue
+            tbl = m.group(1)
+            table_to_ddl[tbl] = stripped
+            refs = set(_FK_REF_RE.findall(stripped))
+            refs.discard(tbl)
+            deps[tbl] = refs
+
+        for tbl, refs in list(deps.items()):
+            for ref in refs:
+                if ref not in deps:
+                    deps[ref] = set()
+
+        in_degree: dict[str, int] = {t: 0 for t in deps}
+        for tbl, refs in deps.items():
+            for ref in refs:
+                in_degree[ref] = in_degree.get(ref, 0)
+                in_degree[tbl] += 1
+
+        queue = deque(t for t, d in in_degree.items() if d == 0)
+        sorted_tables: list[str] = []
+        while queue:
+            t = queue.popleft()
+            sorted_tables.append(t)
+            for tbl, refs in deps.items():
+                if t in refs:
+                    in_degree[tbl] -= 1
+                    if in_degree[tbl] == 0:
+                        queue.append(tbl)
+
+        for tbl in deps:
+            if tbl not in sorted_tables:
+                sorted_tables.append(tbl)
+
+        result = [table_to_ddl[t] for t in sorted_tables if t in table_to_ddl]
+        result.extend(ordered_non_create)
+        return result
+
+    @staticmethod
+    def _strip_fk_constraints(ddl: str) -> str:
+        """Remove FOREIGN KEY clauses from a CREATE TABLE DDL.
+
+        The internal catalog already tracks FK relationships, so they are
+        not needed in the physical database and can cause errors when the
+        referenced column lacks a UNIQUE/PK constraint.
+        """
+        ddl = re.sub(
+            r',?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+[^(]*\([^)]*\)',
+            '',
+            ddl,
+            flags=re.IGNORECASE,
+        )
+        ddl = re.sub(r',\s*\)', ')', ddl)
+        return ddl
+
+    def create_tables(self, *ddls: str) -> None:
+        """Execute one or more DDL statements (CREATE TABLE …), topologically sorted by FK deps."""
+        sorted_ddls = self._topological_sort_ddls(ddls)
+        for ddl in sorted_ddls:
+            ddl = self._strip_fk_constraints(ddl)
+            # Convert fixed-length char types to varchar to avoid Postgres truncation/padding errors.
+            ddl = re.sub(r'\bcharacter\s*\(\s*\d+\s*\)', 'character varying', ddl, flags=re.IGNORECASE)
+            ddl = re.sub(r'\bchar\s*\(\s*\d+\s*\)', 'character varying', ddl, flags=re.IGNORECASE)
+            # Use IF NOT EXISTS to be idempotent — safe when zombie threads
+            # from timed-out runs are concurrently using the same database.
+            ddl = re.sub(
+                r'CREATE\s+TABLE\b',
+                'CREATE TABLE IF NOT EXISTS',
+                ddl, count=1, flags=re.IGNORECASE,
+            )
             self.execute(ddl, fetch=None)
         self._invalidate_metadata()
 
@@ -608,6 +697,12 @@ class DBManager(metaclass=singletonMeta):
                 )
         else:
             connect_args = {"connect_timeout": connect_timeout}
+            # FIBEN/Postgres: schema lives outside `public`. Set search_path via env var
+            # (e.g. PARSEVAL_PG_SEARCH_PATH=fiben,public) so qualified-or-not lookups resolve.
+            if dialect == "postgres":
+                search_path = os.environ.get("PARSEVAL_PG_SEARCH_PATH")
+                if search_path:
+                    connect_args["options"] = f"-c search_path={search_path}"
             return create_engine(
                 conn_url,
                 pool_size=pool_size,

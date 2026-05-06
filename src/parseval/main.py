@@ -8,6 +8,7 @@ def disprove(
     schema,
     host_or_path,
     db_id,
+    run_id=None,
     username=None,
     password=None,
     port=None,
@@ -26,8 +27,25 @@ def disprove(
     dialect="sqlite",
     existing_dbs: Optional[List] = None,
 ):
+    import math
+
     from parseval.disprover import Disprover
     from parseval.configuration import DisproverConfig, GeneratorConfig
+    from parseval.states import RunResult
+
+    for label, query in [("q1", q1), ("q2", q2)]:
+        if not isinstance(query, str) or (isinstance(query, float) and math.isnan(query)):
+            return RunResult(
+                q1=str(q1),
+                q2=str(q2),
+                host_or_path="N/A",
+                db_id="N/A",
+                q1_result=None,
+                q2_result=None,
+                state="ERR",
+                set_semantic=set_semantic,
+                error_msg=f"{label} is not a valid SQL string (got {type(query).__name__}: {query!r})",
+            )
 
     generator_config = GeneratorConfig(
         null_threshold=null_threshold,
@@ -41,9 +59,11 @@ def disprove(
         max_tries=max_tries,
     )
 
+    effective_db_id = f"{db_id}_{run_id}" if run_id is not None else db_id
+
     config = DisproverConfig(
         host_or_path=host_or_path,
-        db_id=db_id,
+        db_id=effective_db_id,
         username=username,
         password=password,
         port=port,
@@ -60,6 +80,7 @@ def disprove(
         dialect=dialect,
         config=config,
         existing_dbs=existing_dbs,
+        schema_db_id=db_id,
     )
     result = klass.run()
     return result

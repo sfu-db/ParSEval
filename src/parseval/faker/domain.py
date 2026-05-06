@@ -691,10 +691,23 @@ class ValueGenerator(ABC, Generic[ValueType]):
 class IntGenerator(ValueGenerator[int]):
 
     def satisfying_value(self, op, value):
+        if op == "BETWEEN":
+            lo, hi = value
+            if isinstance(lo, str) or isinstance(hi, str):
+                return lo
+            return random.choice([lo + 1, hi - 1])
+        if op == "IN":
+            return random.choice(value) if isinstance(value, list) and value else value
+        # Defensive int() for scalar ops — symbolic aggregate aliases
+        # (e.g. 'count_HASACCOUNTNUMBER_0') can leak in from speculative tracing.
+        try:
+            value = int(value)
+        except (ValueError, TypeError):
+            return self._default()
         if op == "EQ":
-            return int(value)
+            return value
         if op == "NEQ":
-            return int(value) + 1
+            return value + 1
         if op == "GT":
             return value + 1
         if op == "GTE":
@@ -703,13 +716,6 @@ class IntGenerator(ValueGenerator[int]):
             return value - 1
         if op == "LTE":
             return value
-        if op == "BETWEEN":
-            lo, hi = value
-            if isinstance(lo, str) or isinstance(hi, str):
-                return lo
-            return random.choice([lo + 1, hi - 1])
-        if op == "IN":
-            return random.choice(value) if isinstance(value, list) and value else value
         return value
 
     def negating_value(self, op, value):
@@ -718,10 +724,16 @@ class IntGenerator(ValueGenerator[int]):
             return self.satisfying_value(neg_op, value)
         if op == "BETWEEN":
             lo, _ = value
-            return int(lo) - 1
+            try:
+                return int(float(lo)) - 1
+            except (ValueError, TypeError):
+                return self._default()
         if op == "IN":
             first = value[0] if value else None
-            return (int(first) + 1) if first is not None else None
+            try:
+                return (int(float(first)) + 1) if first is not None else None
+            except (ValueError, TypeError):
+                return self._default()
         return self.generate()
 
     def propagate_constraints(self):
@@ -866,17 +878,33 @@ class StringGenerator(ValueGenerator[str]):
                         elif isinstance(c, exp.GT):
                             self.length = lv + 1
 
+    def _max_length_from_datatype(self) -> Optional[int]:
+        """Extract max length from the column datatype (e.g. character(1), varchar(50))."""
+        dt = self.pool.domain.datatype
+        if dt and dt.expressions:
+            try:
+                return int(dt.expressions[0].this.this)
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return None
+
     def generate(self, skips) -> str:
         self.propagate_constraints()
         alphabet = string.ascii_letters + string.digits + " "
+        max_len = self._max_length_from_datatype()
         if self._in_values:
             candidates = [v for v in self._in_values if skips is None or v not in skips]
             if candidates:
                 return random.choice(candidates)
         for _ in range(_MAX_UNIQUE_ATTEMPTS):
             if self.fixed_value is not None and self.validate(self.fixed_value, skips):
-                return self.fixed_value
-            length = self.length if self.length is not None else random.randint(5, 15)
+                return self.fixed_value[:max_len] if max_len else self.fixed_value
+            if self.length is not None:
+                length = self.length
+            elif max_len is not None:
+                length = max_len
+            else:
+                length = random.randint(5, 15)
             pattern = self.pattern or ("_" * length)
             result = ""
             for ch in pattern:
@@ -888,6 +916,8 @@ class StringGenerator(ValueGenerator[str]):
                     result += random.choice(alphabet)
                 else:
                     result += ch
+            if max_len is not None:
+                result = result[:max_len]
             if self.validate(result, skips):
                 return result
         raise RuntimeError("StringGenerator could not produce a valid value")
@@ -1374,8 +1404,12 @@ class ColumnDomainPool:
             alias = f"{table}.{column}"
         if alias in self._pools:
             return self._pools[alias]
-        table = normalize_name(table, is_table=True).name
-        column = normalize_name(column).name
+        _tbl = normalize_name(table, is_table=True)
+        _col = normalize_name(column)
+        if _tbl is None or _col is None:
+            raise KeyError(f"Cannot normalize table={table!r} column={column!r}")
+        table = _tbl.name
+        column = _col.name
         qualified_name = f"{table}.{column}"
         domain = self._domains.get(qualified_name)
         if not domain:
