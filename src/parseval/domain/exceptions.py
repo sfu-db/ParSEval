@@ -16,3 +16,7 @@ class UniqueConflictError(ConstraintViolationError):
 
 class ForeignKeyResolutionError(ConstraintViolationError):
     pass
+
+
+class ConstraintConflict(DomainError):
+    """Raised when constraints are contradictory and cannot be satisfied."""

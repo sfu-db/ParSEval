@@ -4,16 +4,15 @@ from typing import Any, Optional
 
 from ..coercion import coerce_reference_value
 from ..compiler import ColumnDomainPlan
-from ..types import TypeFamily, TypeProfile
-
+from ..types import TypeProfile
 from .base import ValueProvider
 
 
-class BooleanProvider(ValueProvider):
-    priority = 10
+class BooleanLikeTinyIntProvider(ValueProvider):
+    priority = 20
 
     def supports(self, spec, type_profile: TypeProfile) -> int:
-        return 10 if type_profile.family == TypeFamily.BOOLEAN else 0
+        return 20 if type_profile.exact_type == "TINYINT" and type_profile.family.value == "boolean" else 0
 
     def generate(
         self,
@@ -30,4 +29,6 @@ class BooleanProvider(ValueProvider):
                 return coerce_reference_value(
                     runtime.rng.choice(referenced), spec.datatype, dialect=spec.dialect
                 )
+        if domain_plan and domain_plan.allowed_values:
+            return runtime.rng.choice(domain_plan.allowed_values)
         return runtime.rng.choice([True, False])

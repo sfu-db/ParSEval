@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import random
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .spec import ColumnSpec, SchemaSpec, TableSpec
+from .spec import ColumnSpec, ForeignKeySpec, SchemaSpec, TableSpec
 
 
 @dataclass
@@ -81,6 +81,17 @@ class SchemaRuntime:
         target_column = foreign_key.target_columns[0]
         target_state = self.column_state(foreign_key.target_table, target_column)
         return list(target_state.used_values)
+
+    def referenced_key_tuples(
+        self, foreign_key: ForeignKeySpec
+    ) -> List[Tuple[Any, ...]]:
+        table_state = self.table_state(foreign_key.target_table)
+        tuples: List[Tuple[Any, ...]] = []
+        for row in table_state.rows:
+            tuples.append(
+                tuple(row.get(column.lower()) for column in foreign_key.target_columns)
+            )
+        return tuples
 
     def remember_row(self, table_name: str, row: Dict[str, Any]) -> None:
         table = self.schema.get_table(table_name)
