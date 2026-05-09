@@ -19,7 +19,13 @@ class GenericTypeAdapter(TypeAdapter):
 
     def profile(self, datatype: DataType, dialect: Optional[str]) -> TypeProfile:
         expressions = datatype.args.get("expressions") or []
-        numbers = [int(expr.this.this) for expr in expressions if getattr(expr, "this", None) is not None]
+        numbers = []
+        for expr in expressions:
+            try:
+                if getattr(expr, "this", None) is not None and hasattr(expr.this, "this"):
+                    numbers.append(int(expr.this.this))
+            except (TypeError, ValueError):
+                continue
         length = numbers[0] if len(numbers) == 1 else None
         precision = numbers[0] if len(numbers) >= 1 and datatype.is_type(*DataType.REAL_TYPES, DataType.Type.DECIMAL) else None
         scale = numbers[1] if len(numbers) >= 2 and datatype.is_type(*DataType.REAL_TYPES, DataType.Type.DECIMAL) else None

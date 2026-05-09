@@ -113,9 +113,6 @@ def instantiate_db(
             host_or_path=host_or_path,
             database=f"{instance.name}.sqlite",
             dialect=dialect,
-            port=port,
-            username=username,
-            password=password,
         ) as conn:
             results = None
             try:

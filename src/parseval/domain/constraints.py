@@ -46,3 +46,24 @@ class PatternConstraint(SchemaConstraint):
 @dataclass(frozen=True)
 class CheckConstraint(SchemaConstraint):
     expression: Any
+
+
+@dataclass(frozen=True)
+class ModuloConstraint(SchemaConstraint):
+    divisor: int
+    remainder: int = 0
+
+
+@dataclass(frozen=True)
+class PrefixConstraint(SchemaConstraint):
+    prefix: str
+
+
+@dataclass(frozen=True)
+class SuffixConstraint(SchemaConstraint):
+    suffix: str
+
+
+@dataclass(frozen=True)
+class ContainsConstraint(SchemaConstraint):
+    substring: str

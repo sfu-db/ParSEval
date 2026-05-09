@@ -195,9 +195,6 @@ class Disprover:
             host_or_path=context.host_or_path,
             database=database_name,
             dialect=self.dialect,
-            port=context.port,
-            username=context.username,
-            password=context.password,
         ) as conn:
             results = None
             error = ""
