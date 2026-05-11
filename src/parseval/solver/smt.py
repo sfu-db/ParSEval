@@ -506,11 +506,18 @@ class SMTSolver:
         function_models: Optional[
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ] = None,
+        timeout_ms: Optional[int] = None,
     ):
         self.variables = variables
         self.verbose = verbose
         self.z3ctx = z3ctx
         self.solver = z3.Solver(ctx=self.z3ctx)
+        if timeout_ms is not None and timeout_ms > 0:
+            try:
+                self.solver.set("timeout", int(timeout_ms))
+            except Exception:
+                pass
+        self.timeout_ms = timeout_ms
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False

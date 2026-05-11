@@ -1,7 +1,6 @@
 from .core import Catalog, Instance
 from .exporter import InstanceExporter
 from .loader import InstanceLoader
-from .schema import build_schema_spec
 from .types import (
     DatabaseTarget,
     InstanceSnapshot,
@@ -20,5 +19,4 @@ __all__ = [
     "RowCreationResult",
     "TableBatch",
     "WriteResult",
-    "build_schema_spec",
 ]

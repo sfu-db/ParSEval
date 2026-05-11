@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
-from typing import Any, Dict, List, Optional, Set
+from functools import cached_property
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 import random
 
 from sqlglot import exp, parse
@@ -23,13 +24,17 @@ from parseval.states import raise_exception
 
 from .exporter import InstanceExporter
 from .loader import InstanceLoader
-from .schema import build_schema_spec
+from .serialization import InstanceValueSerializer
+from .symbols import SymbolIndex
 from .types import (
     DatabaseTarget,
     InstanceSnapshot,
     RowCreationResult,
     TableBatch,
 )
+
+if TYPE_CHECKING:
+    from parseval.domain import SchemaSpec
 
 
 class Catalog(MappingSchema):
@@ -200,38 +205,44 @@ class Catalog(MappingSchema):
                 return True
         return False
 
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
 
-class Instance(Catalog):
-    def __init__(self, ddls: str, name: str, dialect: str, normalize=True):
-        super().__init__(dialect=dialect, normalize=normalize)
-        self.ddls = ddls
-        self.name = name
-        self.data: Dict[str, List[Row]] = defaultdict(list)
-        self.symbols = {}
-        self.symbol_to_table = {}
-        self.symbol_to_tuple_id = {}
-        self.tuple_id_to_symbols = {}
-        self.pk_fk_symbols = {}
-        self.name_seq = name_sequence(self.name)
-        self.schema_spec = build_schema_spec(ddls, dialect)
-        self.builder = DatabaseBuilder(self.schema_spec)
-        self._build_catalog(ddls, dialect)
+    @classmethod
+    def from_ddls(
+        cls,
+        ddls: str,
+        dialect: str,
+        *,
+        normalize: bool = True,
+    ) -> "Catalog":
+        """Build a :class:`Catalog` by parsing ``ddls``.
 
-    @property
-    def catalog(self) -> "Instance":
-        return self
+        This is the single DDL entry point for every schema-aware layer
+        in ParSEval. Prior to this, the domain module (``SchemaSpec``)
+        and the planner (``Catalog``) each parsed the same DDL through
+        their own walkers; they now share this one walk, and anything
+        that needs a dataclass view of the schema (the domain module's
+        value generators) derives it via :meth:`to_schema_spec`.
+        """
+        catalog = cls(dialect=dialect, normalize=normalize)
+        catalog._ingest_ddls(ddls, dialect)
+        return catalog
 
-    def _build_catalog(self, ddls: str, dialect: str):
-        dependency, table_constraints = {}, {}
+    def _ingest_ddls(self, ddls: str, dialect: str) -> None:
+        """Parse ``ddls`` and populate tables / constraints / keys in place."""
+        dependency: Dict[str, int] = {}
+        table_constraints: Dict[str, Dict[str, set]] = {}
 
-        def _build(
+        def _walk(
             ddl: exp.Create,
-            maps: Dict,
-            deps: Dict,
-            pks: Dict,
-            fks: Dict,
-            tbl_constraints: Dict,
-        ):
+            maps: Dict[str, Dict[str, str]],
+            deps: Dict[str, int],
+            pks: Dict[str, set],
+            fks: Dict[str, list],
+            tbl_constraints: Dict[str, Dict[str, set]],
+        ) -> None:
             table_name = ddl.this.this.name
             if table_name not in deps:
                 deps[table_name] = 0
@@ -241,6 +252,17 @@ class Instance(Catalog):
                 if isinstance(node, exp.ColumnDef):
                     table_mapping[node.name] = node.kind.sql(dialect=dialect)
                     constraints.setdefault(node.name, set()).update(node.constraints)
+                    # Capture inline FK references (REFERENCES table(col)).
+                    for constraint in node.constraints:
+                        if isinstance(constraint.kind, exp.Reference):
+                            ref_table = constraint.kind.find(exp.Table).name
+                            deps[ref_table] = deps.get(ref_table, 0) + 1
+                            # Build a synthetic ForeignKey node for uniform handling.
+                            synthetic_fk = exp.ForeignKey(
+                                expressions=[exp.Identifier(this=node.name)],
+                                reference=constraint.kind,
+                            )
+                            fks.setdefault(table_name, []).append(synthetic_fk)
                 elif isinstance(node, exp.PrimaryKey):
                     pks.setdefault(table_name, set()).update(node.expressions)
                 elif isinstance(node, exp.ForeignKey):
@@ -249,11 +271,11 @@ class Instance(Catalog):
                     fks.setdefault(table_name, []).append(node)
 
         parsed_ddls = parse(ddls, dialect=dialect)
-        mappings = {}
-        primary_keys: Dict[str, Set[exp.Identifier]] = {}
-        foreign_keys: Dict[str, List[exp.ForeignKey]] = {}
+        mappings: Dict[str, Dict[str, str]] = {}
+        primary_keys: Dict[str, set] = {}
+        foreign_keys: Dict[str, list] = {}
         for stmt_expr in parsed_ddls:
-            _build(
+            _walk(
                 ddl=stmt_expr.this,
                 maps=mappings,
                 deps=dependency,
@@ -261,6 +283,8 @@ class Instance(Catalog):
                 fks=foreign_keys,
                 tbl_constraints=table_constraints,
             )
+
+        # Order tables so that FK dependencies are built after their targets.
         sorted_table = OrderedDict(
             {
                 table_name: mappings[table_name]
@@ -282,6 +306,142 @@ class Instance(Catalog):
                         column,
                         table_constraints[table_name][column],
                     )
+
+    def to_schema_spec(self) -> "SchemaSpec":
+        """Derive the domain-module :class:`SchemaSpec` view of this catalog.
+
+        This is the single bridge between the sqlglot-native schema
+        representation held by :class:`Catalog` and the dataclass view
+        the domain module's value generators expect. Callers that want
+        the sqlglot perspective should read ``catalog.tables`` and
+        friends directly; callers that want the dataclass view (e.g.
+        ``DatabaseBuilder``) go through this derivation.
+        """
+        # Deferred import avoids a circular dependency at module load time
+        # (parseval.domain imports from parseval.instance via tests / helpers).
+        from parseval.domain import ColumnSpec, ForeignKeySpec, SchemaSpec, TableSpec
+
+        table_specs: List[TableSpec] = []
+
+        for table_name in self.tables.keys():
+            column_types = self.tables[table_name]
+            pk_columns = {
+                identifier.name.lower()
+                for identifier in self.get_primary_key(table_name)
+            }
+            fk_nodes = self.get_foreign_key(table_name)
+            fk_specs: List[ForeignKeySpec] = []
+            single_column_fk_map: Dict[str, ForeignKeySpec] = {}
+            for fk_node in fk_nodes:
+                reference = fk_node.args.get("reference")
+                if reference is None:
+                    continue
+                target_table = reference.find(exp.Table)
+                if target_table is None:
+                    continue
+                source_columns = tuple(
+                    identifier.name.lower()
+                    for identifier in fk_node.expressions
+                )
+                target_columns = tuple(
+                    identifier.name.lower()
+                    for identifier in reference.this.expressions
+                )
+                fk_spec = ForeignKeySpec(
+                    source_table=table_name,
+                    source_columns=source_columns,
+                    target_table=target_table.name,
+                    target_columns=target_columns,
+                )
+                fk_specs.append(fk_spec)
+                if len(source_columns) == 1:
+                    single_column_fk_map[source_columns[0]] = fk_spec
+
+            unique_constraints: List[Tuple[str, ...]] = []
+            column_specs: List[ColumnSpec] = []
+            for column_name, type_sql in column_types.items():
+                raw_constraints = self.get_column_constraints(table_name, column_name)
+                column_pk = any(
+                    isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint)
+                    for constraint in raw_constraints
+                )
+                column_unique = any(
+                    isinstance(constraint.kind, exp.UniqueColumnConstraint)
+                    for constraint in raw_constraints
+                )
+                nullable = not any(
+                    isinstance(constraint.kind, exp.NotNullColumnConstraint)
+                    for constraint in raw_constraints
+                )
+                is_pk = column_pk or column_name.lower() in pk_columns
+                datatype_node = self._datatype_node_for(column_name, type_sql)
+                column_specs.append(
+                    ColumnSpec(
+                        table=table_name,
+                        column=column_name,
+                        datatype=datatype_node.copy(),
+                        nullable=nullable and not is_pk,
+                        unique=column_unique,
+                        primary_key=is_pk,
+                        foreign_key=single_column_fk_map.get(column_name.lower()),
+                        default=None,
+                        native_type=type_sql,
+                        dialect=self.dialect,
+                        length=getattr(datatype_node, "length", None),
+                        precision=getattr(datatype_node, "precision", None),
+                        scale=getattr(datatype_node, "scale", None),
+                    )
+                )
+
+            table_specs.append(
+                TableSpec(
+                    name=table_name,
+                    columns=tuple(column_specs),
+                    primary_key=tuple(sorted(pk_columns)),
+                    unique_constraints=tuple(unique_constraints),
+                    foreign_keys=tuple(fk_specs),
+                )
+            )
+
+        return SchemaSpec(tables=tuple(table_specs), dialect=self.dialect)
+
+    @staticmethod
+    def _datatype_node_for(column_name: str, type_sql: str) -> exp.DataType:
+        """Build a fresh :class:`exp.DataType` node from a stored type SQL string."""
+        try:
+            return exp.DataType.build(type_sql)
+        except Exception:  # pragma: no cover - defensive
+            return exp.DataType.build("TEXT")
+
+
+class Instance(Catalog):
+    def __init__(self, ddls: str, name: str, dialect: str, normalize=True):
+        super().__init__(dialect=dialect, normalize=normalize)
+        self.ddls = ddls
+        self.name = name
+        self.data: Dict[str, List[Row]] = defaultdict(list)
+        self.symbols: SymbolIndex = SymbolIndex()
+        self.name_seq = name_sequence(self.name)
+
+        # Parse the DDL exactly once, into the sqlglot-native catalog state
+        # this Instance inherits. ``schema_spec`` is a lazy domain-module
+        # view over that state (built on first access, cached thereafter).
+        self._ingest_ddls(ddls, dialect)
+        self.builder = DatabaseBuilder(self.schema_spec)
+
+    @cached_property
+    def schema_spec(self) -> "SchemaSpec":
+        """Domain-module :class:`SchemaSpec` derived from this Instance's catalog.
+
+        Cached; safe to call repeatedly. Invalidated only if ``self.ddls``
+        is replaced (not currently supported).
+        """
+        return self.to_schema_spec()
+
+    @property
+    def catalog(self) -> "Instance":
+        return self
+
     def __repr__(self):
         return f"Instance(name={self.name}, tables={list(self.tables.keys())})"
 
@@ -315,10 +475,7 @@ class Instance(Catalog):
                 normalized_concretes.setdefault(normalized_table, {})[
                     normalized_column
                 ] = values
-        for table_name in self.tables:
-            normalized_table = self._normalize_table(table_name, dialect=self.dialect)
-            if normalized_table not in normalized_concretes:
-                continue
+        for normalized_table in self._creation_order(normalized_concretes):
             table_data = normalized_concretes[normalized_table]
             num_rows = max(len(v) for v in table_data.values()) if table_data else 1
             created[normalized_table] = []
@@ -332,6 +489,82 @@ class Instance(Catalog):
                     self.create_row(table_name=normalized_table, values=row_values)
                 )
         return created
+
+    def _creation_order(self, concretes: Dict[str, Dict[str, List[Any]]]) -> List[str]:
+        requested = list(concretes.keys())
+        requested_set = set(requested)
+        visited: Set[str] = set()
+        ordered: List[str] = []
+
+        def visit(table_name: str) -> None:
+            if table_name in visited:
+                return
+            visited.add(table_name)
+            for fk in self.get_foreign_key(table_name):
+                reference = fk.args.get("reference")
+                if reference is None:
+                    continue
+                ref_table_expr = reference.find(exp.Table)
+                if ref_table_expr is None:
+                    continue
+                ref_table = self._normalize_table(ref_table_expr.name, dialect=self.dialect)
+                if ref_table in requested_set:
+                    visit(ref_table)
+            ordered.append(table_name)
+
+        for table_name in requested:
+            visit(table_name)
+        return ordered
+
+    # ------------------------------------------------------------------
+    # Row creation — Level 0 (primitive, unchecked)
+    # ------------------------------------------------------------------
+
+    def place_row(
+        self,
+        table_name: str,
+        values: Dict[str, Any],
+    ) -> Row:
+        """Append a row with explicit values. No FK/unique validation.
+
+        Creates a :class:`Variable` for each column, registers it in the
+        :class:`SymbolIndex`, and appends the :class:`Row`. This is the
+        foundation that :meth:`create_row` builds on; tests and the
+        solver use it when they want full control without policy.
+
+        ``values`` must contain an entry for every column in the table.
+        Missing columns are filled with ``None`` (SQL NULL).
+        """
+        table_name = self._normalize_name(table_name, dialect=self.dialect, is_table=True)
+        if table_name not in self.tables:
+            raise KeyError(f"Unknown table: {table_name}")
+        tuple_index = len(self.get_rows(table_name))
+        rowid = f"{table_name}_rowid_{tuple_index}"
+        normalized_values = {
+            self._normalize_name(k, dialect=self.dialect): v for k, v in values.items()
+        }
+        row_cells: Dict[str, Variable] = {}
+        for column, datatype in self.tables[table_name].items():
+            z_name = normalize_name(f"{table_name}_{column}_{datatype}_{tuple_index}")
+            concrete = normalized_values.get(column)
+            z_value = Variable(
+                this=z_name,
+                _type=datatype,
+                concrete=concrete,
+                table=table_name,
+                column=column,
+                rowid=rowid,
+            )
+            z_value.type = datatype
+            row_cells[column] = z_value
+            self.symbols.register(z_value)
+        row = Row(this=rowid, columns=row_cells)
+        self.add_row(table_name, row)
+        return row
+
+    # ------------------------------------------------------------------
+    # Row creation — Level 1 (policy-driven, validated)
+    # ------------------------------------------------------------------
 
     def create_row(
         self,
@@ -412,7 +645,7 @@ class Instance(Catalog):
         if conflict_index is not None:
             return conflict_index
 
-        for _ in range(100):
+        for _ in range(10):
             try:
                 completed = self.builder.complete_row(
                     table_name,
@@ -422,24 +655,30 @@ class Instance(Catalog):
             except (UniqueConflictError, ForeignKeyResolutionError):
                 raise
             new_values = {}
+            rowid = f"{table_name}_rowid_{tuple_index}"
             for column, datatype in self.tables[table_name].items():
                 z_name = normalize_name(f"{table_name}_{column}_{datatype}_{tuple_index}")
                 concrete = completed.get(column)
-                z_value = Variable(this=z_name, _type=datatype, concrete=concrete)
+                z_value = Variable(
+                    this=z_name,
+                    _type=datatype,
+                    concrete=concrete,
+                    table=table_name,
+                    column=column,
+                    rowid=rowid,
+                )
                 z_value.type = datatype
                 new_values[column] = z_value
-                self.symbols[z_name] = z_value
-                self.symbol_to_table[z_name] = (table_name, column)
+                self.symbols.register(z_value)
             if self._row_violates_unique_constraints(table_name, new_values):
                 continue
-            rowid = f"{table_name}_rowid_{tuple_index}"
             self.add_row(table_name, Row(this=rowid, columns=new_values))
             self.builder.runtime.remember_row(
                 table_name,
                 {column: value.concrete for column, value in new_values.items()},
             )
             return tuple_index
-        raise_exception(f"Failed to create row for table {table_name} after 100 attempts")
+        raise_exception(f"Failed to create row for table {table_name} after 10 attempts")
 
     def _bootstrap_reference_rows(
         self,
@@ -483,18 +722,19 @@ class Instance(Catalog):
                     and self.is_unique(table_name, local_col)
                     and explicit_value in used_child_values
                 ):
-                    ref_position = self._create_row(ref_table, {}, alias=None)
+                    created = self.create_row(ref_table, {}, alias=None)
+                    self._merge_created_rows(created_rows, created.created)
+                    ref_position = next(iter(created.positions.values()))
                     ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
                     values[local_col] = ref_value.concrete
-                    created_rows[ref_table].append(self.get_row(ref_table, ref_position))
                     continue
                 if explicit_value not in existing_parent_values:
-                    ref_position = self._create_row(
+                    created = self.create_row(
                         ref_table,
                         {ref_col: explicit_value},
                         alias=None,
                     )
-                    created_rows[ref_table].append(self.get_row(ref_table, ref_position))
+                    self._merge_created_rows(created_rows, created.created)
                 continue
 
             should_force_new_parent = (
@@ -514,10 +754,11 @@ class Instance(Catalog):
                     values[local_col] = random.choice(available_values)
                     continue
 
-            ref_position = self._create_row(ref_table, {}, alias=None)
+            created = self.create_row(ref_table, {}, alias=None)
+            self._merge_created_rows(created_rows, created.created)
+            ref_position = next(iter(created.positions.values()))
             ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
             values[local_col] = ref_value.concrete
-            created_rows[ref_table].append(self.get_row(ref_table, ref_position))
 
         return created_rows
 
@@ -660,10 +901,11 @@ class Instance(Catalog):
                 if fk_target is None:
                     continue
                 ref_table, ref_col = fk_target
-                ref_position = self._create_row(ref_table, {}, alias=None)
+                created = self.create_row(ref_table, {}, alias=None)
+                self._merge_created_rows(created_rows, created.created)
+                ref_position = next(iter(created.positions.values()))
                 ref_value = self.get_column_data(ref_table, ref_col)[ref_position].concrete
                 values[column] = ref_value
-                created_rows[ref_table].append(self.get_row(ref_table, ref_position))
                 progress = True
                 break
             if not progress:
@@ -689,12 +931,64 @@ class Instance(Catalog):
     def reset(self):
         self.data.clear()
         self.symbols.clear()
-        self.symbol_to_table.clear()
-        self.symbol_to_tuple_id.clear()
-        self.tuple_id_to_symbols.clear()
-        self.pk_fk_symbols.clear()
         self.builder = DatabaseBuilder(self.schema_spec)
-        self._build_catalog(self.ddls, self.dialect)
+        # Re-parse so the catalog state (tables / PK / FK / constraints) is
+        # reconstructed from scratch; schema_spec cache is invalidated too.
+        self.mapping = {}
+        self.constraints.clear()
+        self.primary_keys.clear()
+        self.foreign_keys.clear()
+        self.__dict__.pop("schema_spec", None)  # clear cached_property
+        self._ingest_ddls(self.ddls, self.dialect)
+
+    # ------------------------------------------------------------------
+    # Transactional scoping
+    # ------------------------------------------------------------------
+
+    def checkpoint(self) -> Dict[str, Any]:
+        """Capture a lightweight checkpoint of the current row state.
+
+        Returns an opaque token that can be passed to :meth:`rollback` to
+        restore the Instance to this point. Only row data and symbol
+        registrations are captured; schema / catalog state is immutable
+        and doesn't need checkpointing.
+        """
+        return {
+            "data": {
+                table: list(rows) for table, rows in self.data.items()
+            },
+            "symbols": list(self.symbols.names()),
+        }
+
+    def rollback(self, checkpoint: Dict[str, Any]) -> None:
+        """Restore row state to a previously captured :meth:`checkpoint`.
+
+        Rows added after the checkpoint are removed; symbols registered
+        for those rows are unregistered. The builder's runtime memory is
+        rebuilt from the surviving rows.
+        """
+        saved_data = checkpoint["data"]
+        saved_symbol_names = set(checkpoint["symbols"])
+
+        # Restore row data.
+        self.data.clear()
+        for table, rows in saved_data.items():
+            self.data[table] = rows
+
+        # Unregister symbols that were added after the checkpoint.
+        current_names = list(self.symbols.names())
+        for name in current_names:
+            if name not in saved_symbol_names:
+                self.symbols.unregister(name)
+
+        # Rebuild the builder's runtime memory from surviving rows.
+        self.builder = DatabaseBuilder(self.schema_spec)
+        for table_name in self.tables:
+            for row in self.get_rows(table_name):
+                self.builder.runtime.remember_row(
+                    table_name,
+                    {col: val.concrete for col, val in row.items()},
+                )
 
     def snapshot(self) -> InstanceSnapshot:
         tables: list[TableBatch] = []
@@ -727,20 +1021,21 @@ class Instance(Catalog):
     def to_db(
         self,
         connection_string: str,
-        dialect: str,
+        dialect: str = None,
         truncate_first: bool = True,
         return_inserted: bool = False,
     ):
-        snapshot = self.snapshot()
-        target = DatabaseTarget(
+        """Write this instance to a live database.
+
+        Thin delegation to :func:`parseval.instance.io.to_db`; kept as a
+        method for backward compatibility with existing call sites.
+        """
+        from .io import to_db as _to_db
+
+        return _to_db(
+            self,
             connection_string=connection_string,
             dialect=dialect,
-        )
-        result = InstanceLoader().load(
-            snapshot=snapshot,
-            target=target,
             truncate_first=truncate_first,
+            return_inserted=return_inserted,
         )
-        if return_inserted:
-            return "\n".join(InstanceExporter().render_sql(snapshot))
-        return result

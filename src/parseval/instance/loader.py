@@ -5,6 +5,7 @@ from sqlglot import exp
 from parseval.db_manager import DBManager
 from parseval.helper import normalize_name
 
+from .serialization import InstanceValueSerializer
 from .types import DatabaseTarget, InstanceSnapshot, TableBatch, WriteResult
 
 
@@ -13,6 +14,7 @@ class InstanceLoader:
         self,
         snapshot: InstanceSnapshot,
         target: DatabaseTarget,
+        serializer: InstanceValueSerializer,
         truncate_first: bool = True,
     ) -> WriteResult:
         inserted_tables: list[str] = []
@@ -29,7 +31,12 @@ class InstanceLoader:
             if ddls:
                 conn.create_tables(*ddls)
             for table in snapshot.tables:
-                inserted = self._insert_table(conn, table, target.dialect)
+                inserted = self._insert_table(
+                    conn,
+                    table,
+                    target.dialect,
+                    serializer=serializer,
+                )
                 if inserted:
                     inserted_tables.append(table.table_name)
                     inserted_rows += inserted
@@ -39,7 +46,13 @@ class InstanceLoader:
             inserted_rows=inserted_rows,
         )
 
-    def _insert_table(self, conn, table: TableBatch, dialect: str) -> int:
+    def _insert_table(
+        self,
+        conn,
+        table: TableBatch,
+        dialect: str,
+        serializer: InstanceValueSerializer,
+    ) -> int:
         if not table.rows:
             return 0
         parameter_names = {
@@ -64,10 +77,12 @@ class InstanceLoader:
         ).sql(dialect=dialect)
         payload = [
             {
-                parameter_names[column]: row.get(column)
+                parameter_names[column]: serialized_row.get(column)
                 for column in table.columns
             }
-            for row in table.rows
+            for serialized_row in (
+                serializer.serialize_row(table.table_name, row) for row in table.rows
+            )
         ]
         conn.insert(statement, payload)
         return len(payload)
