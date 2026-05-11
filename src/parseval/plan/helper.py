@@ -3,7 +3,7 @@ from sqlglot import exp
 import math, numbers, datetime
 from parseval.dtype import DataType
 from parseval.states import SyntaxException
-from sqlglot.planner import Aggregate
+from parseval.plan.planner import Aggregate
 
 
 def to_type(type_def: str | DataType | dict) -> DataType:

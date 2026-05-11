@@ -117,6 +117,15 @@ class GenericTypeAdapter(TypeAdapter):
             pass
         return False
 
+    def coerce_out(self, value: Any, profile: TypeProfile) -> Any:
+        if value is None:
+            return None
+        if profile.family == TypeFamily.DECIMAL:
+            if (profile.dialect or "").lower() == "sqlite":
+                return float(value)
+            return value
+        return super().coerce_out(value, profile)
+
     def _family_for(self, datatype: DataType) -> TypeFamily:
         if datatype.is_type(DataType.Type.UUID):
             return TypeFamily.UUID

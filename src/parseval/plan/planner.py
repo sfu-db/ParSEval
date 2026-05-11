@@ -1,218 +1,1027 @@
+"""
+ParSEval logical-plan builder.
+
+This module forks sqlglot's :mod:`sqlglot.planner` and restructures the plan
+tree around ParSEval's needs for plan-aware branch-coverage analysis.
+
+Compared to upstream sqlglot, the plan produced here:
+
+* always ends in a :class:`Project` step (carrying the SELECT list and the
+  ``DISTINCT`` flag), instead of attaching ``step.projections`` to whichever
+  operator happens to be on top;
+* lifts ``WHERE`` into a dedicated :class:`Filter` step above the scan/join
+  rather than fusing it as ``step.condition`` on :class:`Scan`/:class:`Join`;
+* lifts ``HAVING`` into a dedicated :class:`Having` step above
+  :class:`Aggregate`;
+* lifts ``LIMIT`` (and ``OFFSET``) into a dedicated :class:`Limit` step
+  rather than setting ``step.limit`` on the top operator;
+* models ``SELECT DISTINCT`` as ``Project.distinct = True`` rather than by
+  wrapping the tail in an extra :class:`Aggregate`;
+* surfaces every subquery reference (``FROM (SELECT ...)``, ``EXISTS``,
+  ``IN (SELECT ...)``, scalar subquery in projections/filters/ON/HAVING,
+  CTE references) as a first-class :class:`SubPlan` step that owns its
+  inner plan. :class:`SubPlan` nodes are attached as *additional*
+  dependencies of whichever outer step consumes them, producing a fan-in
+  shape that the ``chain_dependencies`` / ``subplan_dependencies``
+  accessors on :class:`Step` separate cleanly.
+
+Logical shape for a SELECT:
+
+    Limit?                (if LIMIT / OFFSET)
+     └── Project          (always; projections + distinct)
+          └── Sort?       (if ORDER BY)
+               └── Having?    (if HAVING)
+                    └── Aggregate?   (if GROUP BY or aggregate funcs)
+                         └── Filter?  (if WHERE)
+                              └── Join? / Scan / SetOperation
+                                   └── Scan  (one per join input)
+
+The plan's DAG does **not** descend into :class:`SubPlan` inner plans:
+each ``SubPlan`` holds its inner plan's root in ``SubPlan.inner`` but has
+no chain dependencies of its own, so the outer :class:`Plan`'s topological
+walk sees ``SubPlan`` as a leaf. Consumers that want to recurse into a
+subquery do so by walking ``subplan.inner`` explicitly.
+"""
+
 from __future__ import annotations
-from typing import List, Set, Tuple, Dict, Optional, TYPE_CHECKING, Any
-from functools import reduce, total_ordering
+
+import enum
+import math
+import typing as t
 from dataclasses import dataclass, field
+
+from sqlglot import alias, exp
+from sqlglot.helper import name_sequence
+from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
-from sqlglot.planner import Plan, Scan, Aggregate, Join, Sort, SetOperation, Step
-from sqlglot import exp
-from parseval.plan.rex import *
-from .context import Context, DerivedSchema
-from parseval.constants import PBit
-import logging, math
-from parseval.states import non_fatal
-from parseval.helper import normalize_name, convert_to_literal
 
-logger = logging.getLogger("parseval.coverage")
-
-if TYPE_CHECKING:
-    from parseval.uexpr.uexprs import UExprToConstraint
+from parseval.helper import normalize_name
 
 
-@dataclass
-class ScopeNode:
+class Plan:
+    def __init__(self, expression: exp.Expression) -> None:
+        """Build a plan for ``expression``.
 
-    node_id: int
-    scope: Scope
-    dependencies: Set[int] = field(default_factory=set)
-    dependents: Set[int] = field(default_factory=set)
-    outputs: List[Tuple] = field(default_factory=list)
-    is_correlated_dependency: bool = False
-
-    def add_dependency(self, node_id: int):
-        self.dependencies.add(node_id)
-
-    def add_dependent(self, node_id: int):
-        self.dependents.add(node_id)
+        Every subquery reference (``FROM (...)``, ``EXISTS``, ``IN (...)``,
+        scalar subqueries, CTEs) is lowered into a :class:`SubPlan` step
+        attached as an extra dependency of its consumer. Correlation
+        columns for each inner scope are precomputed from
+        ``sqlglot.optimizer.scope.traverse_scope`` at build time and baked
+        into the corresponding :class:`SubPlan`, so downstream consumers
+        never need to consult a separate scope graph.
+        """
+        self.expression = expression.copy()
+        self._correlations = _build_correlation_map(self.expression)
+        self.root = Step.from_expression(
+            self.expression, correlations=self._correlations
+        )
+        self._dag: t.Dict["Step", t.Set["Step"]] = {}
+        self._ordered_steps: t.Optional[t.Tuple["Step", ...]] = None
+        self._annotations: t.Optional[t.Dict[int, "StepAnnotations"]] = None
 
     @property
-    def scope_columns(self) -> Set[exp.Column]:
+    def dag(self) -> t.Dict["Step", t.Set["Step"]]:
+        if not self._dag:
+            dag: t.Dict["Step", t.Set["Step"]] = {}
+            nodes = {self.root}
+
+            while nodes:
+                node = nodes.pop()
+                dag[node] = set()
+
+                for dep in node.dependencies:
+                    dag[node].add(dep)
+                    nodes.add(dep)
+
+            self._dag = dag
+
+        return self._dag
+
+    @property
+    def leaves(self) -> t.Iterator["Step"]:
+        return (node for node, deps in self.dag.items() if not deps)
+
+    @property
+    def ordered_steps(self) -> t.Tuple["Step", ...]:
+        """Deterministic topological order of the outer DAG.
+
+        ``SubPlan`` nodes appear as leaves in this ordering because their
+        ``dependencies`` set is empty by construction. The inner plans
+        live under ``SubPlan.inner`` and are walked separately (usually by
+        the encoder / analysis layer recursing into each ``SubPlan``).
         """
-        Get all columns used in the scope with the given ID.
+        if self._ordered_steps is None:
+            self._ordered_steps = tuple(_topological_order(self))
+        return self._ordered_steps
 
-        Args:
-            scope_id: ID of the scope to retrieve columns for
+    def annotation_for(self, step: "Step") -> "StepAnnotations":
+        """Return the cached :class:`StepAnnotations` for ``step``.
 
-        Returns:
-            Set of column names used in the scope
+        Annotations are computed lazily on first access. They carry
+        ``step_id`` (stable index), ``step_type``, ``step_name``,
+        ``condition``, ``projected_columns``, ``source_tables`` (recursive
+        base-table resolution), and ``referenced_columns``.
         """
-        columns = set()
-        column_str = set()
-        for column in self.scope.columns:
-            if column.sql() not in column_str:
-                columns.add(column)
-                column_str.add(column.sql())
-        return columns
+        if self._annotations is None:
+            self._annotate()
+        assert self._annotations is not None
+        return self._annotations[id(step)]
+
+    @property
+    def annotations(self) -> t.Dict[int, "StepAnnotations"]:
+        """All step annotations, keyed by ``id(step)``."""
+        if self._annotations is None:
+            self._annotate()
+        assert self._annotations is not None
+        return self._annotations
+
+    def _annotate(self) -> None:
+        annotations: t.Dict[int, "StepAnnotations"] = {}
+        for index, step in enumerate(self.ordered_steps):
+            annotations[id(step)] = StepAnnotations(
+                step_id=f"step_{index}",
+                step_type=type(step).__name__,
+                step_name=getattr(step, "name", "") or "",
+                condition=getattr(step, "condition", None),
+                projected_columns=_projected_columns(step),
+                source_tables=_source_tables(step),
+                referenced_columns=_unique_columns(_step_expressions(step)),
+            )
+        self._annotations = annotations
+
+    def __repr__(self) -> str:
+        return f"Plan\n----\n{repr(self.root)}"
 
 
-class Graph:
-    def __init__(self):
-        self.nodes: Dict[int, ScopeNode] = {}
-        self.root_node_id: Optional[int] = None
+class Step:
+    """Base class for every plan node.
 
-    def add_node(self, node: ScopeNode) -> None:
-        """Add a node to the graph.
+    See the module docstring for the full tree shape. Subclasses only add
+    their operator-specific fields; the common ones (``name``,
+    ``dependencies``, ``dependents``, ``projections``, ``limit``,
+    ``condition``) stay on the base so that generic traversals (e.g. in
+    ``plan/scope_plan.py``) can keep working uniformly.
+    """
 
-        Args:
-            node: GraphNode to add
+    @classmethod
+    def from_expression(
+        cls,
+        expression: exp.Expression,
+        ctes: t.Optional[t.Dict[str, "SubPlan"]] = None,
+        correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]] = None,
+    ) -> "Step":
+        """Build a plan DAG from ``expression``.
+
+        The expression's tables and subqueries must be aliased. Example::
+
+            SELECT x.a, SUM(x.b)
+            FROM x AS x
+            JOIN y AS y ON x.a = y.a
+            WHERE x.a > 0
+            GROUP BY x.a
+            HAVING SUM(x.b) > 10
+            ORDER BY x.a
+            LIMIT 5
+
+        produces::
+
+            Limit
+              └── Project (a, SUM(b))
+                    └── Sort (x.a)
+                          └── Having (SUM(x.b) > 10)
+                                └── Aggregate (group: x.a, aggs: SUM(b))
+                                      └── Filter (x.a > 0)
+                                            └── Join (x ⋈ y)
+                                                  ├── Scan x
+                                                  └── Scan y
         """
-        self.nodes[node.node_id] = node
+        ctes = ctes or {}
+        expression = expression.unnest()
+        with_ = expression.args.get("with")
 
-    def add_edge(self, from_node_id: int, to_node_id: int) -> None:
-        """Add a dependency edge between nodes.
+        # CTEs break the mold of scope and introduce themselves to all in the context.
+        if with_:
+            ctes = ctes.copy()
+            for cte in with_.expressions:
+                cte_root = Step.from_expression(
+                    cte.this, ctes, correlations=correlations
+                )
+                cte_root.name = cte.alias
+                cte_subplan = SubPlan(
+                    kind=SubPlanKind.CTE,
+                    inner=cte_root,
+                    anchor=cte,
+                    correlation=(),
+                    output_columns=_output_columns_of(cte_root),
+                    alias=cte.alias,
+                )
+                cte_subplan.name = cte.alias
+                ctes[cte.alias] = cte_subplan
 
-        Args:
-            from_node_id: ID of dependent node
-            to_node_id: ID of dependency node
+        from_ = expression.args.get("from")
+
+        if isinstance(expression, exp.Select) and from_:
+            step = Scan.from_expression(from_.this, ctes, correlations=correlations)
+        elif isinstance(expression, exp.Union):
+            step = SetOperation.from_expression(expression, ctes, correlations=correlations)
+        else:
+            step = Scan()
+
+        joins = expression.args.get("joins")
+
+        if joins:
+            join = Join.from_joins(joins, ctes, correlations=correlations)
+            join.name = step.name
+            join.source_name = step.name
+            join.add_dependency(step)
+            # Subqueries in JOIN ON predicates land on the Join step.
+            for join_args in (getattr(join, "joins", None) or {}).values():
+                join_cond = join_args.get("condition")
+                if isinstance(join_cond, exp.Expression):
+                    _attach_subplans(join, join_cond, ctes, correlations)
+            step = join
+
+        # --- extract SELECT-list projections, aggregate operands, aggregations --------
+        projections: t.List[exp.Expression] = []
+        operands: t.Dict[exp.Expression, str] = {}
+        aggregations: t.Set[exp.Expression] = set()
+        next_operand_name = name_sequence("_a_")
+
+        def extract_agg_operands(expr: exp.Expression) -> bool:
+            agg_funcs = tuple(_iter_outer_agg_funcs(expr))
+            if agg_funcs:
+                aggregations.add(expr)
+
+            for agg in agg_funcs:
+                for operand in agg.unnest_operands():
+                    if isinstance(operand, exp.Column):
+                        continue
+                    if operand not in operands:
+                        operands[operand] = next_operand_name()
+
+                    operand.replace(exp.column(operands[operand], quoted=True))
+
+            return bool(agg_funcs)
+
+        def set_ops_and_aggs(agg_step: "Aggregate") -> None:
+            agg_step.operands = tuple(
+                alias(operand, alias_) for operand, alias_ in operands.items()
+            )
+            agg_step.aggregations = list(aggregations)
+
+        for e in expression.expressions:
+            if _has_outer_agg(e):
+                projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
+                extract_agg_operands(e)
+            else:
+                projections.append(e)
+
+        # --- WHERE -> Filter ---------------------------------------------------------
+        where = expression.args.get("where")
+        if where:
+            filter_step = Filter()
+            filter_step.name = step.name
+            filter_step.source = step.name
+            filter_step.condition = where.this
+            filter_step.add_dependency(step)
+            _attach_subplans(filter_step, where.this, ctes, correlations)
+            step = filter_step
+
+        # --- GROUP BY / aggregations -> Aggregate -----------------------------------
+        group = expression.args.get("group")
+        having = expression.args.get("having")
+        aggregate: t.Optional[Aggregate] = None
+
+        if group or aggregations or (having and _has_outer_agg(having.this)):
+            aggregate = Aggregate()
+            aggregate.name = step.name
+            aggregate.source = step.name
+
+            if having:
+                if extract_agg_operands(
+                    exp.alias_(having.this, "_h", quoted=True)
+                ):
+                    aggregate.condition = exp.column("_h", step.name, quoted=True)
+                else:
+                    aggregate.condition = having.this
+
+            set_ops_and_aggs(aggregate)
+
+            # give aggregates names and replace projections with references to them
+            aggregate.group = {
+                f"_g{i}": e
+                for i, e in enumerate(group.expressions if group else [])
+            }
+
+            intermediate: t.Dict[t.Union[str, exp.Expression], str] = {}
+            for k, v in aggregate.group.items():
+                intermediate[v] = k
+                if isinstance(v, exp.Column):
+                    intermediate[v.name] = k
+
+            for projection in projections:
+                for node in projection.walk():
+                    name = intermediate.get(node)
+                    if name:
+                        node.replace(exp.column(name, step.name))
+
+            if aggregate.condition is not None:
+                for node in aggregate.condition.walk():
+                    name = intermediate.get(node) or intermediate.get(node.name)
+                    if name:
+                        node.replace(exp.column(name, step.name))
+
+            aggregate.add_dependency(step)
+            step = aggregate
+
+            # lift HAVING out of Aggregate into its own Having step
+            if aggregate.condition is not None:
+                having_step = Having()
+                having_step.name = aggregate.name
+                having_step.source = aggregate.name
+                having_step.condition = aggregate.condition
+                aggregate.condition = None
+                having_step.add_dependency(aggregate)
+                if having is not None:
+                    _attach_subplans(having_step, having.this, ctes, correlations)
+                step = having_step
+        elif having is not None:
+            # HAVING without any aggregate context; treat as a plain Filter-after-scan.
+            having_step = Having()
+            having_step.name = step.name
+            having_step.source = step.name
+            having_step.condition = having.this
+            having_step.add_dependency(step)
+            _attach_subplans(having_step, having.this, ctes, correlations)
+            step = having_step
+
+        # --- ORDER BY -> Sort -------------------------------------------------------
+        order = expression.args.get("order")
+        if order:
+            if aggregate is not None:
+                for i, ordered in enumerate(order.expressions):
+                    if extract_agg_operands(
+                        exp.alias_(ordered.this, f"_o_{i}", quoted=True)
+                    ):
+                        ordered.this.replace(
+                            exp.column(f"_o_{i}", aggregate.name, quoted=True)
+                        )
+
+                set_ops_and_aggs(aggregate)
+
+            sort = Sort()
+            sort.name = step.name
+            sort.key = order.expressions
+            sort.add_dependency(step)
+            for ordered in order.expressions:
+                _attach_subplans(sort, ordered, ctes, correlations)
+            step = sort
+
+        # --- Project (always, for Select) -------------------------------------------
+        if isinstance(expression, exp.Select):
+            project = Project()
+            project.name = step.name
+            project.source = step.name
+            project.projections = projections
+            project.distinct = bool(expression.args.get("distinct"))
+            project.add_dependency(step)
+            for projection in projections:
+                if isinstance(projection, exp.Expression):
+                    _attach_subplans(project, projection, ctes, correlations)
+            step = project
+
+        # --- LIMIT / OFFSET -> Limit ------------------------------------------------
+        limit = expression.args.get("limit")
+        offset = expression.args.get("offset")
+        if limit or offset:
+            limit_step = Limit()
+            limit_step.name = step.name
+            limit_step.source = step.name
+            if limit:
+                try:
+                    limit_step.limit = int(limit.text("expression"))
+                except (TypeError, ValueError):
+                    limit_step.limit = math.inf
+            if offset:
+                try:
+                    limit_step.offset = int(offset.text("expression"))
+                except (TypeError, ValueError):
+                    limit_step.offset = 0
+            limit_step.add_dependency(step)
+            step = limit_step
+
+        return step
+
+    def __init__(self) -> None:
+        self.name: t.Optional[str] = None
+        self.dependencies: t.Set["Step"] = set()
+        self.dependents: t.Set["Step"] = set()
+        self.projections: t.Sequence[exp.Expression] = []
+        self.limit: float = math.inf
+        self.condition: t.Optional[exp.Expression] = None
+
+    def add_dependency(self, dependency: "Step") -> None:
+        self.dependencies.add(dependency)
+        dependency.dependents.add(self)
+
+    @property
+    def chain_dependencies(self) -> t.Tuple["Step", ...]:
+        """Chain (operator) dependencies, excluding :class:`SubPlan` inputs.
+
+        These are the upstream operators that feed rows into this step.
+        For a :class:`Scan` leaf this is empty; for a :class:`Join` it's
+        the scans (or further joins) being combined; for post-join
+        operators (``Filter``/``Aggregate``/...) it's the single parent
+        step in the chain.
         """
-        if from_node_id in self.nodes and to_node_id in self.nodes:
-            self.nodes[from_node_id].add_dependency(to_node_id)
-            self.nodes[to_node_id].add_dependent(from_node_id)
+        return tuple(d for d in self.dependencies if not isinstance(d, SubPlan))
 
-    def get_node(self, node_id: int) -> Optional[ScopeNode]:
-        """Get a node by its ID.
+    @property
+    def subplan_dependencies(self) -> t.Tuple["SubPlan", ...]:
+        """Attached :class:`SubPlan` nodes (subqueries / CTEs consumed here)."""
+        return tuple(d for d in self.dependencies if isinstance(d, SubPlan))
 
-        Args:
-            node_id: ID of the node to retrieve
+    def __repr__(self) -> str:
+        return self.to_s()
 
-        Returns:
-            The ScopeNode with the given ID, or None if not found
-        """
-        return self.nodes.get(node_id)
+    def to_s(self, level: int = 0) -> str:
+        indent = "  " * level
+        nested = f"{indent}    "
 
-    def get_root_node(self) -> Optional[ScopeNode]:
-        """Get the root node (main query).
+        context = self._to_s(f"{nested}  ")
 
-        Returns:
-            Root GraphNode if exists, None otherwise
-        """
-        if self.root_node_id is not None:
-            return self.nodes.get(self.root_node_id)
-        return None
+        if context:
+            context = [f"{nested}Context:"] + context
 
-    def get_dependency_order(self) -> List[int]:
-        """Get topological ordering of nodes for constraint solving.
-        Returns:
-            List of node IDs in dependency order (dependencies before dependents)
-        """
-        visited = set()
-        order = []
+        lines = [f"{indent}- {self.id}", *context]
 
-        def visit(node_id: int):
-            if node_id in visited:
-                return
-            visited.add(node_id)
-            node = self.nodes[node_id]
-            # Visit dependencies first
-            for dep_id in node.dependencies:
-                visit(dep_id)
+        if self.projections:
+            lines.append(f"{nested}Projections:")
+            for expression in self.projections:
+                lines.append(f"{nested}  - {expression.sql()}")
 
-            order.append(node_id)
+        if self.condition:
+            lines.append(f"{nested}Condition: {self.condition.sql()}")
 
-        # Start from root
-        if self.root_node_id is not None:
-            visit(self.root_node_id)
+        if self.limit is not math.inf:
+            lines.append(f"{nested}Limit: {self.limit}")
 
-        # Visit any remaining unvisited nodes
-        for node_id in self.nodes:
-            visit(node_id)
+        chain_deps = self.chain_dependencies
+        sub_deps = self.subplan_dependencies
 
-        return order
+        if chain_deps:
+            lines.append(f"{nested}Dependencies:")
+            for dependency in chain_deps:
+                lines.append("  " + dependency.to_s(level + 1))
 
-    def get_ancestors(self, node_id: int) -> Set[int]:
-        """Get all ancestor nodes (transitive dependencies).
+        if sub_deps:
+            lines.append(f"{nested}SubPlans:")
+            for sub in sub_deps:
+                lines.append("  " + sub.to_s(level + 1))
 
-        Args:
-            node_id: Node ID to find ancestors for
+        return "\n".join(lines)
 
-        Returns:
-            Set of ancestor node IDs
-        """
-        ancestors = set()
+    @property
+    def type_name(self) -> str:
+        return self.__class__.__name__
 
-        def collect_ancestors(nid: int):
-            node = self.nodes.get(nid)
-            if node:
-                for dep_id in node.dependencies:
-                    if dep_id not in ancestors:
-                        ancestors.add(dep_id)
-                        collect_ancestors(dep_id)
+    @property
+    def id(self) -> str:
+        name = self.name
+        name = f" {name}" if name else ""
+        return f"{self.type_name}:{name} ({id(self)})"
 
-        collect_ancestors(node_id)
-        return ancestors
-
-    def get_descendants(self, node_id: int) -> Set[int]:
-        """Get all descendant nodes (transitive dependents).
-
-        Args:
-            node_id: Node ID to find descendants for
-
-        Returns:
-            Set of descendant node IDs
-        """
-        descendants = set()
-
-        def collect_descendants(nid: int):
-            node = self.nodes.get(nid)
-            if node:
-                for dep_id in node.dependents:
-                    if dep_id not in descendants:
-                        descendants.add(dep_id)
-                        collect_descendants(dep_id)
-
-        collect_descendants(node_id)
-        return descendants
+    def _to_s(self, _indent: str) -> t.List[str]:
+        return []
 
 
-def _scope_local_base_tables(scope: Scope) -> Set[str]:
-    names = set()
+class Scan(Step):
+    @classmethod
+    def from_expression(
+        cls,
+        expression: exp.Expression,
+        ctes: t.Optional[t.Dict[str, "SubPlan"]] = None,
+        correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]] = None,
+    ) -> "Step":
+        table = expression
+        alias_ = expression.alias_or_name
+
+        if isinstance(expression, exp.Subquery):
+            # FROM (SELECT ...) AS alias: build the inner plan, wrap it in a
+            # SubPlan(TABLE), and attach it as a dependency of a Scan whose
+            # ``source`` points at the subquery expression. The outer encoder
+            # resolves rows by the scan's alias rather than by an underlying
+            # table name.
+            inner_expr = expression.this
+            inner_root = Step.from_expression(
+                inner_expr, ctes, correlations=correlations
+            )
+            subplan = SubPlan(
+                kind=SubPlanKind.TABLE,
+                inner=inner_root,
+                anchor=expression,
+                correlation=_lookup_correlation(correlations, inner_expr),
+                output_columns=_output_columns_of(inner_root),
+                alias=alias_,
+            )
+            subplan.name = alias_
+
+            step = Scan()
+            step.name = alias_
+            step.source = expression
+            step.add_dependency(subplan)
+            return step
+
+        step = Scan()
+        step.name = alias_
+        step.source = expression
+        if ctes and table.name in ctes:
+            # Reference to a CTE — attach its SubPlan as a dependency. Multiple
+            # Scans referencing the same CTE share the same SubPlan instance.
+            step.add_dependency(ctes[table.name])
+
+        return step
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: t.Optional[exp.Expression] = None
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        return [f"{indent}Source: {self.source.sql() if self.source else '-static-'}"]  # type: ignore
+
+
+class Join(Step):
+    @classmethod
+    def from_joins(
+        cls,
+        joins: t.Iterable[exp.Join],
+        ctes: t.Optional[t.Dict[str, "SubPlan"]] = None,
+        correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]] = None,
+    ) -> "Join":
+        step = Join()
+
+        for join in joins:
+            source_key, join_key, condition = join_condition(join)
+            step.joins[join.alias_or_name] = {
+                "side": join.side,  # type: ignore
+                "join_key": join_key,
+                "source_key": source_key,
+                "condition": condition,
+            }
+
+            step.add_dependency(
+                Scan.from_expression(join.this, ctes, correlations=correlations)
+            )
+
+        return step
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_name: t.Optional[str] = None
+        self.joins: t.Dict[str, t.Dict[str, t.List[str] | exp.Expression]] = {}
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Source: {self.source_name or self.name}"]
+        for name, join in self.joins.items():
+            lines.append(f"{indent}{name}: {join['side'] or 'INNER'}")
+            join_key = ", ".join(str(key) for key in t.cast(list, join.get("join_key") or []))
+            if join_key:
+                lines.append(f"{indent}Key: {join_key}")
+            if join.get("condition"):
+                lines.append(f"{indent}On: {join['condition'].sql()}")  # type: ignore
+        return lines
+
+
+class Filter(Step):
+    """Applies a ``WHERE`` predicate on the rows produced by its dependency."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: t.Optional[str] = None
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        return [f"{indent}Source: {self.source or '-'}"]
+
+
+class Aggregate(Step):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aggregations: t.List[exp.Expression] = []
+        self.operands: t.Tuple[exp.Expression, ...] = ()
+        self.group: t.Dict[str, exp.Expression] = {}
+        self.source: t.Optional[str] = None
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Aggregations:"]
+
+        for expression in self.aggregations:
+            lines.append(f"{indent}  - {expression.sql()}")
+
+        if self.group:
+            lines.append(f"{indent}Group:")
+            for expression in self.group.values():
+                lines.append(f"{indent}  - {expression.sql()}")
+        if self.operands:
+            lines.append(f"{indent}Operands:")
+            for expression in self.operands:
+                lines.append(f"{indent}  - {expression.sql()}")
+
+        return lines
+
+
+class Having(Step):
+    """Applies a ``HAVING`` predicate on the output of an :class:`Aggregate`.
+
+    The condition expression may reference aggregate-output columns (such as
+    the synthetic ``_h`` alias that :meth:`Step.from_expression` creates when
+    the ``HAVING`` clause itself contains aggregate functions) or
+    ``GROUP BY`` column aliases (``_g0``, ``_g1``, ...).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: t.Optional[str] = None
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        return [f"{indent}Source: {self.source or '-'}"]
+
+
+class Sort(Step):
+    def __init__(self) -> None:
+        super().__init__()
+        self.key = None
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Key:"]
+
+        for expression in self.key:  # type: ignore
+            lines.append(f"{indent}  - {expression.sql()}")
+
+        return lines
+
+
+class Project(Step):
+    """Emits the final SELECT list and handles ``DISTINCT``.
+
+    Exactly one ``Project`` is emitted for every :class:`sqlglot.exp.Select`
+    at the top of its dependency chain.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: t.Optional[str] = None
+        self.distinct: bool = False
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Source: {self.source or '-'}"]
+        if self.distinct:
+            lines.append(f"{indent}Distinct: True")
+        return lines
+
+
+class Limit(Step):
+    """Caps the row count and optionally skips an ``OFFSET`` prefix."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: t.Optional[str] = None
+        self.offset: int = 0
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Source: {self.source or '-'}"]
+        if self.offset:
+            lines.append(f"{indent}Offset: {self.offset}")
+        return lines
+
+
+class SetOperation(Step):
+    def __init__(
+        self,
+        op: t.Type[exp.Expression],
+        left: str | None,
+        right: str | None,
+        distinct: bool = False,
+    ) -> None:
+        super().__init__()
+        self.op = op
+        self.left = left
+        self.right = right
+        self.distinct = distinct
+
+    @classmethod
+    def from_expression(
+        cls,
+        expression: exp.Expression,
+        ctes: t.Optional[t.Dict[str, "SubPlan"]] = None,
+        correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]] = None,
+    ) -> "SetOperation":
+        assert isinstance(expression, exp.Union)
+
+        left = Step.from_expression(expression.left, ctes, correlations=correlations)
+        # SELECT 1 UNION SELECT 2  <-- these subqueries don't have names
+        left.name = left.name or "left"
+        right = Step.from_expression(expression.right, ctes, correlations=correlations)
+        right.name = right.name or "right"
+        step = cls(
+            op=expression.__class__,
+            left=left.name,
+            right=right.name,
+            distinct=bool(expression.args.get("distinct")),
+        )
+
+        step.add_dependency(left)
+        step.add_dependency(right)
+
+        # NOTE: LIMIT / OFFSET on the union itself is handled uniformly by the
+        # outer ``Step.from_expression``, which wraps this step in a ``Limit``.
+
+        return step
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = []
+        if self.distinct:
+            lines.append(f"{indent}Distinct: {self.distinct}")
+        return lines
+
+    @property
+    def type_name(self) -> str:
+        return self.op.__name__
+
+
+class SubPlanKind(enum.Enum):
+    """Kinds of subquery references that :class:`SubPlan` represents."""
+
+    TABLE = "table"    # FROM (SELECT ...) [AS alias] or JOIN (SELECT ...)
+    SCALAR = "scalar"  # (SELECT col FROM ...) used as a value expression
+    EXISTS = "exists"  # [NOT] EXISTS (SELECT ...)
+    IN = "in"          # x [NOT] IN (SELECT ...)
+    CTE = "cte"        # WITH cte_name AS (SELECT ...)
+
+
+class SubPlan(Step):
+    """A first-class reference to a subquery / CTE within a plan.
+
+    ``SubPlan`` carries the subquery's inner plan root (``inner``), the SQL
+    AST node that anchors it in the outer query (``anchor``), the subset
+    of outer columns it truly correlates against (``correlation``; empty
+    means non-correlated), and the schema the outer sees (``output_columns``
+    and, for table/CTE kinds, ``alias``).
+
+    It is always attached as an *extra* dependency of the outer step that
+    consumes the subquery — never as a chain dependency. The outer plan's
+    DAG treats ``SubPlan`` as a leaf: ``SubPlan.dependencies`` is empty and
+    the inner plan's steps are reached only through ``SubPlan.inner``.
+    Consumers iterate them via :attr:`Step.chain_dependencies` (which
+    skips ``SubPlan``) and :attr:`Step.subplan_dependencies` (which returns
+    them).
+    """
+
+    def __init__(
+        self,
+        kind: SubPlanKind,
+        inner: Step,
+        anchor: exp.Expression,
+        correlation: t.Iterable[exp.Column] = (),
+        output_columns: t.Iterable[str] = (),
+        alias: t.Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.kind = kind
+        self.inner = inner
+        self.anchor = anchor
+        self.correlation: t.Tuple[exp.Column, ...] = tuple(correlation)
+        self.output_columns: t.Tuple[str, ...] = tuple(output_columns)
+        self.alias = alias
+
+    @property
+    def correlated(self) -> bool:
+        return bool(self.correlation)
+
+    def _to_s(self, indent: str) -> t.List[str]:
+        lines = [f"{indent}Kind: {self.kind.value}"]
+        if self.alias:
+            lines.append(f"{indent}Alias: {self.alias}")
+        if self.output_columns:
+            lines.append(f"{indent}Output: {', '.join(self.output_columns)}")
+        if self.correlation:
+            cols = ", ".join(column.sql() for column in self.correlation)
+            lines.append(f"{indent}Correlation: {cols}")
+        lines.append(f"{indent}Inner:")
+        lines.append("  " + self.inner.to_s(level=1))
+        return lines
+
+    @property
+    def type_name(self) -> str:
+        return f"SubPlan[{self.kind.value}]"
+
+
+# ---------------------------------------------------------------------------
+# Subquery lowering helpers
+# ---------------------------------------------------------------------------
+
+
+def _iter_outer_agg_funcs(
+    expression: exp.Expression,
+) -> t.Iterator[exp.AggFunc]:
+    """Yield every :class:`exp.AggFunc` in ``expression`` that belongs to the
+    outer scope.
+
+    ``sqlglot``'s ``find_all(exp.AggFunc)`` descends into nested subqueries,
+    which would cause the planner to treat a scalar subquery like
+    ``(SELECT MAX(x) FROM u)`` as if its ``MAX`` were an outer aggregation.
+    This walk stops at :class:`exp.Subquery` / :class:`exp.Exists` /
+    :class:`exp.In` (with a subquery query) boundaries so each scope's
+    aggregates are analysed in isolation.
+    """
+    stack: t.List[exp.Expression] = [expression]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.AggFunc):
+            yield node
+            # AggFunc operands may themselves contain further AggFuncs
+            # (e.g. ``SUM(a + AVG(b))`` — rare but legal). Continue descent.
+        if isinstance(node, (exp.Subquery, exp.Exists)):
+            continue
+        if isinstance(node, exp.In) and isinstance(
+            node.args.get("query"), exp.Expression
+        ):
+            continue
+        for child in node.args.values():
+            if isinstance(child, exp.Expression):
+                stack.append(child)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, exp.Expression):
+                        stack.append(item)
+
+
+def _has_outer_agg(expression: exp.Expression) -> bool:
+    """``True`` when ``expression`` contains an outer-scope aggregate."""
+    for _ in _iter_outer_agg_funcs(expression):
+        return True
+    return False
+
+
+def _output_columns_of(step: Step) -> t.Tuple[str, ...]:
+    """Return the aliases the inner plan's Project will expose.
+
+    Walks through any Limit/Sort wrappers down to the Project step, which
+    is the canonical carrier of output column labels under the new plan
+    shape. Returns an empty tuple for plans with no identifiable Project
+    (e.g. a bare ``SetOperation``).
+    """
+    visited: t.Set[int] = set()
+    stack: t.List[Step] = [step]
+    while stack:
+        current = stack.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, Project):
+            return tuple(
+                projection.alias_or_name
+                for projection in current.projections
+                if getattr(projection, "alias_or_name", None)
+            )
+        stack.extend(current.chain_dependencies)
+    return ()
+
+
+def _lookup_correlation(
+    correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]],
+    inner_expr: exp.Expression,
+) -> t.Tuple[exp.Column, ...]:
+    """Return the true correlation columns for ``inner_expr``'s scope."""
+    if correlations is None:
+        return ()
+    return correlations.get(id(inner_expr), ())
+
+
+def _iter_subquery_sites(
+    expression: exp.Expression,
+) -> t.Iterator[t.Tuple[exp.Expression, SubPlanKind]]:
+    """Yield top-level subquery references in ``expression``.
+
+    Each yield is ``(anchor_node, kind)`` where ``anchor_node`` is the
+    ``exp.Exists`` / ``exp.In`` / ``exp.Subquery`` appearing in the outer
+    expression. This function does **not** descend into nested subqueries
+    — each subquery owns its own lowering via :class:`SubPlan`.
+    """
+    stack: t.List[exp.Expression] = [expression]
+    while stack:
+        node = stack.pop()
+
+        if isinstance(node, exp.Exists):
+            yield node, SubPlanKind.EXISTS
+            continue
+
+        if isinstance(node, exp.In):
+            query = node.args.get("query")
+            if isinstance(query, exp.Expression):
+                yield node, SubPlanKind.IN
+                continue
+            # Not a subquery IN (e.g. ``x IN (1, 2, 3)``) — descend normally.
+
+        if isinstance(node, exp.Subquery):
+            yield node, SubPlanKind.SCALAR
+            continue
+
+        for child in node.args.values():
+            if isinstance(child, exp.Expression):
+                stack.append(child)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, exp.Expression):
+                        stack.append(item)
+
+
+def _attach_subplans(
+    consumer: Step,
+    expression: exp.Expression,
+    ctes: t.Dict[str, SubPlan],
+    correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]],
+) -> None:
+    """Attach ``SubPlan`` dependencies for every subquery in ``expression``.
+
+    The ``anchor`` AST node stays inside ``expression`` unchanged; this
+    function just builds the corresponding inner plans and wires them as
+    extra dependencies of ``consumer`` so the outer plan DAG surfaces the
+    subquery sites as first-class plan nodes.
+    """
+    for anchor, kind in _iter_subquery_sites(expression):
+        if kind is SubPlanKind.EXISTS:
+            inner_container = anchor.this
+        elif kind is SubPlanKind.IN:
+            inner_container = anchor.args.get("query")
+        else:  # SCALAR
+            inner_container = anchor
+
+        if isinstance(inner_container, exp.Subquery):
+            inner_expr = inner_container.this
+        else:
+            inner_expr = inner_container
+
+        inner_root = Step.from_expression(
+            inner_expr, ctes, correlations=correlations
+        )
+        subplan = SubPlan(
+            kind=kind,
+            inner=inner_root,
+            anchor=anchor,
+            correlation=_lookup_correlation(correlations, inner_expr),
+            output_columns=_output_columns_of(inner_root),
+            alias=(
+                anchor.alias_or_name
+                if isinstance(anchor, exp.Subquery)
+                else None
+            ),
+        )
+        subplan.name = subplan.alias or f"{kind.value}_{id(anchor)}"
+        consumer.add_dependency(subplan)
+
+
+# ---------------------------------------------------------------------------
+# Scope / correlation helpers (formerly in parseval.plan.graph)
+# ---------------------------------------------------------------------------
+
+
+def _scope_local_base_tables(scope: Scope) -> t.Set[str]:
+    names: t.Set[str] = set()
     for table in scope.expression.find_all(exp.Table):
         names.add(normalize_name(table.name))
     return names
 
 
-def _parent_alias_base_tables(scope: Scope) -> Dict[str, str]:
+def _parent_alias_base_tables(scope: Scope) -> t.Dict[str, str]:
     if scope.parent is None:
         return {}
-    alias_to_table: Dict[str, str] = {}
+    alias_to_table: t.Dict[str, str] = {}
     for source in scope.parent.expression.find_all(exp.Table):
-        alias = source.alias_or_name
-        if not alias:
+        alias_name = source.alias_or_name
+        if not alias_name:
             continue
-        alias_to_table[normalize_name(alias)] = normalize_name(source.name)
+        alias_to_table[normalize_name(alias_name)] = normalize_name(source.name)
     return alias_to_table
 
 
-def _projection_column_keys(scope: Scope) -> Set[Tuple[str, str]]:
+def _projection_column_keys(scope: Scope) -> t.Set[t.Tuple[str, str]]:
     if not isinstance(scope.expression, exp.Select):
         return set()
-    keys = set()
+    keys: t.Set[t.Tuple[str, str]] = set()
     for projection in scope.expression.expressions:
         for column in projection.find_all(exp.Column):
             keys.add((normalize_name(column.table or ""), normalize_name(column.name)))
     return keys
 
 
-def _non_projection_column_keys(scope: Scope) -> Set[Tuple[str, str]]:
+def _non_projection_column_keys(scope: Scope) -> t.Set[t.Tuple[str, str]]:
     if not isinstance(scope.expression, exp.Select):
         return set()
-    keys = set()
+    keys: t.Set[t.Tuple[str, str]] = set()
     for arg_name, arg_value in scope.expression.args.items():
         if arg_name == "expressions" or arg_value is None:
             continue
-        if isinstance(arg_value, list):
-            items = arg_value
-        else:
-            items = [arg_value]
+        items = arg_value if isinstance(arg_value, list) else [arg_value]
         for item in items:
             if not isinstance(item, exp.Expression):
                 continue
@@ -221,1240 +1030,245 @@ def _non_projection_column_keys(scope: Scope) -> Set[Tuple[str, str]]:
     return keys
 
 
-def _has_true_parent_correlation(scope: Scope) -> bool:
+def correlation_columns(scope: Scope) -> t.Tuple[exp.Column, ...]:
+    """Return the outer-bound columns that a correlated subquery actually uses.
+
+    ``sqlglot``'s ``scope.external_columns`` over-reports: it includes
+    columns that merely *look* external but are really resolved against
+    one of the scope's own base tables, or that appear only in the
+    projection (which downstream decorrelation can safely rewrite). This
+    helper filters them down to the columns that are truly outer-bound,
+    in the order ``sqlglot`` produced them. An empty tuple means the
+    scope is not truly correlated.
+    """
     external_columns = list(getattr(scope, "external_columns", []) or [])
     if not external_columns or scope.parent is None:
-        return False
+        return ()
 
     local_base_tables = _scope_local_base_tables(scope)
     parent_alias_to_base = _parent_alias_base_tables(scope)
     projection_keys = _projection_column_keys(scope)
     non_projection_keys = _non_projection_column_keys(scope)
 
+    surviving: t.List[exp.Column] = []
+    seen: t.Set[str] = set()
     for column in external_columns:
+        key = column.sql()
+        if key in seen:
+            continue
         table_name = normalize_name(column.table) if column.table else None
         column_key = (normalize_name(column.table or ""), normalize_name(column.name))
         if column_key in projection_keys and column_key not in non_projection_keys:
             continue
         if not table_name:
-            return True
+            surviving.append(column)
+            seen.add(key)
+            continue
         parent_base = parent_alias_to_base.get(table_name)
         if parent_base is not None and parent_base in local_base_tables:
             continue
-        return True
-    return False
+        surviving.append(column)
+        seen.add(key)
+    return tuple(surviving)
 
 
-def build_graph_from_scopes(expr: exp.Expression) -> Graph:
-    """Build a dependency graph from a list of scopes.
+def scope_columns(scope: Scope) -> t.Set[exp.Column]:
+    """Deduplicate the columns referenced inside ``scope`` by SQL text.
 
-    Args:
-        scopes: List of Scope objects representing query components
+    Mirrors the helper that lived on the old ``ScopeNode``; callers that
+    need the set of columns a scope reads (for resolution or row tagging)
+    use this without needing a graph wrapper.
     """
-    graph = Graph()
-    scopes = list(traverse_scope(expr))
-
-    mappings = {}
-
-    for index, scope in enumerate(scopes):
-        node = ScopeNode(node_id=index, scope=scope)
-        mappings[scope.expression] = index
-        graph.add_node(node)
-        if scope.parent is None:
-            graph.root_node_id = index
-
-    for index, scope in enumerate(scopes):
-        node = graph.get_node(index)
-        if not node or scope.parent is None:
+    columns: t.Set[exp.Column] = set()
+    column_str: t.Set[str] = set()
+    for column in scope.columns:
+        if column.sql() in column_str:
             continue
-        parent_id = mappings[scope.parent.expression]
-        if _has_true_parent_correlation(scope):
-            node.is_correlated_dependency = True
-            graph.add_edge(from_node_id=index, to_node_id=parent_id)
-        elif (
-            isinstance(scope.expression.parent, exp.Subquery)
-            or scope.is_subquery
-            or scope.is_cte
-            or scope.is_union
-        ):
-            graph.add_edge(from_node_id=parent_id, to_node_id=index)
-    return graph
+        columns.add(column)
+        column_str.add(column.sql())
+    return columns
 
 
-def to_scope_dot(graph: Graph) -> str:
-    """Convert the graph to DOT format for visualization.
-    Args:
-        graph: Graph to convert
-    Returns:
-        String in DOT format representing the graph
+def _build_correlation_map(
+    expression: exp.Expression,
+) -> t.Dict[int, t.Tuple[exp.Column, ...]]:
+    """Precompute ``expression_id → correlation_columns`` for every subscope.
+
+    ``Plan.__init__`` calls this once; ``Step.from_expression`` then uses
+    it to fill ``SubPlan.correlation`` without re-traversing scopes for
+    each subquery.
     """
-    lines = ["digraph G {"]
-    for node_id, node in graph.nodes.items():
-        label = f"Node {node_id}\\n{type(node.scope.expression).__name__}"
-        lines.append(f'  {node_id} [label="{label}"];')
-        for dep_id in node.dependencies:
-            lines.append(f"  {dep_id} -> {node_id};")
-    lines.append("}")
-    return "\n".join(lines)
+    result: t.Dict[int, t.Tuple[exp.Column, ...]] = {}
+    for scope in traverse_scope(expression):
+        result[id(scope.expression)] = correlation_columns(scope)
+    return result
 
 
-class Planner:
+# ---------------------------------------------------------------------------
+# Annotations (formerly in parseval.plan.scope_plan)
+# ---------------------------------------------------------------------------
 
-    DATETIME_FMT = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m"]
 
-    def __init__(
-        self,
-        ctx: Context,
-        scope_node: ScopeNode,
-        tracer: UExprToConstraint,
-        dialect: str,
-        verbose: bool = True,
-    ):
-        self.ctx = ctx
-        self._scope = scope_node
-        self.tracer = tracer
-        self.dialect = dialect
-        self.verbose = verbose
-        self.current_scope = scope_node
+@dataclass
+class StepAnnotations:
+    """Cached derived facts about a :class:`Step` in a :class:`Plan`.
 
-    @property
-    def scope(self):
-        return self._scope.scope
+    Populated lazily by :meth:`Plan.annotation_for`. ``step_id`` is a
+    stable index-based identifier (``step_0``, ``step_1``, ...) usable in
+    decision IDs and coverage records.
+    """
 
-    @property
-    def scope_id(self):
-        return self._scope.node_id
+    step_id: str
+    step_type: str
+    step_name: str
+    condition: t.Optional[exp.Expression] = None
+    referenced_columns: t.Tuple[exp.Column, ...] = ()
+    projected_columns: t.Tuple[str, ...] = ()
+    source_tables: t.Tuple[str, ...] = ()
+    flags: t.FrozenSet[str] = frozenset()
+    metadata: t.Dict[str, t.Any] = field(default_factory=dict)
 
-    def context(self, tables):
-        return Context(tables=tables, external=self.ctx)
 
-    def _expression_label(self, expression: Any) -> str:
-        if isinstance(expression, exp.Expression):
-            if expression.alias_or_name:
-                return expression.alias_or_name
-            if isinstance(expression, exp.AggFunc):
-                operands = []
-                for operand in expression.unnest_operands():
-                    if isinstance(operand, exp.Distinct):
-                        operands.extend(operand.expressions)
-                    else:
-                        operands.append(operand)
-                parts = [normalize_name(expression.key)]
-                if not operands:
-                    parts.append("star")
-                else:
-                    for operand in operands:
-                        if isinstance(operand, exp.Column):
-                            parts.append(normalize_name(operand.name))
-                        elif isinstance(operand, exp.Star):
-                            parts.append("star")
-                        else:
-                            parts.append(normalize_name(operand.sql()))
-                return "_".join(part for part in parts if part)
-            return expression.sql()
-        return str(expression)
-
-    def derived_schema(self, expressions, datatypes=None, nullables=None, uniques=None):
-        datatypes = datatypes or {}
-        columns = []
-        for expression in expressions:
-            if isinstance(expression, exp.Expression):
-                columns.append(expression.alias_or_name)
-                if expression.alias_or_name not in datatypes:
-                    datatypes[expression.alias_or_name] = expression.type
-            else:
-                columns.append(expression)
-        return DerivedSchema(
-            columns=columns,
-            datatypes=datatypes,
-            nullables=nullables,
-            uniqueness=uniques,
-        )
-
-    def encode(self) -> Context:
-        expr = self._scope.scope.expression
-        plan = Plan(expr)
-        contexts = {}
-        finished = set()
-        queue = set(plan.leaves)
-
-        while queue:
-            node = queue.pop()
-            try:
-                context = self.context(
-                    {
-                        name: table
-                        for dep in node.dependencies
-                        for name, table in contexts[dep].tables.items()
-                    }
-                )
-                if isinstance(node, Scan):
-                    contexts[node] = self.scan(node, context)
-                elif isinstance(node, Aggregate):
-                    contexts[node] = self.aggregate(node, context)
-                elif isinstance(node, Join):
-                    contexts[node] = self.join(node, context)
-                elif isinstance(node, Sort):
-                    contexts[node] = self.sort(node, context)
-                elif isinstance(node, SetOperation):
-                    contexts[node] = self.set_operation(node, context)
-                else:
-                    raise NotImplementedError
-                finished.add(node)
-                for dep in node.dependents:
-                    if all(d in contexts for d in dep.dependencies):
-                        queue.add(dep)
-                for dep in node.dependencies:
-                    if all(d in finished for d in dep.dependents):
-                        contexts.pop(dep)
-            except Exception as e:
-                raise NotImplementedError(
-                    f"Failed to encode step '{node.id}' of type {type(node)}"
-                ) from e
-        root = plan.root
-        return contexts.get(root)
-
-    def _project_and_filter(self, node: Step, context: Context) -> Context:
-        if node.condition:
-            context = self.filters(node, context)
-        if node.projections:
-            context = self.project(node, context)
-        return context
-
-    def scan(self, node: Scan, context: Context) -> Context:
-        logger.info(
-            f"Processing Scan node {node.name} with source: {node.source}, {node.source.alias_or_name}"
-        )
-        sql_conditions, rows = [], []
-        alias_or_name = node.source.alias_or_name
-        table_reader = None
-        if isinstance(node.source, exp.Table):
-            table_reader = self.ctx.table_iter(node.source.name)
-            scope_columns = self.current_scope.scope_columns
-            visited = set()
-            for column in scope_columns:
-                if column.sql() in visited:
-                    continue
-                visited.add(column.sql())
-                if column.table == alias_or_name:
-                    resolved_schema = self.ctx.resolve_table(node.source.name)
-                    dtype = resolved_schema.get_column_type(column.name)
-                    nullable = resolved_schema.nullable(column.name)
-                    is_unique = resolved_schema.is_unique(column.name)
-                    col = exp.Column(
-                        this=exp.to_identifier(column.name, quoted=True),
-                        table=node.source.alias_or_name,
-                        _type=dtype,
-                        is_unique=is_unique,
-                        nullable=nullable,
-                    )
-                    col.type = dtype
-                    sql_conditions.append(col)
-        for row in table_reader:
-            symbolic_exprs = [row[columnref.name] for columnref in sql_conditions]
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type=node.type_name,
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=symbolic_exprs,
-                takens=[PBit.TRUE] * len(symbolic_exprs),
-                branch=True,
-                rowids=row.rowid(),
-            )
-            rows.append(row.row)
-        derived_schema = DerivedSchema(
-            columns=self.ctx.resolve_table(node.source.name).columns,
-            rows=rows,
-        )
-
-        source_context = self.context({node.name: derived_schema})
-        return self._project_and_filter(node, source_context)
-
-    def project(self, node: Step, context: Context) -> Context:
-        if node.projections is None:
-            return context
-        sink = self.derived_schema(node.projections)
-        for reader, _ in context:
-            row = {}
-            sql_conditions, smt_conditions = [], []
-            for project in node.projections:
-                alias_name = project.alias_or_name
-                if isinstance(project, exp.Alias):
-                    project = project.this
-                    ctx = self.encode_condition(project, scope=reader, context=context)
-                row[alias_name] = ctx[project]
-                smt_conditions.extend(ctx.get("smt_conditions"))
-                sql_conditions.extend(ctx.get("sql_conditions"))
-
-            sink.append(Row(this=reader.row.rowid, columns=row))
-            takens = [
-                16 if isinstance(sql, exp.Column) else int(smt.concrete)
-                for smt, sql in zip(smt_conditions, sql_conditions)
-            ]
-            self.tracer.which_path(
-                scope_id=self.scope_id,
-                step_type="Project",
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=smt_conditions,
-                takens=takens,
-                branch=True,
-                rowids=reader.rowid(),
-            )
-        return self.context({node.name: sink})
-
-    def filters(self, node: Step, context: Context) -> Dict:
-        if node.condition is None:
-            return context
-        rows = []
-        for reader, _ in context:
-            ctx = self.encode_condition(node.condition, scope=reader, context=context)
-            result = ctx[node.condition]
-            branch = result.concrete is True
-            smt_conditions = ctx.get("smt_conditions", [])
-            sql_conditions = ctx.get("sql_conditions", [])
-            if branch:
-                rows.append(reader.row)
-            takens = [b.concrete is True for b in smt_conditions]
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type="Filter",
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=smt_conditions,
-                takens=takens,
-                branch=branch,
-                rowids=reader.row.rowid,
-            )
-
-        return self.context(
-            {
-                name: DerivedSchema(
-                    table.columns, rows, column_range=table.column_range
-                )
-                for name, table in context.tables.items()
-            }
-        )
-
-    def _inner_join(
-        self, node, join, source_context: Context, join_context: Context
-    ) -> List:
-
-        logger.info(f"start to processing inner join, {node.condition}")
-        rows = []
-        if not join.get("source_key") or not join.get("join_key"):
-            for left_row in source_context.table:
-                for right_row in join_context.table:
-                    rows.append(left_row.row + right_row.row)
-            return rows
-        for left_row in source_context.table:
-            left_flag = False
-            for right_row in join_context.table:
-                combined_row = left_row.row + right_row.row
-                smt_exprs, sql_conditions = [], []
-                for source_key, join_key in zip(join["source_key"], join["join_key"]):
-                    smt_exprs.append(
-                        combined_row[source_key.name].eq(combined_row[join_key.name])
-                    )
-                    sql_conditions.append(exp.EQ(this=source_key, expression=join_key))
-
-                smt_expr = reduce(lambda x, y: x.and_(y), smt_exprs)
-                branch = smt_expr.concrete is True
-                rowids = left_row.row.rowid
-
-                if branch:
-                    left_flag = True
-                    rows.append(combined_row)
-                    rowids = combined_row.rowid
-                    takens = [2] * len(
-                        smt_exprs
-                    )  # [2 if b.concrete is True else 3 for b in smt_exprs]
-                    self.tracer.which_path(
-                        scope_id=self.current_scope.node_id,
-                        step_type=node.type_name,
-                        step_name=node.name,
-                        sql_conditions=sql_conditions,
-                        smt_exprs=smt_exprs,
-                        takens=takens,
-                        branch=branch,
-                        rowids=rowids,
-                    )
-
-            if not left_flag:
-                self.tracer.which_path(
-                    scope_id=self.current_scope.node_id,
-                    step_type=node.type_name,
-                    step_name=node.name,
-                    sql_conditions=sql_conditions,
-                    smt_exprs=[],
-                    takens=[3] * len(sql_conditions),
-                    branch=False,
-                    rowids=left_row.row.rowid,
-                )
-
-        return rows
-
-    def _left_join(
-        self, node, join, source_context: Context, join_context: Context
-    ) -> List[Dict]:
-
-        rows = []
-        if not join.get("source_key") or not join.get("join_key"):
-            for left_row in source_context.table:
-                matched = False
-                for right_row in join_context.table:
-                    rows.append(left_row.row + right_row.row)
-                    matched = True
-                if not matched:
-                    null_vlaues = {
-                        column: Const(None) for column in join_context.table.columns
-                    }
-                    new_row = {c: v for c, v in left_row.row.items()}
-                    new_row.update(null_vlaues)
-                    rows.append(Row(left_row.row.rowid, new_row))
-            return rows
-        for left_row in source_context.table:
-            smt_exprs = []
-            sql_conditions = []
-            for right_row in join_context.table:
-                combined_row = left_row.row + right_row.row
-                smt_conditions, sql_conditions = [], []
-                for source_key, join_key in zip(join["source_key"], join["join_key"]):
-                    smt_conditions.append(
-                        combined_row[source_key.name].eq(combined_row[join_key.name])
-                    )
-                    sql_conditions.append(exp.EQ(this=source_key, expression=join_key))
-
-                smt_expr = reduce(lambda x, y: x.and_(y), smt_conditions)
-                smt_exprs.append(smt_expr)
-                branch = smt_expr.concrete is True
-                if branch:
-                    rows.append(combined_row)
-                    takens = [2 if b else 3 for b in smt_conditions]
-                    self.tracer.which_path(
-                        scope_id=self.current_scope.node_id,
-                        step_type=node.type_name,
-                        step_name=node.name,
-                        sql_conditions=sql_conditions,
-                        smt_exprs=smt_conditions,
-                        takens=takens,
-                        branch=branch,
-                        rowids=combined_row.rowid,
-                    )
-
-            if smt_exprs and any(smt_exprs):
+def _unique_columns(
+    expressions: t.Iterable[exp.Expression],
+) -> t.Tuple[exp.Column, ...]:
+    seen: t.Set[str] = set()
+    columns: t.List[exp.Column] = []
+    for expression in expressions:
+        if expression is None:
+            continue
+        for column in expression.find_all(exp.Column):
+            sql = column.sql()
+            if sql in seen:
                 continue
-            null_vlaues = {column: Const(None) for column in join_context.table.columns}
-            new_row = {c: v for c, v in left_row.row.items()}
-            new_row.update(null_vlaues)
-            row = Row(left_row.row.rowid, new_row)
-            smt_condition = reduce(lambda x, y: x.and_(y).not_(), smt_exprs)
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type=node.type_name,
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=[smt_condition],
-                takens=[3],
-                branch=True,
-                rowids=row.rowid,
-            )
-            rows.append(row)
+            seen.add(sql)
+            columns.append(column)
+    return tuple(columns)
 
-        return rows
 
-    def _right_join(
-        self, node, join, source_context: Context, join_context: Context
-    ) -> List[Dict]:
-        rows = []
-        if not join.get("source_key") or not join.get("join_key"):
-            for right_row in join_context.table:
-                matched = False
-                for left_row in source_context.table:
-                    rows.append(left_row.row + right_row.row)
-                    matched = True
-                if not matched:
-                    null_values = {
-                        column: Const(None) for column in source_context.table.columns
-                    }
-                    new_row = dict(null_values)
-                    new_row.update({c: v for c, v in right_row.row.items()})
-                    rows.append(Row(right_row.row.rowid, new_row))
-            return rows
-        for right_row in join_context.table:
-            smt_exprs = []
-            sql_conditions = []
-            for left_row in source_context.table:
-                combined_row = left_row.row + right_row.row
-                smt_conditions, sql_conditions = [], []
-                for source_key, join_key in zip(join["source_key"], join["join_key"]):
-                    smt_conditions.append(
-                        combined_row[source_key.name].eq(combined_row[join_key.name])
-                    )
-                    sql_conditions.append(exp.EQ(this=source_key, expression=join_key))
+def _projected_columns(step: "Step") -> t.Tuple[str, ...]:
+    projections = getattr(step, "projections", None) or []
+    names: t.List[str] = []
+    for projection in projections:
+        alias_name = projection.alias_or_name
+        if alias_name:
+            names.append(alias_name)
+    return tuple(names)
 
-                smt_expr = reduce(lambda x, y: x.and_(y), smt_conditions)
-                smt_exprs.append(smt_expr)
-                branch = smt_expr.concrete is True
-                if branch:
-                    rows.append(combined_row)
-                    takens = [2 if b else 3 for b in smt_conditions]
-                    self.tracer.which_path(
-                        scope_id=self.current_scope.node_id,
-                        step_type=node.type_name,
-                        step_name=node.name,
-                        sql_conditions=sql_conditions,
-                        smt_exprs=smt_conditions,
-                        takens=takens,
-                        branch=branch,
-                        rowids=combined_row.rowid,
-                    )
 
-            if smt_exprs and any(smt_exprs):
-                continue
-            null_values = {
-                column: Const(None) for column in source_context.table.columns
-            }
-            new_row = dict(null_values)
-            new_row.update({c: v for c, v in right_row.row.items()})
-            row = Row(right_row.row.rowid, new_row)
-            smt_condition = reduce(lambda x, y: x.and_(y).not_(), smt_exprs)
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type=node.type_name,
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=[smt_condition],
-                takens=[3],
-                branch=True,
-                rowids=row.rowid,
-            )
-            rows.append(row)
+def _source_tables(step: "Step") -> t.Tuple[str, ...]:
+    """Base tables this step ultimately reads from.
 
-        return rows
+    ``Scan`` yields its underlying table; ``Join`` yields the source plus
+    every joined alias; ``Filter`` / ``Having`` / ``Project`` / ``Limit`` /
+    ``Sort`` / ``Aggregate`` recurse through chain dependencies to the
+    leaves. ``Scan`` with an ``exp.Subquery`` source resolves through its
+    ``SubPlan(TABLE)`` inner tree. ``SubPlan`` branches of other kinds are
+    intentionally not followed — they represent subqueries whose rows
+    belong to a different scope.
+    """
+    names: t.List[str] = []
+    seen: t.Set[str] = set()
 
-    def _natural_join(
-        self, node, join, source_context: Context, join_context: Context
-    ) -> List[Dict]:
+    def add(name: str) -> None:
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
 
-        rows = []
-        source_keys = []
-        join_keys = []
-        for column in source_context.table.columns:
-            if column in join_context.table.columns:
-                source_keys.append(
-                    exp.Column(
-                        this=exp.to_identifier(column),
-                        table=source_context.table.alias_or_name,
-                    )
-                )
-                join_keys.append(
-                    exp.Column(
-                        this=exp.to_identifier(column),
-                        table=join_context.table.alias_or_name,
-                    )
-                )
-
-        for left_row in source_context.table:
-            for right_row in join_context.table:
-                combined_row = left_row.row + right_row.row
-                smt_exprs, sql_conditions = [], []
-                for source_key, join_key in zip(source_keys, join_keys):
-                    smt_exprs.append(
-                        combined_row[source_key.name].eq(combined_row[join_key.name])
-                    )
-                    sql_conditions.append(exp.EQ(this=source_key, expression=join_key))
-                smt_expr = reduce(lambda x, y: x.and_(y), smt_exprs)
-                branch = smt_expr.concrete is True
-                if branch:
-                    rows.append(combined_row)
-                takens = [2 if b.concrete is True else 3 for b in smt_exprs]
-                self.tracer.which_path(
-                    scope_id=self.current_scope.node_id,
-                    step_type=node.type_name,
-                    step_name=node.name,
-                    sql_conditions=sql_conditions,
-                    smt_exprs=smt_exprs,
-                    takens=takens,
-                    branch=branch,
-                    rowids=combined_row.rowid,
-                )
-
-        return rows
-
-    def join(self, node: Join, context):
-        source = node.source_name
-        source_table = context.resolve_table(source)
-        source_context = self.context({source: source_table})
-        column_ranges = {source: range(0, len(source_table.columns))}
-
-        def merged_columns(left_columns, right_columns):
-            columns = []
-            seen = set()
-            for column in list(left_columns) + list(right_columns):
-                key = normalize_name(column)
-                if key in seen:
-                    continue
-                seen.add(key)
-                columns.append(column)
-            return tuple(columns)
-
-        # logger.info(f"column ranges: {column_ranges}")
-        for name, join in node.joins.items():
-            table = context.resolve_table(name)
-            join_context = self.context({name: table})
-            kind = join["side"]
-
-            if kind == "LEFT":
-                rows = self._left_join(node, join, source_context, join_context)
-            elif kind == "RIGHT":
-                rows = self._right_join(node, join, source_context, join_context)
-            elif kind == "NATURAL":
-                rows = self._natural_join(node, join, source_context, join_context)
-            else:
-                rows = self._inner_join(node, join, source_context, join_context)
-
-            combined_columns = merged_columns(source_table.columns, table.columns)
-            offsets = {}
-            cursor = 0
-            for table_name in [source] + list(node.joins.keys()):
-                table_columns = []
-                for col in context.resolve_table(table_name).columns:
-                    col_key = normalize_name(col)
-                    if col_key in offsets:
-                        continue
-                    offsets[col_key] = cursor
-                    table_columns.append(col)
-                    cursor += 1
-                start = (
-                    min(offsets[normalize_name(c)] for c in table_columns)
-                    if table_columns
-                    else cursor
-                )
-                column_ranges[table_name] = range(start, start + len(table_columns))
-
-            source_context = self.context(
-                {
-                    name: DerivedSchema(combined_columns, rows, column_range)
-                    for name, column_range in column_ranges.items()
-                }
-            )
-            source_table = source_context.tables[source]
-        return self._project_and_filter(node, source_context)
-
-    def aggregate(self, node: Aggregate, context: Context):
-        operand_map: dict[str, exp.Expression] = {
-            operand.alias: operand.this for operand in node.operands
-        }
-        group_map: dict[str, exp.Expression] = dict(node.group)
-
-        def restore(expr: exp.Expression) -> exp.Expression:
-            expr = expr.copy()
-            for col_ref in expr.find_all(exp.Column):
-                name = col_ref.name
-                if name in operand_map:
-                    col_ref.replace(operand_map[name].copy())
-                elif name in group_map:
-                    col_ref.replace(group_map[name].copy())
-            return expr
-
-        group_by_columns: list[exp.Expression] = list(node.group.values())
-        h_aliases = {a.alias for a in node.aggregations if isinstance(a, exp.Alias)}
-        having_operand_name: str | None = None
-        if (
-            node.condition is not None
-            and isinstance(node.condition, exp.Column)
-            and node.condition.name in h_aliases
-        ):
-            having_operand_name = node.condition.name
-
-        having_condition: exp.Expression | None = None
-        having_agg_sqls: set[str] = set()
-        if node.condition is not None:
-            if having_operand_name:
-                h_entry = next(
-                    a
-                    for a in node.aggregations
-                    if isinstance(a, exp.Alias) and a.alias == having_operand_name
-                )
-                having_condition = restore(h_entry.this)
-                for agg_func in having_condition.find_all(exp.AggFunc):
-                    having_agg_sqls.add(agg_func.sql())
-            else:
-                having_condition = restore(node.condition)
-
-        aggregations: list[exp.Expression] = []
-        aggregation_alias: dict[str, exp.Expression] = {}
-        covered_having_aggs: set[str] = set()
-
-        for agg_expr in node.aggregations:
-            if (
-                isinstance(agg_expr, exp.Alias)
-                and agg_expr.alias == having_operand_name
-            ):
-                continue
-
-            restored = restore(agg_expr)
-            inner = restored.this if isinstance(restored, exp.Alias) else restored
-
-            if inner.sql() in having_agg_sqls:
-                covered_having_aggs.add(inner.sql())
-
-            aggregations.append(restored)
-            aggregation_alias[restored.alias_or_name] = inner
-
-        if having_condition is not None:
-            for having_agg_sql in having_agg_sqls - covered_having_aggs:
-                having_agg_node = next(
-                    f
-                    for f in having_condition.find_all(exp.AggFunc)
-                    if f.sql() == having_agg_sql
-                )
-                internal_alias = f"_having_agg_{len(aggregation_alias)}"
-                aggregations.append(having_agg_node.copy())
-                aggregation_alias[internal_alias] = having_agg_node.copy()
-
-        projection_labels = [
-            self._expression_label(project) for project in node.projections
-        ]
-        group_labels = [
-            (
-                projection_labels[index]
-                if index < len(projection_labels)
-                else self._expression_label(groupby)
-            )
-            for index, groupby in enumerate(group_by_columns)
-        ]
-        aggregate_labels: list[str] = []
-        derived_scm = []
-        dtypes = {}
-        uniques = {}
-        notnulls = {}
-
-        for index, groupby in enumerate(group_by_columns):
-            label = group_labels[index]
-            derived_scm.append(label)
-            dtypes[label] = groupby.type
-            uniques[label] = True
-            notnulls[label] = groupby.args.get("nullable", True)
-
-        for index, agg in enumerate(aggregations):
-            projection_index = len(group_by_columns) + index
-            label = (
-                projection_labels[projection_index]
-                if projection_index < len(projection_labels)
-                else self._expression_label(agg)
-            )
-            aggregate_labels.append(label)
-            derived_scm.append(label)
-            dtypes[label] = agg.type
-            uniques[label] = False
-            notnulls[label] = agg.args.get("nullable", True)
-
-        sink = self.derived_schema(
-            derived_scm, datatypes=dtypes, nullables=notnulls, uniques=uniques
-        )
-
-        groups = {}
-        for reader, _ in context:
-            row = reader.row
-            group_key = ()
-            for expression in group_by_columns:
-                group_key += (row[expression.alias_or_name],)
-
-            concrete_group_key = tuple(v.concrete for v in group_key)
-            if concrete_group_key not in groups:
-                groups[concrete_group_key] = {"group_key": group_key, "rows": []}
-            groups[concrete_group_key]["rows"].append(row)
-
-        self.groupby(node, group_by_columns=group_by_columns, groups=groups)
-
-        aggregate_results = self.aggregate_functions(
-            node,
-            groups,
-            group_by_columns,
-            aggregations,
-            aggregate_labels=aggregate_labels,
-            context=context,
-        )
-
-        sink.rows.extend(aggregate_results)
-        context = self.context(
-            {node.name: sink, **{name: sink for name in context.tables}}
-        )
-        if having_condition:
-            return self.having(
-                node,
-                having_condition,
-                group_labels,
-                aggregate_labels,
-                aggregations,
-                context,
-            )
-        return context
-
-    def groupby(self, node: Aggregate, group_by_columns, groups: Dict):
-        if not node.group:
+    def collect(current: "Step") -> None:
+        source = getattr(current, "source", None)
+        if isinstance(source, exp.Table):
+            add(source.name)
+        if isinstance(current, Scan):
+            for dependency in current.chain_dependencies:
+                collect(dependency)
+            for sub in current.subplan_dependencies:
+                if sub.kind is SubPlanKind.TABLE:
+                    collect(sub.inner)
             return
-
-        sql_conditions, takens = [], []
-        for groupby in group_by_columns:
-            sql_conditions.append(groupby)
-            takens.append(PBit.GROUP_SIZE)
-
-        for _, group_info in groups.items():
-            group_key = group_info["group_key"]
-            group_rows = group_info["rows"]
-            rowids = sum((row.rowid for row in group_rows), ())
-            g = AggGroup(this=rowids, group_key=group_key, group_values=group_rows)
-            smt_conditions = [g] * len(sql_conditions)
-            self.tracer.which_path(
-                scope_id=self.scope_id,
-                step_type="Groupby",
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=smt_conditions,
-                takens=takens,
-                branch=True,
-                rowids=rowids,
-            )
-
-    def aggregate_functions(
-        self,
-        node: Aggregate,
-        groups: Dict,
-        group_by_columns,
-        aggregations: List,
-        aggregate_labels: List[str],
-        context: Context,
-    ):
-        def compute_aggregate_symbol(
-            func_expr: exp.Expression, group_rows: List[Row]
-        ) -> Const:
-            func = func_expr.this if isinstance(func_expr, exp.Alias) else func_expr
-            operands = func.unnest_operands()
-            operand = operands[0] if operands else exp.Star()
-            is_distinct = isinstance(operand, exp.Distinct)
-            if is_distinct:
-                operand = operand.expressions[0]
-            values = []
-            concrete_values = []
-            if isinstance(operand, exp.Star):
-                values = list(group_rows)
-                concrete_values = [1 for _ in group_rows]
-            else:
-                for row in group_rows:
-                    if isinstance(operand, exp.Column):
-                        v = row[operand.alias_or_name or operand.name]
-                    else:
-                        operand_ctx = self.encode_condition(operand, scope=row)
-                        v = operand_ctx[operand]
-                    if v.concrete is not None:
-                        values.append(v)
-                        concrete_values.append(v.concrete)
-            if is_distinct:
-                deduped = {}
-                for value in values:
-                    deduped.setdefault(value.concrete, value)
-                values = list(deduped.values())
-                concrete_values = list(deduped.keys())
-            if isinstance(func, exp.Count):
-                value = Const(this=len(values), _type=DataType.build("int"))
-                value.type = DataType.build("int")
-                return value
-            if isinstance(func, exp.Sum):
-                sum_value = sum(concrete_values) if concrete_values else 0
-                value = Const(this=sum_value, _type=DataType.build("int"))
-                value.type = DataType.build("int")
-                return value
-            if isinstance(func, exp.Max):
-                max_value = max(concrete_values) if concrete_values else None
-                value = Const(this=max_value, _type=func.type)
-                value.type = value.type or func.type
-                return value
-            if isinstance(func, exp.Min):
-                min_value = min(concrete_values) if concrete_values else None
-                value = Const(this=min_value, _type=func.type)
-                value.type = value.type or func.type
-                return value
-            if isinstance(func, exp.Avg):
-                avg_value = (
-                    (sum(concrete_values) / len(concrete_values))
-                    if concrete_values
-                    else None
-                )
-                value = Const(this=avg_value, _type=DataType.build("REAL"))
-                value.type = DataType.build("REAL")
-                return value
-            if any(
-                isinstance(child, exp.AggFunc) for child in func.find_all(exp.AggFunc)
+        if isinstance(current, Join):
+            for dependency in sorted(
+                current.chain_dependencies,
+                key=lambda dep: dep.name or "",
             ):
-                rewritten = func.copy()
-                for agg_child in list(rewritten.find_all(exp.AggFunc)):
-                    agg_symbol = compute_aggregate_symbol(agg_child, group_rows)
-                    agg_child.replace(
-                        convert_to_literal(agg_symbol.concrete, agg_symbol.type)
-                    )
-                concrete = rewritten.concrete
-                value = Const(this=concrete, _type=func.type or DataType.build("REAL"))
-                value.type = value.type or func.type or DataType.build("REAL")
-                return value
-            raise NotImplementedError(f"Aggregation function {func} not supported yet.")
+                collect(dependency)
+            for join_name in sorted((getattr(current, "joins", None) or {}).keys()):
+                add(join_name)
+            return
+        if isinstance(current, SubPlan):
+            return
+        for dependency in current.chain_dependencies:
+            collect(dependency)
 
-        result_rows = []
-        for _, group_info in groups.items():
-            group_key = group_info["group_key"]
-            group_rows = group_info["rows"]
-            rowids = sum((row.rowid for row in group_rows), ())
-            new_row = {
-                self._expression_label(g_name): k
-                for g_name, k in zip(group_by_columns, group_key)
-            }
+    collect(step)
+    return tuple(names)
 
-            for agg_func, aggregate_label in zip(aggregations, aggregate_labels):
-                value = compute_aggregate_symbol(agg_func, group_rows)
-                new_row[aggregate_label] = value
 
-            result_rows.append(Row(this=rowids, columns=new_row))
-            g = AggGroup(this=rowids, group_key=group_key, group_values=group_rows)
-            sql_conditions = list(aggregations)
-            smt_conditions = [g] * len(sql_conditions)
-            takens = [PBit.AGGREGATE_SIZE] * len(sql_conditions)
-            if aggregations:
-                self.tracer.which_path(
-                    scope_id=self.scope_id,
-                    step_type="Aggregate",
-                    step_name=node.name,
-                    sql_conditions=sql_conditions,
-                    smt_exprs=smt_conditions,
-                    takens=takens,
-                    branch=True,
-                    rowids=rowids,
-                )
-        return result_rows
+def _step_expressions(step: "Step") -> t.Tuple[exp.Expression, ...]:
+    expressions: t.List[exp.Expression] = []
 
-    def having(
-        self,
-        node: Aggregate,
-        having_condition: exp.Expression,
-        group_labels: List[str],
-        aggregate_labels: List[str],
-        aggregations: List,
-        context: Context,
-    ):
-        if node.condition is None:
-            return context
+    condition = getattr(step, "condition", None)
+    if condition is not None:
+        expressions.append(condition)
 
-        rows = []
+    projections = getattr(step, "projections", None) or []
+    expressions.extend(
+        projection for projection in projections if isinstance(projection, exp.Expression)
+    )
 
-        for reader, _ in context:
-            row = {}
-            mappings = {}
-            cond = having_condition.copy()
+    if isinstance(step, Join):
+        for join_data in (getattr(step, "joins", None) or {}).values():
+            expressions.extend(join_data.get("source_key", []))
+            expressions.extend(join_data.get("join_key", []))
+            join_cond = join_data.get("condition")
+            if isinstance(join_cond, exp.Expression):
+                expressions.append(join_cond)
 
-            for index, func in enumerate(cond.find_all(exp.AggFunc)):
-                if func not in mappings:
-                    column = exp.Column(
-                        this=exp.to_identifier(f"agg_fun_{index}"), _type=func.type
-                    )
-                    mappings[func] = column
-                    candidate_labels = [self._expression_label(func), *aggregate_labels]
-                    for candidate in candidate_labels:
-                        try:
-                            row[column.name] = reader.row[candidate]
-                            break
-                        except KeyError:
-                            normalized = normalize_name(candidate)
-                            for key, value in reader.row.items():
-                                if normalize_name(str(key)) == normalized:
-                                    row[column.name] = value
-                                    break
-                            if column.name in row:
-                                break
-                    else:
-                        raise KeyError(self._expression_label(func))
-
-            def replace_func(e):
-                if e in mappings:
-                    return mappings[e]
-                return e
-
-            cond = cond.transform(replace_func)
-            ctx = self.encode_condition(cond, scope=row)
-            result = ctx[cond]
-            branch = result.concrete is True
-            smt_conditions = ctx["smt_conditions"]
-            sql_conditions = []
-            for sql_condition in ctx["sql_conditions"]:
-
-                def restore(e):
-                    for k, v in mappings.items():
-                        if e == v:
-                            return k
-                    return e
-
-                sql_conditions.append(sql_condition.transform(restore))
-            if branch:
-                rows.append(reader.row)
-            takens = [
-                (PBit.HAVING_TRUE if b.concrete is True else PBit.HAVING_FALSE)
-                for b in smt_conditions
-            ]
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type="Having",
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=smt_conditions,
-                takens=takens,
-                branch=branch,
-                rowids=reader.rowid(),
-            )
-        return self.context(
-            {
-                name: DerivedSchema(
-                    table.columns, rows, column_range=table.column_range
-                )
-                for name, table in context.tables.items()
-            }
+    if isinstance(step, Aggregate):
+        group = getattr(step, "group", None) or {}
+        expressions.extend(
+            value for value in group.values() if isinstance(value, exp.Expression)
+        )
+        aggregations = getattr(step, "aggregations", None) or []
+        expressions.extend(
+            agg for agg in aggregations if isinstance(agg, exp.Expression)
         )
 
-    @non_fatal(default_from_args=lambda *args, **kwargs: args[2])
-    def sort(self, node: Sort, context):
-        projection_labels = [self._expression_label(p) for p in node.projections]
-        evaluated_rows = []
+    return tuple(expressions)
 
-        for reader, ctx in context:
-            projected = {}
-            sort_values = []
-            sort_symbols = []
 
-            for projection in node.projections:
-                label = self._expression_label(projection)
-                expr = (
-                    projection.this if isinstance(projection, exp.Alias) else projection
-                )
-                expr_ctx = self.encode_condition(expr, scope=reader, context=ctx)
-                projected[label] = expr_ctx[expr]
+# ---------------------------------------------------------------------------
+# Topological order (formerly in scope_plan._order_steps)
+# ---------------------------------------------------------------------------
 
-            for ordered in node.key:
-                key_expr = ordered.this
-                key_ctx = self.encode_condition(key_expr, scope=reader, context=ctx)
-                symbol = key_ctx[key_expr]
-                sort_symbols.append(symbol)
-                sort_values.append(
-                    (
-                        symbol.concrete,
-                        ordered.args.get("desc"),
-                        ordered.args.get("nulls_first", False),
-                    )
-                )
 
-            evaluated_rows.append(
-                (reader.row.rowid, projected, sort_values, sort_symbols)
-            )
+def _topological_order(plan: "Plan") -> t.List["Step"]:
+    """Deterministic topological walk of ``plan.dag``.
 
-        @total_ordering
-        class SortValue:
-            def __init__(self, value, descending: bool):
-                self.value = value
-                self.desc = descending
+    Uses Kahn's algorithm with a stable tie-break on ``(type, name, id)``
+    so the resulting order is reproducible across runs.
+    """
 
-            def __eq__(self, other):
-                return self.value == other.value
+    def sort_key(step: "Step") -> t.Tuple[str, str, int]:
+        return (type(step).__name__, step.name or "", id(step))
 
-            def __lt__(self, other):
-                if self.desc:
-                    return self.value > other.value
-                return self.value < other.value
-
-        def sort_key(item):
-            _, _, order_values, _ = item
-            key = []
-            for v, desc, null_first in order_values:
-                if v is None:
-                    w = 1 if null_first else -1
-                    key.append((w, None))
-                else:
-                    key.append((0, SortValue(v, desc)))
-            return tuple(key)
-
-        sorted_data = sorted(evaluated_rows, key=sort_key)
-        sql_conditions = [o.this for o in node.key]
-
-        for rowid, _, _, sort_symbols in sorted_data:
-            self.tracer.which_path(
-                scope_id=self.current_scope.node_id,
-                step_type="Sort",
-                step_name=node.name,
-                sql_conditions=sql_conditions,
-                smt_exprs=sort_symbols,
-                takens=[True] * len(sort_symbols),
-                branch=True,
-                rowids=rowid,
-            )
-        rows = sorted_data
-        if not math.isinf(node.limit):
-            rows = sorted_data[0 : node.limit]
-        new_rows = []
-        for rowid, projected, _, _ in rows:
-            new_rows.append(Row(rowid, projected))
-
-        output = DerivedSchema(
-            projection_labels,
-            rows=new_rows,
-        )
-        return self.context({node.name: output})
-
-    def set_operation(self, node: SetOperation, context: Context) -> Dict:
-        """We do not need to track set operations here"""
-
-        left = context.tables[node.left]
-        right = context.tables[node.right]
-
-        sink = self.derived_schema(left.columns)
-
-        def row_signature(row):
-            return tuple(
-                row[column].concrete if column in row else None for column in sink.columns
-            )
-
-        def unique_rows(rows):
-            seen = {}
-            for row in rows:
-                seen.setdefault(row_signature(row), row)
-            return seen
-
-        left_unique = unique_rows(left.rows)
-        right_unique = unique_rows(right.rows)
-
-        if issubclass(node.op, exp.Intersect):
-            sink.rows = [
-                left_unique[key]
-                for key in left_unique.keys() & right_unique.keys()
-            ]
-        elif issubclass(node.op, exp.Except):
-            sink.rows = [
-                left_unique[key]
-                for key in left_unique.keys() - right_unique.keys()
-            ]
-        elif issubclass(node.op, exp.Union) and node.distinct:
-            merged = dict(left_unique)
-            for key, row in right_unique.items():
-                merged.setdefault(key, row)
-            sink.rows = list(merged.values())
-        else:
-            sink.rows = left.rows + right.rows
-        if not math.isinf(node.limit):
-            sink.rows = sink.rows[0 : node.limit]
-        return self.context({node.name: sink})
-
-    def encode_condition(
-        self, condition: exp.Expression, ctx: Optional[Dict] = None, **kwargs
-    ):
-
-        ctx = ctx if ctx is not None else {}
-        ctx.update(**kwargs)
-        original_condition = condition
-        condition = condition.transform(
-            lambda node: (
-                exp.Boolean(this=True) if isinstance(node, exp.Exists) else node
-            ),
-            copy=True,
-        )
-        if condition in ctx:
-            return ctx
-
-        result = condition.transform(self.transform, copy=True, ctx=ctx)
-        mappings = ctx.pop("mappings", {})
-
-        for smt_expr in ctx.get("smt_conditions", []):
-            sql_cond = smt_expr.transform(
-                lambda node: mappings[node] if node in mappings else node, copy=True
-            )
-            ctx.setdefault("sql_conditions", []).append(sql_cond)
-        if not ctx.get("sql_conditions"):
-            for smt_cond, sql_cond in mappings.items():
-                ctx.setdefault("sql_conditions", []).append(sql_cond)
-                ctx.setdefault("smt_conditions", []).append(smt_cond)
-        ctx[condition] = result
-        if original_condition is not condition:
-            ctx[original_condition] = result
-        return ctx
-
-    def _get_sql_condition(self, smt_conditions: List[exp.Expression], ctx: Dict):
-        mappings = ctx.get("mappings", {})
-        sql_conditions = []
-        for smt_cond in smt_conditions:
-            sql_conditions.append(
-                smt_cond.transform(
-                    lambda node: mappings[node] if node in mappings else node, copy=True
-                )
-            )
-        return sql_conditions
-
-    def transform(self, condition: exp.Expression, ctx: Dict[str, Any]):
-        if isinstance(condition, exp.Exists):
-            return exp.Boolean(this=True)
-        if isinstance(condition, exp.Predicate):
-            ctx.setdefault("smt_conditions", []).append(condition)
-
-        if isinstance(condition, exp.Column):
-            column = condition
-            table = column.table
-            column_name = column.name
-            row = ctx["scope"]
-            smt_expr = None
-            if hasattr(row, "get") and not isinstance(row, dict):
-                try:
-                    smt_expr = row.get(table, column_name)
-                except Exception:
-                    smt_expr = None
-            if smt_expr is None and table and "context" in ctx:
-                try:
-                    reader_context = ctx["context"]
-                    reader = reader_context.resolve_reader(table)
-                    smt_expr = reader[column_name]
-                except Exception:
-                    smt_expr = None
-            if smt_expr is None:
-                try:
-                    smt_expr = row[column_name]
-                except Exception:
-                    normalized = normalize_name(column_name)
-                    if hasattr(row, "items"):
-                        for key, value in row.items():
-                            if normalize_name(str(key)) == normalized:
-                                smt_expr = value
-                                break
-                    if smt_expr is None:
-                        smt_expr = Const(this=None)
-            ctx.setdefault("mappings", {})[smt_expr] = column
-            return smt_expr
-
-        elif isinstance(condition, exp.Literal):
-            from .helper import to_literal
-
-            literal = to_literal(condition, datatype=condition.type)
-            return literal
-
-        elif isinstance(condition, exp.Cast):
-            to_type = condition.to
-            inner = condition.this
-            if isinstance(condition.this, exp.Column):
-                ctx.setdefault("datatype", {})[condition.this] = to_type
-            inner.type = to_type
-            return inner
-        elif isinstance(condition, exp.Case):
-            for when in condition.args.get("ifs"):
-                smt_expr = when.this.transform(self.transform, copy=True, ctx=ctx)
-                if smt_expr.concrete:
-                    return when.args.get("true").transform(
-                        self.transform, copy=True, ctx=ctx
-                    )
-            default = condition.args.get("default")
-            if default is None:
-                return exp.Null()
-            return default.transform(self.transform, copy=True, ctx=ctx)
-        return condition
+    indegree: t.Dict["Step", int] = {
+        step: len(step.dependencies) for step in plan.dag
+    }
+    ready: t.List["Step"] = sorted(
+        [step for step, degree in indegree.items() if degree == 0],
+        key=sort_key,
+    )
+    ordered: t.List["Step"] = []
+    while ready:
+        current = ready.pop(0)
+        ordered.append(current)
+        newly_ready: t.List["Step"] = []
+        for dependent in sorted(current.dependents, key=sort_key):
+            if dependent not in indegree:
+                continue
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                newly_ready.append(dependent)
+        ready = sorted(ready + newly_ready, key=sort_key)
+    return ordered

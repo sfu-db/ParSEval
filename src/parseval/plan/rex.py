@@ -1,249 +1,223 @@
+"""Concrete evaluation of sqlglot expressions under a ParSEval Symbol env.
+
+The rex module provides the vocabulary ParSEval uses to reason about SQL
+expressions at the value level. It sits between the AST layer (where
+sqlglot expression trees describe query structure) and the solver layer
+(where variables get concrete values assigned): sitting in the middle, it
+offers a *single* path from an AST node plus an :class:`Environment` to a
+Python primitive, and a single vocabulary of :class:`Symbol` objects that
+travel through the Instance, through the encoder's expression trees, and
+into / out of the solver.
+
+Design
+------
+
+* **Tri-state Symbol**. Every ParSEval symbolic value has three states:
+
+    +----------+------------+----------+---------------------+-------------------+
+    | State    | is_bound   | is_null  | ``.concrete``       | Meaning           |
+    +==========+============+==========+=====================+===================+
+    | Unbound  | False      | False    | ``None``            | Free, solver to   |
+    |          |            |          |                     | choose            |
+    +----------+------------+----------+---------------------+-------------------+
+    | NULL     | True       | True     | ``None``            | SQL NULL          |
+    +----------+------------+----------+---------------------+-------------------+
+    | Bound    | True       | False    | the Python value    | committed value   |
+    +----------+------------+----------+---------------------+-------------------+
+
+  The evaluator treats both "unbound" and "NULL" as ``None`` for the
+  purposes of value-level arithmetic (SQL-style propagation). Solvers
+  that need to distinguish the two cases read the ``is_bound`` flag on
+  the :class:`Variable` directly.
+
+* **Class-dispatched handlers**. Each sqlglot expression class has a
+  registered handler that produces the Python value of that expression
+  under an :class:`Environment`. Handlers are composable: ``x + 1`` calls
+  the evaluator recursively for ``x``, gets its value, adds 1. Unknown
+  classes fall back to sqlglot's ``executor.env`` for broad built-in
+  coverage.
+
+* **Uniform three-valued logic**. The three logical helpers
+  (:func:`tvl_and`, :func:`tvl_or`, :func:`tvl_not`) implement SQL's 3VL
+  truth tables, and comparison handlers propagate NULL through any
+  NULL operand. This is one place — handlers that need to see NULL
+  (``IS NULL``, ``COALESCE``, ``IS NOT DISTINCT FROM``) do so explicitly.
+
+* **Type coercion on Const**. :meth:`Const.coerce_to` is the one place
+  type conversions live. Handlers that compare or combine values across
+  types route through coercion so the rest of the evaluator stays
+  type-agnostic.
+
+* **Environment for column resolution**. The encoder builds an
+  :class:`Environment` per row (or per outer-correlation key) and hands
+  it to :func:`concrete`. The environment supports scope chaining so a
+  correlated subquery's inner evaluation can look up outer columns
+  naturally, without the AST being mutated.
+"""
+
 from __future__ import annotations
-from abc import abstractmethod
-from collections.abc import Iterable
-from functools import reduce
+
+import math
+import re
 from datetime import date, datetime
-from sqlglot import exp
-from sqlglot import generator, MappingSchema
-from sqlglot.executor.env import ENV
-from parseval.dtype import DataType
-from parseval.helper import normalize_name, like_to_pattern
-from typing import TYPE_CHECKING, List, Optional, Dict, Any, Tuple, Type
-from sqlglot.optimizer.simplify import simplify
+from functools import wraps
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+
 from dateutil import parser as date_parser
+from sqlglot import exp, generator
+from sqlglot.executor.env import ENV as _SQLGLOT_ENV
+from sqlglot.optimizer.simplify import simplify
+
+from parseval.dtype import DataType
+from parseval.helper import like_to_pattern, normalize_name
+
+# Re-export AST-extension predicates and runtime containers from their homes
+# so callers can still import them as ``parseval.plan.rex.Is_Null`` / etc.
+from .ast_ext import Is_Not_Null, Is_Null  # noqa: F401
+from .context import AggGroup, Row  # noqa: F401
 
 
-def _coerce_temporal_pair(left, right):
-    if left is None or right is None:
-        return left, right
-    left_is_temporal = isinstance(left, (date, datetime))
-    right_is_temporal = isinstance(right, (date, datetime))
-    if left_is_temporal and isinstance(right, str):
-        try:
-            return left, date_parser.parse(right)
-        except Exception:
-            return left, right
-    if right_is_temporal and isinstance(left, str):
-        try:
-            return date_parser.parse(left), right
-        except Exception:
-            return left, right
-    return left, right
-
-
-def _coerce_numeric_pair(left, right):
-    def coerce_str_number(value, other):
-        if not isinstance(value, str) or isinstance(other, bool):
-            return value
-        text = value.strip()
-        try:
-            if isinstance(other, int) and text.isdigit():
-                return int(text)
-            if isinstance(other, int):
-                digits = "".join(ch for ch in text if ch.isdigit())
-                if digits:
-                    return int(digits[:4] if len(digits) >= 4 else digits)
-            if isinstance(other, float):
-                return float(text)
-        except Exception:
-            return value
-        return value
-
-    left = coerce_str_number(left, right)
-    right = coerce_str_number(right, left)
-    return left, right
-
-
-def _coerce_comparable_pair(left, right):
-    left, right = _coerce_temporal_pair(left, right)
-    left, right = _coerce_numeric_pair(left, right)
-    return left, right
-
-
-def _null_if_any_compare(func):
-    def _wrapped(left, right):
-        if left is None or right is None:
-            return None
-        left, right = _coerce_comparable_pair(left, right)
-        return func(left, right)
-
-    return _wrapped
-
-
-def _ensure_iterable(values):
-    if isinstance(values, (str, bytes)):
-        return [values]
-    if isinstance(values, Iterable):
-        return list(values)
-    return [values]
-
-
-def _aggregate_values(values):
-    return [value for value in _ensure_iterable(values) if value is not None]
-
-
-def _agg_sum(values):
-    items = _aggregate_values(values)
-    return sum(items) if items else None
-
-
-def _agg_avg(values):
-    items = _aggregate_values(values)
-    return (sum(items) / len(items)) if items else None
-
-
-def _agg_min(values):
-    items = _aggregate_values(values)
-    return min(items) if items else None
-
-
-def _agg_max(values):
-    items = _aggregate_values(values)
-    return max(items) if items else None
-
-
-def _agg_count(values):
-    return len(_aggregate_values(values))
-
-
-def _case_op(*args):
-    if not args:
-        return None
-    if len(args) == 1:
-        return args[0]
-    if len(args) == 2:
-        cond, true_value = args
-        return true_value if cond else None
-    cond, true_value, false_value = args[:3]
-    return true_value if cond else false_value
-
-
-def _safe_div(left, right):
-    if left is None or right in (None, 0):
-        return None
-    return left / right
-
-
-def _nullif(left, right):
-    if left == right:
-        return None
-    return left
-
-
-def _between(value, low, high):
-    if value is None or low is None or high is None:
-        return None
-    value, low = _coerce_comparable_pair(value, low)
-    value, high = _coerce_comparable_pair(value, high)
-    try:
-        return low <= value and value <= high
-    except TypeError:
-        return False
-
-
-OPS = {
-    **ENV,
-    "VARIABLE": lambda x: x.concrete,
-    "CONST": lambda x: x.args.get("concrete"),
-    "AND": lambda x, y: x and y,
-    "OR": lambda x, y: x or y,
-    "NOT": lambda x: not x,
-    "NULL": lambda: None,
-    "IS": lambda x, y: x is y,
-    "GT": _null_if_any_compare(lambda x, y: x > y),
-    "GTE": _null_if_any_compare(lambda x, y: x >= y),
-    "LT": _null_if_any_compare(lambda x, y: x < y),
-    "LTE": _null_if_any_compare(lambda x, y: x <= y),
-    "SUM": _agg_sum,
-    "AVG": _agg_avg,
-    "MIN": _agg_min,
-    "MAX": _agg_max,
-    "COUNT": _agg_count,
-    "CASE": _case_op,
-    "IF": _case_op,
-    "CAST": lambda value: value,
-    "ORDERED": lambda value, desc=None, nulls_first=False: value,
-    "DIV": _safe_div,
-    "NULLIF": _nullif,
-    "BETWEEN": _between,
-}
-
-
-def _safe_like(this, pattern):
-    if this is None or pattern is None:
-        return None
-    try:
-        compiled = like_to_pattern(str(pattern))
-        return bool(compiled.match(str(this)))
-    except Exception:
-        return False
-
-
-OPS["LIKE"] = _safe_like
-OPS["ILIKE"] = lambda this, pattern: _safe_like(
-    None if this is None else str(this).lower(),
-    None if pattern is None else str(pattern).lower(),
-)
-
-
-def ref(self) -> int:
-    return self.args.get("ref", 0)
-
-
-def datatype(self) -> DataType:
-    if self.type is not None:
-        return self.type
-    dtype = self.args.get("_type")
-    return DataType.build(dtype)
-
-
-def concrete(self) -> Any:
-    if isinstance(self, exp.Column):
-        return self.args.get("concrete")
-    if isinstance(self, exp.Literal):
-        from .helper import to_const
-
-        return to_const(self)
-    concretes = [
-        a.concrete for a in self.iter_expressions() if not isinstance(a, exp.DataType)
-    ]
-    if self.key.upper() not in OPS:
-        return None
-    return OPS[self.key.upper()](*concretes)
-
-
-def __bool__(self) -> bool:
-    if self.concrete is None:
-        return False
-    return bool(self.concrete)
-
-
-setattr(exp.Column, "ref", property(ref))
-setattr(exp.Expression, "datatype", property(datatype))
-setattr(exp.Expression, "concrete", property(concrete))
-
-ColumnRef = exp.Column
+# =============================================================================
+# Symbol hierarchy
+# =============================================================================
 
 
 class Symbol(exp.Expression):
+    """Base class for every ParSEval value node.
 
-    arg_types = {"this": True, "concrete": True}
+    Subclasses inherit :class:`sqlglot.exp.Expression` so they can embed
+    naturally as leaves of an AST; they share the tri-state ``is_bound``
+    / ``is_null`` convention and carry a ParSEval :class:`DataType`.
 
-    def is_number(self):
-        return self.type.is_type(DataType.NUMERIC_TYPES)
+    ``Symbol`` itself is abstract in the usage sense — callers should
+    always construct :class:`Const` (for literals) or :class:`Variable`
+    (for cell identities).
+    """
 
-    def is_datetime(self):
-        return self.type.is_type(*DataType.TEMPORAL_TYPES)
+    arg_types = {
+        "this": True,
+        "type": False,
+        "concrete": False,
+        "is_bound": False,
+        "is_null": False,
+        "source": False,
+    }
 
-    def sql(self, dialect=None, **opts):
+    @property
+    def type(self) -> Optional[DataType]:  # type: ignore[override]
+        return self.args.get("type")
+
+    @type.setter
+    def type(self, value: Optional[DataType]) -> None:  # type: ignore[override]
+        self.set("type", value)
+
+    @property
+    def is_bound(self) -> bool:
+        return bool(self.args.get("is_bound", False))
+
+    @property
+    def is_null(self) -> bool:
+        return bool(self.args.get("is_null", False))
+
+    @property
+    def source(self) -> Optional[str]:
+        return self.args.get("source")
+
+    def sql(self, dialect=None, **opts):  # pragma: no cover - pretty-printer
         return f"{self.key}({self.this})"
 
 
+class Const(Symbol):
+    """A literal value with attached :class:`DataType` and coercion support.
+
+    Unlike :class:`sqlglot.exp.Literal` (raw from the parser), a ``Const``
+    carries a resolved ParSEval ``DataType`` and knows how to convert
+    itself via :meth:`coerce_to`. Always ``is_bound=True``; may be NULL
+    via :meth:`null`.
+    """
+
+    arg_types = {
+        "this": True,
+        "type": False,
+        "is_bound": False,
+        "is_null": False,
+        "source": False,
+    }
+
+    def __init__(self, *args, **kwargs):
+        # Legacy kwargs used by the older API.
+        if "_type" in kwargs:
+            kwargs["type"] = kwargs.pop("_type")
+        # A Const with ``this=None`` means SQL NULL unless explicitly flagged.
+        if "is_null" not in kwargs:
+            kwargs["is_null"] = kwargs.get("this") is None
+        kwargs.setdefault("is_bound", True)
+        super().__init__(*args, **kwargs)
+
+    @property
+    def concrete(self) -> Any:
+        return self.this
+
+    @property
+    def value(self) -> Any:
+        # Legacy accessor.
+        return self.this
+
+    @classmethod
+    def null(cls, type: Optional[DataType] = None) -> "Const":
+        """Return a Const representing SQL NULL with the given type."""
+        return cls(this=None, type=type, is_null=True)
+
+    def coerce_to(
+        self, target: Union[DataType, str], dialect: str = "sqlite"
+    ) -> "Const":
+        """Return a new Const whose value has been coerced to ``target``.
+
+        NULLs short-circuit to :meth:`null`. Same-type coercions are
+        identity. Failures (e.g. strict parsing of a non-numeric string
+        into INT) return :meth:`null` under strict dialects and
+        best-effort values under lenient ones.
+        """
+        target_dt = target if isinstance(target, DataType) else DataType.build(target)
+        if self.is_null:
+            return Const.null(target_dt)
+        if self.type is not None and self.type == target_dt:
+            return self
+        coerced = _coerce_value(self.this, self.type, target_dt, dialect=dialect)
+        return Const(this=coerced, type=target_dt)
+
+
 class Variable(Symbol):
-    arg_types = {"this": True, "concrete": False}
+    """A cell identity: one column-value in one row of one table.
+
+    A ``Variable`` is the bridge between the ``Instance`` (which stores
+    it in rows), the AST (in which it appears as a leaf of expressions),
+    and the solver (which chooses its value). It carries the usual
+    tri-state slots plus optional back-pointers (``table`` / ``column`` /
+    ``rowid``) and solver hints (``nullable`` / ``unique`` / ``domain``).
     """
-        Represents a symbolic variable with additional attributes.
-    """
+
+    arg_types = {
+        "this": True,  # stable name, e.g. ``"T_0003_x"``
+        "type": False,
+        "concrete": False,
+        "is_bound": False,
+        "is_null": False,
+        # --- Instance back-pointers ---
+        "table": False,
+        "column": False,
+        "rowid": False,
+        # --- solver hints ---
+        "nullable": False,
+        "unique": False,
+        "domain": False,
+        "source": False,
+    }
+
+    def __init__(self, *args, **kwargs):
+        if "_type" in kwargs:
+            kwargs["type"] = kwargs.pop("_type")
+        super().__init__(*args, **kwargs)
 
     @property
     def name(self) -> str:
@@ -251,23 +225,46 @@ class Variable(Symbol):
 
     @property
     def concrete(self) -> Any:
-        return self.args.get("concrete", None)
+        # If the Variable has been explicitly bound we honour that; otherwise
+        # we return whatever value was stored at construction time (so legacy
+        # callers that pass ``Variable(this=..., concrete=v)`` still work).
+        if self.args.get("is_bound"):
+            if self.args.get("is_null"):
+                return None
+            return self.args.get("concrete")
+        return self.args.get("concrete")
 
+    def bind(self, value: Any) -> None:
+        """Bind to a concrete non-NULL value."""
+        self.set("is_bound", True)
+        self.set("is_null", False)
+        self.set("concrete", value)
 
-class Const(Symbol):
-    arg_types = {"this": True}
+    def bind_null(self) -> None:
+        """Bind to SQL NULL."""
+        self.set("is_bound", True)
+        self.set("is_null", True)
+        self.set("concrete", None)
 
-    @property
-    def value(self) -> Any:
-        return self.concrete
-
-    @property
-    def concrete(self):
-        return self.this
+    def unbind(self) -> None:
+        """Revert to unbound / free state."""
+        self.set("is_bound", False)
+        self.set("is_null", False)
+        self.set("concrete", None)
 
 
 class ITE(Symbol):
-    arg_types = {"this": True, "true_branch": True, "false_branch": True}
+    """Symbolic if-then-else (``CASE WHEN cond THEN a ELSE b END``).
+
+    Kept as an explicit node because downstream branch analysis wants to
+    treat each arm of a conditional as a first-class decision site.
+    """
+
+    arg_types = {
+        "this": True,
+        "true_branch": True,
+        "false_branch": True,
+    }
 
     @property
     def condition(self) -> Symbol:
@@ -282,881 +279,898 @@ class ITE(Symbol):
         return self.args.get("false_branch")
 
 
-class Row(Symbol):
-    arg_types = {"this": True, "columns": True}
-    """
-    rowid, {column_name: value, ...}
-        rowid: Tuple
-        column_name: str
-        value: Symbol
-    """
-
-    @property
-    def columns(self):
-        return tuple(self.args.get("columns", {}).keys())
-
-    @property
-    def rowid(self) -> Tuple[Any, ...]:
-        if isinstance(self.this, tuple):
-            return self.this
-        return (self.this,)
-
-    def _key_name(self, key):
-        if isinstance(key, exp.Expression):
-            if isinstance(key, exp.Column):
-                return key.name
-            return key.alias_or_name or key.sql()
-        return str(key)
-
-    def items(self):
-        return self.args.get("columns", {}).items()
-
-    def __iter__(self):
-        return iter(self.args.get("columns"))
-
-    def __getitem__(self, key):
-        columns = self.args.get("columns", {})
-        if key in columns:
-            return columns[key]
-        if hasattr(key, "name"):
-            key = key.name
-            if key in columns:
-                return columns[key]
-        normalized = normalize_name(self._key_name(key))
-        for column_name, value in columns.items():
-            if normalize_name(self._key_name(column_name)) == normalized:
-                return value
-        raise KeyError(key)
-
-    def get(self, table, column):
-        del table
-        return self[column]
-
-    def __len__(self):
-        return len(self.args.get("columns", {}))
-
-    def __add__(self, other):
-        assert isinstance(other, Row), f"Cannot add Row with {type(other)}"
-        new_columns = {**self.args.get("columns"), **other.args.get("columns", {})}
-        rid = self.rowid + other.rowid
-        return Row(this=rid, columns=new_columns)
-
-
-class AggGroup(Symbol):
-    """
-    this: rowids of the group,
-    group_key: group by key values,
-    group_values: list of group by key values
-    """
-
-    arg_types = {"this": True, "group_key": True, "group_values": True}
-
-    @property
-    def group_key(self):
-        return self.args.get("group_key", ())
-
-    @property
-    def group_values(self):
-        return self.args.get("group_values", [])
-
-    @property
-    def name(self) -> Any:
-        return self.text("this")
-
-    @property
-    def rowids(self) -> Tuple[Any, ...]:
-        return self.this
-
-    # def extend(self, items: Iterable[Symbol]):
-    #     object.__setattr__(self, "args", self.args + tuple(items))
-
-    # def append(self, item: Symbol):
-    #     object.__setattr__(self, "args", self.args + (item,))
-
-    # def __iter__(self):
-    #     return iter(self.args[2:])
-
-    # def __getitem__(self, index):
-    #     return self.args[2:][index]
-
-
-from sqlglot import generator
-
-for klass in [Symbol, Variable, Const, ITE, Row, AggGroup]:
-    generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
-        dialect=self.dialect
+# Register generator transforms so ``Symbol`` et al. pretty-print when a
+# sqlglot ``Generator`` runs over an AST containing them.
+for _klass in [Symbol, Const, Variable, ITE, Row, AggGroup]:
+    generator.Generator.TRANSFORMS[_klass] = (
+        lambda self, expression: expression.sql(dialect=self.dialect)
     )
 
 
-class Is_Null(exp.Unary, exp.Predicate):
-
-    def sql(self, dialect=None, **opts):
-        return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
-
-
-class Is_Not_Null(exp.Unary, exp.Predicate):
-    def sql(self, dialect=None, **opts):
-        return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
+# Legacy alias for ``exp.Column`` kept because some downstream code still
+# imports :data:`ColumnRef`. Thin alias; removal tracked for the consumer
+# migration phase.
+ColumnRef = exp.Column
 
 
-class FunctionCall(exp.Func):
-    arg_types = {"this": True, "expressions": False}
-
-    def params(self) -> List[exp.Expression]:
-        return self.expressions
-
-    def sql(self, dialect=None, **opts):
-        args_sql = ", ".join(
-            [expr.sql(dialect=dialect, **opts) for expr in self.expressions]
-        )
-        return f"{self.this}({args_sql})"
+# =============================================================================
+# Environment
+# =============================================================================
 
 
-class Strftime(FunctionCall):
-    arg_types = {"this": True, "expressions": True, "datatype": True}
+class Environment:
+    """Column → value resolver with scope chaining for correlated subqueries.
 
-    @property
-    def fmt(self) -> exp.Expression:
-        return self.expressions[1]
+    Construct with a dict of bindings keyed by either ``"name"`` or
+    ``"table.name"`` strings. Resolution first checks the fully-qualified
+    ``table.name`` key, then the bare column name, then the outer
+    environment (if any). Binding stores under the fully-qualified key
+    when the column is qualified.
 
-    @property
-    def operand(self) -> exp.Expression:
-        return self.this
+    Environments are immutable in intent: to extend with new bindings for
+    a nested scope, call :meth:`extend`, which returns a child
+    environment rather than mutating the parent.
+    """
 
+    __slots__ = ("_bindings", "_outer")
 
-class ABS(FunctionCall):
-    arg_types = {"this": True, "datatype": True}
-
-    @property
-    def operand(self) -> exp.Expression:
-        return self.this
-
-
-class ScalarQuery(exp.Expression):
-    arg_types = {
-        "this": True,
-        "datatype": False,
-        "correlated": False,
-    }
-
-    @property
-    def query(self) -> "exp.Expression":
-        return self.this
-
-    @property
-    def selects(self) -> List["exp.Expression"]:
-        return (
-            self.query.schema.columns if isinstance(self.query, LogicalOperator) else []
-        )
-
-    def sql(self, dialect=None, **opts):
-        if self.query:
-            return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
-        if self.args.get("expressions"):
-            return f"{self.key}( {', '.join([expr.sql(dialect=dialect, **opts) for expr in self.expressions])})"
-
-        # return f"{self.key}( {self.query.sql(dialect=dialect, **opts)})"
-
-
-class FieldAccess(exp.Expression):
-    arg_types = {
-        "this": True,
-        "column": True,
-        "datatype": False,
-        "correlated": False,
-    }
-
-    @property
-    def name(self) -> str:
-        return self.text("this")
-
-    @property
-    def column(self) -> int:
-        return self.args.get("column", 0)
-
-    def sql(self, dialect=None, **opts):
-        return f"{self.key}({self.this}, column={self.column})"
-
-
-# class DerivedSchema(exp.Expression):
-#     arg_types = {"this": False, "expressions": True}
-#     @property
-#     def columns(self) -> List[exp.Expression]:
-#         return self.expressions
-
-#     def column_names(self) -> List[str]:
-#         """Get list of column names"""
-#         return [col.name for col in self.columns]
-
-
-class Schema(exp.Expression):
-    arg_types = {"this": False, "expressions": True}
-
-    @property
-    def columns(self) -> List[exp.Expression]:
-        return self.expressions
-
-    def column_names(self) -> List[str]:
-        """Get list of column names"""
-        return [col.name for col in self.columns]
-
-
-class Table(exp.Expression):
-    arg_types = {
-        "this": True,
-        "schema": False,
-        "constraints": False,
-        "primary_key": False,
-        "foreign_key": False,
-    }
-
-    @property
-    def schema(self) -> Schema:
-        return self.args.get("schema")
-
-    @property
-    def constraints(self):
-        return self.args.get("constraints", {})
-
-    @property
-    def columns(self) -> List[ColumnRef]:
-        if "_columns" in self.args:
-            return self.args.get("_columns")
-
-        columns = []
-        for column in self.schema.columns:
-            nullable = self.nullable(column.name)
-            unique = self.is_unique(column.name)
-            column.set("table", self.name)
-            column.set("unique", unique)
-            column.set("nullable", nullable)
-            columns.append(column)
-        self.set("_columns", columns)
-        return columns
-
-    def nullable(self, column_name: str):
-        primary_key = self.args.get("primary_key", None)
-        if primary_key:
-            for column_name in primary_key.find_all(exp.Identifier):
-                if str(column_name) == column_name:
-                    return False
-        for constraint in self.constraints.get(column_name, []):
-
-            if isinstance(constraint.kind, exp.NotNullColumnConstraint):
-                return constraint.kind.args.get("allow_null", False)
-        return True
-
-    def is_unique(self, column_name):
-        for constraint in self.constraints.get(column_name, []):
-            if isinstance(
-                constraint.kind,
-                (
-                    exp.UniqueColumnConstraint,
-                    exp.PrimaryKeyColumnConstraint,
-                ),
-            ):
-                return True
-        primary_key = self.args.get("primary_key", None)
-        if primary_key:
-            for column_name in primary_key.find_all(exp.Identifier):
-                if str(column_name) == column_name:
-                    return True
-        return False
-
-
-class Catalog(exp.Expression):
-    arg_types = {"tables": False}
-
-    @property
-    def tables(self) -> Dict[str, Table]:
-        return self.args.get("tables", {})
-
-    def add_table(self, table_info: Table):
-        """Register a table in the catalog"""
-        self.tables[table_info.name] = table_info
-
-    def get_table(self, name: str) -> Optional[Table]:
-        """Get table information by name"""
-        return self.tables.get(name)
-
-
-from sqlglot.schema import (
-    AbstractMappingSchema,
-    MappingSchema,
-    flatten_schema,
-    dict_depth,
-    nested_get,
-    nested_set,
-    SchemaError,
-)
-from collections import OrderedDict
-
-# class Catalog2(AbstractMappingSchema, Schema):
-#     def __init__(self, schema = None, constraints = None, primary_keys = None, foreign_keys = None, visible = None, dialect = None, normalize = True):
-#         self.dialect = dialect
-#         self.visible = {} if visible is None else visible
-#         self.normalize = normalize
-#         self._type_mapping_cache: Dict[str, DataType] = {}
-#         self._depth = 0
-#         self.constraints = {}
-#         self.primary_keys = {}
-#         self.foreign_keys = {}
-#         schema = OrderedDict() if schema is None else schema
-#         super().__init__(schema if self.normalize else schema)
-
-
-class Catalog2(MappingSchema):
     def __init__(
         self,
-        schema=None,
-        constraints=None,
-        primary_keys=None,
-        foreign_keys=None,
-        visible=None,
-        dialect=None,
-        normalize=True,
-    ):
-        self.constraints = {}
-        self.primary_keys = {}
-        self.foreign_keys = {}
-        schema = OrderedDict() if schema is None else schema
-        super().__init__(schema, visible, dialect, normalize)
-        constraints = {} if constraints is None else constraints
-        primary_keys = {} if primary_keys is None else primary_keys
-        foreign_keys = {} if foreign_keys is None else foreign_keys
+        bindings: Optional[Dict[str, Any]] = None,
+        outer: Optional["Environment"] = None,
+    ) -> None:
+        self._bindings: Dict[str, Any] = dict(bindings) if bindings else {}
+        self._outer: Optional[Environment] = outer
 
-        for table_name, table_constraints in constraints.items():
-            for column_name, column_constraints in table_constraints.items():
-                for constraint in column_constraints:
-                    self.add_constraint(table_name, column_name, constraint)
-        for table_name, pks in primary_keys.items():
-            self.add_primary_key(table_name, pks)
-        for table_name, fks in foreign_keys.items():
-            self.add_foreign_key(table_name, fks)
+    @staticmethod
+    def _column_key(column: Union[exp.Column, str]) -> str:
+        if isinstance(column, exp.Column):
+            if column.table:
+                return f"{normalize_name(column.table)}.{normalize_name(column.name)}"
+            return normalize_name(column.name)
+        return normalize_name(str(column))
 
-    def _normalize(self, schema):
-        normalized_mapping: Dict = OrderedDict()
-        flattened_schema = flatten_schema(schema, depth=dict_depth(schema) - 1)
-        for keys in flattened_schema:
-            columns = nested_get(schema, *zip(keys, keys))
-            if not isinstance(columns, dict):
-                raise SchemaError(
-                    f"Table {'.'.join(keys[:-1])} must match the schema's nesting level: {len(flattened_schema[0])}."
-                )
-            normalized_keys = [
-                self._normalize_name(
-                    key, is_table=True, dialect=self.dialect, normalize=self.normalize
-                )
-                for key in keys
-            ]
-            for column_name, column_type in columns.items():
-                nested_set(
-                    normalized_mapping,
-                    normalized_keys
-                    + [
-                        self._normalize_name(
-                            column_name, dialect=self.dialect, normalize=self.normalize
-                        )
-                    ],
-                    column_type,
-                )
-        return normalized_mapping
+    def resolve(self, column: Union[exp.Column, str]) -> Any:
+        """Return the value bound to ``column``, or ``None`` if unresolved."""
+        if isinstance(column, exp.Column):
+            if column.table:
+                full_key = f"{normalize_name(column.table)}.{normalize_name(column.name)}"
+                if full_key in self._bindings:
+                    return self._bindings[full_key]
+            bare_key = normalize_name(column.name)
+            if bare_key in self._bindings:
+                return self._bindings[bare_key]
+        else:
+            key = normalize_name(str(column))
+            if key in self._bindings:
+                return self._bindings[key]
 
-    @property
-    def tables(self):
-        return self.mapping
+        if self._outer is not None:
+            return self._outer.resolve(column)
+        return None
 
-    def add_primary_key(
-        self, table: exp.Table | str, columns: List[exp.Identifier] | exp.Identifier
-    ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        pk_set = self.primary_keys.setdefault(table, set())
-        columns = [columns] if isinstance(columns, exp.Identifier) else columns
-        pk_set.update(columns)
+    def bind(self, column: Union[exp.Column, str], value: Any) -> None:
+        """Bind ``column`` to ``value`` in this environment."""
+        key = self._column_key(column)
+        self._bindings[key] = value
 
-    def get_primary_key(self, table: exp.Table | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        return self.primary_keys.get(table, set())
+    def extend(self, bindings: Dict[str, Any]) -> "Environment":
+        """Return a child environment layering ``bindings`` on top of this one."""
+        return Environment(bindings=bindings, outer=self)
 
-    def add_foreign_key(
-        self, table: exp.Table | str, foreign_key: List[exp.ForeignKey] | exp.ForeignKey
-    ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        fk_list = self.foreign_keys.setdefault(table, [])
-        fks = [foreign_key] if isinstance(foreign_key, exp.ForeignKey) else foreign_key
-        fk_list.extend(fks)
+    def contains(self, column: Union[exp.Column, str]) -> bool:
+        """Return True if ``column`` resolves in this or any outer env."""
+        if isinstance(column, exp.Column):
+            if column.table:
+                full_key = f"{normalize_name(column.table)}.{normalize_name(column.name)}"
+                if full_key in self._bindings:
+                    return True
+            if normalize_name(column.name) in self._bindings:
+                return True
+        else:
+            if normalize_name(str(column)) in self._bindings:
+                return True
+        return self._outer.contains(column) if self._outer is not None else False
 
-    def get_foreign_key(self, table: exp.Table | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        return self.foreign_keys.get(table, [])
 
-    def add_constraint(
-        self, table: exp.Table | str, column: exp.Column | str, constraint
-    ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        column = self._normalize_name(
-            column if isinstance(column, str) else column.this, normalize=self.normalize
-        )
-        table_constraints = self.constraints.setdefault(table, {})
-        column_constraints = table_constraints.setdefault(column, set())
-        column_constraints.add(constraint)
+# =============================================================================
+# Handler registry and the top-level ``concrete`` entry point
+# =============================================================================
 
-    def get_column_constraints(self, table: exp.Table | str, column: exp.Column | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        column = self._normalize_name(
-            column if isinstance(column, str) else column.this, normalize=self.normalize
-        )
-        table_constraints = self.constraints.get(table, {})
-        column_constraints = table_constraints.get(column, set())
-        return column_constraints
 
-    def nullable(
-        self,
-        table: exp.Table | str,
-        column: exp.Column | str,
-        normalize: Optional[bool] = None,
-    ):
-        for constraint in self.get_column_constraints(table, column):
-            if isinstance(constraint.kind, exp.NotNullColumnConstraint):
-                return constraint.kind.args.get("allow_null", False)
-        for pk in self.get_primary_key(table):
-            if pk.name == (column if isinstance(column, str) else column.this):
-                return False
+_Handler = Callable[[exp.Expression, Environment], Any]
+_HANDLERS: Dict[Type[exp.Expression], _Handler] = {}
+
+
+def handler(*classes: Type[exp.Expression]) -> Callable[[_Handler], _Handler]:
+    """Register ``func`` as the evaluator for each class in ``classes``."""
+
+    def decorator(func: _Handler) -> _Handler:
+        for cls in classes:
+            _HANDLERS[cls] = func
+        return func
+
+    return decorator
+
+
+def concrete(
+    expr: exp.Expression, env: Optional[Environment] = None
+) -> Any:
+    """Evaluate ``expr`` to a Python value under ``env``.
+
+    This is the single entry point for concrete evaluation. ``env`` may
+    be omitted for expressions that don't reference columns (e.g.
+    literal arithmetic). Columns that don't resolve in ``env`` produce
+    ``None`` — which the SQL 3VL propagation then spreads upward.
+    """
+    if env is None:
+        env = Environment()
+    return _eval(expr, env)
+
+
+def _eval(node: Any, env: Environment) -> Any:
+    if node is None:
+        return None
+    # Walk MRO so subclasses inherit their parent's handler if none is
+    # registered for the specific type.
+    for cls in type(node).__mro__:
+        fn = _HANDLERS.get(cls)
+        if fn is not None:
+            return fn(node, env)
+    return _eval_via_sqlglot_env(node, env)
+
+
+def _eval_via_sqlglot_env(node: exp.Expression, env: Environment) -> Any:
+    """Fallback for sqlglot nodes we haven't explicitly handled.
+
+    Routes through :data:`sqlglot.executor.env.ENV` with operand values
+    obtained by recursive evaluation. Returns ``None`` on lookup miss or
+    evaluation error — safer than raising, given the breadth of SQL.
+    """
+    op_key = getattr(node, "key", None)
+    if op_key is None:
+        return None
+    op = _SQLGLOT_ENV.get(op_key.upper())
+    if op is None:
+        return None
+    operand_values = [
+        _eval(child, env)
+        for child in node.iter_expressions()
+        if not isinstance(child, exp.DataType)
+    ]
+    try:
+        return op(*operand_values)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+# =============================================================================
+# Three-valued logic primitives
+# =============================================================================
+
+
+def tvl_and(a: Any, b: Any) -> Optional[bool]:
+    """SQL 3VL AND.
+
+    Truth table (left x right → result):
+
+        TRUE   AND TRUE   = TRUE
+        TRUE   AND FALSE  = FALSE
+        TRUE   AND NULL   = NULL
+        FALSE  AND *      = FALSE
+        NULL   AND FALSE  = FALSE
+        NULL   AND TRUE   = NULL
+        NULL   AND NULL   = NULL
+    """
+    if a is False or b is False:
+        return False
+    if a is None or b is None:
+        return None
+    return bool(a and b)
+
+
+def tvl_or(a: Any, b: Any) -> Optional[bool]:
+    """SQL 3VL OR.
+
+        TRUE   OR *       = TRUE
+        FALSE  OR FALSE   = FALSE
+        FALSE  OR NULL    = NULL
+        NULL   OR TRUE    = TRUE
+        NULL   OR FALSE   = NULL
+        NULL   OR NULL    = NULL
+    """
+    if a is True or b is True:
         return True
+    if a is None or b is None:
+        return None
+    return bool(a or b)
 
-    def is_unique(
-        self,
-        table: exp.Table | str,
-        column: exp.Column | str,
-        normalize: Optional[bool] = None,
-    ):
-        for constraint in self.get_column_constraints(table, column):
-            if isinstance(
-                constraint.kind,
-                (
-                    exp.UniqueColumnConstraint,
-                    exp.PrimaryKeyColumnConstraint,
-                ),
-            ):
-                return True
-        for pk in self.get_primary_key(table):
-            if pk.name == (column if isinstance(column, str) else column.this):
-                return True
 
+def tvl_not(a: Any) -> Optional[bool]:
+    """SQL 3VL NOT: ``NOT NULL == NULL``."""
+    if a is None:
+        return None
+    return not a
+
+
+def _null_aware(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Binary-op decorator: NULL in → NULL out."""
+
+    @wraps(func)
+    def wrapper(a: Any, b: Any) -> Any:
+        if a is None or b is None:
+            return None
+        return func(a, b)
+
+    return wrapper
+
+
+# =============================================================================
+# Type coercion (used by comparisons, arithmetic, Const.coerce_to)
+# =============================================================================
+
+
+_STRICT_DIALECTS = frozenset({"postgres", "strict"})
+
+
+def _parse_temporal(value: Any) -> Optional[Union[date, datetime]]:
+    if isinstance(value, (date, datetime)):
+        return value
+    if isinstance(value, str):
+        try:
+            return date_parser.parse(value)
+        except (ValueError, OverflowError, TypeError):
+            return None
+    return None
+
+
+def _coerce_temporal_pair(left: Any, right: Any) -> Tuple[Any, Any]:
+    """Align date/datetime operands so they can be compared."""
+    if left is None or right is None:
+        return left, right
+    left_temp = isinstance(left, (date, datetime))
+    right_temp = isinstance(right, (date, datetime))
+    if left_temp and isinstance(right, str):
+        parsed = _parse_temporal(right)
+        if parsed is not None:
+            return left, parsed
+    if right_temp and isinstance(left, str):
+        parsed = _parse_temporal(left)
+        if parsed is not None:
+            return parsed, right
+    return left, right
+
+
+def _coerce_numeric_pair(left: Any, right: Any) -> Tuple[Any, Any]:
+    """Align numeric-ish operands. Strings get parsed into numbers if safely possible."""
+
+    def _coerce_str(value: Any, other: Any) -> Any:
+        if not isinstance(value, str) or isinstance(other, bool):
+            return value
+        text = value.strip()
+        try:
+            if isinstance(other, int):
+                if text.lstrip("-").isdigit():
+                    return int(text)
+                return value
+            if isinstance(other, float):
+                return float(text)
+        except (ValueError, TypeError):
+            return value
+        return value
+
+    left = _coerce_str(left, right)
+    right = _coerce_str(right, left)
+    return left, right
+
+
+def _coerce_comparable(left: Any, right: Any) -> Tuple[Any, Any]:
+    """Best-effort alignment so two values are comparable with Python ops."""
+    left, right = _coerce_temporal_pair(left, right)
+    left, right = _coerce_numeric_pair(left, right)
+    return left, right
+
+
+def _coerce_value(
+    value: Any,
+    from_type: Optional[DataType],
+    to_type: DataType,
+    dialect: str = "sqlite",
+) -> Any:
+    """Convert ``value`` to ``to_type``.
+
+    Returns ``None`` when coercion is undefined and the dialect is
+    strict; returns a best-effort value under lenient dialects (SQLite /
+    MySQL defaults).
+    """
+    if value is None:
+        return None
+
+    # Numeric targets
+    if to_type.is_type(*DataType.INTEGER_TYPES):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            try:
+                return int(value)
+            except (OverflowError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except (ValueError, TypeError):
+                try:
+                    return int(float(value))
+                except (ValueError, TypeError):
+                    return None if dialect in _STRICT_DIALECTS else 0
+        return None
+
+    if to_type.is_type(*DataType.REAL_TYPES):
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (ValueError, TypeError):
+                return None if dialect in _STRICT_DIALECTS else 0.0
+        return None
+
+    # Text
+    if to_type.is_type(*DataType.TEXT_TYPES):
+        if isinstance(value, bool):
+            # MySQL: TRUE → '1'; Postgres: TRUE → 'true'
+            return "true" if value and dialect in ("postgres",) else (
+                "false" if not value and dialect in ("postgres",) else str(int(value))
+            )
+        if isinstance(value, (datetime,)):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, date):
+            return value.strftime("%Y-%m-%d")
+        return str(value)
+
+    # Boolean
+    if to_type.is_type(exp.DataType.Type.BOOLEAN):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("true", "t", "1", "yes", "y"):
+                return True
+            if normalized in ("false", "f", "0", "no", "n"):
+                return False
+            return None
+        return bool(value)
+
+    # Temporal
+    if to_type.is_type(*DataType.TEMPORAL_TYPES):
+        if isinstance(value, datetime):
+            if to_type.is_type(exp.DataType.Type.DATE):
+                return value.date()
+            return value
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            parsed = _parse_temporal(value)
+            if parsed is None:
+                return None
+            if to_type.is_type(exp.DataType.Type.DATE) and isinstance(parsed, datetime):
+                return parsed.date()
+            return parsed
+        return None
+
+    # No explicit coercion rule — pass through unchanged.
+    return value
+
+
+# =============================================================================
+# Handler implementations
+# =============================================================================
+
+
+# ----- leaves -----
+
+
+@handler(exp.Literal)
+def _eval_literal(node: exp.Literal, env: Environment) -> Any:
+    if node.is_string:
+        return str(node.this)
+    text = node.this
+    # sqlglot stores numeric literals as strings in ``node.this``.
+    try:
+        if isinstance(text, str) and "." in text:
+            return float(text)
+        return int(text)
+    except (TypeError, ValueError):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return text
+
+
+@handler(exp.Null)
+def _eval_null(node: exp.Null, env: Environment) -> None:
+    return None
+
+
+@handler(exp.Boolean)
+def _eval_boolean(node: exp.Boolean, env: Environment) -> bool:
+    return bool(node.this)
+
+
+@handler(exp.Column)
+def _eval_column(node: exp.Column, env: Environment) -> Any:
+    # Legacy / encoder convention: columns may be stamped with a concrete
+    # value via ``column.set("concrete", ...)`` during row-by-row
+    # evaluation. Honor that first so existing callers keep working, then
+    # fall back to the Environment for Clean-API callers.
+    if "concrete" in node.args:
+        stamped = node.args["concrete"]
+        if isinstance(stamped, Symbol):
+            return stamped.concrete
+        return stamped
+    value = env.resolve(node)
+    if isinstance(value, Symbol):
+        return value.concrete
+    return value
+
+
+@handler(Const)
+def _eval_const(node: Const, env: Environment) -> Any:
+    return node.concrete
+
+
+@handler(Variable)
+def _eval_variable(node: Variable, env: Environment) -> Any:
+    if node.is_bound:
+        return None if node.is_null else node.args.get("concrete")
+    # For unbound variables, try the environment by name.
+    resolved = env.resolve(node.name)
+    if isinstance(resolved, Symbol):
+        return resolved.concrete
+    if resolved is not None:
+        return resolved
+    return node.args.get("concrete")
+
+
+# ----- arithmetic -----
+
+
+@handler(exp.Add)
+def _eval_add(node: exp.Add, env: Environment) -> Any:
+    l, r = _eval(node.left, env), _eval(node.right, env)
+    if l is None or r is None:
+        return None
+    try:
+        return l + r
+    except TypeError:
+        l, r = _coerce_comparable(l, r)
+        try:
+            return l + r
+        except TypeError:
+            return None
+
+
+@handler(exp.Sub)
+def _eval_sub(node: exp.Sub, env: Environment) -> Any:
+    l, r = _eval(node.left, env), _eval(node.right, env)
+    if l is None or r is None:
+        return None
+    return l - r
+
+
+@handler(exp.Mul)
+def _eval_mul(node: exp.Mul, env: Environment) -> Any:
+    l, r = _eval(node.left, env), _eval(node.right, env)
+    if l is None or r is None:
+        return None
+    return l * r
+
+
+@handler(exp.Div)
+def _eval_div(node: exp.Div, env: Environment) -> Any:
+    l, r = _eval(node.left, env), _eval(node.right, env)
+    if l is None or r is None or r == 0:
+        return None
+    return l / r
+
+
+@handler(exp.Mod)
+def _eval_mod(node: exp.Mod, env: Environment) -> Any:
+    l, r = _eval(node.left, env), _eval(node.right, env)
+    if l is None or r is None or r == 0:
+        return None
+    return l % r
+
+
+@handler(exp.Neg)
+def _eval_neg(node: exp.Neg, env: Environment) -> Any:
+    v = _eval(node.this, env)
+    return None if v is None else -v
+
+
+# ----- comparison -----
+
+
+def _compare(op: Callable[[Any, Any], bool]) -> _Handler:
+    """Build a NULL-propagating comparison handler from a Python binary op."""
+
+    def fn(node: exp.Expression, env: Environment) -> Any:
+        l, r = _eval(node.left, env), _eval(node.right, env)
+        if l is None or r is None:
+            return None
+        l, r = _coerce_comparable(l, r)
+        try:
+            return op(l, r)
+        except TypeError:
+            return None
+
+    return fn
+
+
+_HANDLERS[exp.EQ] = _compare(lambda a, b: a == b)
+_HANDLERS[exp.NEQ] = _compare(lambda a, b: a != b)
+_HANDLERS[exp.GT] = _compare(lambda a, b: a > b)
+_HANDLERS[exp.GTE] = _compare(lambda a, b: a >= b)
+_HANDLERS[exp.LT] = _compare(lambda a, b: a < b)
+_HANDLERS[exp.LTE] = _compare(lambda a, b: a <= b)
+
+
+# ----- logical -----
+
+
+@handler(exp.And)
+def _eval_and(node: exp.And, env: Environment) -> Optional[bool]:
+    return tvl_and(_eval(node.left, env), _eval(node.right, env))
+
+
+@handler(exp.Or)
+def _eval_or(node: exp.Or, env: Environment) -> Optional[bool]:
+    return tvl_or(_eval(node.left, env), _eval(node.right, env))
+
+
+@handler(exp.Not)
+def _eval_not(node: exp.Not, env: Environment) -> Optional[bool]:
+    return tvl_not(_eval(node.this, env))
+
+
+# ----- NULL checks -----
+
+
+@handler(exp.Is)
+def _eval_is(node: exp.Is, env: Environment) -> Optional[bool]:
+    """``x IS y``. Mostly appears as ``x IS NULL`` / ``x IS NOT NULL``; also
+    ``x IS TRUE`` / ``x IS FALSE`` in some dialects."""
+    left = _eval(node.this, env)
+    right_node = node.expression
+    if isinstance(right_node, exp.Null):
+        return left is None
+    if isinstance(right_node, exp.Boolean):
+        if left is None:
+            return False  # IS TRUE / IS FALSE treats NULL as not-matching
+        return bool(left) is bool(right_node.this)
+    right = _eval(right_node, env)
+    return left is right
+
+
+@handler(Is_Null)
+def _eval_is_null_class(node: Is_Null, env: Environment) -> bool:
+    return _eval(node.this, env) is None
+
+
+@handler(Is_Not_Null)
+def _eval_is_not_null_class(node: Is_Not_Null, env: Environment) -> bool:
+    return _eval(node.this, env) is not None
+
+
+# ----- conditional -----
+
+
+@handler(exp.Case)
+def _eval_case(node: exp.Case, env: Environment) -> Any:
+    for branch in node.args.get("ifs", []) or []:
+        condition = _eval(branch.this, env)
+        if condition is True:
+            return _eval(branch.args.get("true"), env)
+    default = node.args.get("default")
+    return _eval(default, env) if default is not None else None
+
+
+@handler(exp.If)
+def _eval_if(node: exp.Expression, env: Environment) -> Any:
+    cond = _eval(node.this, env)
+    if cond is None:
+        return None
+    if cond:
+        target = node.args.get("true") or node.args.get("expression")
+    else:
+        target = node.args.get("false")
+    return _eval(target, env) if target is not None else None
+
+
+@handler(exp.Coalesce)
+def _eval_coalesce(node: exp.Coalesce, env: Environment) -> Any:
+    candidates: List[Any] = [node.this]
+    candidates.extend(node.args.get("expressions") or [])
+    for candidate in candidates:
+        value = _eval(candidate, env)
+        if value is not None:
+            return value
+    return None
+
+
+@handler(exp.Nullif)
+def _eval_nullif(node: exp.Nullif, env: Environment) -> Any:
+    left = _eval(node.this, env)
+    right = _eval(node.expression, env)
+    if left is None:
+        return None
+    return None if left == right else left
+
+
+# ----- membership -----
+
+
+@handler(exp.Between)
+def _eval_between(node: exp.Between, env: Environment) -> Optional[bool]:
+    value = _eval(node.this, env)
+    low = _eval(node.args.get("low"), env)
+    high = _eval(node.args.get("high"), env)
+    if value is None or low is None or high is None:
+        return None
+    try:
+        return low <= value <= high
+    except TypeError:
+        return None
+
+
+@handler(exp.In)
+def _eval_in(node: exp.In, env: Environment) -> Optional[bool]:
+    value = _eval(node.this, env)
+    if value is None:
+        return None
+    expressions = node.args.get("expressions") or []
+    saw_null = False
+    for candidate_node in expressions:
+        candidate = _eval(candidate_node, env)
+        if candidate is None:
+            saw_null = True
+            continue
+        if value == candidate:
+            return True
+    return None if saw_null else False
+
+
+# ----- string -----
+
+
+@handler(exp.Like)
+def _eval_like(node: exp.Like, env: Environment) -> Optional[bool]:
+    return _like(_eval(node.this, env), _eval(node.expression, env), case_insensitive=False)
+
+
+@handler(exp.ILike)
+def _eval_ilike(node: exp.ILike, env: Environment) -> Optional[bool]:
+    return _like(_eval(node.this, env), _eval(node.expression, env), case_insensitive=True)
+
+
+def _like(value: Any, pattern: Any, *, case_insensitive: bool) -> Optional[bool]:
+    if value is None or pattern is None:
+        return None
+    try:
+        compiled = like_to_pattern(str(pattern))
+        text = str(value)
+        if case_insensitive:
+            text = text.lower()
+        return bool(compiled.match(text))
+    except re.error:  # pragma: no cover - defensive
         return False
 
 
-class LogicalOperator(exp.Expression):
+@handler(exp.Concat)
+def _eval_concat(node: exp.Concat, env: Environment) -> Any:
+    parts = [_eval(piece, env) for piece in (node.args.get("expressions") or [])]
+    if any(part is None for part in parts):
+        return None
+    return "".join(str(part) for part in parts)
+
+
+@handler(exp.Substring)
+def _eval_substring(node: exp.Substring, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    start = _eval(node.args.get("start"), env)
+    length = _eval(node.args.get("length"), env)
+    if value is None or start is None:
+        return None
+    text = str(value)
+    start_idx = max(int(start) - 1, 0)  # SQL is 1-indexed
+    if length is None:
+        return text[start_idx:]
+    return text[start_idx : start_idx + int(length)]
+
+
+@handler(exp.Length)
+def _eval_length(node: exp.Length, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else len(str(value))
+
+
+@handler(exp.Upper)
+def _eval_upper(node: exp.Upper, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else str(value).upper()
+
+
+@handler(exp.Lower)
+def _eval_lower(node: exp.Lower, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else str(value).lower()
+
+
+@handler(exp.Trim)
+def _eval_trim(node: exp.Trim, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else str(value).strip()
+
+
+# ----- numeric functions -----
+
+
+@handler(exp.Abs)
+def _eval_abs(node: exp.Abs, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else abs(value)
+
+
+@handler(exp.Round)
+def _eval_round(node: exp.Round, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    digits_node = node.args.get("decimals")
+    digits = _eval(digits_node, env) if digits_node is not None else 0
+    if value is None or digits is None:
+        return None
+    return round(value, int(digits))
+
+
+@handler(exp.Ceil)
+def _eval_ceil(node: exp.Ceil, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else math.ceil(value)
+
+
+@handler(exp.Floor)
+def _eval_floor(node: exp.Floor, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    return None if value is None else math.floor(value)
+
+
+# ----- cast -----
+
+
+@handler(exp.Cast, exp.TryCast)
+def _eval_cast(node: exp.Cast, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    target_node = node.args.get("to")
+    if value is None or target_node is None:
+        return value
+    try:
+        target_dt = DataType.build(target_node.sql() if hasattr(target_node, "sql") else str(target_node))
+    except Exception:  # pragma: no cover - defensive
+        return value
+    strict = isinstance(node, exp.Cast)
+    dialect = "postgres" if strict else "sqlite"
+    return _coerce_value(value, None, target_dt, dialect=dialect)
+
+
+# ----- ordered (pass-through used inside ORDER BY) -----
+
+
+@handler(exp.Ordered)
+def _eval_ordered(node: exp.Ordered, env: Environment) -> Any:
+    return _eval(node.this, env)
+
+
+# ----- paren -----
+
+
+@handler(exp.Paren)
+def _eval_paren(node: exp.Paren, env: Environment) -> Any:
+    return _eval(node.this, env)
+
+
+# ----- ITE -----
+
+
+@handler(ITE)
+def _eval_ite(node: ITE, env: Environment) -> Any:
+    cond = _eval(node.condition, env)
+    if cond is None:
+        return None
+    return _eval(node.true_branch if cond else node.false_branch, env)
+
+
+# =============================================================================
+# negate_predicate
+# =============================================================================
+
+
+def negate_predicate(expr: exp.Expression) -> exp.Expression:
+    """Return the logical negation of ``expr``.
+
+    ``IS NULL`` ↔ ``IS NOT NULL`` are flipped directly via the dedicated
+    :class:`Is_Null` / :class:`Is_Not_Null` classes; any other predicate
+    is wrapped in ``NOT`` and handed to sqlglot's ``simplify`` so double
+    negations collapse naturally.
     """
-    Represents a single step in a REX (Relational EXpression) plan.
-    """
-
-    @property
-    def operator_id(self) -> str:
-        return self.args.get("operator_id", "")
-
-    @property
-    def operator_type(self) -> str:
-        return self.key[7:].capitalize()
-
-    @property
-    def children(self) -> List[LogicalOperator]:
-        return []
-
-    @abstractmethod
-    def schema(self):
-        """
-        Returns the schema of the output produced by this operator.
-        """
-        pass
-
-    def sql(self, dialect=None, **opts):
-        indent = opts.get("indent", 0)
-        pad = "  " * indent
-        lines = [f"{pad}{self._sql(dialect=dialect, **opts)}"]
-        opts.setdefault("skips", set()).add(self.operator_id)
-        for child in self.children:
-            if child.operator_id in opts["skips"]:
-                continue
-            opts["indent"] = indent + 1
-            lines.append(child.sql(dialect=dialect, **opts))
-        return "\n".join(lines)
-
-
-class LeafOperator(LogicalOperator):
-    """Base class for operators with no children (leaf nodes)"""
-
-
-class UnaryOperator(LogicalOperator):
-    """Base class for operators with exactly one child"""
-
-    arg_types = {"this": True}
-
-    @property
-    def children(self) -> List[LogicalOperator]:
-        return [self.this]
-
-    def schema(self):
-        if "_schema" in self.args:
-            return self.args.get("_schema")
-        scm = self.this.schema()
-        self.set("_schema", scm)
-        return scm
-
-
-class BinaryOperator(LogicalOperator):
-    """Base class for operators with exactly two children"""
-
-    @property
-    def left(self):
-        return self.this
-
-    @property
-    def right(self):
-        return self.expression
-
-    @property
-    def children(self) -> List[LogicalOperator]:
-        return [self.left, self.right]
-
-
-class LogicalScan(LeafOperator):
-    """
-    Represents a logical scan operation in a REX plan.
-    """
-
-    arg_types = {
-        "this": True,
-        "operator_id": True,
-        "expressions": False,
-    }
-
-    @property
-    def table_name(self) -> str:
-        return self.text("this")
-
-    @property
-    def columns(self):
-        return self.expressions
-
-    def _sql(self, dialect=None, **opts):
-        return f"{self.operator_type}(table={self.table_name}, id = {self.operator_id})"
-
-    def __repr__(self):
-        return f"{self.operator_type}(table={self.table_name}, id = {self.operator_id})"
-
-    def schema(self):
-        if "_schema" in self.args:
-            return self.args.get("_schema")
-        scm = Schema(expressions=self.expressions)
-        self.set("_schema", scm)
-        return scm
-
-
-class LogicalProject(UnaryOperator):
-    """
-    Represents a logical projection operation in a REX plan.
-    """
-
-    arg_types = {
-        "this": True,
-        "expressions": True,
-        "operator_id": True,
-    }
-
-    def _sql(self, dialect=None, **opts):
-        exprs = ", ".join(expr.sql(dialect) for expr in self.expressions)
-        return f"{self.operator_type}({exprs}, id={self.operator_id})"
-
-    def __repr__(self) -> str:
-        exprs = ", ".join(f"{expr}" for expr in self.expressions)
-        return f"{self.operator_type}({exprs}, id={self.operator_id})"
-
-    def schema(self):
-        if "_schema" in self.args:
-            return self.args.get("_schema")
-        input_scm = self.this.schema()
-        columns = []
-        for expr in self.expressions:
-            new_expr = expr.transform(resolve_schema, input_schema=input_scm)
-            columns.append(new_expr)
-        scm = Schema(expressions=columns)
-        self.set("_schema", scm)
-        return self.args.get("_schema")
-
-
-class LogicalFilter(UnaryOperator):
-    """
-    Represents a logical filter operation in a REX plan.
-    """
-
-    arg_types = {
-        "this": True,
-        "condition": True,
-        "operator_id": True,
-    }
-
-    @property
-    def children(self) -> List[LogicalOperator]:
-        children = [self.this]
-        return children
-
-    @property
-    def condition(self) -> exp.Expression:
-        return self.args.get("condition")
-
-    def _sql(self, dialect=None, **opts):
-        # for child in self.children[1:]:
-        #     opts.setdefault("skips", set()).add(child.operator_id)
-        return f"{self.operator_type}(condition={self.condition}, id={self.operator_id }, variableset={self.args.get('variableset')})"
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.operator_type}(condition={self.condition}, id={self.operator_id })"
-        )
-
-
-class LogicalHaving(LogicalFilter):
-    pass
-
-
-class LogicalSort(UnaryOperator):
-    arg_types = {
-        "this": True,
-        "expressions": True,
-        "dirs": True,
-        "offset": True,
-        "limit": True,
-        "operator_id": True,
-    }
-
-    @property
-    def sorts(self) -> List[exp.Expression]:
-        return self.expressions
-
-    @property
-    def offset(self) -> int:
-        return self.args.get("offset", 0)
-
-    @property
-    def limit(self) -> Optional[int]:
-        return self.args.get("limit", None)
-
-    @property
-    def dirs(self) -> List:
-        return self.args.get("dirs", [])
-
-    def _sql(self, dialect=None, **opts):
-        return f"{self.operator_type}({', '.join([s.sql(dialect, **opts) for s in self.sorts])}, dir={self.dirs}, offset={self.offset}, limit={self.limit})"
-
-    def __repr__(self):
-        return f"{self.operator_type}({', '.join([str(s) for s in self.sorts])}, dir={self.dirs}, offset={self.offset}, limit={self.limit})"
-
-
-class LogicalAggregate(UnaryOperator):
-    arg_types = {
-        "this": True,
-        "expressions": True,
-        "aggs": True,
-        "operator_id": True,
-    }
-
-    @property
-    def keys(self) -> List[exp.Expression]:
-        return self.expressions
-
-    @property
-    def aggs(self) -> List[exp.Expression]:
-        return self.args.get("aggs", [])
-
-    def _sql(self, dialect=None, **opts):
-        keys_sql = ", ".join([k.sql(dialect) for k in self.keys])
-        aggs_sql = ", ".join([a.sql(dialect) for a in self.aggs])
-        return f"{self.operator_type}(keys=[{keys_sql}], aggs=[{aggs_sql}])"
-
-    def __repr__(self):
-        keys = ", ".join([str(k) for k in self.keys])
-        agg_funcs = ", ".join([str(a) for a in self.aggs])
-        return f"{self.operator_type}(keys=[{keys}], aggs=[{agg_funcs}]"
-
-    def schema(self):
-        if "_schema" in self.args:
-            return self.args.get("_schema")
-        input_schema = self.this.schema()
-        columns = []
-        for key in self.keys:
-            colref = input_schema.columns[key.ref].copy()
-            colref.set("unique", True)
-            columns.append(colref)
-        for agg_expr in self.aggs:
-            agg = agg_expr.transform(resolve_schema, input_schema=input_schema)
-            columns.append(agg)
-        scm = Schema(expressions=columns)
-        self.set("_schema", scm)
-        return scm
-
-
-class LogicalJoin(BinaryOperator):
-    arg_types = {
-        "this": True,
-        "expression": True,
-        "join_type": True,
-        "condition": True,
-        "operator_id": True,
-    }
-
-    @property
-    def join_type(self) -> str:
-        return self.args.get("join_type")
-
-    @property
-    def condition(self) -> Optional[Expression]:
-        return self.args.get("condition", None)
-
-    def _sql(self, dialect=None, **opts):
-        return f"{self.operator_type}(condition={self.condition}, type={self.join_type}, id={self.operator_id })"
-
-    def __repr__(self) -> str:
-        return f"{self.operator_type}(condition= {self.condition}, type={self.join_type}, id={self.operator_id})"
-
-    def schema(self):
-        if "_schema" in self.args:
-            return self.args.get("_schema")
-        scm = Schema(
-            expressions=[column for column in self.left.schema().columns]
-            + [column for column in self.right.schema().columns]
-        )
-        self.set("_schema", scm)
-        return self.args.get("_schema")
-
-
-class LogicalUnion(BinaryOperator):
-    arg_types = {
-        "this": True,
-        "expression": True,
-        "union_all": True,
-        "operator_id": True,
-    }
-
-    @property
-    def union_all(self) -> bool:
-        return self.args.get("union_all", False)
-
-    def _sql(self, dialect=None, **opts):
-        return f"{self.operator_type}(all={self.union_all})"
-
-    def __repr__(self) -> str:
-        return f"{self.operator_type}(all={self.all})"
-
-    def schema(self):
-        return self.left.schema()
-
-
-class LogicalIntersect(LogicalUnion):
-    pass
-
-
-class LogicalDifference(LogicalUnion):
-    pass
-
-
-class LogicalCorrelate(UnaryOperator):
-    arg_types = {
-        "this": True,
-        "expressions": False,
-        "query": True,
-        "correlated": False,
-        "operator_id": True,
-    }
-
-    def query(self) -> LogicalOperator:
-        return self.this
-
-    def sql(self, dialect=None, **opts):
-        indent = opts.get("indent", 0)
-        pad = "  " * indent
-        lines = [f"{pad}{repr(self)}"]
-        # for child in self.children:
-        #     opts["indent"] = indent + 1
-        #     lines.append(child.sql(dialect=dialect, **opts))
-        return "\n".join(lines)
-
-    def __repr__(self) -> str:
-        return f"{self.operator_type}({self.this}, id={self.operator_id})"
-
-    def schema(self):
-        return self.this.schema()
-
-
-for klass in [
-    # ColumnRef,
-    Is_Null,
-    Is_Not_Null,
-    LogicalOperator,
-    LogicalAggregate,
-    LogicalJoin,
-    LogicalFilter,
-    LogicalProject,
-    LogicalScan,
-    LogicalSort,
-    LogicalCorrelate,
-    ScalarQuery,
-    FieldAccess,
-]:
-    generator.Generator.TRANSFORMS[klass] = lambda self, expression: expression.sql(
-        dialect=self.dialect
-    )
-
-
-def resolve_schema(expr, input_schema: Schema):
-    """
-    Resolve a ColumnRef expression to its corresponding schema entry.
-
-    Args:
-        expr (sql_exp.Expression): The expression to check.
-        input_schema: The schema of children used to retrieve schema info.
-
-    Returns:
-        The resolved schema column if applicable, otherwise None.
-    """
-    if isinstance(expr, ColumnRef):
-        return input_schema.columns[expr.ref]
-    if isinstance(expr, ScalarQuery):
-        sub_schema = expr.this.schema()
-        return sub_schema.columns[0]
-    return expr
-
-
-def negate_predicate(expr) -> "exp.Expression":
-    """Return the negation of this expression."""
-
     if expr.key == "is_null":
         return Is_Not_Null(this=expr.this)
-    elif expr.key == "is_not_null":
+    if expr.key == "is_not_null":
         return Is_Null(this=expr.this)
-
     return simplify(expr.not_())
+
+
+# =============================================================================
+# Compatibility shims (to be removed once consumers migrate)
+# =============================================================================
+
+
+def _concrete_shim(self: exp.Expression) -> Any:
+    """``expr.concrete`` — legacy property wrapper around :func:`concrete`.
+
+    Provided for consumers that still read ``expression.concrete`` as a
+    property. Does one evaluation under an empty :class:`Environment`
+    each call; callers that need repeated evaluation under a real
+    environment should migrate to the function form.
+    """
+    return _eval(self, Environment())
+
+
+def _datatype_shim(self: exp.Expression) -> Optional[DataType]:
+    """``expr.datatype`` — legacy property resolving the expression's type."""
+    if self.type is not None:
+        return self.type
+    raw = self.args.get("_type")
+    if raw is None:
+        return None
+    return DataType.build(raw)
+
+
+def _column_ref_shim(self: exp.Column) -> int:
+    """``column.ref`` — legacy positional reference slot."""
+    return self.args.get("ref", 0)
+
+
+exp.Expression.concrete = property(_concrete_shim)  # type: ignore[attr-defined]
+exp.Expression.datatype = property(_datatype_shim)  # type: ignore[attr-defined]
+exp.Column.ref = property(_column_ref_shim)  # type: ignore[attr-defined]
+
+
+__all__ = [
+    # Symbol vocabulary
+    "Symbol",
+    "Const",
+    "Variable",
+    "ITE",
+    "ColumnRef",
+    # Environment + evaluator
+    "Environment",
+    "concrete",
+    "handler",
+    # 3VL
+    "tvl_and",
+    "tvl_or",
+    "tvl_not",
+    # Re-exports
+    "Row",
+    "AggGroup",
+    "Is_Null",
+    "Is_Not_Null",
+    "DataType",
+    # Utilities
+    "negate_predicate",
+]
