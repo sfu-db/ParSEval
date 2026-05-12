@@ -1,0 +1,17 @@
+{
+  "total_pairs": 1534,
+  "verdict_counts": {
+    "neq": 665,
+    "eq": 736,
+    "syntax_error": 71,
+    "unknown": 39,
+    "runtime_error": 23
+  },
+  "verdict_ratio": {
+    "neq": 0.4335,
+    "eq": 0.4798,
+    "syntax_error": 0.0463,
+    "unknown": 0.0254,
+    "runtime_error": 0.015
+  }
+}
