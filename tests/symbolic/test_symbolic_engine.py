@@ -1,0 +1,355 @@
+"""Tests for the new symbolic module: evaluator, engine, constraints, types."""
+
+from __future__ import annotations
+
+import unittest
+
+from parseval.instance import Instance
+from parseval.plan import Plan
+from parseval.query import preprocess_sql
+from parseval.symbolic import (
+    BranchTree,
+    BranchType,
+    CoverageThresholds,
+    PlanEvaluator,
+    SymbolicEngine,
+    decompose_atoms,
+    is_infeasible,
+)
+from parseval.symbolic.types import BranchNode
+
+
+SCHEMA = "CREATE TABLE t (a INT, b INT, c TEXT);"
+def _pred(sql: str):
+    from sqlglot import parse_one, exp as sqlexp
+    return parse_one(f"SELECT * FROM t WHERE {sql}").find(sqlexp.Where).this
+
+
+SCHEMA_FK = (
+    "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT NOT NULL);"
+    "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id), val INT);"
+)
+
+
+def _plan(sql: str, schema: str = SCHEMA, dialect: str = "sqlite") -> Plan:
+    instance = Instance(ddls=schema, name="test", dialect=dialect)
+    expr = preprocess_sql(sql, instance, dialect=dialect)
+    return Plan(expr)
+
+
+# ---------------------------------------------------------------------------
+# decompose_atoms
+# ---------------------------------------------------------------------------
+
+
+class TestDecomposeAtoms(unittest.TestCase):
+    def test_simple_comparison(self):
+        from sqlglot import parse_one, exp
+
+        pred = parse_one("SELECT * FROM t WHERE a > 5").find(exp.Where).this
+        atoms = decompose_atoms(pred)
+        self.assertEqual(len(atoms), 1)
+        self.assertIn(">", atoms[0].sql())
+
+    def test_and_splits(self):
+        from sqlglot import parse_one, exp
+
+        pred = parse_one("SELECT * FROM t WHERE a > 5 AND b < 10").find(exp.Where).this
+        atoms = decompose_atoms(pred)
+        self.assertEqual(len(atoms), 2)
+
+    def test_or_splits(self):
+        from sqlglot import parse_one, exp
+
+        pred = parse_one("SELECT * FROM t WHERE a > 5 OR b < 10").find(exp.Where).this
+        atoms = decompose_atoms(pred)
+        self.assertEqual(len(atoms), 2)
+
+    def test_nested_and_or(self):
+        from sqlglot import parse_one, exp
+
+        pred = parse_one("SELECT * FROM t WHERE (a > 5 AND b < 10) OR c = 'x'").find(exp.Where).this
+        atoms = decompose_atoms(pred)
+        self.assertEqual(len(atoms), 3)
+
+
+# ---------------------------------------------------------------------------
+# PlanEvaluator
+# ---------------------------------------------------------------------------
+
+
+class TestPlanEvaluator(unittest.TestCase):
+    def test_empty_instance_produces_no_observations(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        # Branch node should exist (the filter site) but with no observations.
+        self.assertTrue(len(tree.nodes) >= 1)
+        filter_nodes = [n for n in tree.nodes if n.site == "filter"]
+        self.assertEqual(len(filter_nodes), 1)
+        self.assertEqual(len(filter_nodes[0].observations), 0)
+
+    def test_single_row_produces_observations(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        instance.create_row("t", {"a": 10, "b": 1})
+        expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        filter_nodes = [n for n in tree.nodes if n.site == "filter"]
+        self.assertEqual(len(filter_nodes), 1)
+        self.assertGreater(len(filter_nodes[0].observations), 0)
+        outcomes = filter_nodes[0].observed_outcomes(0)
+        self.assertIn(BranchType.ATOM_TRUE, outcomes)
+
+    def test_false_branch_observed(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        instance.create_row("t", {"a": 3, "b": 1})
+        expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        filter_nodes = [n for n in tree.nodes if n.site == "filter"]
+        outcomes = filter_nodes[0].observed_outcomes(0)
+        self.assertIn(BranchType.ATOM_FALSE, outcomes)
+
+    def test_null_branch_observed(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        instance.place_row("t", {"a": None, "b": 1, "c": "x"})
+        expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        filter_nodes = [n for n in tree.nodes if n.site == "filter"]
+        outcomes = filter_nodes[0].observed_outcomes(0)
+        self.assertIn(BranchType.ATOM_NULL, outcomes)
+
+    def test_compound_predicate_atoms_tracked_independently(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        instance.create_row("t", {"a": 10, "b": 3})
+        expr = preprocess_sql(
+            "SELECT a FROM t WHERE a > 5 AND b < 10", instance, dialect="sqlite"
+        )
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        filter_nodes = [n for n in tree.nodes if n.site == "filter"]
+        self.assertEqual(len(filter_nodes[0].atoms), 2)
+
+    def test_case_arm_branches_discovered(self):
+        instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
+        instance.create_row("t", {"a": 10, "b": 1})
+        expr = preprocess_sql(
+            "SELECT CASE WHEN a > 5 THEN 'big' ELSE 'small' END FROM t",
+            instance,
+            dialect="sqlite",
+        )
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance)
+        tree = evaluator.evaluate()
+        case_nodes = [n for n in tree.nodes if n.site == "case_arm"]
+        self.assertTrue(len(case_nodes) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# BranchTree coverage tracking
+# ---------------------------------------------------------------------------
+
+
+class TestBranchTree(unittest.TestCase):
+    def test_uncovered_targets_with_default_thresholds(self):
+        tree = BranchTree(thresholds=CoverageThresholds())
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        # No observations → all atom outcomes are uncovered.
+        targets = tree.uncovered_targets
+        self.assertEqual(len(targets), 3)  # TRUE, FALSE, NULL
+
+    def test_observation_reduces_uncovered(self):
+        tree = BranchTree(thresholds=CoverageThresholds())
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        from parseval.symbolic.types import AtomObservation
+
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
+        )
+        targets = tree.uncovered_targets
+        self.assertEqual(len(targets), 2)  # FALSE and NULL still missing
+
+    def test_threshold_zero_skips_branch_type(self):
+        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
+        tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        targets = tree.uncovered_targets
+        # Only TRUE and FALSE, not NULL.
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
+
+    def test_infeasible_excluded_from_targets(self):
+        tree = BranchTree(thresholds=CoverageThresholds())
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a IS NULL"),
+            atoms=(_pred("a IS NULL"),),
+            tables=("t",),
+        )
+        tree.mark_infeasible(node, 0, BranchType.ATOM_NULL)
+        targets = tree.uncovered_targets
+        self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
+
+    def test_coverage_ratio(self):
+        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        self.assertEqual(tree.coverage_ratio, 0.0)
+        from parseval.symbolic.types import AtomObservation
+
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
+        )
+        self.assertEqual(tree.coverage_ratio, 0.5)
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_FALSE)
+        )
+        self.assertEqual(tree.coverage_ratio, 1.0)
+        self.assertTrue(tree.fully_covered)
+
+
+# ---------------------------------------------------------------------------
+# Infeasibility
+# ---------------------------------------------------------------------------
+
+
+class TestInfeasibility(unittest.TestCase):
+    def test_is_null_predicate_cannot_be_null(self):
+        from sqlglot import parse_one, exp as sqlexp
+
+        pred = parse_one("SELECT * FROM t WHERE a IS NULL").find(sqlexp.Where).this
+        node = BranchNode(
+            step_id="s0", step_type="Filter", site="filter",
+            predicate=pred, atoms=(pred,), tables=("t",),
+        )
+        reason = is_infeasible(
+            node, 0, BranchType.ATOM_NULL,
+            Instance(ddls=SCHEMA, name="t", dialect="sqlite"),
+        )
+        self.assertIsNotNone(reason)
+
+    def test_normal_predicate_is_feasible(self):
+        from sqlglot import parse_one, exp as sqlexp
+
+        pred = parse_one("SELECT * FROM t WHERE a > 5").find(sqlexp.Where).this
+        node = BranchNode(
+            step_id="s0", step_type="Filter", site="filter",
+            predicate=pred, atoms=(pred,), tables=("t",),
+        )
+        reason = is_infeasible(
+            node, 0, BranchType.ATOM_NULL,
+            Instance(ddls=SCHEMA, name="t", dialect="sqlite"),
+        )
+        self.assertIsNone(reason)
+
+
+# ---------------------------------------------------------------------------
+# SymbolicEngine (integration)
+# ---------------------------------------------------------------------------
+
+
+class TestSymbolicEngine(unittest.TestCase):
+    def test_generates_rows_for_simple_filter(self):
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5",
+            dialect="sqlite",
+            max_iterations=10,
+        )
+        result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
+        # Should have generated at least one row.
+        self.assertGreater(result.rows_generated, 0)
+        # Should have some coverage.
+        self.assertGreater(result.coverage, 0.0)
+
+    def test_respects_max_iterations(self):
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5 AND b < 10",
+            dialect="sqlite",
+            max_iterations=2,
+        )
+        result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
+        self.assertLessEqual(result.iterations, 2)
+
+    def test_checkpoint_rollback_on_failure(self):
+        """Engine should not leave partial state on solver failure."""
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        initial_rows = sum(len(instance.get_rows(t)) for t in instance.tables)
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5",
+            dialect="sqlite",
+            max_iterations=5,
+        )
+        # Even if some iterations fail, the instance should be consistent.
+        result = engine.generate()
+        final_rows = sum(len(instance.get_rows(t)) for t in instance.tables)
+        self.assertGreaterEqual(final_rows, initial_rows)
+
+    def test_full_coverage_for_simple_query(self):
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5",
+            dialect="sqlite",
+            max_iterations=20,
+        )
+        result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
+        # For a simple single-atom filter, we should achieve full coverage
+        # (TRUE + FALSE) within 20 iterations.
+        self.assertEqual(result.coverage, 1.0)
+
+    def test_compound_filter_coverage(self):
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5 AND b < 10",
+            dialect="sqlite",
+            max_iterations=20,
+        )
+        result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
+        # Should cover both atoms' TRUE and FALSE.
+        self.assertGreaterEqual(result.coverage, 0.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

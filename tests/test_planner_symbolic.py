@@ -1,11 +1,11 @@
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 from parseval.constants import PBit, StepType
 from parseval.data_generator import DataGenerator
-from parseval.datasets import get_schema_ddl, load_dev_examples
 from parseval.db_manager import DBManager
 from parseval.instance import Instance
 from parseval.main import instantiate_db
-from parseval.plan import Planner, build_context_from_instance, build_graph_from_scopes
+from parseval.plan import SymbolicScopeEncoder, build_context_from_instance
 from parseval.query import preprocess_sql
 from parseval.uexpr.uexprs import UExprToConstraint
 import tempfile
@@ -21,16 +21,15 @@ def _encode(sql: str, seed_rows):
     expr = preprocess_sql(sql, instance, dialect="sqlite")
     tracer = UExprToConstraint()
     context = build_context_from_instance(instance)
-    graph = build_graph_from_scopes(expr)
-    for node_id in graph.get_dependency_order():
-        scope_node = graph.get_node(node_id)
-        planner = Planner(
+    for scope_id, scope in enumerate(traverse_scope(expr)):
+        encoder = SymbolicScopeEncoder(
             ctx=context,
-            scope_node=scope_node,
+            scope=scope,
+            scope_id=scope_id,
             tracer=tracer,
             dialect="sqlite",
         )
-        planner.encode()
+        encoder.encode()
     return tracer
 
 
@@ -69,42 +68,6 @@ def test_having_branch_is_encoded_after_groupby():
 
     assert having_nodes
     assert any(node.sql_condition.sql() == 'COUNT("users"."id") > 1' for node in having_nodes)
-
-
-def test_scope_graph_uses_outer_query_as_root_and_orders_derived_subqueries_first():
-    example = next(
-        example
-        for example in load_dev_examples()
-        if example.db_id == "california_schools" and example.question_id == 84
-    )
-    instance = Instance(
-        ddls=get_schema_ddl(example.db_id), name="graph_grouped_subquery", dialect="sqlite"
-    )
-    expr = preprocess_sql(example.sql, instance, dialect="sqlite")
-
-    graph = build_graph_from_scopes(expr)
-
-    assert graph.root_node_id == 1
-    assert graph.get_node(1).dependencies == {0}
-    assert graph.get_dependency_order() == [0, 1]
-
-
-def test_scope_graph_treats_alias_leakage_as_non_correlated_dependency():
-    example = next(
-        example
-        for example in load_dev_examples()
-        if example.db_id == "financial" and example.question_id == 94
-    )
-    instance = Instance(
-        ddls=get_schema_ddl(example.db_id), name="graph_scalar_subquery", dialect="sqlite"
-    )
-    expr = preprocess_sql(example.sql, instance, dialect="sqlite")
-
-    graph = build_graph_from_scopes(expr)
-
-    assert graph.root_node_id == 2
-    assert graph.get_node(2).dependencies == {0, 1}
-    assert graph.get_node(1).dependencies == set()
 
 
 def test_intersect_set_operation_generates_rows_under_smt_only():
