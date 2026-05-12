@@ -31,8 +31,7 @@ jobs:
           python tests/experiment/test_sqlite.py \
             --schema_fp data/sqlite/schema.json \
             --gold_fp data/sqlite/dev.json \
-            --preds_fp data/sqlite/dail.txt \
-            --connection_string file:ci_sqlite.db \
+            --preds_fp data/sqlite/dail.txt \            
             --output_dir results
 
       - name: Commit results
