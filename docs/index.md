@@ -1,41 +1,34 @@
-# Welcome to MkDocs
+# ParSEval Documentation
 
-For full documentation visit [mkdocs.org](https://www.mkdocs.org).
+ParSEval is a sophisticated tool for validating SQL parsers and database engines through automated query generation and smart data synthesis.
 
-## Commands
+## Core Features
 
-* `mkdocs new [dir-name]` - Create a new project.
-* `mkdocs serve` - Start the live-reloading docs server.
-* `mkdocs build` - Build the documentation site.
-* `mkdocs -h` - Print help message and exit.
+- **Query Generation**: Generate complex SQL queries covering various clauses (SELECT, JOIN, WHERE, GROUP BY, HAVING, etc.).
+- **Differential Testing**: Compare the results of the same query across different database engines or parser versions.
+- **Smart Data Generation**: Utilize the [Domain Module](domain.md) to generate schema-valid data that satisfies complex constraints and referential integrity.
+- **Dialect Support**: Built-in support for multiple SQL dialects including PostgreSQL, MySQL, and SQLite.
 
-## Project layout
+## Getting Started
 
-    mkdocs.yml    # The configuration file.
-    docs/
-        index.md  # The documentation homepage.
-        ...       # Other markdown pages, images and other files.
+### Installation
 
+ParSEval uses Poetry for dependency management.
 
-
-# Build dev environment from poetry
-## Add package to poetry dependency
 ```bash
-poetry add --group dev func_timeout==4.3.5
+# Install dependencies
+poetry install
 ```
 
-## Add a runtime dependency
-```bash
-poetry add <package_name>
-poetry add sqlglot
-```
+### Basic Usage
 
-## Install only dev dependencies
-If you want to include dev dependencies when installing:
-```bash
-poetry install --with dev
-```
-If you want to install only the main (non-dev) dependencies:
-```bash
-poetry install --without dev
-```
+(Add basic usage examples here if available in main.py)
+
+---
+
+## Technical Guides
+
+- [Domain Module](domain.md): Deep dive into the data generation engine.
+- [Instance Module](instance.md): Comprehensive guide to database instance management and data generation.
+- [DB Manager](db_manager.md): Guide to database connection management and SQL operations.
+- [Developer Guide](dev.md): Instructions for setting up the development environment.

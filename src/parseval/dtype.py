@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any, Optional, Union
 from sqlglot.expressions import DataType as sqlglot_datatype
 
+from enum import Enum
 
 def precision(self) -> Optional[int]:
     """
@@ -62,6 +63,18 @@ setattr(sqlglot_datatype, "default", property(default))
 DataType = sqlglot_datatype
 
 
+class TypeFamily(str, Enum):
+    INTEGER = "integer"
+    DECIMAL = "decimal"
+    TEXT = "text"
+    BOOLEAN = "boolean"
+    DATE = "date"
+    DATETIME = "datetime"
+    TIME = "time"
+    UUID = "uuid"
+    JSON = "json"
+    BINARY = "binary"
+    UNKNOWN = "unknown"
 
 # # dd = exp.DataType.build("INT", dialect= 'sqlite', precision=10)
 

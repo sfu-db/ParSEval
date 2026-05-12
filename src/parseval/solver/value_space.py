@@ -1,0 +1,480 @@
+"""CSP-lite constraint solver using value-space narrowing.
+
+Replaces the ad-hoc Tier 0/1 heuristics with a principled approach:
+1. BUILD: Extract variables + constraints from predicates.
+2. PROPAGATE: Narrow value spaces via constraint intersection (AC-3 lite).
+3. ASSIGN: Topological sort by dependency, pick values from narrowed spaces.
+
+Integrates with the domain module's TypeAdapter for type-correct value
+generation within the narrowed space.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from parseval.domain.types import TypeFamily, TypeService
+from parseval.dtype import DataType
+from parseval.instance import Instance
+
+
+# =============================================================================
+# ValueSpace: the constrained set of valid values for one column
+# =============================================================================
+
+
+@dataclass
+class ValueSpace:
+    """The narrowed space of valid values for a variable."""
+
+    family: TypeFamily = TypeFamily.TEXT
+    min_val: Optional[Any] = None
+    max_val: Optional[Any] = None
+    equals: Optional[Any] = None
+    not_equals: Set[Any] = field(default_factory=set)
+    allowed: Optional[Set[Any]] = None  # IN (...)
+    must_null: bool = False
+    not_null: bool = False
+    like_pattern: Optional[str] = None
+    max_length: Optional[int] = None
+    # Derived: value = source_var OP operand
+    derived_from: Optional[Tuple[str, str, Any]] = None
+
+    def is_empty(self) -> bool:
+        """True if no valid value exists in this space."""
+        if self.must_null and self.not_null:
+            return True
+        if self.must_null:
+            return False
+        if self.equals is not None:
+            if self.equals in self.not_equals:
+                return True
+            if self.min_val is not None and self.equals < self.min_val:
+                return True
+            if self.max_val is not None and self.equals > self.max_val:
+                return True
+            if self.allowed is not None and self.equals not in self.allowed:
+                return True
+            return False
+        if self.min_val is not None and self.max_val is not None:
+            if self.min_val > self.max_val:
+                return True
+        if self.allowed is not None:
+            valid = self.allowed - self.not_equals
+            if self.min_val is not None:
+                valid = {v for v in valid if v >= self.min_val}
+            if self.max_val is not None:
+                valid = {v for v in valid if v <= self.max_val}
+            if not valid:
+                return True
+        return False
+
+    def pick(self) -> Any:
+        """Choose a concrete value from this space."""
+        if self.must_null:
+            return None
+        if self.equals is not None:
+            return self.equals
+        if self.allowed is not None:
+            valid = self.allowed - self.not_equals
+            if self.min_val is not None:
+                valid = {v for v in valid if v >= self.min_val}
+            if self.max_val is not None:
+                valid = {v for v in valid if v <= self.max_val}
+            if valid:
+                return min(valid)  # deterministic
+            return None
+
+        # Range-based selection (prefer middle for robustness).
+        if self.family in (TypeFamily.INTEGER, TypeFamily.DECIMAL):
+            return self._pick_numeric()
+        elif self.family == TypeFamily.TEXT:
+            return self._pick_text()
+        elif self.family in (TypeFamily.DATE, TypeFamily.DATETIME):
+            return self._pick_temporal()
+        elif self.family == TypeFamily.BOOLEAN:
+            if True not in self.not_equals:
+                return True
+            return False
+        # Fallback
+        return self._pick_numeric() if self.min_val is not None or self.max_val is not None else "value"
+
+    def _pick_numeric(self) -> Any:
+        """Pick a numeric value from the narrowed range, avoiding excluded values."""
+        lo = self.min_val if self.min_val is not None else 1
+        hi = self.max_val if self.max_val is not None else lo + 100
+        # Pick middle of range, avoiding not_equals.
+        candidate = (lo + hi) // 2 if isinstance(lo, int) else (lo + hi) / 2
+        while candidate in self.not_equals:
+            candidate = candidate + 1
+            if self.max_val is not None and candidate > self.max_val:
+                candidate = lo
+                while candidate in self.not_equals:
+                    candidate += 1
+                break
+        return candidate
+
+    def _pick_text(self) -> str:
+        """Pick a text value, matching LIKE pattern if present, avoiding excluded values."""
+        if self.like_pattern:
+            return self.like_pattern.replace("%", "x").replace("_", "a")
+        length = min(self.max_length or 10, 10)
+        base = "value"[:length]
+        i = 1
+        while base in self.not_equals:
+            base = f"val_{i}"[:length]
+            i += 1
+        return base
+
+    def _pick_temporal(self) -> Any:
+        if self.min_val and isinstance(self.min_val, (date, datetime)):
+            return self.min_val
+        if self.max_val and isinstance(self.max_val, (date, datetime)):
+            return self.max_val - timedelta(days=1)
+        return date(2024, 6, 15)
+
+    def narrow_min(self, val: Any) -> None:
+        """Narrow the minimum bound of this value space to ``val`` (if higher)."""
+        if self.min_val is None or val > self.min_val:
+            self.min_val = val
+
+    def narrow_max(self, val: Any) -> None:
+        """Narrow the maximum bound of this value space to ``val`` (if lower)."""
+        if self.max_val is None or val < self.max_val:
+            self.max_val = val
+
+    def narrow_eq(self, val: Any) -> None:
+        """Set the exact-equality constraint to ``val``."""
+        self.equals = val
+
+    def narrow_neq(self, val: Any) -> None:
+        """Add ``val`` to the set of excluded values."""
+        self.not_equals.add(val)
+
+    def narrow_in(self, values: Set[Any]) -> None:
+        """Restrict allowed values to the intersection with ``values``."""
+        if self.allowed is None:
+            self.allowed = values
+        else:
+            self.allowed &= values
+
+
+# =============================================================================
+# CSP Variables and Constraints
+# =============================================================================
+
+
+@dataclass
+class CSPVariable:
+    """A column variable in the CSP solver that needs a value assigned.
+
+    Attributes:
+        name: Qualified name like ``"table.column"``.
+        table: The table this variable belongs to.
+        column: The column name.
+        space: The narrowed :class:`ValueSpace` for this variable.
+        assigned: The final assigned value (set during assignment phase).
+        depends_on: Name of another variable this one derives from (e.g., via equality).
+    """
+
+    name: str  # "table.column"
+    table: str
+    column: str
+    space: ValueSpace
+    assigned: Optional[Any] = None
+    depends_on: Optional[str] = None  # name of variable this derives from
+
+
+@dataclass
+class CSPConstraint:
+    """A relationship between two CSP variables.
+
+    Attributes:
+        kind: The constraint type — ``"eq"`` (same value) or ``"derived"`` (arithmetic).
+        left: Name of the left variable.
+        right: Name of the right variable.
+        operator: For derived constraints: ``"+"``, ``"-"``, ``"*"``, ``"/"``.
+        operand: For derived constraints: the constant operand.
+    """
+
+    kind: str  # "eq" / "derived"
+    left: str  # variable name
+    right: str  # variable name
+    operator: str = "="  # for derived: +, -, *, /
+    operand: Any = None  # for derived: the constant
+
+
+# =============================================================================
+# DomainSolver: build → propagate → assign
+# =============================================================================
+
+
+class DomainSolver:
+    """CSP-lite solver using value-space narrowing with three phases.
+
+    1. **BUILD**: Create :class:`CSPVariable` entries for each target column
+       and :class:`CSPConstraint` entries from predicates and equivalences.
+    2. **PROPAGATE**: Iteratively narrow each variable's :class:`ValueSpace`
+       using equality and bound propagation (AC-3 lite, capped at 10 iterations).
+    3. **ASSIGN**: Pick concrete values from narrowed spaces, respecting
+       equality groups and remaining constraints.
+
+    Attributes:
+        instance: The database instance providing schema and type info.
+        dialect: SQL dialect for type resolution (default "sqlite").
+        _type_service: Cached :class:`TypeService` for type-family lookups.
+    """
+
+    def __init__(self, instance: Instance, dialect: str = "sqlite"):
+        """Initialize the domain solver.
+
+        Args:
+            instance: The database instance to solve constraints for.
+            dialect: SQL dialect string (default "sqlite").
+        """
+        self.instance = instance
+        self.dialect = dialect
+        self._type_service = TypeService()
+
+    def solve(
+        self,
+        tables: Tuple[str, ...],
+        fixed_values: Dict[str, Dict[str, Any]],
+        predicates: List[Tuple[str, str, str, Any]],  # (table, col, op, value)
+        equivalences: Optional["ColumnUnionFind"] = None,
+        shared_keys: Optional[Dict[str, List[Tuple[str, str]]]] = None,
+        not_null: List[Tuple[str, str]] = None,
+        must_null: List[Tuple[str, str]] = None,
+        avoid_values: Dict[str, Set[Any]] = None,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Solve the constraint set and return assignments per table.
+
+        Accepts either a ``ColumnUnionFind`` (preferred) or legacy
+        ``shared_keys`` dict for column equivalence.
+        """
+        not_null = not_null or []
+        must_null = must_null or []
+        avoid_values = avoid_values or {}
+
+        # Convert legacy shared_keys to ColumnUnionFind if needed.
+        if equivalences is None:
+            from .lowering import ColumnUnionFind
+            equivalences = ColumnUnionFind()
+            if shared_keys:
+                for key_id, cols in shared_keys.items():
+                    if len(cols) >= 2:
+                        first = f"{cols[0][0]}.{cols[0][1]}"
+                        for table, col in cols[1:]:
+                            equivalences.union(first, f"{table}.{col}")
+        # Phase 1: BUILD
+        variables, constraints = self._build(
+            tables, fixed_values, predicates, equivalences,
+            not_null, must_null, avoid_values,
+        )
+
+        # Phase 2: PROPAGATE
+        if not self._propagate(variables, constraints):
+            return None  # UNSAT
+
+        # Phase 3: ASSIGN
+        return self._assign(variables, constraints)
+
+    def _build(
+        self, tables, fixed_values, predicates, equivalences,
+        not_null, must_null, avoid_values,
+    ) -> Tuple[Dict[str, CSPVariable], List[CSPConstraint]]:
+        """Build CSP variables and constraints from the input specification.
+
+        Creates one :class:`CSPVariable` per column in each target table,
+        then applies fixed values, predicates, equivalences, NOT NULL / must-NULL
+        constraints, and UNIQUE avoidance as value-space narrowings.
+
+        Returns:
+            Tuple of (variables dict, constraints list).
+        """
+        variables: Dict[str, CSPVariable] = {}
+        constraints: List[CSPConstraint] = []
+
+        # Create variables for all columns in target tables.
+        for table in tables:
+            if table not in self.instance.tables:
+                continue
+            for col, col_type in self.instance.tables[table].items():
+                name = f"{table}.{col}"
+                family = self._type_family(col_type)
+                space = ValueSpace(family=family)
+                variables[name] = CSPVariable(name=name, table=table, column=col, space=space)
+
+        # Apply fixed values.
+        for table, cols in fixed_values.items():
+            for col, val in cols.items():
+                name = f"{table}.{col}"
+                if name in variables:
+                    variables[name].space.narrow_eq(val)
+
+        # Apply predicates.
+        for table, col, op, val in predicates:
+            name = f"{table}.{col}"
+            if name not in variables:
+                continue
+            space = variables[name].space
+            if op == "=":
+                space.narrow_eq(val)
+            elif op == ">" and isinstance(val, (int, float)):
+                space.narrow_min(val + 1 if isinstance(val, int) else val + 0.01)
+            elif op == ">=" and isinstance(val, (int, float)):
+                space.narrow_min(val)
+            elif op == "<" and isinstance(val, (int, float)):
+                space.narrow_max(val - 1 if isinstance(val, int) else val - 0.01)
+            elif op == "<=" and isinstance(val, (int, float)):
+                space.narrow_max(val)
+            elif op == "!=":
+                space.narrow_neq(val)
+            elif op == "in":
+                space.narrow_in(set(val) if isinstance(val, (list, tuple, set)) else {val})
+            elif op == "like":
+                space.like_pattern = val
+            elif op == "is_null":
+                space.must_null = True
+            elif op == ">" and isinstance(val, str):
+                space.narrow_eq(val + "z")
+            elif op == "<" and isinstance(val, str):
+                space.narrow_eq(val[:-1] if len(val) > 1 else "a")
+
+        # Apply equivalences from Union-Find.
+        for representative, members in equivalences.groups().items():
+            if len(members) >= 2:
+                first = members[0]
+                for other in members[1:]:
+                    if first in variables and other in variables:
+                        constraints.append(CSPConstraint(kind="eq", left=first, right=other))
+
+        # Apply NOT NULL.
+        for table, col in not_null:
+            name = f"{table}.{col}"
+            if name in variables:
+                variables[name].space.not_null = True
+
+        # Apply must NULL.
+        for table, col in must_null:
+            name = f"{table}.{col}"
+            if name in variables:
+                variables[name].space.must_null = True
+
+        # Apply UNIQUE avoidance.
+        for key, existing in avoid_values.items():
+            if key in variables:
+                for val in existing:
+                    variables[key].space.narrow_neq(val)
+
+        return variables, constraints
+
+    def _propagate(self, variables: Dict[str, CSPVariable], constraints: List[CSPConstraint]) -> bool:
+        """Narrow value spaces via constraint propagation (AC-3 lite).
+
+        Iterates over equality constraints, propagating equal values,
+        minimums, and maximums between linked variables. Capped at 10
+        iterations to prevent infinite loops on circular constraints.
+
+        Args:
+            variables: Map of variable names to CSPVariable objects.
+            constraints: List of CSPConstraint objects to propagate.
+
+        Returns:
+            False if any domain becomes empty (UNSAT), True otherwise.
+        """
+        changed = True
+        iterations = 0
+        while changed and iterations < 10:
+            changed = False
+            iterations += 1
+            for constraint in constraints:
+                if constraint.kind == "eq":
+                    left = variables.get(constraint.left)
+                    right = variables.get(constraint.right)
+                    if left and right:
+                        # Unify: if one has equals, propagate to the other.
+                        if left.space.equals is not None and right.space.equals is None:
+                            right.space.narrow_eq(left.space.equals)
+                            changed = True
+                        elif right.space.equals is not None and left.space.equals is None:
+                            left.space.narrow_eq(right.space.equals)
+                            changed = True
+                        # Propagate bounds.
+                        if left.space.min_val and (right.space.min_val is None or left.space.min_val > right.space.min_val):
+                            right.space.narrow_min(left.space.min_val)
+                            changed = True
+                        if left.space.max_val and (right.space.max_val is None or left.space.max_val < right.space.max_val):
+                            right.space.narrow_max(left.space.max_val)
+                            changed = True
+
+            # Check for empty domains.
+            for var in variables.values():
+                if var.space.is_empty():
+                    return False
+
+        return True
+
+    def _assign(self, variables: Dict[str, CSPVariable], constraints: List[CSPConstraint]) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Pick concrete values from narrowed spaces for all variables.
+
+        Resolves equality groups so all linked variables get the same
+        value, then picks from each variable's narrowed space.
+
+        Returns:
+            Dict of {table_name: {column_name: value}}, or None if empty.
+        """
+        # Resolve equality groups: all vars in an eq constraint get the same value.
+        eq_groups: Dict[str, str] = {}  # var_name → group leader
+        for c in constraints:
+            if c.kind == "eq":
+                leader = eq_groups.get(c.left, c.left)
+                eq_groups[c.right] = leader
+                eq_groups[c.left] = leader
+
+        # Pick values for leaders first, then propagate to group members.
+        assigned: Dict[str, Any] = {}
+        for var in variables.values():
+            leader = eq_groups.get(var.name, var.name)
+            if leader in assigned:
+                var.assigned = assigned[leader]
+            else:
+                val = var.space.pick()
+                var.assigned = val
+                assigned[var.name] = val
+                assigned[leader] = val
+
+        # Build result grouped by table.
+        result: Dict[str, Dict[str, Any]] = {}
+        for var in variables.values():
+            if var.assigned is not None or var.space.must_null:
+                result.setdefault(var.table, {})[var.column] = var.assigned
+
+        return result if result else None
+
+    def _type_family(self, col_type_str: str) -> TypeFamily:
+        """Map a column type string (e.g. 'INT', 'VARCHAR') to a TypeFamily enum.
+
+        Uses substring matching: 'INTEGER' and 'BIGINT' both map to INTEGER,
+        'DECIMAL' and 'FLOAT' both map to DECIMAL, etc. Falls back to TEXT
+        for unrecognized types.
+        """
+        upper = str(col_type_str).upper()
+        if any(t in upper for t in ("INT", "INTEGER", "BIGINT", "SMALLINT")):
+            return TypeFamily.INTEGER
+        if any(t in upper for t in ("REAL", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC")):
+            return TypeFamily.DECIMAL
+        if any(t in upper for t in ("BOOL",)):
+            return TypeFamily.BOOLEAN
+        if "DATETIME" in upper or "TIMESTAMP" in upper:
+            return TypeFamily.DATETIME
+        if "DATE" in upper:
+            return TypeFamily.DATE
+        if "TIME" in upper:
+            return TypeFamily.TIME
+        return TypeFamily.TEXT
+
+
+__all__ = ["DomainSolver", "ValueSpace", "CSPVariable", "CSPConstraint"]

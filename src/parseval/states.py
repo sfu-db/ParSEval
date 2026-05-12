@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import functools
+import logging
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Any,
-    Dict,
-    List,
-    Set,
-    Union,
-    Optional,
-    Generic,
-    TypeVar,
-    NamedTuple,
-    Iterable,
-    Type,
     Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
     Tuple,
+    Type,
+    TypeVar,
+    Union,
 )
-import functools, logging
 
-logger = logging.getLogger("parseval.uexpr")
+logger = logging.getLogger("parseval")
+
+
+# =============================================================================
+# Enums
+# =============================================================================
 
 
 class ParSEvalState(Enum):
@@ -31,48 +35,187 @@ class ParSEvalState(Enum):
     ERROR = "error"
 
 
-T = TypeVar("T")  # Type for the success value
-E = TypeVar("E")  # Type for the error value
+class Verdict(Enum):
+    """Result of equivalence checking."""
+    EQ = "eq"              # Queries are equivalent on generated instance
+    NEQ = "neq"            # Queries produce different results
+    SYNTAX_ERROR = "syntax_error"  # One or both queries have syntax errors
+    RUNTIME_ERROR = "runtime_error"  # Execution error (not syntax)
+    TIMEOUT = "timeout"    # Generation or execution timed out
+    UNKNOWN = "unknown"    # Could not determine
+
+
+class Semantics(Enum):
+    """How to compare query results."""
+    BAG = "bag"    # Order + duplicates matter (multiset)
+    SET = "set"    # Only distinct tuples matter (set)
+
+
+# =============================================================================
+# Result Types
+# =============================================================================
+
+
+@dataclass
+class ExecutionResult:
+    """Result of executing a single query."""
+    query: str
+    rows: List[Tuple[Any, ...]] = field(default_factory=list)
+    error_msg: str = ""
+    elapsed_time: float = 0.0
+
+    @property
+    def is_error(self) -> bool:
+        return bool(self.error_msg)
+
+    @property
+    def is_syntax_error(self) -> bool:
+        if not self.error_msg:
+            return False
+        lower = self.error_msg.lower()
+        return any(k in lower for k in ("syntax", "parse", "near", "no such column", "no such table"))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "rows": self.rows,
+            "error_msg": self.error_msg,
+            "elapsed_time": self.elapsed_time,
+        }
+
+@dataclass
+class GenerationResult:
+    """Result of test database generation."""
+    success: bool
+    rows_generated: int = 0
+    coverage: float = 0.0
+    error_msg: str = ""
+    elapsed_time: float = 0.0
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "rows_generated": self.rows_generated,
+            "coverage": self.coverage,
+            "error_msg": self.error_msg,
+            "elapsed_time": self.elapsed_time,
+        }
+
+
+@dataclass
+class DisproveResult:
+    """Result of equivalence disproval attempt."""
+    verdict: Verdict
+    semantics: Semantics
+    q1_result: ExecutionResult
+    q2_result: ExecutionResult
+    generation: GenerationResult
+    connection_string: str = ""
+    db_id: str = ""
+    error_msg: str = ""
+
+    @property
+    def is_equivalent(self) -> bool:
+        return self.verdict == Verdict.EQ
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict.value,
+            "semantics": self.semantics.value,
+            "q1_rows": len(self.q1_result.rows),
+            "q2_rows": len(self.q2_result.rows),
+            "q1_error": self.q1_result.error_msg,
+            "q2_error": self.q2_result.error_msg,
+            "generation_success": self.generation.success,
+            "rows_generated": self.generation.rows_generated,
+            "coverage": self.generation.coverage,
+            "elapsed_time": self.generation.elapsed_time,
+            "error_msg": self.error_msg,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-serializable dict."""
+        return {
+            "verdict": self.verdict.value,
+            "semantics": self.semantics.value,
+            "q1_result": self.q1_result.to_dict(),
+            "q2_result": self.q2_result.to_dict(),
+            "generation": self.generation.to_dict(),
+            "connection_string": self.connection_string,
+            "db_id": self.db_id,
+            "error_msg": self.error_msg,
+        }
+
+@dataclass
+class InstantiateResult:
+    """Result of database instantiation."""
+    success: bool
+    generation: GenerationResult
+    connection_string: str = ""
+    db_id: str = ""
+    error_msg: str = ""
+
+
+# =============================================================================
+# Comparison Logic
+# =============================================================================
+
+
+def compare_results(
+    r1: ExecutionResult,
+    r2: ExecutionResult,
+    semantics: Semantics = Semantics.BAG,
+) -> Verdict:
+    """Compare two execution results and return a verdict."""
+    # Syntax errors
+    if r1.is_syntax_error or r2.is_syntax_error:
+        return Verdict.SYNTAX_ERROR
+
+    # Runtime errors
+    if r1.is_error or r2.is_error:
+        return Verdict.RUNTIME_ERROR
+
+    # Compare based on semantics
+    if semantics == Semantics.SET:
+        eq = set(r1.rows) == set(r2.rows)
+    else:
+        # BAG: sort both (order-independent multiset comparison)
+        try:
+            eq = sorted(r1.rows) == sorted(r2.rows)
+        except TypeError:
+            # Unsortable (e.g., None values) — compare as-is
+            eq = r1.rows == r2.rows
+
+    return Verdict.EQ if eq else Verdict.NEQ
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
 
 
 class ParSEvalError(Exception):
-    """Base exception for ParSEval-related errors.
-
-    This exception is raised when there are general errors related to
-    the ParSEval process.
-    """
-
+    """Base exception for ParSEval-related errors."""
     pass
 
 
 class SchemaException(ParSEvalError):
-    """Base exception for schema-related errors.
-
-    This exception is raised when there are issues related to the schema,
-    such as missing columns, mismatched data types, or invalid schema definitions.
-    """
-
+    """Schema-related errors (missing columns, invalid definitions)."""
     pass
 
 
 class SyntaxException(ParSEvalError):
-    """Base exception for syntax-related errors.
-
-    This exception is raised when there are syntax errors in the input,
-    such as invalid query syntax or malformed expressions.
-    """
-
+    """Syntax errors in SQL input."""
     pass
 
 
 class ValidationException(ParSEvalError):
-    """Base exception for validation-related errors.
-
-    This exception is raised when validation checks fail, such as
-    constraints on data integrity, uniqueness, or nullability.
-    """
-
+    """Validation failures (constraints, integrity)."""
     pass
+
+
+# =============================================================================
+# Decorators
+# =============================================================================
 
 
 from sqlglot.errors import ParseError, SchemaError, OptimizeError, UnsupportedError
@@ -80,17 +223,23 @@ from sqlglot.errors import ParseError, SchemaError, OptimizeError, UnsupportedEr
 ExceptionTypes = Tuple[Type[BaseException], ...]
 
 
-def raise_exception(func):
-    @functools.wraps(func)
+def raise_exception(func_or_msg):
+    """Decorator or direct call to raise ParSEvalError."""
+    if isinstance(func_or_msg, str):
+        raise ParSEvalError(func_or_msg)
+
+    @functools.wraps(func_or_msg)
     def wrapper(*args, **kwargs):
         try:
-            return func(*args, **kwargs)
+            return func_or_msg(*args, **kwargs)
         except ParseError as e:
             raise SyntaxException(str(e)) from e
         except SchemaError as e:
             raise SchemaException(str(e)) from e
         except OptimizeError as e:
-            raise UnsupportedError(str(e)) from e
+            raise ParSEvalError(str(e)) from e
+        except ParSEvalError:
+            raise
         except Exception as e:
             raise ParSEvalError(str(e)) from e
 
@@ -104,20 +253,7 @@ def non_fatal(
     catch: Optional[Iterable[Type[Exception]]] = None,
     log: bool = False,
 ) -> Callable:
-    """
-    Decorator that makes a function non-fatal:
-    - Exceptions are caught and suppressed
-    - A default value is returned instead
-    Parameters
-    ----------
-    default:
-        Value returned when an exception is caught.
-    catch:
-        Iterable of exception types to catch.
-        Defaults to (Exception,).
-    log:
-        Whether to log the exception.
-    """
+    """Decorator that catches exceptions and returns a default value."""
     exceptions: ExceptionTypes = tuple(catch) if catch is not None else (Exception,)
 
     def decorator(func: Callable) -> Callable:
@@ -127,15 +263,9 @@ def non_fatal(
                 return func(*args, **kwargs)
             except exceptions as e:
                 if log:
-                    logger.debug(
-                        "[non_fatal] Ignored error in %s: %s",
-                        func.__qualname__,
-                        e,
-                        exc_info=True,
-                    )
+                    logger.debug("[non_fatal] %s: %s", func.__qualname__, e, exc_info=True)
                 if default_from_args is not None:
                     return default_from_args(*args, **kwargs)
-
                 return default
 
         return wrapper
@@ -143,6 +273,7 @@ def non_fatal(
     return decorator
 
 
+# Legacy compat
 @dataclass
 class RunResult:
     q1: str
@@ -158,23 +289,3 @@ class RunResult:
     database_source: str = "none"
     database_name: str | None = None
     elapsed_time: float = 0.0
-
-
-@dataclass
-class ExecutionResult:
-    host_or_path: str
-    db_id: str
-    query: str
-    rows: List[Tuple[Any, ...]]
-    elapsed_time: float
-    error_msg: str = ""
-    dialect: str = "sqlite"
-
-    def is_equivalent(self, other: ExecutionResult, set_semantic=False) -> bool:
-        if self.error_msg or other.error_msg:
-            return False
-
-        if set_semantic:
-            return set(self.rows) == set(other.rows)
-        else:
-            return self.rows == other.rows

@@ -377,7 +377,7 @@ class TestInstance(unittest.TestCase):
         # logger.info("Group BY" + "->>>>>".join(str(j) for j in coverage_constraints.group_by['by']))
         # logger.info("->>>>>".join(str(j) for j in coverage_constraints.having))
 
-        from sqlglot.planner import Plan
+        from parseval.plan.planner import Plan
 
         # for scope in scopes:
         #     p = Plan(scope.expression)

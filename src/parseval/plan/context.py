@@ -2,10 +2,117 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple, Optional, List, TYPE_CHECKING
 from itertools import product
 
+from sqlglot import exp
+
+from parseval.helper import normalize_name
+
 if TYPE_CHECKING:
     from parseval.instance import Instance
     from parseval.dtype import DATATYPE
-    from .rex import Row
+    from .rex import Symbol
+
+
+class Row(exp.Expression):
+    """One logical row produced by a plan step.
+
+    A ``Row`` pairs a stable row identity (``this`` — a tuple of ids) with
+    a mapping ``columns: Dict[str, Symbol]`` from column name to the cell
+    value. Rows are the unit of currency for :class:`DerivedSchema` and
+    flow through :class:`parseval.symbolic.encoder.SymbolicScopeEncoder`
+    between plan steps.
+
+    Although it subclasses :class:`sqlglot.exp.Expression` (so it can be
+    embedded in SQL-like pretty-printing and share the Symbol dispatch),
+    ``Row`` is a runtime container, not an AST node used for planning.
+    Keep the AST-flavored operations (``sql()`` etc.) minimal.
+    """
+
+    arg_types = {"this": True, "columns": True}
+
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        return tuple(self.args.get("columns", {}).keys())
+
+    @property
+    def rowid(self) -> Tuple[Any, ...]:
+        if isinstance(self.this, tuple):
+            return self.this
+        return (self.this,)
+
+    def _key_name(self, key):
+        if isinstance(key, exp.Expression):
+            if isinstance(key, exp.Column):
+                return key.name
+            return key.alias_or_name or key.sql()
+        return str(key)
+
+    def items(self):
+        return self.args.get("columns", {}).items()
+
+    def __iter__(self):
+        return iter(self.args.get("columns"))
+
+    def __getitem__(self, key):
+        columns = self.args.get("columns", {})
+        if key in columns:
+            return columns[key]
+        if hasattr(key, "name"):
+            key = key.name
+            if key in columns:
+                return columns[key]
+        normalized = normalize_name(self._key_name(key))
+        for column_name, value in columns.items():
+            if normalize_name(self._key_name(column_name)) == normalized:
+                return value
+        raise KeyError(key)
+
+    def get(self, table, column):
+        del table
+        return self[column]
+
+    def __len__(self):
+        return len(self.args.get("columns", {}))
+
+    def __add__(self, other):
+        assert isinstance(other, Row), f"Cannot add Row with {type(other)}"
+        new_columns = {**self.args.get("columns"), **other.args.get("columns", {})}
+        rid = self.rowid + other.rowid
+        return Row(this=rid, columns=new_columns)
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.key}({self.this})"
+
+
+class AggGroup(exp.Expression):
+    """A group of rows aggregated under a single GROUP BY key.
+
+    ``this`` carries the concatenated row identities forming the group,
+    ``group_key`` is the tuple of key values, and ``group_values`` is the
+    list of contributing :class:`Row` objects. Produced by the
+    :class:`parseval.plan.Aggregate` step and consumed by HAVING and any
+    downstream consumer that needs per-group provenance.
+    """
+
+    arg_types = {"this": True, "group_key": True, "group_values": True}
+
+    @property
+    def group_key(self):
+        return self.args.get("group_key", ())
+
+    @property
+    def group_values(self):
+        return self.args.get("group_values", [])
+
+    @property
+    def name(self) -> Any:
+        return self.text("this")
+
+    @property
+    def rowids(self) -> Tuple[Any, ...]:
+        return self.this
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.key}({self.this})"
 
 
 class DerivedSchema:

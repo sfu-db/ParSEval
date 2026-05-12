@@ -1,158 +1,227 @@
-from typing import List, Optional
-from parseval.query import preprocess_sql
+"""ParSEval main entry point — public API for test database generation.
 
+Usage::
 
-def disprove(
-    q1,
-    q2,
-    schema,
-    host_or_path,
-    db_id,
-    username=None,
-    password=None,
-    port=None,
-    global_timeout=360,
-    query_timeout=10,
-    set_semantic=True,
-    null_threshold=1,
-    unique_threshold=1,
-    duplicate_threshold=2,
-    group_count_threshold=2,
-    group_size_threshold=3,
-    positive_threshold=2,
-    negative_threshold=1,
-    min_rows=3,
-    max_tries=2,
-    dialect="sqlite",
-    existing_dbs: Optional[List] = None,
-):
-    from parseval.disprover import Disprover
-    from parseval.configuration import DisproverConfig, GeneratorConfig
+    from parseval import instantiate_db, disprove
 
-    generator_config = GeneratorConfig(
-        null_threshold=null_threshold,
-        unique_threshold=unique_threshold,
-        duplicate_threshold=duplicate_threshold,
-        group_count_threshold=group_count_threshold,
-        group_size_threshold=group_size_threshold,
-        positive_threshold=positive_threshold,
-        negative_threshold=negative_threshold,
-        min_rows=min_rows,
-        max_tries=max_tries,
-    )
+    result = instantiate_db(sql, schema, connection_string, dialect)
+    result = disprove(sql1, sql2, schema, connection_string, dialect)
+"""
 
-    config = DisproverConfig(
-        host_or_path=host_or_path,
-        db_id=db_id,
-        username=username,
-        password=password,
-        port=port,
-        global_timeout=global_timeout,
-        query_timeout=query_timeout,
-        set_semantic=set_semantic,
-        generator=generator_config,
-    )
+from __future__ import annotations
 
-    klass = Disprover(
-        q1=q1,
-        q2=q2,
-        schema=schema,
-        dialect=dialect,
-        config=config,
-        existing_dbs=existing_dbs,
-    )
-    result = klass.run()
-    return result
+import time
+from typing import Any, Optional
+
+from parseval.db_manager import DBManager
+from parseval.instance import Instance
+from parseval.instance.io import to_db
+from parseval.logger import get_logger
+from parseval.states import (
+    DisproveResult,
+    ExecutionResult,
+    GenerationResult,
+    InstantiateResult,
+    Semantics,
+    Verdict,
+    compare_results,
+)
+from parseval.symbolic import CoverageThresholds, SymbolicEngine
+
+_log = get_logger("engine")
 
 
 def instantiate_db(
-    query,
-    schema,
-    host_or_path,
-    db_id,
-    username=None,
-    password=None,
-    port=None,
-    global_timeout=360,
-    query_timeout=10,
-    null_threshold=1,
-    unique_threshold=1,
-    duplicate_threshold=2,
-    group_count_threshold=2,
-    group_size_threshold=3,
-    positive_threshold=2,
-    negative_threshold=1,
-    min_rows=3,
-    max_tries=2,
-    dialect="sqlite",
-):
-    from parseval.speculative import SpeculativeGenerator
-    from parseval.data_generator import DataGenerator
-    from parseval.configuration import GeneratorConfig
-    from parseval.instance import Instance
-    from parseval.db_manager import DBManager
-    import threading
-
-    stop_event = threading.Event()
-
-    def early_stop(instance: Instance) -> bool:
-        instance.to_db(
-            host_or_path=host_or_path,
-            database=f"{instance.name}.sqlite",
-            port=port,
-            username=username,
-            password=password,
-            truncate_first=True,
+    sql: str,
+    schema: str,
+    connection_string: str,
+    dialect: str = "sqlite",
+    *,
+    db_id: str = "parseval",
+    max_iterations: int = 10,
+    atom_null: int = 0,
+    **kwargs: Any,
+) -> InstantiateResult:
+    """Generate a test database instance for a SQL query and persist it."""
+    t0 = time.time()
+    _log.info("instantiate_db: dialect=%s, sql=%.80s", dialect, sql)
+    try:
+        instance = Instance(ddls=schema, name=db_id, dialect=dialect)
+        thresholds = CoverageThresholds(atom_null=atom_null)
+        engine = SymbolicEngine(
+            instance, sql, dialect=dialect, max_iterations=max_iterations, **kwargs
+        )
+        gen_result = engine.generate(thresholds=thresholds)
+        generation = GenerationResult(
+            success=True,
+            rows_generated=gen_result.rows_generated,
+            coverage=gen_result.coverage,
+            elapsed_time=time.time() - t0,
+        )
+        to_db(instance, connection_string, dialect=dialect)
+        _log.info("instantiate_db: done, %d rows, coverage=%.2f, %.3fs",
+                  gen_result.rows_generated, gen_result.coverage, time.time() - t0)
+        return InstantiateResult(
+            success=True, generation=generation,
+            connection_string=connection_string, db_id=db_id,
+        )
+    except Exception as e:
+        _log.error("instantiate_db failed: %s", e)
+        return InstantiateResult(
+            success=False,
+            generation=GenerationResult(success=False, error_msg=str(e), elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id, error_msg=str(e),
         )
 
-        with DBManager().get_connection(
-            host_or_path=host_or_path,
-            database=f"{instance.name}.sqlite",
-            dialect=dialect,
-            port=port,
-            username=username,
-            password=password,
-        ) as conn:
-            results = None
-            try:
-                results = conn.execute(query, fetch="all", timeout=query_timeout)
-                return len(results) > 0
-            except Exception as e:
-                return False
-        return None
 
-    instance = Instance(ddls=schema, name=db_id, dialect=dialect)
+def disprove(
+    sql1: str,
+    sql2: str,
+    schema: str,
+    connection_string: str,
+    dialect: str,
+    *,
+    db_id: str = "parseval_disprove",
+    max_iterations: int = 10,
+    semantics: Semantics = Semantics.BAG,
+    atom_null: int = 0,
+    timeout: int = 15,
+    **kwargs: Any,
+) -> DisproveResult:
+    """Attempt to disprove equivalence of two SQL queries.
 
-    generator_config = GeneratorConfig(
-        null_threshold=null_threshold,
-        unique_threshold=unique_threshold,
-        duplicate_threshold=duplicate_threshold,
-        group_count_threshold=group_count_threshold,
-        group_size_threshold=group_size_threshold,
-        positive_threshold=positive_threshold,
-        negative_threshold=negative_threshold,
-        min_rows=min_rows,
-        max_tries=max_tries,
+    Strategy:
+    1. If queries are textually identical → EQ immediately.
+    2. Generate instance targeting sql1, dump to DB, execute both.
+       If NEQ → return early.
+    3. Generate instance targeting sql2 on same instance, dump, execute both.
+       Return final verdict.
+    """
+    t0 = time.time()
+    empty = ExecutionResult(query="")
+    _log.info("disprove: semantics=%s, dialect=%s", semantics.value, dialect)
+    _log.debug("  sql1=%.100s", sql1)
+    _log.debug("  sql2=%.100s", sql2)
+
+    # 1. Textual identity check
+    if _normalize_sql(sql1) == _normalize_sql(sql2):
+        return DisproveResult(
+            verdict=Verdict.EQ, semantics=semantics,
+            q1_result=empty, q2_result=empty,
+            generation=GenerationResult(success=True, elapsed_time=0.0),
+            connection_string=connection_string, db_id=db_id,
+        )
+
+    # 2. Generate targeting sql1, check for NEQ
+    try:
+        instance = Instance(ddls=schema, name=db_id, dialect=dialect)
+        engine1 = SymbolicEngine(instance, sql1, dialect=dialect, max_iterations=max_iterations, **kwargs)
+        engine1.generate(thresholds=CoverageThresholds(atom_null=atom_null))
+    except Exception as e:
+        return DisproveResult(
+            verdict=Verdict.UNKNOWN, semantics=semantics,
+            q1_result=empty, q2_result=empty,
+            generation=GenerationResult(success=False, error_msg=str(e), elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id, error_msg=f"Generation failed: {e}",
+        )
+
+    # Dump and execute
+    try:
+        to_db(instance, connection_string, dialect=dialect)
+    except Exception as e:
+        return DisproveResult(
+            verdict=Verdict.UNKNOWN, semantics=semantics,
+            q1_result=empty, q2_result=empty,
+            generation=GenerationResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id, error_msg=f"DB write failed: {e}",
+        )
+
+    q1_result = _execute(connection_string, dialect, sql1, timeout)
+    q2_result = _execute(connection_string, dialect, sql2, timeout)
+    verdict = compare_results(q1_result, q2_result, semantics)
+
+    if verdict == Verdict.NEQ:
+        # Early exit — found a distinguishing instance
+        _log.info("disprove: NEQ on round 1 (early exit), %.3fs", time.time() - t0)
+        return DisproveResult(
+            verdict=Verdict.NEQ, semantics=semantics,
+            q1_result=q1_result, q2_result=q2_result,
+            generation=GenerationResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id,
+        )
+
+    if verdict in (Verdict.SYNTAX_ERROR, Verdict.RUNTIME_ERROR):
+        return DisproveResult(
+            verdict=verdict, semantics=semantics,
+            q1_result=q1_result, q2_result=q2_result,
+            generation=GenerationResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id,
+        )
+
+    # 3. Generate targeting sql2 on same instance, try again
+    try:
+        engine2 = SymbolicEngine(instance, sql2, dialect=dialect, max_iterations=max_iterations, **kwargs)
+        gen_result = engine2.generate(thresholds=CoverageThresholds(atom_null=atom_null))
+    except Exception:
+        # If sql2 generation fails, return EQ from round 1
+        return DisproveResult(
+            verdict=Verdict.EQ, semantics=semantics,
+            q1_result=q1_result, q2_result=q2_result,
+            generation=GenerationResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string, db_id=db_id,
+        )
+
+    # Dump updated instance and re-execute
+    try:
+        to_db(instance, connection_string, dialect=dialect)
+    except Exception:
+        pass
+
+    q1_result = _execute(connection_string, dialect, sql1, timeout)
+    q2_result = _execute(connection_string, dialect, sql2, timeout)
+    verdict = compare_results(q1_result, q2_result, semantics)
+
+    _log.info("disprove: round 2 verdict=%s, %.3fs", verdict.value, time.time() - t0)
+    return DisproveResult(
+        verdict=verdict, semantics=semantics,
+        q1_result=q1_result, q2_result=q2_result,
+        generation=GenerationResult(
+            success=True,
+            rows_generated=gen_result.rows_generated,
+            coverage=gen_result.coverage,
+            elapsed_time=time.time() - t0,
+        ),
+        connection_string=connection_string, db_id=db_id,
     )
 
-    expr = preprocess_sql(query, instance, dialect=dialect)
 
-    spec = SpeculativeGenerator(expr, instance, generator_config=generator_config)
-    spec.generate(
-        early_stoper=early_stop,
-        stop_event=stop_event,
-        timeout=global_timeout,
-    )
-    # if early_stop(instance):
-    #     return instance
-    return instance
-    # generator = DataGenerator(
-    #     query,
-    #     instance,
-    #     verbose=False,
-    #     config=generator_config,
-    # )
+# =============================================================================
+# Helpers
+# =============================================================================
 
-    # generator.generate(early_stop=early_stop, stop_event=stop_event)
 
-    # early_stop(instance)
+def _execute(connection_string: str, dialect: str, sql: str, timeout: int = 15) -> ExecutionResult:
+    """Execute a query using DBManager."""
+    t0 = time.time()
+    try:
+        with DBManager().get_connection(connection_string, dialect) as conn:
+            rows = conn.execute(sql, fetch="all", timeout=timeout)
+            return ExecutionResult(
+                query=sql,
+                rows=rows or [],
+                elapsed_time=time.time() - t0,
+            )
+    except Exception as e:
+        return ExecutionResult(
+            query=sql,
+            error_msg=str(e),
+            elapsed_time=time.time() - t0,
+        )
+
+
+def _normalize_sql(sql: str) -> str:
+    """Normalize SQL for textual comparison."""
+    import re
+    s = sql.strip().rstrip(";").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()

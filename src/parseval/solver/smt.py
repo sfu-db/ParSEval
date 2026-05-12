@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import z3
@@ -22,6 +22,10 @@ except Exception:
 
 @contextmanager
 def checkpoint(z3solver):
+    """Context manager that pushes/pops an SMT solver checkpoint.
+
+    Allows tentative constraint additions to be rolled back on failure.
+    """
     z3solver.push()
     try:
         yield z3solver
@@ -30,6 +34,7 @@ def checkpoint(z3solver):
 
 
 def infer(value: Any) -> DataType:
+    """Infer a SQL DataType from a Python value's runtime type."""
     if value is None:
         return DataType.build("NULL")
     if isinstance(value, bool):
@@ -52,6 +57,11 @@ def infer(value: Any) -> DataType:
 def make_option_type(
     name: str, inner_sort: z3.SortRef, z3ctx: Optional[z3.Context] = None
 ) -> z3.DatatypeSortRef:
+    """Build a Z3 Option datatype with NULL and Some(value) constructors.
+
+    This wraps an inner sort in a tagged union so SQL NULL semantics
+    (three-valued logic) can be represented in Z3.
+    """
     dtype = z3.Datatype(name, ctx=z3ctx)
     dtype.declare("NULL")
     dtype.declare("Some", ("value", inner_sort))
@@ -59,6 +69,13 @@ def make_option_type(
 
 
 class LogicalTypeRegistry:
+    """Global cache of Z3 sort/tag definitions for SQL logical types.
+
+    Maps each SQL type name (INT, FLOAT, TEXT, etc.) to a Z3 constructor
+    within a shared ``LogicalSQLType`` datatype, ensuring a single canonical
+    representation per Z3 context.
+    """
+
     _sort_cache: Dict[int, z3.DatatypeSortRef] = {}
     _tag_cache: Dict[int, Dict[str, z3.ExprRef]] = {}
 
@@ -100,6 +117,16 @@ class LogicalTypeRegistry:
 
 @dataclass(frozen=True)
 class SMTTypeInfo:
+    """Metadata about a SQL type as seen by the Z3 SMT solver.
+
+    Attributes:
+        dtype: The original DataType.
+        logical_name: Canonical type name in the LogicalTypeRegistry.
+        family: Broad family string (int, real, text, bool, date, etc.).
+        payload_sort: The Z3 sort for the value payload (inside the Option wrapper).
+        logical_tag: Z3 constructor for this type's tag in the Option union.
+    """
+
     dtype: DataType
     logical_name: str
     family: str
@@ -109,6 +136,14 @@ class SMTTypeInfo:
 
 @dataclass(frozen=True)
 class SMTValue:
+    """A value expression in the Z3 SMT solver, wrapped in an Option type.
+
+    Attributes:
+        expr: The Z3 expression (or None).
+        typeinfo: Type metadata from SMTTypeInfo.
+        is_null_literal: True if this represents an explicit SQL NULL.
+    """
+
     expr: Optional[z3.ExprRef]
     typeinfo: SMTTypeInfo
     is_null_literal: bool = False
@@ -119,11 +154,23 @@ class SMTValue:
 
 
 class UnsupportedSMTError(NotImplementedError):
-    pass
+    """Raised when an expression or operation is not supported by the SMT solver."""
 
 
 @dataclass(frozen=True)
 class SpecialFunctionModel:
+    """Describes how a SQL function should be translated into Z3 constraints.
+
+    Attributes:
+        name: Canonical function name (e.g. "ABS").
+        translator: Callable that translates the function into Z3 expressions.
+        return_type: Optional callable that infers the return DataType.
+        arg_policy: Argument handling policy ("fixed", "variadic", etc.).
+        evaluator: Optional callable for concrete evaluation.
+        matcher: Optional predicate to filter which expressions this model handles.
+        null_propagation: How NULL inputs propagate ("any", "never", etc.).
+    """
+
     name: str
     translator: Callable[
         ["SMTSolver", exp.Expression, List[Union["SMTValue", z3.BoolRef]]],
@@ -156,6 +203,24 @@ def register_special_function(
     matcher: Optional[Callable[[exp.Expression], bool]] = None,
     null_propagation: str = "any",
 ) -> SpecialFunctionModel:
+    """Register a custom SMT translation model for a SQL function.
+
+    This is the plugin mechanism that allows extending the SMT solver's
+    function support without modifying its core translation logic.
+
+    Args:
+        name: SQL function name (will be uppercased).
+        translator: Callable that receives the solver, the SQL expression,
+            and resolved Z3 argument values, and returns an SMTValue or BoolRef.
+        return_type: Optional callable to infer the return DataType.
+        arg_policy: Argument handling policy (default "fixed").
+        evaluator: Optional callable for concrete evaluation.
+        matcher: Optional predicate for custom expression filtering.
+        null_propagation: How NULL inputs are handled.
+
+    Returns:
+        The created SpecialFunctionModel.
+    """
     model = SpecialFunctionModel(
         name=name.upper(),
         translator=translator,
@@ -170,10 +235,12 @@ def register_special_function(
 
 
 def _is_temporal_string(value: str) -> bool:
+    """Check if a string value looks like a temporal (date/time/datetime) representation."""
     return any(ch in value for ch in ("-", ":", "T", " "))
 
 
 def _infer_temporal_dtype(value: str) -> DataType:
+    """Infer the most likely temporal DataType from a string value."""
     if _parse_datetime(value) is not None and ("T" in value or " " in value):
         return DataType.build("DATETIME")
     if _parse_date(value) is not None and "-" in value and ":" not in value:
@@ -184,6 +251,7 @@ def _infer_temporal_dtype(value: str) -> DataType:
 
 
 def _parse_date(value: Any) -> Optional[date]:
+    """Parse a value into a ``date``, or None if unparseable."""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -199,6 +267,7 @@ def _parse_date(value: Any) -> Optional[date]:
 
 
 def _parse_time(value: Any) -> Optional[time]:
+    """Parse a value into a ``time``, or None if unparseable."""
     if isinstance(value, datetime):
         return value.time().replace(microsecond=0)
     if isinstance(value, time):
@@ -216,6 +285,7 @@ def _parse_time(value: Any) -> Optional[time]:
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
+    """Parse a value into a ``datetime``, or None if unparseable."""
     if isinstance(value, datetime):
         return value.replace(microsecond=0)
     if isinstance(value, date):
@@ -230,6 +300,7 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
 
 
 def _date_to_epoch_day(value: Any) -> int:
+    """Convert a date value to days since the Unix epoch (1970-01-01)."""
     parsed = _parse_date(value)
     if parsed is not None:
         return (parsed - date(1970, 1, 1)).days
@@ -237,6 +308,7 @@ def _date_to_epoch_day(value: Any) -> int:
 
 
 def _time_to_seconds(value: Any) -> int:
+    """Convert a time value to seconds since midnight."""
     parsed = _parse_time(value)
     if parsed is not None:
         return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
@@ -244,6 +316,7 @@ def _time_to_seconds(value: Any) -> int:
 
 
 def _datetime_to_epoch_second(value: Any) -> int:
+    """Convert a datetime value to seconds since the Unix epoch."""
     parsed = _parse_datetime(value)
     if parsed is not None:
         return int(parsed.timestamp())
@@ -251,10 +324,12 @@ def _datetime_to_epoch_second(value: Any) -> int:
 
 
 def _from_epoch_day(days: int) -> date:
+    """Convert days since Unix epoch back to a ``date``."""
     return date(1970, 1, 1) + timedelta(days=days)
 
 
 def _from_seconds(seconds: int) -> time:
+    """Convert seconds since midnight back to a ``time``."""
     seconds = max(0, seconds) % 86400
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
@@ -262,12 +337,30 @@ def _from_seconds(seconds: int) -> time:
 
 
 def _from_epoch_second(value: int) -> datetime:
-    return datetime.utcfromtimestamp(value)
+    """Convert Unix epoch seconds back to a timezone-naive ``datetime``."""
+    return datetime.fromtimestamp(value, tz=UTC).replace(tzinfo=None)
 
 
 def normalize_dtype(
     dtype: DataType, z3ctx: Optional[z3.Context] = None, value: Any = None
 ) -> SMTTypeInfo:
+    """Map a SQL DataType to its Z3 sort representation and logical tag.
+
+    Dispatches to the appropriate Z3 sort (IntSort, RealSort, StringSort,
+    or BoolSort) and caches the result by context. Also returns the
+    corresponding ``SMTTypeInfo`` metadata record.
+
+    Args:
+        dtype: The SQL DataType to normalize.
+        z3ctx: Optional Z3 context.
+        value: Optional sample value for type inference when dtype is UNKNOWN.
+
+    Returns:
+        An SMTTypeInfo with payload sort, logical name, and family.
+
+    Raises:
+        RuntimeError: If the data type is unsupported.
+    """
     dtype = DataType.build(dtype)
     if str(dtype) == "UNKNOWN":
         dtype = infer(value)
@@ -320,6 +413,12 @@ def normalize_dtype(
 
 
 class OptionTypeRegistry:
+    """Global cache that maps base Z3 sorts to their ``Option(NULL | Some)`` wrapper types.
+
+    This avoids recreating the same Option datatype for the same inner
+    sort across multiple SMT solver instances.
+    """
+
     _base_to_option: Dict[Tuple[int, str], z3.DatatypeSortRef] = {}
     _sort_to_option: Dict[Tuple[int, str], z3.DatatypeSortRef] = {}
 
@@ -362,6 +461,7 @@ def unwrap_option(expr: z3.ExprRef) -> z3.ExprRef:
 
 
 def _coerce_numeric_sort(expr: z3.ExprRef, target_sort: z3.SortRef) -> z3.ExprRef:
+    """Coerce a Z3 expression to a target numeric sort, promoting int→real if needed."""
     if expr.sort() == target_sort:
         return expr
     if (
@@ -373,10 +473,12 @@ def _coerce_numeric_sort(expr: z3.ExprRef, target_sort: z3.SortRef) -> z3.ExprRe
 
 
 def _to_z3_sort(dtype: DataType, z3ctx: Optional[z3.Context] = None) -> z3.SortRef:
+    """Get the Z3 payload sort for a given SQL DataType."""
     return normalize_dtype(dtype, z3ctx).payload_sort
 
 
 def _python_to_payload(typeinfo: SMTTypeInfo, value: Any, z3ctx: Optional[z3.Context]):
+    """Convert a Python value to a Z3 constant of the appropriate sort."""
     if typeinfo.family == "int":
         return z3.IntVal(int(value), ctx=z3ctx)
     if typeinfo.family == "real":
@@ -418,24 +520,32 @@ def declare_column(variable: exp.Column, z3ctx: Optional[z3.Context] = None) -> 
 
 
 def _value_some(value: SMTValue) -> z3.BoolRef:
+    """Return a Z3 predicate that is True when the Option value is Some(...)."""
     if value.expr is None:
         return z3.BoolVal(False)
     return option_of(value.expr).is_Some(value.expr)
 
 
 def _value_null(value: SMTValue) -> z3.BoolRef:
+    """Return a Z3 predicate that is True when the Option value is NULL."""
     if value.expr is None:
         return z3.BoolVal(True)
     return option_of(value.expr).is_NULL(value.expr)
 
 
 def _value_payload(value: SMTValue) -> z3.ExprRef:
+    """Extract the inner payload from a non-NULL Option value."""
     if value.expr is None:
         raise RuntimeError("NULL literal does not have a payload")
     return unwrap_option(value.expr)
 
 
 def _coerce_pair(left: SMTValue, right: SMTValue) -> Tuple[z3.ExprRef, z3.ExprRef, str]:
+    """Coerce a pair of SMTValues to a common Z3 sort for comparison/arithmetic.
+
+    If either side is a real, both are promoted to real. Otherwise they are
+    left at their natural sort. Returns (left_payload, right_payload, family).
+    """
     if left.typeinfo.family == "real" or right.typeinfo.family == "real":
         target_sort = z3.RealSort()
         return (
@@ -447,12 +557,14 @@ def _coerce_pair(left: SMTValue, right: SMTValue) -> Tuple[z3.ExprRef, z3.ExprRe
 
 
 def _bool_value(expr: z3.BoolRef, z3ctx: Optional[z3.Context] = None) -> SMTValue:
+    """Wrap a Z3 boolean expression into an SMTValue with BOOLEAN type info."""
     typeinfo = normalize_dtype(DataType.build("BOOLEAN"), z3ctx)
     option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, z3ctx)
     return SMTValue(option_sort.Some(expr), typeinfo)
 
 
 def _null_value(typeinfo: SMTTypeInfo, z3ctx: Optional[z3.Context] = None) -> SMTValue:
+    """Create an SMTValue representing an explicit SQL NULL of the given type."""
     option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, z3ctx)
     return SMTValue(option_sort.NULL, typeinfo, is_null_literal=True)
 
@@ -462,6 +574,11 @@ def _zfill2(expr: z3.ExprRef, z3ctx: Optional[z3.Context] = None) -> z3.ExprRef:
 
 
 def like_to_z3(var: SMTValue, pattern: Union[SMTValue, str]) -> z3.BoolRef:
+    """Translate a SQL LIKE expression into Z3 string constraints.
+
+    Supports ``%`` (any sequence) and ``_`` (any single character) wildcards.
+    If ``pattern`` is an SMTValue, it must resolve to a concrete string.
+    """
     some_checks = [_value_some(var)]
     raw = _value_payload(var)
     parts: List[z3.ExprRef] = []
@@ -498,6 +615,26 @@ def like_to_z3(var: SMTValue, pattern: Union[SMTValue, str]) -> z3.BoolRef:
 
 
 class SMTSolver:
+    """Full Z3-backed SMT solver for complex SQL constraint satisfaction.
+
+    Translates SQL expressions (via sqlglot AST) into Z3 constraints using
+    a discriminated-union (Option type) encoding for SQL NULL semantics.
+    Supports arithmetic, comparisons, logical operators, LIKE, IS, CAST,
+    NULLIF, BETWEEN, IN, CASE, IF, COALESCE, NEG, string concatenation (DPIPE),
+    and registered special functions.
+
+    Attributes:
+        variables: List of columns the solver is tracking (unused, legacy).
+        verbose: If True, log constraints as they are added.
+        z3ctx: Optional Z3 context (defaults to global context).
+        timeout_ms: Optional solver timeout in milliseconds.
+        model: The Z3 model after a successful solve, or None.
+        context: Dict storing the bidirectional mapping between column names
+            and their Z3 variable expressions.
+        function_models: Registry of special function translators.
+        core_registry: Mapping of SQL expression keys to translation methods.
+    """
+
     def __init__(
         self,
         variables,
@@ -506,11 +643,27 @@ class SMTSolver:
         function_models: Optional[
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ] = None,
+        timeout_ms: Optional[int] = None,
     ):
+        """Initialize the SMT solver.
+
+        Args:
+            variables: List of columns (legacy, currently unused for Z3 var creation).
+            z3ctx: Optional Z3 context; defaults to Z3's global context.
+            verbose: If True, log each added constraint via the ``parseval.smt`` logger.
+            function_models: Optional custom function translators (list or dict).
+            timeout_ms: Optional solver timeout in milliseconds.
+        """
         self.variables = variables
         self.verbose = verbose
         self.z3ctx = z3ctx
         self.solver = z3.Solver(ctx=self.z3ctx)
+        if timeout_ms is not None and timeout_ms > 0:
+            try:
+                self.solver.set("timeout", int(timeout_ms))
+            except Exception:
+                pass
+        self.timeout_ms = timeout_ms
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False
@@ -530,6 +683,7 @@ class SMTSolver:
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ],
     ) -> Dict[str, SpecialFunctionModel]:
+        """Merge custom function models with the global registry into a single dict."""
         models = dict(_SPECIAL_FUNCTION_MODELS)
         if function_models is None:
             return models
@@ -542,6 +696,7 @@ class SMTSolver:
         return models
 
     def _build_core_registry(self) -> Dict[str, Callable[[exp.Expression], Union[SMTValue, z3.BoolRef]]]:
+        """Build the dispatch table mapping SQL expression types to translators."""
         return {
             "ADD": self._translate_add,
             "SUB": self._translate_sub,
@@ -564,9 +719,22 @@ class SMTSolver:
             "NULLIF": self._translate_nullif,
             "BETWEEN": self._translate_between,
             "IN": self._translate_in,
+            "CASE": self._translate_case,
+            "IF": self._translate_if,
+            "COALESCE": self._translate_coalesce,
+            "NEG": self._translate_neg,
+            "DPIPE": self._translate_dpipe,
         }
 
     def add(self, constraint, track_vars: bool = True):
+        """Add a constraint expression to the Z3 solver.
+
+        Args:
+            constraint: A Z3 boolean expression or an SMTValue (which gets
+                converted to a predicate via ``_as_predicate``).
+            track_vars: If True, extract and track Z3 variables for later
+                solution extraction.
+        """
         if isinstance(constraint, SMTValue):
             constraint = self._as_predicate(constraint)
         if z3.is_bool(constraint):
@@ -578,6 +746,15 @@ class SMTSolver:
             self.solver.add(constraint)
 
     def solve(self):
+        """Check satisfiability and return the solution mapping.
+
+        Applies domain constraints (temporal bounds, string character limits)
+        on the first call, then invokes the Z3 solver. Returns a tuple of
+        ``("sat", {var_name: python_value})`` or ``("unsat", {})``.
+
+        The returned dict keys are ``"table.column"`` strings. Only variables
+        referenced in the added constraints are included.
+        """
         if not self._domain_constraints_applied:
             for var_name, z3var in self.context.get("variable_to_z3", {}).items():
                 column = self.context["z3_to_variable"][str(z3var)]
@@ -598,6 +775,17 @@ class SMTSolver:
         return "sat", solutions
 
     def _declare_or_get_column(self, condition: exp.Column) -> SMTValue:
+        """Look up or create a Z3 variable for a column reference.
+
+        Maintains a bidirectional mapping between column names
+        (``"table.column"``) and Z3 expressions in ``self.context``.
+
+        Args:
+            condition: A sqlglot Column expression.
+
+        Returns:
+            An SMTValue wrapping the Z3 variable with its type info.
+        """
         col_key = f"{condition.table}.{condition.name}"
         if col_key not in self.context.get("variable_to_z3", {}):
             value = declare_column(condition, z3ctx=self.z3ctx)
@@ -607,11 +795,17 @@ class SMTSolver:
         return SMTValue(expr, normalize_dtype(condition.type, self.z3ctx))
 
     def _as_value(self, item) -> SMTValue:
+        """Assert that an item is an SMTValue and return it."""
         if isinstance(item, SMTValue):
             return item
         raise UnsupportedSMTError(f"Expected a value expression, got {item!r}")
 
     def _as_predicate(self, item) -> z3.BoolRef:
+        """Convert an SMTValue to a Z3 boolean predicate.
+
+        A non-boolean SMTValue is rejected. NULL literals map to False.
+        Non-null values are unwrapped to their payload and asserted as Some.
+        """
         if z3.is_bool(item):
             return item
         value = self._as_value(item)
@@ -624,6 +818,7 @@ class SMTSolver:
         return z3.And(_value_some(value), _value_payload(value))
 
     def _result_family_type(self, family: str, left: SMTTypeInfo, right: Optional[SMTTypeInfo] = None) -> DataType:
+        """Determine the result DataType for a binary operation between two type families."""
         if family == "real":
             return DataType.build("FLOAT")
         if family == "int":
@@ -643,9 +838,83 @@ class SMTSolver:
         return left.dtype if right is None else left.dtype
 
     def _wrap_payload(self, payload: z3.ExprRef, dtype: DataType) -> SMTValue:
+        """Wrap a Z3 payload expression in an ``Option.Some(...)`` with type info."""
         typeinfo = normalize_dtype(dtype, self.z3ctx)
         option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, self.z3ctx)
         return SMTValue(option_sort.Some(payload), typeinfo)
+
+    def _wrap_nullable_payload(self, source: SMTValue, payload: z3.ExprRef, dtype: DataType) -> SMTValue:
+        """Wrap a payload as ``Some(...)`` when source is non-null, else ``NULL``."""
+        typeinfo = normalize_dtype(dtype, self.z3ctx)
+        option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(_value_some(source), option_sort.Some(payload), option_sort.NULL),
+            typeinfo,
+        )
+
+    def _coerce_value_to_type(self, value: SMTValue, target_dtype: DataType) -> SMTValue:
+        """Coerce an SMTValue to a different SQL DataType within Z3.
+
+        Supports int↔real, int/text/date/time/datetime/timestamp↔text,
+        and text→int conversions.  Raises UnsupportedSMTError for
+        unsupported type pairs.
+        """
+        target_type = normalize_dtype(target_dtype, self.z3ctx)
+        if value.typeinfo.family == target_type.family:
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        if value.is_null_literal:
+            return _null_value(target_type, self.z3ctx)
+        raw = _value_payload(value)
+        if target_type.family == "real" and value.typeinfo.family == "int":
+            return self._wrap_payload(z3.ToReal(raw), target_type.dtype)
+        if target_type.family == "int" and value.typeinfo.family == "real":
+            return self._wrap_payload(z3.ToInt(raw), target_type.dtype)
+        if target_type.family == "text":
+            if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"}:
+                return self._wrap_payload(z3.IntToStr(raw), target_type.dtype)
+            if value.typeinfo.family == "bool":
+                return self._wrap_payload(
+                    z3.If(
+                        raw,
+                        z3.StringVal("TRUE", ctx=self.z3ctx),
+                        z3.StringVal("FALSE", ctx=self.z3ctx),
+                    ),
+                    target_type.dtype,
+                )
+        if target_type.family == "int" and value.typeinfo.family == "text":
+            return self._wrap_payload(z3.StrToInt(raw), target_type.dtype)
+        raise UnsupportedSMTError(
+            f"Unsupported conversion from {value.typeinfo.logical_name} to {target_type.logical_name}"
+        )
+
+    def _common_case_dtype(self, expression: exp.Expression, branches: Sequence[SMTValue]) -> DataType:
+        """Infer the common result DataType from a list of branch SMTValues.
+
+        Checks for explicit type annotations first, then falls back to
+        family-based precedence (text > real > int > bool > datetime >
+        timestamp > date > time).
+        """
+        annotated = getattr(expression, "type", None)
+        if annotated is not None and not DataType.build(annotated).is_type(DataType.Type.UNKNOWN):
+            return annotated
+        families = {branch.typeinfo.family for branch in branches}
+        if "text" in families:
+            return DataType.build("TEXT")
+        if "real" in families:
+            return DataType.build("FLOAT")
+        if "int" in families:
+            return DataType.build("INT")
+        if "bool" in families:
+            return DataType.build("BOOLEAN")
+        if "datetime" in families:
+            return DataType.build("DATETIME")
+        if "timestamp" in families:
+            return DataType.build("TIMESTAMP")
+        if "date" in families:
+            return DataType.build("DATE")
+        if "time" in families:
+            return DataType.build("TIME")
+        return branches[0].typeinfo.dtype
 
     def _nullable_numeric_binary(
         self,
@@ -655,6 +924,11 @@ class SMTSolver:
         result_family: Optional[str] = None,
         null_condition: Optional[Callable[[z3.ExprRef, z3.ExprRef], z3.BoolRef]] = None,
     ) -> SMTValue:
+        """Apply a binary numeric operation with SQL NULL propagation.
+
+        If either operand is NULL (absent), the result is NULL.  An optional
+        ``null_condition`` can force NULL for additional cases (e.g., div-by-zero).
+        """
         result_family = result_family or (
             "real"
             if left.typeinfo.family == "real" or right.typeinfo.family == "real"
@@ -702,21 +976,25 @@ class SMTSolver:
         return [self._to_z3_expr(child) for child in expression.iter_expressions() if not isinstance(child, exp.DataType)]
 
     def _translate_add(self, expression: exp.Expression) -> SMTValue:
+        """Translate an addition (``a + b``) with NULL propagation."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         return self._nullable_numeric_binary(left, right, lambda a, b: a + b)
 
     def _translate_sub(self, expression: exp.Expression) -> SMTValue:
+        """Translate a subtraction (``a - b``) with NULL propagation."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         return self._nullable_numeric_binary(left, right, lambda a, b: a - b)
 
     def _translate_mul(self, expression: exp.Expression) -> SMTValue:
+        """Translate a multiplication (``a * b``) with NULL propagation."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         return self._nullable_numeric_binary(left, right, lambda a, b: a * b)
 
     def _translate_div(self, expression: exp.Expression) -> SMTValue:
+        """Translate a division (``a / b``) with NULL propagation and div-by-zero handling."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         return self._nullable_numeric_binary(
@@ -728,6 +1006,7 @@ class SMTSolver:
         )
 
     def _translate_mod(self, expression: exp.Expression) -> SMTValue:
+        """Translate a modulo (``a % b``) with NULL propagation and div-by-zero handling."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         return self._nullable_numeric_binary(
@@ -739,6 +1018,7 @@ class SMTSolver:
         )
 
     def _translate_gt(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a greater-than comparison (``a > b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -746,6 +1026,7 @@ class SMTSolver:
         )
 
     def _translate_lt(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a less-than comparison (``a < b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -753,6 +1034,7 @@ class SMTSolver:
         )
 
     def _translate_gte(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a greater-than-or-equal comparison (``a >= b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -760,6 +1042,7 @@ class SMTSolver:
         )
 
     def _translate_lte(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a less-than-or-equal comparison (``a <= b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -767,6 +1050,7 @@ class SMTSolver:
         )
 
     def _translate_eq(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate an equality comparison (``a = b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -774,6 +1058,7 @@ class SMTSolver:
         )
 
     def _translate_neq(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a not-equal comparison (``a != b``)."""
         return self._compare_values(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
@@ -781,32 +1066,38 @@ class SMTSolver:
         )
 
     def _translate_like(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a LIKE pattern match into Z3 string constraints."""
         return like_to_z3(
             self._as_value(self._to_z3_expr(expression.this)),
             self._as_value(self._to_z3_expr(expression.expression)),
         )
 
     def _translate_and(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a logical AND (``a AND b``)."""
         return z3.And(
             self._as_predicate(self._to_z3_expr(expression.this)),
             self._as_predicate(self._to_z3_expr(expression.expression)),
         )
 
     def _translate_or(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a logical OR (``a OR b``)."""
         return z3.Or(
             self._as_predicate(self._to_z3_expr(expression.this)),
             self._as_predicate(self._to_z3_expr(expression.expression)),
         )
 
     def _translate_not(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a logical NOT."""
         return z3.Not(self._as_predicate(self._to_z3_expr(expression.this)))
 
     def _translate_distinct(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate a ``DISTINCT`` / ``!= ALL`` comparison."""
         items = [self._as_value(self._to_z3_expr(arg)) for arg in expression.expressions]
         exprs = [item.expr for item in items if item.expr is not None]
         return z3.Distinct(*exprs)
 
     def _translate_is(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate an ``IS`` / ``IS NOT`` comparison (including NULL checks)."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         if left.is_null_literal and right.is_null_literal:
@@ -822,6 +1113,7 @@ class SMTSolver:
         )
 
     def _translate_cast(self, expression: exp.Expression) -> SMTValue:
+        """Translate a ``CAST(expr AS type)`` expression."""
         value = self._as_value(self._to_z3_expr(expression.this))
         to_dtype = expression.args.get("to") or value.typeinfo.dtype
         to_type = normalize_dtype(to_dtype, self.z3ctx)
@@ -830,16 +1122,31 @@ class SMTSolver:
         if value.is_null_literal:
             return _null_value(to_type, self.z3ctx)
         raw = _value_payload(value)
+        if value.typeinfo.family in {"date", "time", "datetime", "timestamp"} and to_type.family in {
+            "date",
+            "time",
+            "datetime",
+            "timestamp",
+        }:
+            if value.typeinfo.family == "date" and to_type.family in {"datetime", "timestamp"}:
+                return self._wrap_nullable_payload(value, raw * 86400, to_type.dtype)
+            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "date":
+                return self._wrap_nullable_payload(value, raw / 86400, to_type.dtype)
+            if value.typeinfo.family == "time" and to_type.family in {"datetime", "timestamp"}:
+                return self._wrap_nullable_payload(value, raw, to_type.dtype)
+            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "time":
+                return self._wrap_nullable_payload(value, raw % 86400, to_type.dtype)
         if to_type.family == "text":
             converted = z3.IntToStr(raw) if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"} else raw
-            return self._wrap_payload(converted, to_type.dtype)
+            return self._wrap_nullable_payload(value, converted, to_type.dtype)
         if to_type.family == "int" and value.typeinfo.family == "text":
-            return self._wrap_payload(z3.StrToInt(raw), to_type.dtype)
+            return self._wrap_nullable_payload(value, z3.StrToInt(raw), to_type.dtype)
         raise UnsupportedSMTError(
             f"Unsupported CAST from {value.typeinfo.logical_name} to {to_type.logical_name}"
         )
 
     def _translate_nullif(self, expression: exp.Expression) -> SMTValue:
+        """Translate ``NULLIF(a, b)`` — returns NULL if a equals b, else a."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
         option_sort = OptionTypeRegistry.get(left.typeinfo.payload_sort, self.z3ctx)
@@ -860,6 +1167,7 @@ class SMTSolver:
         )
 
     def _translate_between(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate ``value BETWEEN low AND high`` (inclusive range check)."""
         value = self._as_value(self._to_z3_expr(expression.this))
         low = self._as_value(self._to_z3_expr(expression.args["low"]))
         high = self._as_value(self._to_z3_expr(expression.args["high"]))
@@ -877,6 +1185,7 @@ class SMTSolver:
         )
 
     def _translate_in(self, expression: exp.Expression) -> z3.BoolRef:
+        """Translate ``value IN (v1, v2, ...)`` as a disjunction of equalities."""
         needle = self._as_value(self._to_z3_expr(expression.this))
         clauses = []
         for candidate_expr in expression.expressions:
@@ -884,7 +1193,98 @@ class SMTSolver:
             clauses.append(self._compare_values(needle, candidate, lambda a, b: a == b))
         return z3.Or(*clauses) if clauses else z3.BoolVal(False, ctx=self.z3ctx)
 
+    def _translate_neg(self, expression: exp.Expression) -> SMTValue:
+        """Translate unary negation (``-a``) with NULL propagation."""
+        value = self._as_value(self._to_z3_expr(expression.this))
+        return self._nullable_unary(value, lambda raw: -raw, value.typeinfo.dtype)
+
+    def _translate_dpipe(self, expression: exp.Expression) -> SMTValue:
+        """Translate string concatenation (``a || b``), coercing both sides to TEXT."""
+        left = self._coerce_value_to_type(
+            self._as_value(self._to_z3_expr(expression.this)),
+            DataType.build("TEXT"),
+        )
+        right = self._coerce_value_to_type(
+            self._as_value(self._to_z3_expr(expression.expression)),
+            DataType.build("TEXT"),
+        )
+        result_type = normalize_dtype(DataType.build("TEXT"), self.z3ctx)
+        option_sort = OptionTypeRegistry.get(result_type.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(
+                z3.And(_value_some(left), _value_some(right)),
+                option_sort.Some(z3.Concat(_value_payload(left), _value_payload(right))),
+                option_sort.NULL,
+            ),
+            result_type,
+        )
+
+    def _translate_if(self, expression: exp.Expression) -> SMTValue:
+        """Translate an ``IF(cond, true_val, false_val)`` expression."""
+        condition = self._as_predicate(self._to_z3_expr(expression.this))
+        true_value = self._as_value(self._to_z3_expr(expression.args["true"]))
+        false_expr = expression.args.get("false")
+        false_value = (
+            self._as_value(self._to_z3_expr(false_expr))
+            if false_expr is not None
+            else _null_value(normalize_dtype(true_value.typeinfo.dtype, self.z3ctx), self.z3ctx)
+        )
+        result_dtype = self._common_case_dtype(expression, [true_value, false_value])
+        true_value = self._coerce_value_to_type(true_value, result_dtype)
+        false_value = self._coerce_value_to_type(false_value, result_dtype)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        option_sort = OptionTypeRegistry.get(result_type.payload_sort, self.z3ctx)
+        return SMTValue(
+            z3.If(condition, true_value.expr, false_value.expr),
+            result_type,
+        )
+
+    def _translate_case(self, expression: exp.Expression) -> SMTValue:
+        """Translate a ``CASE WHEN ... THEN ... ELSE ... END`` expression."""
+        branches: List[Tuple[z3.BoolRef, SMTValue]] = []
+        for when in expression.args.get("ifs") or []:
+            predicate = self._as_predicate(self._to_z3_expr(when.this))
+            branch_value = self._as_value(self._to_z3_expr(when.args["true"]))
+            branches.append((predicate, branch_value))
+        default_expr = expression.args.get("default")
+        if default_expr is not None:
+            default_value = self._as_value(self._to_z3_expr(default_expr))
+        elif branches:
+            default_value = _null_value(
+                normalize_dtype(branches[0][1].typeinfo.dtype, self.z3ctx), self.z3ctx
+            )
+        else:
+            default_value = encode_literal(DataType.build("NULL"), None, self.z3ctx)
+        all_values = [value for _, value in branches] + [default_value]
+        result_dtype = self._common_case_dtype(expression, all_values)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        default_value = self._coerce_value_to_type(default_value, result_dtype)
+        branch_expr = default_value.expr
+        for predicate, value in reversed(branches):
+            coerced = self._coerce_value_to_type(value, result_dtype)
+            branch_expr = z3.If(predicate, coerced.expr, branch_expr)
+        return SMTValue(branch_expr, result_type)
+
+    def _translate_coalesce(self, expression: exp.Expression) -> SMTValue:
+        """Translate ``COALESCE(a, b, ...)`` — first non-NULL argument."""
+        args = [self._as_value(self._to_z3_expr(arg)) for arg in expression.expressions]
+        if not args:
+            return encode_literal(DataType.build("NULL"), None, self.z3ctx)
+        result_dtype = self._common_case_dtype(expression, args)
+        result_type = normalize_dtype(result_dtype, self.z3ctx)
+        fallback = _null_value(result_type, self.z3ctx)
+        expr = fallback.expr
+        for arg in reversed(args):
+            coerced = self._coerce_value_to_type(arg, result_dtype)
+            expr = z3.If(_value_some(coerced), coerced.expr, expr)
+        return SMTValue(expr, result_type)
+
     def _function_name(self, expression: exp.Expression) -> Optional[str]:
+        """Extract the canonical function name from a sqlglot expression.
+
+        Handles exp.Anonymous, exp.Substring, exp.TimeToStr, and
+        generic expressions with a ``key`` attribute.
+        """
         if isinstance(expression, exp.Anonymous):
             return (expression.name or "").upper()
         if isinstance(expression, exp.Substring):
@@ -894,6 +1294,11 @@ class SMTSolver:
         return expression.key.upper() if expression.key else None
 
     def _function_args(self, expression: exp.Expression):
+        """Extract the argument list from a sqlglot function expression.
+
+        Handles special cases for SUBSTR, STRFTIME, and generic functions,
+        skipping DataType child nodes.
+        """
         if isinstance(expression, exp.Substring):
             args = [expression.this]
             if expression.args.get("start") is not None:
@@ -908,6 +1313,14 @@ class SMTSolver:
     def _resolve_special_function(
         self, expression: exp.Expression
     ) -> Optional[Union[SMTValue, z3.BoolRef]]:
+        """Try to translate a function call using a registered special model.
+
+        Looks up the function name in ``self.function_models`` and, if a
+        matching model is found (and its ``matcher`` predicate passes),
+        invokes the model's translator.
+
+        Returns None if no model matches.
+        """
         name = self._function_name(expression)
         if not name:
             return None
@@ -918,6 +1331,11 @@ class SMTSolver:
         return model.translator(self, expression, args)
 
     def _to_z3_expr(self, condition: exp.Expression):
+        """Recursively translate a sqlglot AST node into a Z3 expression.
+
+        Handles: Paren, Column, Null, Boolean, Literal, Const, and any
+        node matching a registered special function or core registry key.
+        """
         if isinstance(condition, exp.Paren):
             return self._to_z3_expr(condition.this)
         if isinstance(condition, exp.Column):
@@ -952,12 +1370,14 @@ class SMTSolver:
         )
 
     def _ensure_str_printable(self, expr: z3.ExprRef):
+        """Constrain string values to printable ASCII (space through tilde)."""
         if is_option_expr(expr) and option_of(expr).value(expr).sort() == z3.StringSort():
             raw = unwrap_option(expr)
             ascii_printable = z3.Range(chr(32), chr(126))
             self.add(z3.InRe(raw, z3.Star(ascii_printable)), track_vars=False)
 
     def _ensure_str_length(self, expr: z3.ExprRef, length: int):
+        """Constrain string values to be non-empty and longer than ``length``."""
         if is_option_expr(expr):
             raw = unwrap_option(expr)
             if isinstance(raw.sort(), z3.SeqSortRef):
@@ -977,6 +1397,7 @@ class SMTSolver:
                 )
 
     def _ensure_temporal_bounds(self, expr: z3.ExprRef, typeinfo: SMTTypeInfo):
+        """Constrain temporal values to the range 1970-01-01 to 2030-01-01."""
         opt = option_of(expr)
         value = unwrap_option(expr)
         if typeinfo.family == "date":
@@ -991,6 +1412,17 @@ class SMTSolver:
         self.add(z3.Implies(opt.is_Some(expr), value < upper), track_vars=False)
 
     def z3_to_python(self, model: z3.ModelRef):
+        """Extract concrete Python values from a Z3 model for tracked variables.
+
+        Only returns values for variables that were actively constrained
+        (i.e., appear in ``self.constrained_var_names``).
+
+        Args:
+            model: A satisfiable Z3 model.
+
+        Returns:
+            Dict mapping variable name (``"table.column"``) to Python value.
+        """
         result = {}
         for var_name, z3var in self.context.get("variable_to_z3", {}).items():
             if var_name not in self.constrained_var_names:
@@ -1008,6 +1440,18 @@ class SMTSolver:
     def _decode_option_value(
         self, value: z3.ExprRef, var_name: Optional[str] = None
     ) -> Any:
+        """Decode a Z3 Option value (NULL or Some(...)) into a Python value.
+
+        Args:
+            value: A Z3 expression of an Option datatype.
+            var_name: Optional variable name for type-aware decoding.
+
+        Returns:
+            None for NULL, or the decoded payload value.
+
+        Raises:
+            RuntimeError: If the value is not a valid Option.
+        """
         decl = value.decl()
         name = decl.name() if decl is not None else ""
         if name == "NULL":
@@ -1022,6 +1466,18 @@ class SMTSolver:
         raise RuntimeError(f"Invalid option value: {value}")
 
     def _decode_payload(self, payload: z3.ExprRef, var_name: Optional[str] = None) -> Any:
+        """Convert a Z3 payload expression to a Python value.
+
+        If ``var_name`` is provided, uses the column's type info for
+        temporal/date decoding. Otherwise, uses raw payload conversion.
+
+        Args:
+            payload: The Z3 payload expression (already unwrapped from Option).
+            var_name: Optional variable name for type-aware decoding.
+
+        Returns:
+            A Python value (int, float, str, bool, date, time, datetime, or None).
+        """
         if var_name is None:
             return self._raw_payload_to_python(payload)
         variable = self.context["z3_to_variable"][var_name]
@@ -1038,6 +1494,11 @@ class SMTSolver:
         return raw
 
     def _raw_payload_to_python(self, payload: z3.ExprRef) -> Any:
+        """Convert a raw Z3 payload expression to a Python value.
+
+        Supports integer, rational, string, boolean, and falls back to
+        string representation for unrecognized sorts.
+        """
         if z3.is_int_value(payload):
             return payload.as_long()
         if z3.is_rational_value(payload):
@@ -1052,6 +1513,11 @@ class SMTSolver:
         return str(payload)
 
     def _z3_to_python(self, value: z3.ExprRef, var_name: Optional[str] = None) -> Any:
+        """Convert a Z3 expression to a Python value, handling Option wrappers.
+
+        If the value is an Option datatype, decodes the NULL/Some distinction.
+        Otherwise decodes the raw payload.
+        """
         if isinstance(value.sort(), z3.DatatypeSortRef) and OptionTypeRegistry.is_option_sort(
             value.sort()
         ):
@@ -1060,21 +1526,25 @@ class SMTSolver:
 
 
 def _return_same_type(expression: exp.Expression, arg_types: Sequence[SMTTypeInfo]) -> DataType:
+    """Return the same type as the first argument (passthrough type policy)."""
     del expression
     return arg_types[0].dtype
 
 
 def _return_int(_expression: exp.Expression, _arg_types: Sequence[SMTTypeInfo]) -> DataType:
+    """Return INT type regardless of argument types."""
     return DataType.build("INT")
 
 
 def _return_text(_expression: exp.Expression, _arg_types: Sequence[SMTTypeInfo]) -> DataType:
+    """Return TEXT type regardless of argument types."""
     return DataType.build("TEXT")
 
 
 def _translate_abs(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
+    """Translate ``ABS(x)`` as ``If(x >= 0, x, -x)``."""
     arg = solver._as_value(args[0])
     return solver._nullable_unary(
         arg,
@@ -1086,6 +1556,7 @@ def _translate_abs(
 def _translate_length(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
+    """Translate ``LENGTH(s)`` as the Z3 ``Length`` string function."""
     arg = solver._as_value(args[0])
     return solver._nullable_unary(arg, lambda raw: z3.Length(raw), DataType.build("INT"))
 
@@ -1093,19 +1564,28 @@ def _translate_length(
 def _translate_substr(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
+    """Translate ``SUBSTR(s, start[, length])`` into Z3 ``SubString``."""
     source = solver._as_value(args[0])
     start = solver._as_value(args[1])
     length = solver._as_value(args[2]) if len(args) > 2 else None
     result_type = normalize_dtype(DataType.build("TEXT"), solver.z3ctx)
     option_sort = OptionTypeRegistry.get(result_type.payload_sort, solver.z3ctx)
-    start_payload = z3.If(_value_payload(start) >= 1, _value_payload(start) - 1, 0)
+    raw_source = _value_payload(source)
+    raw_start = _value_payload(start)
+    source_len = z3.Length(raw_source)
+    start_payload = z3.If(
+        raw_start >= 1,
+        raw_start - 1,
+        z3.If(raw_start < 0, source_len + raw_start, 0),
+    )
+    start_payload = z3.If(start_payload >= 0, start_payload, 0)
     if length is None:
         body = z3.SubString(
-            _value_payload(source), start_payload, z3.Length(_value_payload(source))
+            raw_source, start_payload, source_len
         )
         some = z3.And(_value_some(source), _value_some(start))
     else:
-        body = z3.SubString(_value_payload(source), start_payload, _value_payload(length))
+        body = z3.SubString(raw_source, start_payload, _value_payload(length))
         some = z3.And(_value_some(source), _value_some(start), _value_some(length))
     return SMTValue(z3.If(some, option_sort.Some(body), option_sort.NULL), result_type)
 
@@ -1113,6 +1593,7 @@ def _translate_substr(
 def _translate_instr(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
+    """Translate ``INSTR(haystack, needle)`` as ``IndexOf + 1`` (1-based)."""
     haystack = solver._as_value(args[0])
     needle = solver._as_value(args[1])
     result_type = normalize_dtype(DataType.build("INT"), solver.z3ctx)
@@ -1130,6 +1611,11 @@ def _translate_instr(
 
 
 def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
+    """Decompose a Z3 temporal payload into (year, month, day, hour, minute, second).
+
+    Uses epoch-day arithmetic for dates and epoch-second for datetimes.
+    The year is estimated from the Gregorian average year length.
+    """
     raw = _value_payload(value)
     if value.typeinfo.family == "date":
         ts = raw * 86400
@@ -1153,6 +1639,11 @@ def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
 def _translate_strftime(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
+    """Translate ``STRFTIME(fmt, temporal)`` into Z3 string construction.
+
+    Supported format specifiers: ``%Y``, ``%m``, ``%d``, ``%Y-%m-%d``,
+    ``%H``, ``%M``, ``%S``.
+    """
     fmt = solver._as_value(args[0])
     temporal = solver._as_value(args[1])
     fmt_expr = z3.simplify(_value_payload(fmt))
