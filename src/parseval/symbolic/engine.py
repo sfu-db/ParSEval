@@ -321,80 +321,215 @@ class SymbolicEngine:
     def _smt_repair_where(self) -> None:
         """Use Z3 to solve the full WHERE clause and repair rows.
 
-        For each Filter step, if existing rows don't satisfy the predicate,
-        invoke the SMT solver on the full predicate to get valid assignments
-        and update the first row's values accordingly.
+        Self-join aware: when multiple aliases reference the same table,
+        ensures separate rows exist and solves per-alias constraints
+        independently.
         """
-        from parseval.plan.planner import Filter
+        from parseval.plan.planner import Filter, Join
         from parseval.plan.rex import concrete, Environment
         from parseval.helper import normalize_name
+
+        # Ensure rows exist for self-joins
+        if self.alias_map.self_join_tables():
+            self.alias_map.ensure_rows_exist(self.instance)
 
         for step in self.plan.ordered_steps:
             if not isinstance(step, Filter) or step.condition is None:
                 continue
-            # Skip predicates with subqueries (handled separately)
-            if step.condition.find(exp.Subquery):
-                continue
 
             condition = step.condition
-            # Check if any existing row satisfies the full predicate
-            satisfied = False
-            tables_in_condition = set()
-            for col in condition.find_all(exp.Column):
-                table = self.alias_map.get(normalize_name(col.table or ""), col.table or "")
-                table = normalize_name(table)
-                if table in self.instance.tables:
-                    tables_in_condition.add(table)
+            has_subquery = bool(condition.find(exp.Subquery))
 
-            if not tables_in_condition:
+            # Check if this specific condition involves self-join aliases
+            condition_aliases = set()
+            for col in condition.find_all(exp.Column):
+                if col.table:
+                    condition_aliases.add(normalize_name(col.table))
+            self_join_tables = self.alias_map.self_join_tables()
+            condition_has_self_join = any(
+                len([a for a in aliases if a in condition_aliases]) >= 2
+                for aliases in self_join_tables.values()
+            )
+
+            # Skip conditions with subqueries unless it's NOT IN
+            if has_subquery:
+                has_not_in = any(
+                    isinstance(n.parent, exp.Not) for n in condition.find_all(exp.In)
+                    if n.find(exp.Subquery)
+                )
+                if has_not_in:
+                    self._repair_not_in_simple(condition)
                 continue
 
-            # Build environment from first row of each table and check
+            # Collect aliases referenced in the condition
+            aliases_in_condition = set()
+            for col in condition.find_all(exp.Column):
+                if col.table:
+                    aliases_in_condition.add(normalize_name(col.table))
+
+            if not aliases_in_condition:
+                continue
+
+            # For non-self-join conditions, use the simple SMT path
+            if not condition_has_self_join:
+                # Simple path: check if satisfied, if not use _try_smt
+                env = Environment()
+                for alias in aliases_in_condition:
+                    table = normalize_name(self.alias_map.get(alias, alias))
+                    if table not in self.instance.tables:
+                        continue
+                    rows = self.instance.get_rows(table)
+                    if rows:
+                        for col_name, sym in rows[0].items():
+                            env.bind(f"{alias}.{col_name}", sym.concrete)
+                            env.bind(f"{table}.{col_name}", sym.concrete)
+                            env.bind(col_name, sym.concrete)
+                if concrete(condition, env) is True:
+                    continue
+                try:
+                    from parseval.solver.unified import _try_smt
+                    from parseval.symbolic.constraints import SolverConstraint
+                    from parseval.symbolic.types import BranchType
+                    tables_in_condition = set(
+                        normalize_name(self.alias_map.get(a, a)) for a in aliases_in_condition
+                    ) & set(self.instance.tables.keys())
+                    smt_constraint = SolverConstraint(
+                        target_tables=tuple(tables_in_condition),
+                        atom=condition,
+                        target_outcome=BranchType.ATOM_TRUE,
+                        path_predicates=[], join_equalities=[],
+                    )
+                    smt_result = _try_smt(smt_constraint, self.instance, self.dialect, timeout_ms=3000)
+                    if smt_result:
+                        for table, col_values in smt_result.items():
+                            real_table = normalize_name(self.alias_map.get(table, table))
+                            if real_table not in self.instance.tables:
+                                continue
+                            rows = self.instance.get_rows(real_table)
+                            if not rows:
+                                continue
+                            for col, val in col_values.items():
+                                matched_col = next(
+                                    (c for c in self.instance.tables[real_table] if c.lower() == col.lower()), None
+                                )
+                                if matched_col and matched_col in rows[0].columns and val is not None:
+                                    rows[0][matched_col].set("concrete", val)
+                                    rows[0][matched_col].set("is_bound", True)
+                                    rows[0][matched_col].set("is_null", False)
+                except Exception:
+                    pass
+                continue
+
+            # Self-join path: use per-alias Z3 context
             env = Environment()
-            for table in tables_in_condition:
+            for alias in aliases_in_condition:
+                table = self.alias_map.get(alias, alias)
+                table = normalize_name(table)
+                if table not in self.instance.tables:
+                    continue
+                row_idx = self.alias_map.row_index(alias)
                 rows = self.instance.get_rows(table)
-                if rows:
-                    for col_name, sym in rows[0].items():
-                        env.bind(f"{table}.{col_name}", sym.concrete)
+                if row_idx >= len(rows):
+                    continue
+                row = rows[row_idx]
+                for col_name, sym in row.items():
+                    env.bind(f"{alias}.{col_name}", sym.concrete)
+                    env.bind(f"{table}.{col_name}", sym.concrete)
+                    if alias == normalize_name(list(aliases_in_condition)[0]):
                         env.bind(col_name, sym.concrete)
 
             result = concrete(condition, env)
             if result is True:
-                continue  # Already satisfied
+                continue
 
-            # Not satisfied — try SMT solver
+            # Not satisfied — use UExprToConstraint with per-alias awareness
             try:
-                from parseval.solver.unified import _try_smt
-                from parseval.symbolic.constraints import SolverConstraint
-                from parseval.symbolic.types import BranchType
+                from .uexpr import UExprToConstraint
+                uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
 
-                smt_constraint = SolverConstraint(
-                    target_tables=tuple(tables_in_condition),
-                    atom=condition,
-                    target_outcome=BranchType.ATOM_TRUE,
-                    path_predicates=[],
-                    join_equalities=[],
-                )
-                smt_result = _try_smt(smt_constraint, self.instance, self.dialect, timeout_ms=3000)
-                if smt_result:
-                    # Apply SMT solution to existing rows
-                    for table, col_values in smt_result.items():
-                        real_table = self.alias_map.get(table, table)
-                        real_table = normalize_name(real_table)
-                        if real_table not in self.instance.tables:
+                # Build per-alias Z3 context
+                import z3
+                ctx: Dict[str, Any] = {}
+                # Include all aliases involved in JOINs with WHERE aliases
+                all_aliases = set(aliases_in_condition)
+                for jstep in self.plan.ordered_steps:
+                    if not isinstance(jstep, Join):
+                        continue
+                    src_alias = normalize_name(jstep.source_name or jstep.name)
+                    for jn in (jstep.joins or {}):
+                        jn_alias = normalize_name(jn)
+                        if src_alias in aliases_in_condition or jn_alias in aliases_in_condition:
+                            all_aliases.add(src_alias)
+                            all_aliases.add(jn_alias)
+
+                for alias in all_aliases:
+                    table = normalize_name(self.alias_map.get(alias, alias))
+                    if table not in self.instance.tables:
+                        continue
+                    row_idx = self.alias_map.row_index(alias)
+                    rows = self.instance.get_rows(table)
+                    if row_idx >= len(rows):
+                        continue
+                    row = rows[row_idx]
+                    for col_name, sym in row.items():
+                        var_name = f"{alias}[{row_idx}].{col_name}"
+                        var = uexpr._declare_var(var_name, table, col_name)
+                        ctx[f"{alias}.{col_name}"] = var
+                        uexpr._var_to_symbol[var_name] = sym
+
+                # Translate and solve (handle subquery-containing conditions)
+                if has_subquery:
+                    # Only translate non-subquery conjuncts
+                    uexpr._translate_non_subquery_parts_to_solver(condition, ctx)
+                    # Handle NOT IN: add anti-value constraints
+                    uexpr._add_not_in_constraints(condition, ctx)
+                else:
+                    z3_pred = uexpr._translate(condition, ctx)
+                    if z3_pred is not None:
+                        uexpr.solver.add(z3_pred)
+
+                if True:  # always add JOIN + distinctness
+
+                    # Add JOIN constraints between aliases
+                    for jstep in self.plan.ordered_steps:
+                        if not isinstance(jstep, Join):
                             continue
-                        rows = self.instance.get_rows(real_table)
-                        if not rows:
+                        src_alias = normalize_name(jstep.source_name or jstep.name)
+                        for jn, jd in (jstep.joins or {}).items():
+                            jn_alias = normalize_name(jn)
+                            for sk, jk in zip(jd.get("source_key", []), jd.get("join_key", [])):
+                                sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
+                                jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
+                                sk_key = f"{src_alias}.{sk_name}"
+                                jk_key = f"{jn_alias}.{jk_name}"
+                                if sk_key in ctx and jk_key in ctx:
+                                    try:
+                                        uexpr.solver.add(ctx[sk_key] == ctx[jk_key])
+                                    except Exception:
+                                        pass
+
+                    # Self-join: distinct PK values
+                    for table, aliases in self.alias_map.self_join_tables().items():
+                        active = [a for a in aliases if a in aliases_in_condition]
+                        if len(active) < 2:
                             continue
-                        for col, val in col_values.items():
-                            matched_col = next(
-                                (c for c in self.instance.tables[real_table] if c.lower() == col.lower()),
-                                None
-                            )
-                            if matched_col and matched_col in rows[0].columns and val is not None:
-                                rows[0][matched_col].set("concrete", val)
-                                rows[0][matched_col].set("is_bound", True)
-                                rows[0][matched_col].set("is_null", False)
+                        pk_col = next(
+                            (c for c in self.instance.tables.get(table, {}) if 'id' in c.lower()),
+                            None
+                        )
+                        if pk_col:
+                            for i in range(len(active)):
+                                for j in range(i + 1, len(active)):
+                                    ki = f"{active[i]}.{pk_col}"
+                                    kj = f"{active[j]}.{pk_col}"
+                                    if ki in ctx and kj in ctx:
+                                        try:
+                                            uexpr.solver.add(ctx[ki] != ctx[kj])
+                                        except Exception:
+                                            pass
+
+                    if uexpr.solver.check() == z3.sat:
+                        uexpr._apply_model(uexpr.solver.model())
             except Exception:
                 pass
 
@@ -647,13 +782,93 @@ class SymbolicEngine:
         except Exception:
             pass
 
+    def _repair_not_in_simple(self, condition: exp.Expression) -> None:
+        """Simple NOT IN repair: set the outer column to a fresh value not in inner results."""
+        from parseval.helper import normalize_name
+        from parseval.plan.rex import concrete, Environment
+
+        for in_node in condition.find_all(exp.In):
+            if not in_node.find(exp.Subquery):
+                continue
+            if not isinstance(in_node.parent, exp.Not):
+                continue
+            outer_col = in_node.this
+            if not isinstance(outer_col, exp.Column):
+                continue
+
+            # Find the outer column's table and row
+            alias = normalize_name(outer_col.table or "")
+            table = normalize_name(self.alias_map.get(alias, alias))
+            if table not in self.instance.tables:
+                continue
+            col_name = normalize_name(outer_col.name)
+            if col_name not in self.instance.tables[table]:
+                continue
+
+            rows = self.instance.get_rows(table)
+            if not rows:
+                continue
+
+            # Get inner query values
+            from .uexpr import UExprToConstraint
+            uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
+            inner_vals = set(uexpr._get_inner_query_values(in_node))
+
+            # Find a value not in inner_vals and set it on the first row
+            row = rows[0]
+            current = row[col_name].concrete if col_name in row.columns else None
+            if current not in inner_vals:
+                continue  # Already satisfies NOT IN
+
+            # Generate a fresh value
+            col_type = str(self.instance.tables[table].get(col_name, "TEXT")).upper()
+            if "INT" in col_type:
+                fresh = max((v for v in inner_vals if isinstance(v, int)), default=0) + 9999
+            else:
+                fresh = f"__fresh_{col_name}__"
+                i = 0
+                while fresh in inner_vals:
+                    i += 1
+                    fresh = f"__fresh_{col_name}_{i}__"
+
+            row[col_name].set("concrete", fresh)
+            row[col_name].set("is_bound", True)
+
+        # Also fix non-subquery parts of the condition (e.g., year = 2017)
+        # by applying them directly
+        self._apply_non_subquery_literals(condition)
+
+    def _apply_non_subquery_literals(self, condition: exp.Expression) -> None:
+        """Apply simple literal equality constraints from a condition."""
+        from parseval.helper import normalize_name
+        from parseval.plan.rex import concrete as _concrete
+
+        if isinstance(condition, exp.And):
+            self._apply_non_subquery_literals(condition.left)
+            self._apply_non_subquery_literals(condition.right)
+        elif isinstance(condition, exp.Paren):
+            self._apply_non_subquery_literals(condition.this)
+        elif isinstance(condition, exp.EQ) and not condition.find(exp.Subquery):
+            left, right = condition.this, condition.expression
+            col = left if isinstance(left, exp.Column) else (right if isinstance(right, exp.Column) else None)
+            lit = right if isinstance(left, exp.Column) else left
+            if col and not isinstance(lit, exp.Column):
+                val = _concrete(lit)
+                if val is not None:
+                    alias = normalize_name(col.table or "")
+                    table = normalize_name(self.alias_map.get(alias, alias))
+                    col_name = normalize_name(col.name)
+                    if table in self.instance.tables and col_name in self.instance.tables[table]:
+                        rows = self.instance.get_rows(table)
+                        if rows:
+                            rows[0][col_name].set("concrete", val)
+                            rows[0][col_name].set("is_bound", True)
+
     def _create_having_count_rows(self) -> None:
         """Create coordinated rows for HAVING COUNT > N requirements."""
         from parseval.plan.planner import Aggregate
         from parseval.plan.rex import concrete as _concrete
-        from parseval.helper import normalize_name
-
-        # Find HAVING COUNT threshold from Aggregate.aggregations
+        from parseval.helper import normalize_name        # Find HAVING COUNT threshold from Aggregate.aggregations
         count_threshold = 0
         for step in self.plan.ordered_steps:
             if not isinstance(step, Aggregate):
@@ -753,7 +968,73 @@ class SymbolicEngine:
 # =============================================================================
 
 
-def _build_alias_map(plan: Plan) -> Dict[str, str]:
+class AliasMap(dict):
+    """Alias → physical table mapping that also tracks per-alias row indices.
+
+    Backward-compatible with Dict[str, str] (alias → table_name).
+    Additionally tracks which row index each alias should bind to when
+    multiple aliases reference the same physical table (self-joins).
+
+    Usage:
+        alias_map['t1']  → 'superhero'  (dict-compatible)
+        alias_map['t2']  → 'colour'
+        alias_map['t3']  → 'colour'
+        alias_map.row_index('t2')  → 0  (first row of colour)
+        alias_map.row_index('t3')  → 1  (second row of colour)
+        alias_map.self_join_aliases('colour')  → ['t2', 't3']
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._row_indices: Dict[str, int] = {}
+        self._compute_row_indices()
+
+    def _compute_row_indices(self):
+        """Assign row indices: each alias to the same table gets a unique index."""
+        table_counters: Dict[str, int] = {}
+        # Sort aliases for determinism
+        for alias in sorted(self.keys()):
+            table = self[alias]
+            idx = table_counters.get(table, 0)
+            self._row_indices[alias] = idx
+            table_counters[table] = idx + 1
+
+    def row_index(self, alias: str) -> int:
+        """Return the row index this alias binds to within its physical table."""
+        return self._row_indices.get(alias, 0)
+
+    def self_join_aliases(self, table: str) -> List[str]:
+        """Return all aliases that reference the given physical table."""
+        return [a for a, t in self.items() if t == table]
+
+    def has_self_join(self, table: str) -> bool:
+        """True if multiple aliases reference the same physical table."""
+        return sum(1 for t in self.values() if t == table) > 1
+
+    def self_join_tables(self) -> Dict[str, List[str]]:
+        """Return {table: [aliases]} for tables with multiple aliases."""
+        from collections import defaultdict
+        groups: Dict[str, List[str]] = defaultdict(list)
+        for alias, table in self.items():
+            groups[table].append(alias)
+        return {t: aliases for t, aliases in groups.items() if len(aliases) > 1}
+
+    def ensure_rows_exist(self, instance) -> None:
+        """Ensure the Instance has enough rows for all aliases (self-joins need multiple rows)."""
+        from collections import Counter
+        table_needs = Counter(self.values())
+        for table, needed in table_needs.items():
+            if table not in instance.tables:
+                continue
+            existing = len(instance.get_rows(table))
+            for _ in range(max(0, needed - existing)):
+                try:
+                    instance.create_row(table, values={})
+                except Exception:
+                    pass
+
+
+def _build_alias_map(plan: Plan) -> AliasMap:
     """Build alias → real table name mapping from the Plan's Scan steps.
 
     Walks all steps in the plan (including SubPlan inner plans) to find
@@ -761,7 +1042,7 @@ def _build_alias_map(plan: Plan) -> Dict[str, str]:
     tables are inside the SubPlan's inner plan.
     """
     from parseval.helper import normalize_name
-    alias_map: Dict[str, str] = {}
+    raw: Dict[str, str] = {}
 
     def _walk_steps(steps):
         for step in steps:
@@ -770,8 +1051,8 @@ def _build_alias_map(plan: Plan) -> Dict[str, str]:
                     alias = step.source.alias_or_name
                     real = step.source.name
                     if alias and real:
-                        alias_map[alias] = real
-                        alias_map[normalize_name(alias)] = normalize_name(real)
+                        raw[alias] = real
+                        raw[normalize_name(alias)] = normalize_name(real)
             # Walk into SubPlan inner plans.
             for sub in step.subplan_dependencies:
                 if sub.inner:
@@ -791,13 +1072,13 @@ def _build_alias_map(plan: Plan) -> Dict[str, str]:
                     alias = current.source.alias_or_name
                     real = current.source.name
                     if alias and real:
-                        alias_map[alias] = real
-                        alias_map[normalize_name(alias)] = normalize_name(real)
+                        raw[alias] = real
+                        raw[normalize_name(alias)] = normalize_name(real)
             for dep in current.dependencies:
                 stack.append(dep)
 
     _walk_steps(plan.ordered_steps)
-    return alias_map
+    return AliasMap(raw)
 
 
 # =============================================================================

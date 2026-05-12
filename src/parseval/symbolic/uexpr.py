@@ -719,6 +719,42 @@ class UExprToConstraint:
             if z3_p is not None:
                 self.solver.add(z3_p)
 
+    # Alias for engine.py usage
+    _translate_non_subquery_parts_to_solver = _translate_non_subquery_parts
+
+    def _add_not_in_constraints(self, condition: exp.Expression, ctx: Dict[str, z3.ExprRef]):
+        """Add NOT IN anti-value constraints from a condition."""
+        for in_node in condition.find_all(exp.In):
+            if not in_node.find(exp.Subquery):
+                continue
+            parent = in_node.parent
+            is_not_in = isinstance(parent, exp.Not)
+            if not is_not_in:
+                continue
+            outer_col = in_node.this
+            if not isinstance(outer_col, exp.Column):
+                continue
+            col_name = normalize_name(outer_col.name)
+            # Find the variable in ctx
+            alias_key = f"{normalize_name(outer_col.table)}.{col_name}" if outer_col.table else None
+            var = ctx.get(alias_key) if alias_key else None
+            if var is None:
+                # Try all aliases
+                for k, v in ctx.items():
+                    if k.endswith(f".{col_name}"):
+                        var = v
+                        break
+            if var is None:
+                continue
+            # Get inner query values
+            inner_vals = self._get_inner_query_values(in_node)
+            table = self._resolve_col_table(outer_col, tuple(self.alias_map.values())) or ""
+            for v in inner_vals:
+                try:
+                    self.solver.add(var != self._make_const(v, table, col_name))
+                except Exception:
+                    pass
+
     def _get_inner_query_values(self, in_node: exp.In) -> List[Any]:
         """Evaluate the inner query of an IN expression against current instance."""
         subq = in_node.find(exp.Subquery)

@@ -75,6 +75,13 @@ class ExecutionResult:
         lower = self.error_msg.lower()
         return any(k in lower for k in ("syntax", "parse", "near", "no such column", "no such table"))
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "rows": self.rows,
+            "error_msg": self.error_msg,
+            "elapsed_time": self.elapsed_time,
+        }
 
 @dataclass
 class GenerationResult:
@@ -84,6 +91,14 @@ class GenerationResult:
     coverage: float = 0.0
     error_msg: str = ""
     elapsed_time: float = 0.0
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "rows_generated": self.rows_generated,
+            "coverage": self.coverage,
+            "error_msg": self.error_msg,
+            "elapsed_time": self.elapsed_time,
+        }
 
 
 @dataclass
@@ -102,6 +117,18 @@ class DisproveResult:
     def is_equivalent(self) -> bool:
         return self.verdict == Verdict.EQ
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-serializable dict."""
+        return {
+            "verdict": self.verdict.value,
+            "semantics": self.semantics.value,
+            "q1_result": self.q1_result.to_dict(),
+            "q2_result": self.q2_result.to_dict(),
+            "generation": self.generation.to_dict(),
+            "connection_string": self.connection_string,
+            "db_id": self.db_id,
+            "error_msg": self.error_msg,
+        }
 
 @dataclass
 class InstantiateResult:

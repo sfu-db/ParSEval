@@ -192,3 +192,5 @@ web/dist/
 AGENTS.md
 tmp/
 legacy/
+.agents
+
