@@ -96,10 +96,25 @@ class UExprToConstraint:
 
     def ensure_nonempty(self) -> bool:
         """Ensure the query returns non-empty results."""
-        # Analyze requirements
+        self_joins = self._detect_self_joins()
         requirements = self._analyze_requirements()
 
-        # Create rows as needed
+        # Phase A: Handle HAVING COUNT — create coordinated rows
+        self._create_having_count_rows(requirements)
+
+        # Phase B: Create rows for remaining tables (including self-join extras)
+        self_joins = self._detect_self_joins()
+        for alias, table in self.alias_map.items():
+            if table not in self.instance.tables:
+                continue
+            if table in self_joins and len(self_joins[table]) > 1:
+                needed = len(self_joins[table])
+                existing = len(self.instance.get_rows(table))
+                for _ in range(max(0, needed - existing)):
+                    try:
+                        self.instance.create_row(table, values={})
+                    except Exception:
+                        pass
         for table, count in requirements.items():
             existing = len(self.instance.get_rows(table))
             for _ in range(max(0, count - existing)):
@@ -108,9 +123,8 @@ class UExprToConstraint:
                 except Exception:
                     pass
 
-        # Build context with all rows
-        all_tables = set(self.alias_map.values()) & set(self.instance.tables.keys())
-        row_ctx = self._build_row_context(tuple(all_tables))
+        # Phase C: Build per-alias context and solve with Z3
+        row_ctx = self._build_alias_context(self_joins)
 
         # WHERE constraints
         for step in self.plan.ordered_steps:
@@ -124,11 +138,13 @@ class UExprToConstraint:
 
         # JOIN constraints
         self._add_join_constraints(row_ctx)
+        self._add_self_join_distinctness(self_joins, row_ctx)
 
-        # HAVING constraints
+        # HAVING value constraints (SUM/AVG thresholds)
         self._add_having_constraints(row_ctx)
 
         # Schema constraints
+        all_tables = set(self.alias_map.values()) & set(self.instance.tables.keys())
         for table in all_tables:
             self._add_schema_constraints(table)
 
@@ -137,6 +153,175 @@ class UExprToConstraint:
             self._apply_model(self.solver.model())
             return True
         return False
+
+    def _create_having_count_rows(self, requirements: Dict[str, int]):
+        """Create coordinated rows for HAVING COUNT > N.
+
+        Ensures all rows in the counted table share the same JOIN key
+        so they form one group.
+        """
+        # Find JOIN relationships
+        join_info = self._get_join_info()
+
+        for table, needed in requirements.items():
+            if needed <= 1:
+                continue
+            existing = len(self.instance.get_rows(table))
+            if existing >= needed:
+                continue
+
+            # Find the FK/JOIN key for this table
+            fk_col = None
+            parent_table = None
+            parent_col = None
+            for child_t, child_c, par_t, par_c in join_info:
+                if child_t == table:
+                    fk_col = child_c
+                    parent_table = par_t
+                    parent_col = par_c
+                    break
+
+            # Get the parent key value to reference
+            fk_value = None
+            if parent_table and parent_col:
+                parent_rows = self.instance.get_rows(parent_table)
+                if parent_rows and parent_col in parent_rows[0].columns:
+                    fk_value = parent_rows[0][parent_col].concrete
+
+            # Create coordinated rows
+            for _ in range(needed - existing):
+                values = {}
+                if fk_col and fk_value is not None:
+                    values[fk_col] = fk_value
+                try:
+                    self.instance.create_row(table, values=values)
+                except Exception:
+                    pass
+
+    def _get_join_info(self) -> List[Tuple[str, str, str, str]]:
+        """Extract (child_table, child_col, parent_table, parent_col) from JOINs."""
+        info = []
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Join):
+                continue
+            source_name = normalize_name(step.source_name or step.name)
+            source_table = self._resolve_alias(source_name)
+            for join_name, join_data in (step.joins or {}).items():
+                join_table = self._resolve_alias(join_name)
+                for sk, jk in zip(join_data.get("source_key", []), join_data.get("join_key", [])):
+                    sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
+                    jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
+                    info.append((join_table, jk_name, source_table, sk_name))
+        return info
+
+    def _detect_self_joins(self) -> Dict[str, List[str]]:
+        """Find physical tables referenced by multiple aliases."""
+        table_to_aliases: Dict[str, List[str]] = {}
+        for alias, table in self.alias_map.items():
+            table_to_aliases.setdefault(table, []).append(alias)
+        return {t: aliases for t, aliases in table_to_aliases.items() if len(aliases) > 1}
+
+    def _build_alias_context(self, self_joins: Dict[str, List[str]]) -> Dict[str, z3.ExprRef]:
+        """Build Z3 context with per-alias row mapping for self-joins."""
+        ctx: Dict[str, z3.ExprRef] = {}
+        table_alias_counter: Dict[str, int] = {}
+
+        for alias, table in self.alias_map.items():
+            if table not in self.instance.tables:
+                continue
+            rows = self.instance.get_rows(table)
+            if not rows:
+                continue
+
+            # For self-joins, each alias gets a different row
+            if table in self_joins and len(self_joins[table]) > 1:
+                idx = table_alias_counter.get(table, 0)
+                table_alias_counter[table] = idx + 1
+                row_idx = min(idx, len(rows) - 1)
+            else:
+                row_idx = 0
+
+            row = rows[row_idx]
+            for col, sym in row.items():
+                alias_key = f"{alias}.{col}"
+                table_key = f"{table}.{col}"
+                # Keep FK/JOIN key values as constants if they were set by
+                # _create_having_count_rows (they're already correct).
+                # Make other values solvable.
+                is_fk = any(
+                    normalize_name(fk.expressions[0].name) == col
+                    for fk in self.instance.get_foreign_key(table)
+                    if fk.expressions
+                )
+                is_join_key = self._is_join_key(table, col)
+                if (is_fk or is_join_key) and sym.concrete is not None:
+                    val = self._make_const(sym.concrete, table, col)
+                    ctx[alias_key] = val
+                    if table_key not in ctx:
+                        ctx[table_key] = val
+                else:
+                    var_name = f"{alias}[{row_idx}].{col}"
+                    var = self._declare_var(var_name, table, col)
+                    ctx[alias_key] = var
+                    if table_key not in ctx:
+                        ctx[table_key] = var
+                    self._var_to_symbol[var_name] = sym
+        return ctx
+
+    def _is_join_key(self, table: str, col: str) -> bool:
+        """Check if a column is used as a JOIN key in the plan."""
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Join):
+                continue
+            for join_name, join_data in (step.joins or {}).items():
+                join_table = self._resolve_alias(join_name)
+                source_table = self._resolve_alias(step.source_name or step.name)
+                for sk, jk in zip(join_data.get("source_key", []), join_data.get("join_key", [])):
+                    sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
+                    jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
+                    if table == join_table and col == jk_name:
+                        return True
+                    if table == source_table and col == sk_name:
+                        return True
+        return False
+
+    def _add_self_join_distinctness(self, self_joins: Dict[str, List[str]], ctx: Dict[str, z3.ExprRef]):
+        """For self-joins, assert that different aliases reference different rows (distinct PKs)."""
+        for table, aliases in self_joins.items():
+            if len(aliases) < 2:
+                continue
+            # Find PK column
+            pk_col = None
+            pk_set = self.instance.get_primary_key(table)
+            if pk_set:
+                pk_col = next(iter(pk_set)).name.lower()
+            else:
+                # Check column constraints for PK
+                for col in self.instance.tables.get(table, {}):
+                    constraints = self.instance.get_column_constraints(table, col)
+                    for c in constraints:
+                        if hasattr(c, 'kind') and 'PrimaryKey' in type(c.kind).__name__:
+                            pk_col = col
+                            break
+                    if pk_col:
+                        break
+            if not pk_col:
+                # Use 'id' as fallback
+                pk_col = next((c for c in self.instance.tables.get(table, {}) if 'id' in c.lower()), None)
+
+            if not pk_col:
+                continue
+
+            # Assert distinctness between all alias pairs
+            for i in range(len(aliases)):
+                for j in range(i + 1, len(aliases)):
+                    key_i = f"{aliases[i]}.{pk_col}"
+                    key_j = f"{aliases[j]}.{pk_col}"
+                    if key_i in ctx and key_j in ctx:
+                        try:
+                            self.solver.add(ctx[key_i] != ctx[key_j])
+                        except (z3.Z3Exception, TypeError):
+                            pass
 
     # =========================================================================
     # Row Context Building
@@ -319,15 +504,20 @@ class UExprToConstraint:
             return None
 
         if isinstance(node, exp.Column):
+            col_name = normalize_name(node.name)
+            # Try alias-based key first (for self-joins)
+            if node.table:
+                alias_key = f"{normalize_name(node.table)}.{col_name}"
+                if alias_key in ctx:
+                    return ctx[alias_key]
+            # Try physical table resolution
             table = self._resolve_col_table(node, tuple(
                 t for t in self.alias_map.values() if t in self.instance.tables
             ))
             if table:
-                col_name = normalize_name(node.name)
                 key = self._var_key(table, col_name)
                 if key in ctx:
                     return ctx[key]
-                # Try to find in z3_vars
                 if key in self._z3_vars:
                     return self._z3_vars[key]
             return None
@@ -404,15 +594,21 @@ class UExprToConstraint:
         for step in self.plan.ordered_steps:
             if not isinstance(step, Join):
                 continue
-            source_name = step.source_name or step.name
+            source_name = normalize_name(step.source_name or step.name)
             source_table = self._resolve_alias(source_name)
             for join_name, join_data in (step.joins or {}).items():
-                join_table = self._resolve_alias(join_name)
+                join_alias = normalize_name(join_name)
+                join_table = self._resolve_alias(join_alias)
                 for sk, jk in zip(join_data.get("source_key", []), join_data.get("join_key", [])):
                     sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
                     jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
-                    sk_key = self._var_key(source_table, sk_name)
-                    jk_key = self._var_key(join_table, jk_name)
+                    # Try alias keys first, then table keys
+                    sk_key = f"{source_name}.{sk_name}"
+                    if sk_key not in ctx:
+                        sk_key = self._var_key(source_table, sk_name)
+                    jk_key = f"{join_alias}.{jk_name}"
+                    if jk_key not in ctx:
+                        jk_key = self._var_key(join_table, jk_name)
                     if sk_key in ctx and jk_key in ctx:
                         try:
                             self.solver.add(ctx[sk_key] == ctx[jk_key])
@@ -451,37 +647,77 @@ class UExprToConstraint:
     def _handle_subquery_filter(self, step: Filter, ctx: Dict[str, z3.ExprRef]):
         """Handle filter predicates containing subqueries."""
         condition = step.condition
+
+        # First, translate non-subquery parts of the condition
+        self._translate_non_subquery_parts(condition, ctx)
+
         # Handle NOT IN
         for in_node in condition.find_all(exp.In):
             if in_node.find(exp.Subquery):
-                # Check if it's NOT IN (wrapped in Not)
                 parent = in_node.parent
                 is_not_in = isinstance(parent, exp.Not)
                 outer_col = in_node.this
                 if isinstance(outer_col, exp.Column):
+                    col_name = normalize_name(outer_col.name)
+                    # Try alias key first
+                    alias_key = f"{normalize_name(outer_col.table)}.{col_name}" if outer_col.table else None
                     table = self._resolve_col_table(outer_col, tuple(self.alias_map.values()))
-                    if table:
-                        key = self._var_key(table, normalize_name(outer_col.name))
-                        if key in ctx and is_not_in:
-                            # Get existing values from inner query
+                    key = alias_key if alias_key and alias_key in ctx else (
+                        self._var_key(table, col_name) if table else None)
+                    if key and key in ctx:
+                        if is_not_in:
                             inner_vals = self._get_inner_query_values(in_node)
                             for v in inner_vals:
-                                self.solver.add(ctx[key] != self._make_const(v, table, normalize_name(outer_col.name)))
+                                self.solver.add(ctx[key] != self._make_const(v, table or "", col_name))
+                        else:
+                            # IN: outer value must be one of inner values
+                            inner_vals = self._get_inner_query_values(in_node)
+                            if inner_vals:
+                                self.solver.add(z3.Or(*[
+                                    ctx[key] == self._make_const(v, table or "", col_name)
+                                    for v in inner_vals
+                                ]))
 
-        # Handle scalar subquery: col = (SELECT ...)
-        for eq_node in condition.find_all(exp.EQ):
-            if eq_node.find(exp.Subquery):
-                col_side = eq_node.this if isinstance(eq_node.this, exp.Column) else (
-                    eq_node.expression if isinstance(eq_node.expression, exp.Column) else None)
-                subq_side = eq_node.expression if eq_node.this is col_side else eq_node.this
-                if col_side and subq_side:
-                    scalar = self._evaluate_scalar_subquery(subq_side)
-                    if scalar is not None:
-                        table = self._resolve_col_table(col_side, tuple(self.alias_map.values()))
-                        if table:
-                            key = self._var_key(table, normalize_name(col_side.name))
-                            if key in ctx:
-                                self.solver.add(ctx[key] == self._make_const(scalar, table, normalize_name(col_side.name)))
+        # Handle scalar subquery: col = (SELECT ...) or col > (SELECT ...)
+        for cmp_node in condition.find_all((exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            if not cmp_node.find(exp.Subquery):
+                continue
+            col_side = cmp_node.this if isinstance(cmp_node.this, exp.Column) else (
+                cmp_node.expression if isinstance(cmp_node.expression, exp.Column) else None)
+            subq_side = cmp_node.expression if cmp_node.this is col_side else cmp_node.this
+            if col_side and subq_side and subq_side.find(exp.Subquery):
+                scalar = self._evaluate_scalar_subquery(subq_side)
+                if scalar is not None:
+                    table = self._resolve_col_table(col_side, tuple(self.alias_map.values()))
+                    if table:
+                        col_name = normalize_name(col_side.name)
+                        key = self._var_key(table, col_name)
+                        alias_key = f"{normalize_name(col_side.table)}.{col_name}" if col_side.table else None
+                        actual_key = alias_key if alias_key and alias_key in ctx else key
+                        if actual_key in ctx:
+                            const = self._make_const(scalar, table, col_name)
+                            if isinstance(cmp_node, exp.EQ):
+                                self.solver.add(ctx[actual_key] == const)
+                            elif isinstance(cmp_node, exp.GT):
+                                self.solver.add(ctx[actual_key] > const)
+                            elif isinstance(cmp_node, exp.GTE):
+                                self.solver.add(ctx[actual_key] >= const)
+                            elif isinstance(cmp_node, exp.LT):
+                                self.solver.add(ctx[actual_key] < const)
+                            elif isinstance(cmp_node, exp.LTE):
+                                self.solver.add(ctx[actual_key] <= const)
+
+    def _translate_non_subquery_parts(self, condition: exp.Expression, ctx: Dict[str, z3.ExprRef]):
+        """Translate parts of a condition that don't contain subqueries."""
+        if isinstance(condition, exp.And):
+            self._translate_non_subquery_parts(condition.left, ctx)
+            self._translate_non_subquery_parts(condition.right, ctx)
+        elif isinstance(condition, exp.Paren):
+            self._translate_non_subquery_parts(condition.this, ctx)
+        elif not condition.find(exp.Subquery):
+            z3_p = self._translate(condition, ctx)
+            if z3_p is not None:
+                self.solver.add(z3_p)
 
     def _get_inner_query_values(self, in_node: exp.In) -> List[Any]:
         """Evaluate the inner query of an IN expression against current instance."""

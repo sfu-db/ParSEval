@@ -109,6 +109,9 @@ class SymbolicEngine:
         # clause and update rows that don't satisfy it.
         self._smt_repair_where()
 
+        # Phase 0f: Create coordinated rows for HAVING COUNT > N.
+        self._create_having_count_rows()
+
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
         tree = evaluator.evaluate(tree)
@@ -151,7 +154,7 @@ class SymbolicEngine:
                 self.instance.rollback(cp)
                 tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
 
-        # Phase 2: Ensure non-empty results via UExprToConstraint.
+        # Phase 2: Final ensure non-empty (catches cases coverage loop broke)
         self._ensure_nonempty_via_uexpr()
 
         return GenerationResult(
@@ -643,6 +646,67 @@ class SymbolicEngine:
                 self.instance.rollback(cp)
         except Exception:
             pass
+
+    def _create_having_count_rows(self) -> None:
+        """Create coordinated rows for HAVING COUNT > N requirements."""
+        from parseval.plan.planner import Aggregate
+        from parseval.plan.rex import concrete as _concrete
+        from parseval.helper import normalize_name
+
+        # Find HAVING COUNT threshold from Aggregate.aggregations
+        count_threshold = 0
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Aggregate):
+                continue
+            for agg_expr in step.aggregations:
+                for node in agg_expr.find_all((exp.GT, exp.GTE)):
+                    if node.this.find(exp.Count):
+                        val = _concrete(node.expression)
+                        if isinstance(val, (int, float)):
+                            t = int(val) + (1 if isinstance(node, exp.GT) else 0)
+                            count_threshold = max(count_threshold, t)
+
+        if count_threshold <= 1:
+            return
+
+        # Find the joined (child) table and its FK to the parent
+        join_info = []
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Join):
+                continue
+            source_table = self.alias_map.get(
+                normalize_name(step.source_name or step.name), ""
+            )
+            for join_name, join_data in (step.joins or {}).items():
+                join_table = self.alias_map.get(normalize_name(join_name), "")
+                for sk, jk in zip(join_data.get("source_key", []), join_data.get("join_key", [])):
+                    sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
+                    jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
+                    join_info.append((join_table, jk_name, source_table, sk_name))
+
+        if not join_info:
+            return
+
+        # Use the first join relationship
+        child_table, child_fk, parent_table, parent_pk = join_info[0]
+        if child_table not in self.instance.tables:
+            return
+
+        # Get the parent key value (from the first parent row)
+        parent_rows = self.instance.get_rows(parent_table)
+        if not parent_rows:
+            return
+        fk_value = parent_rows[0][parent_pk].concrete if parent_pk in parent_rows[0].columns else None
+        if fk_value is None:
+            return
+
+        # Create enough child rows with the same FK value
+        existing = len(self.instance.get_rows(child_table))
+        for _ in range(max(0, count_threshold - existing)):
+            try:
+                self.instance.create_row(child_table, values={child_fk: fk_value})
+            except Exception:
+                pass
 
     def _query_produces_rows(self) -> bool:
         """Check if the query returns non-empty results against current Instance."""
