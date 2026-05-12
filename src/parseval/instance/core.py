@@ -118,6 +118,37 @@ class Catalog(MappingSchema):
         )
         return self.primary_keys.get(table, set())
 
+    def resolve_fk_ref_column(self, fk: exp.ForeignKey) -> Optional[str]:
+        """Resolve the referenced column name from a ForeignKey node.
+
+        When the FK is defined as ``REFERENCES parent_table`` without
+        specifying the column (implying the parent's PK), this method
+        infers the referenced column from the parent table's primary key
+        or column-level PK constraints.  Returns None if unresolvable.
+        """
+        ref = fk.args.get("reference")
+        if ref is None:
+            return None
+        # Explicit referenced column.
+        if ref.this.expressions:
+            return self._normalize_name(ref.this.expressions[0].name, normalize=self.normalize)
+        # Implicit: resolve from parent table's PK.
+        ref_table_node = ref.find(exp.Table)
+        if ref_table_node is None:
+            return None
+        ref_table = self._normalize_name(ref_table_node.name, self.dialect, self.normalize)
+        # Check table-level PK first.
+        pk_set = self.primary_keys.get(ref_table, set())
+        if pk_set:
+            # Use first PK column (single-column FK implies single-column PK).
+            return self._normalize_name(next(iter(pk_set)).name, normalize=self.normalize)
+        # Check column-level PK constraints.
+        for col_name in (self.mapping.get(ref_table) or {}):
+            for constraint in self.get_column_constraints(ref_table, col_name):
+                if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+                    return self._normalize_name(col_name, normalize=self.normalize)
+        return None
+
     def add_foreign_key(
         self, table: exp.Table | str, foreign_key: List[exp.ForeignKey] | exp.ForeignKey
     ):
@@ -168,6 +199,20 @@ class Catalog(MappingSchema):
         )
         table_constraints = self.constraints.get(table, {})
         return table_constraints.get(column, set())
+
+    def get_check_constraints(self, table: exp.Table | str) -> List[exp.Expression]:
+        """Return parsed CHECK constraint expressions for a table."""
+        table = self._normalize_name(
+            table if isinstance(table, str) else table.this,
+            self.dialect,
+            self.normalize,
+        )
+        results = []
+        for col_constraints in self.constraints.get(table, {}).values():
+            for c in col_constraints:
+                if isinstance(c.kind, exp.CheckColumnConstraint):
+                    results.append(c.kind.this)
+        return results
 
     def nullable(
         self,
@@ -347,6 +392,10 @@ class Catalog(MappingSchema):
                     identifier.name.lower()
                     for identifier in reference.this.expressions
                 )
+                # If target columns not specified, infer from parent PK.
+                if not target_columns:
+                    ref_col = self.resolve_fk_ref_column(fk_node)
+                    target_columns = (ref_col,) if ref_col else source_columns
                 fk_spec = ForeignKeySpec(
                     source_table=table_name,
                     source_columns=source_columns,
@@ -698,14 +747,16 @@ class Instance(Catalog):
 
         for fk in self.get_foreign_key(table_name):
             local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
-            ref_table = self._normalize_table(
-                fk.args.get("reference").find(exp.Table).name,
-                dialect=self.dialect,
-            )
-            ref_col = self._normalize_name(
-                fk.args.get("reference").this.expressions[0].name,
-                dialect=self.dialect,
-            )
+            ref = fk.args.get("reference")
+            if ref is None:
+                continue
+            ref_table_node = ref.find(exp.Table)
+            if ref_table_node is None:
+                continue
+            ref_table = self._normalize_table(ref_table_node.name, dialect=self.dialect)
+            ref_col = self.resolve_fk_ref_column(fk)
+            if ref_col is None:
+                continue
 
             explicit_value = values.get(local_col)
             existing_parent_values = [
@@ -917,14 +968,16 @@ class Instance(Catalog):
         mapping: dict[str, tuple[str, str]] = {}
         for fk in self.get_foreign_key(table_name):
             local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
-            ref_table = self._normalize_table(
-                fk.args.get("reference").find(exp.Table).name,
-                dialect=self.dialect,
-            )
-            ref_col = self._normalize_name(
-                fk.args.get("reference").this.expressions[0].name,
-                dialect=self.dialect,
-            )
+            ref = fk.args.get("reference")
+            if ref is None:
+                continue
+            ref_table_node = ref.find(exp.Table)
+            if ref_table_node is None:
+                continue
+            ref_table = self._normalize_table(ref_table_node.name, dialect=self.dialect)
+            ref_col = self.resolve_fk_ref_column(fk)
+            if ref_col is None:
+                continue
             mapping[local_col] = (ref_table, ref_col)
         return mapping
 

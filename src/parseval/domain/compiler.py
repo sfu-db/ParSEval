@@ -59,7 +59,17 @@ class ColumnDomainPlan:
 
 
 class ConstraintCompiler:
-    """Compiles ColumnSpec constraints into a normalized ColumnDomainPlan."""
+    """Compiles ColumnSpec constraints into a normalized ColumnDomainPlan.
+
+    This is the static analysis layer that translates SQL-like CHECK
+    constraints (Choices, Range, Length, Pattern, Prefix, Suffix, Contains,
+    Modulo, Check lambdas) into an executable constraint representation
+    suitable for value generation and validation.
+
+    The ``compile()`` method intersects multiple constraints of the same
+    type (e.g., two RangeConstraints) and stores incompatible constraints
+    as opaque ``residual_predicates``.
+    """
 
     def compile(self, spec: ColumnSpec) -> ColumnDomainPlan:
         # Initial values from spec
@@ -252,22 +262,33 @@ class ConstraintCompiler:
         )
 
     def _check_pattern(self, value: Any, pattern: str) -> bool:
+        """Test a value against a regex pattern, returning True if it matches.
+
+        None values always pass (nullable handling is done elsewhere).
+        """
         import re
+
         if value is None:
             return True
         return bool(re.search(pattern, str(value)))
 
-    def _intersect_preserving_order(
+def _intersect_preserving_order(
         self, current: Iterable[Any], incoming: Iterable[Any]
     ) -> Tuple[Any, ...]:
+        """Intersect two iterables, preserving the order of ``current``."""
         incoming_values = tuple(incoming)
         incoming_set = set(incoming_values)
         return tuple(value for value in current if value in incoming_set)
 
 
-
 class ConstraintValidator:
-    """Validates values against a compiled ColumnDomainPlan."""
+    """Validates concrete values against a compiled ColumnDomainPlan.
+
+    Checks value against every dimension of the plan: allowed/excluded
+    values, range bounds, length limits, pattern/prefix/suffix/contains,
+    modulo, and residual predicates. Raises ``ConstraintViolationError``
+    on the first failure.
+    """
 
     def validate(self, plan: ColumnDomainPlan, value: Any, column_name: str = "column") -> None:
         """

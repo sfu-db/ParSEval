@@ -393,26 +393,79 @@ def _try_smt(
 ) -> Optional[Dict[str, Dict[str, Any]]]:
     """Delegate to Z3 for complex constraints.
 
-    The existing smt.py has a different interface than what we need here;
-    this is a best-effort integration that will be tightened when smt.py
-    is refactored to use the domain type system. For now, if the SMT
-    layer can't handle the constraint, we return None gracefully.
+    Translates the atom expression + path predicates into Z3 constraints
+    using the SMTSolver's sqlglot-to-Z3 translation layer.
     """
     try:
-        from .smt import SMTSolver
-        solver = SMTSolver(timeout_ms=timeout_ms)
-        solver.add(constraint.atom)
+        from .smt import SMTSolver, UnsupportedSMTError
+        from parseval.helper import normalize_name
+
+        # Collect all columns referenced in the constraint and annotate types
+        all_exprs = [constraint.atom] + list(constraint.path_predicates)
+        columns = []
+        for expr in all_exprs:
+            for col in expr.find_all(exp.Column):
+                # Ensure column has type annotation
+                if col.type is None or str(col.type) in ("", "UNKNOWN"):
+                    table_name = normalize_name(col.table or "")
+                    if table_name not in instance.tables:
+                        for t in constraint.target_tables:
+                            real_t = normalize_name(t)
+                            if real_t in instance.tables and normalize_name(col.name) in instance.tables[real_t]:
+                                table_name = real_t
+                                col.set("table", exp.to_identifier(real_t))
+                                break
+                    if table_name in instance.tables:
+                        col_name = normalize_name(col.name)
+                        if col_name in instance.tables[table_name]:
+                            try:
+                                col.type = exp.DataType.build(str(instance.tables[table_name][col_name]))
+                            except Exception:
+                                col.type = exp.DataType.build("TEXT")
+                columns.append(col)
+
+        solver = SMTSolver(variables=columns, timeout_ms=timeout_ms)
+
+        # Translate and add the target atom
+        try:
+            z3_atom = solver._to_z3_expr(constraint.atom)
+            solver.add(z3_atom)
+        except (UnsupportedSMTError, Exception):
+            return None
+
+        # Add path predicates
         for pred in constraint.path_predicates:
             try:
-                solver.add(pred)
+                z3_pred = solver._to_z3_expr(pred)
+                solver.add(z3_pred)
             except Exception:
                 pass
-        result = solver.solve()
-        if not result:
+
+        # Add join equalities
+        for lt, lc, rt, rc in constraint.join_equalities:
+            try:
+                left_col = exp.column(lc, lt)
+                right_col = exp.column(rc, rt)
+                # Annotate types
+                lt_real = normalize_name(lt)
+                rt_real = normalize_name(rt)
+                if lt_real in instance.tables and normalize_name(lc) in instance.tables[lt_real]:
+                    left_col.type = exp.DataType.build(str(instance.tables[lt_real][normalize_name(lc)]))
+                if rt_real in instance.tables and normalize_name(rc) in instance.tables[rt_real]:
+                    right_col.type = exp.DataType.build(str(instance.tables[rt_real][normalize_name(rc)]))
+                eq_expr = exp.EQ(this=left_col, expression=right_col)
+                z3_eq = solver._to_z3_expr(eq_expr)
+                solver.add(z3_eq)
+            except Exception:
+                pass
+
+        status, solutions = solver.solve()
+        if status != "sat" or not solutions:
             return None
-        # Extract assignments grouped by table.
+
+        # Group assignments by table
         assignments: Dict[str, Dict[str, Any]] = {}
-        for var_name, value in result.items():
+        for var_name, value in solutions.items():
             parts = var_name.split(".")
             if len(parts) == 2:
                 table, col = parts
@@ -446,6 +499,14 @@ class Solver:
         timeout_ms: int = 5000,
         seed: int = 42,
     ):
+        """Initialize the unified constraint solver.
+
+        Args:
+            instance: The database instance with schema and existing row data.
+            dialect: SQL dialect for type-aware generation (default "sqlite").
+            timeout_ms: Timeout for SMT solver queries in milliseconds (default 5000).
+            seed: Random seed for deterministic value generation (default 42).
+        """
         self.instance = instance
         self.dialect = dialect
         self.timeout_ms = timeout_ms
@@ -482,7 +543,7 @@ class Solver:
         from .lowering import lower_predicates
         all_exprs = [constraint.atom] + list(constraint.path_predicates)
         for expr in all_exprs:
-            lowered, _ = lower_predicates(expr, self.instance, tables)
+            lowered, _ = lower_predicates(expr, self.instance, tables, constraint.alias_map or None)
             for lp in lowered:
                 if lp.op == "=":
                     fixed_values.setdefault(lp.table, {})[lp.column] = lp.value
@@ -490,10 +551,14 @@ class Solver:
                     predicates.append((lp.table, lp.column, lp.op, lp.value))
 
         # JOIN equalities → Union-Find equivalences.
+        from .lowering import match_column as _mc
         for lt, lc, rt, rc in constraint.join_equalities:
             lt_real = self._resolve(lt)
             rt_real = self._resolve(rt)
-            equivalences.union(f"{lt_real}.{lc}", f"{rt_real}.{rc}")
+            # Normalize column names to match Instance's canonical names.
+            lc_matched = _mc(self.instance, lt_real, lc) or lc
+            rc_matched = _mc(self.instance, rt_real, rc) or rc
+            equivalences.union(f"{lt_real}.{lc_matched}", f"{rt_real}.{rc_matched}")
 
         # FK: use existing parent values.
         for child_t, child_c, parent_t, parent_c in constraint.foreign_keys:
@@ -619,10 +684,14 @@ class Solver:
                     if value is None and not self.instance.nullable(table_name, col_name):
                         return None
                     # Coerce through the domain adapter for type safety.
+                    # For SQLite, preserve string datetime values as-is (SQLite stores them as TEXT).
                     if value is not None:
                         try:
                             datatype = DataType.build(col_type)
-                            value = coerce_value(value, datatype, dialect=self.dialect)
+                            if self.dialect == "sqlite" and isinstance(value, str) and datatype.is_type(*DataType.TEMPORAL_TYPES):
+                                pass  # Keep original string format for SQLite
+                            else:
+                                value = coerce_value(value, datatype, dialect=self.dialect)
                         except Exception:
                             pass
                     row[col_name] = value

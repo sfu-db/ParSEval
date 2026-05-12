@@ -35,9 +35,18 @@ def resolve_table(
 ) -> str:
     """Resolve which real table a column belongs to.
 
-    Checks (in order):
-    1. Column's own table qualifier → alias_map → instance tables
-    2. Column name lookup across all candidate tables
+    Resolution order:
+    1. Column's own table qualifier, checked against alias_map and instance tables.
+    2. Column-name lookup across all candidate tables (for unqualified columns).
+
+    Args:
+        col: A sqlglot Column expression.
+        candidate_tables: Tuple of table names to search.
+        instance: The Instance providing real table names and column info.
+        alias_map: Optional mapping of alias names to real table names.
+
+    Returns:
+        The resolved real table name, or the first candidate if resolution fails.
     """
     alias_map = alias_map or {}
 
@@ -67,7 +76,16 @@ def resolve_table(
 
 
 def match_column(instance: Instance, table: str, col_name: str) -> Optional[str]:
-    """Find the canonical column name in the instance (case-insensitive, space-preserving)."""
+    """Find the canonical column name in the instance (case-insensitive, space-preserving).
+
+    Args:
+        instance: The Instance to look up columns in.
+        table: The table name.
+        col_name: The column name to match.
+
+    Returns:
+        The canonical column name, or None if not found.
+    """
     if table not in instance.tables:
         return None
     lower = col_name.lower()
@@ -75,7 +93,10 @@ def match_column(instance: Instance, table: str, col_name: str) -> Optional[str]
 
 
 def resolve_table_name(name: str, instance: Instance, alias_map: Optional[Dict[str, str]] = None) -> str:
-    """Resolve a table name/alias to the real instance table name."""
+    """Resolve a table name or alias to the real instance table name.
+
+    Uses alias_map first, then falls back to normalize_name matching.
+    """
     alias_map = alias_map or {}
     real = alias_map.get(name.lower(), name)
     real = normalize_name(real)
@@ -93,7 +114,15 @@ def _has_column(instance: Instance, table: str, col_name_lower: str) -> bool:
 
 @dataclass
 class ColumnPredicate:
-    """A lowered constraint on a single column."""
+    """A lowered constraint on a single column, extracted from SQL.
+
+    Attributes:
+        table: Resolved table name.
+        column: Canonical column name from the instance.
+        op: Operator — ``"="``, ``">"``, ``">="``, ``"<"``, ``"<="``, ``"!="``,
+            ``"in"``, ``"like"``, ``"is_null"``, etc.
+        value: The comparison value (Python scalar or list for ``in``).
+    """
     table: str
     column: str  # canonical name from instance
     op: str      # "=" / ">" / ">=" / "<" / "<=" / "!=" / "in" / "like" / "is_null"
@@ -106,12 +135,22 @@ def lower_predicates(
     candidate_tables: Tuple[str, ...] = (),
     alias_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[ColumnPredicate], List[exp.Expression]]:
-    """Lower a SQL expression into column predicates + residuals.
+    """Lower a SQL expression into column predicates + residual expressions.
+
+    Walks the AST recursively, extracting simple column constraints into
+    :class:`ColumnPredicate` objects. Expressions that can't be lowered
+    (subqueries, complex arithmetic, NOT, OR) are returned as residuals
+    for SMT fallback.
+
+    Args:
+        expr: A sqlglot expression to lower.
+        instance: The Instance for table/column resolution.
+        candidate_tables: Tuple of table names to search for unqualified columns.
+        alias_map: Optional mapping of table aliases to real names.
 
     Returns:
-        (predicates, residuals) where predicates are directly satisfiable
-        column constraints and residuals are expressions that need SMT or
-        can't be lowered (subqueries, complex arithmetic, etc.)
+        Tuple of (predicates, residuals). Predicates are directly satisfiable
+        column constraints; residuals need SMT or can't be lowered.
     """
     predicates: List[ColumnPredicate] = []
     residuals: List[exp.Expression] = []
@@ -127,7 +166,11 @@ def _lower_recursive(
     predicates: List[ColumnPredicate],
     residuals: List[exp.Expression],
 ) -> None:
-    """Recursively decompose and lower predicates."""
+    """Recursively decompose and lower predicates into column constraints.
+
+    AND expressions are flattened; OR takes the left branch for satisfiability;
+    NOT and subqueries are pushed to residuals.
+    """
     if isinstance(expr, exp.And):
         _lower_recursive(expr.left, instance, tables, alias_map, predicates, residuals)
         _lower_recursive(expr.right, instance, tables, alias_map, predicates, residuals)
@@ -162,7 +205,11 @@ def _lower_atom(
     tables: Tuple[str, ...],
     alias_map: Dict[str, str],
 ) -> Optional[ColumnPredicate]:
-    """Try to lower a single atom into a ColumnPredicate."""
+    """Try to lower a single atom (comparison expression) into a ColumnPredicate.
+
+    Handles EQ, GT, GTE, LT, LTE, NEQ, BETWEEN, LIKE, IS NULL, and IN operators,
+    including function-wrapped variants (SUBSTR, CAST, UPPER, LENGTH, etc.).
+    """
 
     # EQ: col = literal
     if isinstance(atom, exp.EQ):
@@ -171,6 +218,10 @@ def _lower_atom(
             return _make_pred(col, "=", val, instance, tables, alias_map)
         # strftime/temporal function = literal
         col, val = _extract_temporal_func(atom)
+        if col and val is not None:
+            return _make_pred(col, "=", val, instance, tables, alias_map)
+        # Function-wrapped: SUBSTR(col, ...) = 'val', CAST(col) = val, etc.
+        col, val = _extract_func_column(atom)
         if col and val is not None:
             return _make_pred(col, "=", val, instance, tables, alias_map)
 
@@ -227,14 +278,21 @@ def _lower_atom(
                 val = concrete(low)
                 if isinstance(val, str) and val.isdigit():
                     return _make_pred(inner_col, "=", date(int(val), 6, 15), instance, tables, alias_map)
+        # Function-wrapped column: date(SUBSTR(col, ...)) BETWEEN 'date1' AND 'date2'
+        inner_col = next(col.find_all(exp.Column), None) if not isinstance(col, exp.Column) else None
+        if inner_col and isinstance(low, exp.Literal):
+            low_val = concrete(low)
+            if isinstance(low_val, str):
+                # Use the low bound as the value (it's within the range)
+                return _make_pred(inner_col, "=", low_val, instance, tables, alias_map)
 
     # LIKE
     elif isinstance(atom, exp.Like):
         col = atom.this
         pattern = atom.expression
         if isinstance(col, exp.Column) and isinstance(pattern, exp.Literal):
-            pat = str(pattern.this).replace("%", "x").replace("_", "a")
-            return _make_pred(col, "=", pat, instance, tables, alias_map)
+            pat = str(pattern.this)
+            return _make_pred(col, "like", pat, instance, tables, alias_map)
 
     # IS NULL
     elif isinstance(atom, exp.Is):
@@ -243,7 +301,84 @@ def _lower_atom(
         if isinstance(left, exp.Column) and isinstance(right, exp.Null):
             return _make_pred(left, "is_null", True, instance, tables, alias_map)
 
+    # IN (literal list): col IN ('a', 'b', 'c')
+    elif isinstance(atom, exp.In):
+        col = atom.this
+        expressions = atom.args.get("expressions") or []
+        if isinstance(col, exp.Column) and expressions and not atom.args.get("query"):
+            values = [concrete(e) for e in expressions if isinstance(e, (exp.Literal, exp.Boolean))]
+            if values:
+                # Pick the first value from the IN list.
+                return _make_pred(col, "=", values[0], instance, tables, alias_map)
+
     return None
+
+
+def _extract_func_column(node: exp.Expression) -> Tuple[Optional[exp.Column], Optional[Any]]:
+    """Extract column + value from function-wrapped comparisons.
+
+    Handles patterns like SUBSTR(col, 1, 4) = 'val', CAST(col AS INT) > 5,
+    UPPER(col) = 'VALUE', LENGTH(col) > 5, REPLACE(col, 'x', 'y') = 'val', etc.
+
+    Returns:
+        Tuple of (inner Column expression, comparison value), or (None, None).
+    """
+    left, right = node.this, node.expression
+
+    # Determine which side is the function and which is the literal.
+    func_side, lit_side = None, None
+    if isinstance(right, (exp.Literal, exp.Boolean)) and not isinstance(left, (exp.Column, exp.Literal, exp.Boolean)):
+        func_side, lit_side = left, right
+    elif isinstance(left, (exp.Literal, exp.Boolean)) and not isinstance(right, (exp.Column, exp.Literal, exp.Boolean)):
+        func_side, lit_side = right, left
+    if func_side is None or lit_side is None:
+        return None, None
+
+    val = concrete(lit_side)
+    if val is None:
+        return None, None
+
+    # Find the column inside the function.
+    inner_col = next(func_side.find_all(exp.Column), None)
+    if inner_col is None:
+        return None, None
+
+    # SUBSTR: the column should contain the target value.
+    if isinstance(func_side, exp.Substring):
+        # SUBSTR(col, start, len) = 'val' → col should start with/contain 'val'
+        start = concrete(func_side.args.get("start"))
+        if start == 1 and isinstance(val, str):
+            # col starts with val → set col = val + padding
+            return inner_col, val + "xxx"
+        return inner_col, str(val) if isinstance(val, str) else val
+
+    # CAST: pass through the value directly.
+    if isinstance(func_side, exp.Cast):
+        return inner_col, val
+
+    # UPPER/LOWER: pass through (case doesn't matter for generation).
+    if isinstance(func_side, (exp.Upper, exp.Lower)):
+        return inner_col, val
+
+    # LENGTH: generate a string of that length.
+    if isinstance(func_side, exp.Length):
+        if isinstance(val, (int, float)) and isinstance(node, exp.GT):
+            return inner_col, "a" * (int(val) + 1)
+        if isinstance(val, (int, float)) and isinstance(node, exp.EQ):
+            return inner_col, "a" * int(val)
+        return None, None
+
+    # REPLACE: approximate — use the literal value directly.
+    if hasattr(exp, 'Replace') and isinstance(func_side, exp.Replace):
+        return inner_col, val
+
+    # IIF/CASE: too complex, skip.
+    # INSTR: col contains substring.
+    if hasattr(func_side, "key") and func_side.key.upper() == "INSTR":
+        return None, None
+
+    # Generic: if we can find a column, use the literal value.
+    return inner_col, val
 
 
 def _make_pred(
@@ -259,7 +394,10 @@ def _make_pred(
 
 
 def _extract_col_literal(node: exp.Expression) -> Tuple[Optional[exp.Column], Optional[Any]]:
-    """Extract (column, python_value) from a binary comparison."""
+    """Extract (column, Python value) from a binary comparison if one side is a literal.
+
+    Returns (None, None) if neither side is a column-literal pair.
+    """
     left, right = node.this, node.expression
     if isinstance(left, exp.Column) and isinstance(right, (exp.Literal, exp.Boolean)):
         return left, concrete(right)
@@ -269,13 +407,20 @@ def _extract_col_literal(node: exp.Expression) -> Tuple[Optional[exp.Column], Op
 
 
 def _extract_temporal_func(node: exp.Expression) -> Tuple[Optional[exp.Column], Optional[Any]]:
-    """Handle strftime('%Y', col) patterns."""
+    """Extract column and value from temporal function patterns like strftime('%Y', col) = '2024'.
+
+    Returns (None, None) if the expression is not a temporal function comparison.
+    """
     left = node.this
     right = getattr(node, "expression", None)
     func_side, lit_side = None, None
-    if isinstance(left, (exp.TimeToStr, exp.Anonymous)):
+    if isinstance(left, exp.TimeToStr):
         func_side, lit_side = left, right
-    elif right and isinstance(right, (exp.TimeToStr, exp.Anonymous)):
+    elif isinstance(left, exp.Anonymous) and _is_temporal_func_name(left):
+        func_side, lit_side = left, right
+    elif right and isinstance(right, exp.TimeToStr):
+        func_side, lit_side = right, left
+    elif right and isinstance(right, exp.Anonymous) and _is_temporal_func_name(right):
         func_side, lit_side = right, left
     if func_side and lit_side:
         inner_col = next(func_side.find_all(exp.Column), None)
@@ -286,17 +431,46 @@ def _extract_temporal_func(node: exp.Expression) -> Tuple[Optional[exp.Column], 
     return None, None
 
 
+def _is_temporal_func_name(node: exp.Anonymous) -> bool:
+    """Check if an Anonymous function node represents a temporal function.
+
+    Checks the function name against known temporal functions: STRFTIME,
+    DATE, DATETIME, JULIANDAY, TIME. Falls back to parsing the SQL
+    representation if the name attribute is unavailable.
+    """
+    name = (node.name or "").upper() if hasattr(node, "name") else ""
+    if not name:
+        # Try to get name from the SQL representation.
+        sql = node.sql()[:20].upper()
+        name = sql.split("(")[0].strip()
+    return name in ("STRFTIME", "DATE", "DATETIME", "JULIANDAY", "TIME")
+
+
 # =============================================================================
 # Predicate negation
 # =============================================================================
 
 
 def negate_predicate_value(op: str, value: Any) -> Tuple[str, Any]:
-    """Negate a predicate for negative branch generation."""
+    """Negate a predicate (op, value) pair for generating the negative branch.
+
+    Converts ``=`` to ``!=`` (by changing the value), ``>`` to ``<=``,
+    ``like`` to ``= "__no_match__"``, etc. Used when the symbolic engine
+    needs the complementary constraint.
+
+    Args:
+        op: The operator string (e.g. "=", ">", "is_null").
+        value: The comparison value.
+
+    Returns:
+        A (negated_op, negated_value) tuple.
+    """
     if op == "=" and isinstance(value, (int, float)):
         return "=", value + 1
     if op == "=" and isinstance(value, str):
         return "=", value + "_neg"
+    if op == "=" and isinstance(value, bool):
+        return "=", not value
     if op == ">":
         return "<=", value
     if op == ">=":
@@ -305,6 +479,14 @@ def negate_predicate_value(op: str, value: Any) -> Tuple[str, Any]:
         return ">=", value
     if op == "<=":
         return ">", value
+    if op == "is_null":
+        return "not_null", True
+    if op == "not_null":
+        return "is_null", True
+    if op == "like":
+        return "=", "__no_match__"
+    if op == "!=":
+        return "=", value
     return "=", value
 
 
@@ -325,11 +507,18 @@ __all__ = [
 
 
 class ColumnUnionFind:
-    """Union-Find for column equivalence classes.
+    """Union-Find (Disjoint Set Union) for tracking column equivalence classes.
 
-    Tracks which columns must share the same value. Used by both the
-    speculative component (JOIN coordination, GROUP BY) and the solver
-    (constraint propagation).
+    Used by the solver to propagate equality constraints across JOINs,
+    GROUP BY, and speculative execution. Supports path compression and
+    union by rank.
+
+    Methods:
+        find(x): Find the representative of x's set.
+        union(x, y): Merge the sets containing x and y.
+        same(x, y): Check if x and y are in the same set.
+        groups(): Return all equivalence groups as a dict.
+        members(): Return all tracked elements.
     """
 
     def __init__(self):

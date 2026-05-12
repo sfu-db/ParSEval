@@ -1075,6 +1075,124 @@ def _eval_ordered(node: exp.Ordered, env: Environment) -> Any:
     return _eval(node.this, env)
 
 
+# ----- dialect functions (Anonymous dispatch) -----
+
+
+@handler(exp.Anonymous)
+def _eval_anonymous(node: exp.Anonymous, env: Environment) -> Any:
+    name = node.name.upper()
+    args = [_eval(arg, env) for arg in node.expressions]
+    fn = _ANONYMOUS_HANDLERS.get(name)
+    if fn:
+        try:
+            return fn(*args)
+        except (TypeError, ValueError, IndexError):
+            return None
+    return None
+
+
+def _julianday(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    d = _parse_temporal(val) if isinstance(val, str) else val
+    if isinstance(d, datetime):
+        d = d.date()
+    if isinstance(d, date):
+        # Julian day number approximation (days since epoch for diff purposes)
+        from datetime import date as _date
+        return float((d - _date(1, 1, 1)).days + 1721425.5)
+    return None
+
+
+def _instr(haystack: Any, needle: Any) -> Any:
+    if haystack is None or needle is None:
+        return None
+    pos = str(haystack).find(str(needle))
+    return pos + 1 if pos >= 0 else 0
+
+
+def _replace(s: Any, old: Any, new: Any) -> Any:
+    if s is None or old is None or new is None:
+        return None
+    return str(s).replace(str(old), str(new))
+
+
+def _typeof(val: Any) -> str:
+    if val is None:
+        return "null"
+    if isinstance(val, int):
+        return "integer"
+    if isinstance(val, float):
+        return "real"
+    if isinstance(val, str):
+        return "text"
+    return "text"
+
+
+def _total(val: Any) -> float:
+    if val is None:
+        return 0.0
+    return float(val)
+
+
+def _sign(val: Any) -> Any:
+    if val is None:
+        return None
+    if val > 0:
+        return 1
+    if val < 0:
+        return -1
+    return 0
+
+
+def _unicode(val: Any) -> Any:
+    if val is None:
+        return None
+    s = str(val)
+    return ord(s[0]) if s else None
+
+
+_ANONYMOUS_HANDLERS = {
+    "JULIANDAY": _julianday,
+    "INSTR": _instr,
+    "REPLACE": _replace,
+    "TYPEOF": _typeof,
+    "TOTAL": _total,
+    "SIGN": _sign,
+    "UNICODE": _unicode,
+    "CHAR": lambda *args: chr(int(args[0])) if args and args[0] is not None else None,
+    "HEX": lambda val: hex(int(val))[2:].upper() if val is not None else None,
+    "LTRIM": lambda s, *a: str(s).lstrip(a[0] if a else None) if s is not None else None,
+    "RTRIM": lambda s, *a: str(s).rstrip(a[0] if a else None) if s is not None else None,
+    "PRINTF": lambda fmt, *a: str(fmt) % tuple(a) if fmt is not None and all(x is not None for x in a) else None,
+}
+
+
+# ----- TimeToStr (STRFTIME) -----
+
+
+@handler(exp.TimeToStr)
+def _eval_time_to_str(node: exp.TimeToStr, env: Environment) -> Any:
+    value = _eval(node.this, env)
+    fmt = node.args.get("format")
+    if value is None or fmt is None:
+        return None
+    fmt_str = str(fmt) if not isinstance(fmt, str) else fmt
+    d = _parse_temporal(value) if isinstance(value, str) else value
+    if d is None:
+        d = _parse_temporal(str(value))
+    if d is None:
+        return None
+    if isinstance(d, date) and not isinstance(d, datetime):
+        d = datetime(d.year, d.month, d.day)
+    try:
+        return d.strftime(fmt_str)
+    except (ValueError, AttributeError):
+        return None
+
+
 # ----- paren -----
 
 

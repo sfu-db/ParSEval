@@ -102,6 +102,7 @@ class ValueSpace:
         return self._pick_numeric() if self.min_val is not None or self.max_val is not None else "value"
 
     def _pick_numeric(self) -> Any:
+        """Pick a numeric value from the narrowed range, avoiding excluded values."""
         lo = self.min_val if self.min_val is not None else 1
         hi = self.max_val if self.max_val is not None else lo + 100
         # Pick middle of range, avoiding not_equals.
@@ -116,6 +117,7 @@ class ValueSpace:
         return candidate
 
     def _pick_text(self) -> str:
+        """Pick a text value, matching LIKE pattern if present, avoiding excluded values."""
         if self.like_pattern:
             return self.like_pattern.replace("%", "x").replace("_", "a")
         length = min(self.max_length or 10, 10)
@@ -134,20 +136,25 @@ class ValueSpace:
         return date(2024, 6, 15)
 
     def narrow_min(self, val: Any) -> None:
+        """Narrow the minimum bound of this value space to ``val`` (if higher)."""
         if self.min_val is None or val > self.min_val:
             self.min_val = val
 
     def narrow_max(self, val: Any) -> None:
+        """Narrow the maximum bound of this value space to ``val`` (if lower)."""
         if self.max_val is None or val < self.max_val:
             self.max_val = val
 
     def narrow_eq(self, val: Any) -> None:
+        """Set the exact-equality constraint to ``val``."""
         self.equals = val
 
     def narrow_neq(self, val: Any) -> None:
+        """Add ``val`` to the set of excluded values."""
         self.not_equals.add(val)
 
     def narrow_in(self, values: Set[Any]) -> None:
+        """Restrict allowed values to the intersection with ``values``."""
         if self.allowed is None:
             self.allowed = values
         else:
@@ -161,7 +168,17 @@ class ValueSpace:
 
 @dataclass
 class CSPVariable:
-    """A column that needs a value."""
+    """A column variable in the CSP solver that needs a value assigned.
+
+    Attributes:
+        name: Qualified name like ``"table.column"``.
+        table: The table this variable belongs to.
+        column: The column name.
+        space: The narrowed :class:`ValueSpace` for this variable.
+        assigned: The final assigned value (set during assignment phase).
+        depends_on: Name of another variable this one derives from (e.g., via equality).
+    """
+
     name: str  # "table.column"
     table: str
     column: str
@@ -172,7 +189,16 @@ class CSPVariable:
 
 @dataclass
 class CSPConstraint:
-    """A relationship between variables."""
+    """A relationship between two CSP variables.
+
+    Attributes:
+        kind: The constraint type — ``"eq"`` (same value) or ``"derived"`` (arithmetic).
+        left: Name of the left variable.
+        right: Name of the right variable.
+        operator: For derived constraints: ``"+"``, ``"-"``, ``"*"``, ``"/"``.
+        operand: For derived constraints: the constant operand.
+    """
+
     kind: str  # "eq" / "derived"
     left: str  # variable name
     right: str  # variable name
@@ -186,9 +212,28 @@ class CSPConstraint:
 
 
 class DomainSolver:
-    """CSP-lite solver using value-space narrowing."""
+    """CSP-lite solver using value-space narrowing with three phases.
+
+    1. **BUILD**: Create :class:`CSPVariable` entries for each target column
+       and :class:`CSPConstraint` entries from predicates and equivalences.
+    2. **PROPAGATE**: Iteratively narrow each variable's :class:`ValueSpace`
+       using equality and bound propagation (AC-3 lite, capped at 10 iterations).
+    3. **ASSIGN**: Pick concrete values from narrowed spaces, respecting
+       equality groups and remaining constraints.
+
+    Attributes:
+        instance: The database instance providing schema and type info.
+        dialect: SQL dialect for type resolution (default "sqlite").
+        _type_service: Cached :class:`TypeService` for type-family lookups.
+    """
 
     def __init__(self, instance: Instance, dialect: str = "sqlite"):
+        """Initialize the domain solver.
+
+        Args:
+            instance: The database instance to solve constraints for.
+            dialect: SQL dialect string (default "sqlite").
+        """
         self.instance = instance
         self.dialect = dialect
         self._type_service = TypeService()
@@ -240,7 +285,15 @@ class DomainSolver:
         self, tables, fixed_values, predicates, equivalences,
         not_null, must_null, avoid_values,
     ) -> Tuple[Dict[str, CSPVariable], List[CSPConstraint]]:
-        """Build CSP variables and constraints."""
+        """Build CSP variables and constraints from the input specification.
+
+        Creates one :class:`CSPVariable` per column in each target table,
+        then applies fixed values, predicates, equivalences, NOT NULL / must-NULL
+        constraints, and UNIQUE avoidance as value-space narrowings.
+
+        Returns:
+            Tuple of (variables dict, constraints list).
+        """
         variables: Dict[str, CSPVariable] = {}
         constraints: List[CSPConstraint] = []
 
@@ -319,7 +372,19 @@ class DomainSolver:
         return variables, constraints
 
     def _propagate(self, variables: Dict[str, CSPVariable], constraints: List[CSPConstraint]) -> bool:
-        """Narrow domains via constraint propagation. Returns False if UNSAT."""
+        """Narrow value spaces via constraint propagation (AC-3 lite).
+
+        Iterates over equality constraints, propagating equal values,
+        minimums, and maximums between linked variables. Capped at 10
+        iterations to prevent infinite loops on circular constraints.
+
+        Args:
+            variables: Map of variable names to CSPVariable objects.
+            constraints: List of CSPConstraint objects to propagate.
+
+        Returns:
+            False if any domain becomes empty (UNSAT), True otherwise.
+        """
         changed = True
         iterations = 0
         while changed and iterations < 10:
@@ -353,7 +418,14 @@ class DomainSolver:
         return True
 
     def _assign(self, variables: Dict[str, CSPVariable], constraints: List[CSPConstraint]) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Assign values from narrowed spaces."""
+        """Pick concrete values from narrowed spaces for all variables.
+
+        Resolves equality groups so all linked variables get the same
+        value, then picks from each variable's narrowed space.
+
+        Returns:
+            Dict of {table_name: {column_name: value}}, or None if empty.
+        """
         # Resolve equality groups: all vars in an eq constraint get the same value.
         eq_groups: Dict[str, str] = {}  # var_name → group leader
         for c in constraints:
@@ -383,7 +455,12 @@ class DomainSolver:
         return result if result else None
 
     def _type_family(self, col_type_str: str) -> TypeFamily:
-        """Map a column type string to TypeFamily."""
+        """Map a column type string (e.g. 'INT', 'VARCHAR') to a TypeFamily enum.
+
+        Uses substring matching: 'INTEGER' and 'BIGINT' both map to INTEGER,
+        'DECIMAL' and 'FLOAT' both map to DECIMAL, etc. Falls back to TEXT
+        for unrecognized types.
+        """
         upper = str(col_type_str).upper()
         if any(t in upper for t in ("INT", "INTEGER", "BIGINT", "SMALLINT")):
             return TypeFamily.INTEGER

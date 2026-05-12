@@ -56,6 +56,8 @@ class SolverConstraint:
     avoid_values: Dict[str, Set[Any]] = field(default_factory=dict)
     # FK relationships: (child_table, child_col, parent_table, parent_col).
     foreign_keys: List[Tuple[str, str, str, str]] = field(default_factory=list)
+    # Alias map for column resolution.
+    alias_map: Dict[str, str] = field(default_factory=dict)
 
 
 def _collect_path_predicates_and_joins(
@@ -173,8 +175,14 @@ class ConstraintGenerator:
                 if ref_table_node is None:
                     continue
                 ref_table = normalize_name(ref_table_node.name)
-                ref_col = normalize_name(ref.this.expressions[0].name)
+                ref_col = self.instance.resolve_fk_ref_column(fk)
+                if ref_col is None:
+                    continue
                 foreign_keys.append((real_table, local_col, ref_table, ref_col))
+
+            # Include CHECK constraints as path predicates.
+            for check_expr in self.instance.get_check_constraints(real_table):
+                path_predicates.append(check_expr)
 
         return SolverConstraint(
             target_tables=tables,

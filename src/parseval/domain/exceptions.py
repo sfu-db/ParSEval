@@ -3,19 +3,19 @@ class DomainError(Exception):
 
 
 class TypeCoercionError(DomainError):
-    pass
+    """Raised when a value cannot be coerced to the required column type."""
 
 
 class ConstraintViolationError(DomainError):
-    pass
+    """Raised when a value violates a column constraint (NOT NULL, range, etc.)."""
 
 
 class UniqueConflictError(ConstraintViolationError):
-    pass
+    """Raised when a UNIQUE constraint is violated by a duplicate value."""
 
 
 class ForeignKeyResolutionError(ConstraintViolationError):
-    pass
+    """Raised when a foreign key reference cannot be resolved to a parent row."""
 
 
 class ConstraintConflict(DomainError):
