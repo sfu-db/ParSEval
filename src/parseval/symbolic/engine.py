@@ -105,6 +105,10 @@ class SymbolicEngine:
         # Phase 0d: Handle subquery predicates.
         self._resolve_subquery_predicates()
 
+        # Phase 0e: SMT-based WHERE repair — use Z3 to solve the full WHERE
+        # clause and update rows that don't satisfy it.
+        self._smt_repair_where()
+
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
         tree = evaluator.evaluate(tree)
@@ -146,6 +150,9 @@ class SymbolicEngine:
             else:
                 self.instance.rollback(cp)
                 tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+
+        # Phase 2: Ensure non-empty results via UExprToConstraint.
+        self._ensure_nonempty_via_uexpr()
 
         return GenerationResult(
             tree=tree,
@@ -220,7 +227,9 @@ class SymbolicEngine:
             if ref_table_node is None:
                 continue
             ref_table = normalize_name(ref_table_node.name)
-            ref_col = normalize_name(ref.this.expressions[0].name)
+            ref_col = self.instance.resolve_fk_ref_column(fk)
+            if ref_col is None:
+                continue
 
             # Get existing parent values.
             parent_rows = self.instance.get_rows(ref_table)
@@ -305,6 +314,86 @@ class SymbolicEngine:
                         except Exception:
                             break
 
+
+    def _smt_repair_where(self) -> None:
+        """Use Z3 to solve the full WHERE clause and repair rows.
+
+        For each Filter step, if existing rows don't satisfy the predicate,
+        invoke the SMT solver on the full predicate to get valid assignments
+        and update the first row's values accordingly.
+        """
+        from parseval.plan.planner import Filter
+        from parseval.plan.rex import concrete, Environment
+        from parseval.helper import normalize_name
+
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Filter) or step.condition is None:
+                continue
+            # Skip predicates with subqueries (handled separately)
+            if step.condition.find(exp.Subquery):
+                continue
+
+            condition = step.condition
+            # Check if any existing row satisfies the full predicate
+            satisfied = False
+            tables_in_condition = set()
+            for col in condition.find_all(exp.Column):
+                table = self.alias_map.get(normalize_name(col.table or ""), col.table or "")
+                table = normalize_name(table)
+                if table in self.instance.tables:
+                    tables_in_condition.add(table)
+
+            if not tables_in_condition:
+                continue
+
+            # Build environment from first row of each table and check
+            env = Environment()
+            for table in tables_in_condition:
+                rows = self.instance.get_rows(table)
+                if rows:
+                    for col_name, sym in rows[0].items():
+                        env.bind(f"{table}.{col_name}", sym.concrete)
+                        env.bind(col_name, sym.concrete)
+
+            result = concrete(condition, env)
+            if result is True:
+                continue  # Already satisfied
+
+            # Not satisfied — try SMT solver
+            try:
+                from parseval.solver.unified import _try_smt
+                from parseval.symbolic.constraints import SolverConstraint
+                from parseval.symbolic.types import BranchType
+
+                smt_constraint = SolverConstraint(
+                    target_tables=tuple(tables_in_condition),
+                    atom=condition,
+                    target_outcome=BranchType.ATOM_TRUE,
+                    path_predicates=[],
+                    join_equalities=[],
+                )
+                smt_result = _try_smt(smt_constraint, self.instance, self.dialect, timeout_ms=3000)
+                if smt_result:
+                    # Apply SMT solution to existing rows
+                    for table, col_values in smt_result.items():
+                        real_table = self.alias_map.get(table, table)
+                        real_table = normalize_name(real_table)
+                        if real_table not in self.instance.tables:
+                            continue
+                        rows = self.instance.get_rows(real_table)
+                        if not rows:
+                            continue
+                        for col, val in col_values.items():
+                            matched_col = next(
+                                (c for c in self.instance.tables[real_table] if c.lower() == col.lower()),
+                                None
+                            )
+                            if matched_col and matched_col in rows[0].columns and val is not None:
+                                rows[0][matched_col].set("concrete", val)
+                                rows[0][matched_col].set("is_bound", True)
+                                rows[0][matched_col].set("is_null", False)
+            except Exception:
+                pass
 
     def _resolve_subquery_predicates(self) -> None:
         """Evaluate subquery predicates against the instance and adjust rows.
@@ -534,6 +623,65 @@ class SymbolicEngine:
                 self.instance.create_row(real_table, values=values)
             except Exception:
                 pass
+
+    def _ensure_nonempty_via_uexpr(self) -> None:
+        """Use UExprToConstraint to ensure the query returns non-empty results.
+        
+        Only invoked if the query currently returns empty results.
+        """
+        # Quick check: does the query already return non-empty?
+        if self._query_produces_rows():
+            return
+        try:
+            from .uexpr import UExprToConstraint
+            cp = self.instance.checkpoint()
+            uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
+            if not uexpr.ensure_nonempty():
+                self.instance.rollback(cp)
+            elif not self._query_produces_rows():
+                # Z3 solved but result still empty — rollback
+                self.instance.rollback(cp)
+        except Exception:
+            pass
+
+    def _query_produces_rows(self) -> bool:
+        """Check if the query returns non-empty results against current Instance."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        try:
+            for ddl in self.instance.ddls.split(";"):
+                ddl = ddl.strip()
+                if ddl:
+                    try:
+                        conn.execute(ddl)
+                    except Exception:
+                        pass
+            for table_name in self.instance.tables:
+                rows = self.instance.get_rows(table_name)
+                if not rows:
+                    continue
+                cols = list(self.instance.tables[table_name].keys())
+                placeholders = ",".join(["?"] * len(cols))
+                col_names = ",".join(f'"{c}"' for c in cols)
+                stmt = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+                for row in rows:
+                    values = []
+                    for c in cols:
+                        v = row[c].concrete if c in row.columns else None
+                        if v is not None and not isinstance(v, (int, float, str, bytes)):
+                            v = str(v)
+                        values.append(v)
+                    try:
+                        conn.execute(stmt, values)
+                    except Exception:
+                        pass
+            conn.commit()
+            result = conn.execute(self.sql).fetchone()
+            return result is not None
+        except Exception:
+            return False
+        finally:
+            conn.close()
 
 
 # =============================================================================

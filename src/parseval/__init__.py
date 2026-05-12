@@ -1,2 +1,4 @@
 # ParSEval top-level package.
-# Legacy imports removed — use parseval.instance, parseval.symbolic, etc. directly.
+from parseval.main import instantiate_db, disprove
+
+__all__ = ["instantiate_db", "disprove"]
