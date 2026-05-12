@@ -117,6 +117,21 @@ class DisproveResult:
     def is_equivalent(self) -> bool:
         return self.verdict == Verdict.EQ
 
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict.value,
+            "semantics": self.semantics.value,
+            "q1_rows": len(self.q1_result.rows),
+            "q2_rows": len(self.q2_result.rows),
+            "q1_error": self.q1_result.error_msg,
+            "q2_error": self.q2_result.error_msg,
+            "generation_success": self.generation.success,
+            "rows_generated": self.generation.rows_generated,
+            "coverage": self.generation.coverage,
+            "elapsed_time": self.generation.elapsed_time,
+            "error_msg": self.error_msg,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-serializable dict."""
         return {

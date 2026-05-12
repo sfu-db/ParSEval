@@ -1,45 +1,52 @@
-name: Run SQLite test and save results
+name: Run SQLite Experiment
 
 on:
   push:
-    branches: ["main", "master", "dev"]
-  pull_request:
+    branches: ["main", "dev"]
   workflow_dispatch:
 
 jobs:
-  run-sqlite-test:
+  sqlite-experiment:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install -e ".[dev]" || pip install -e .
+          uv venv
+          uv sync
+          uv pip install -e .
 
-      - name: Run sqlite test script
+      - name: Run SQLite experiment
         run: |
+          source .venv/bin/activate
           python tests/experiment/test_sqlite.py \
             --schema_fp data/sqlite/schema.json \
             --gold_fp data/sqlite/dev.json \
-            --preds_fp data/sqlite/dail.txt \            
+            --preds_fp data/sqlite/dail.txt \
             --output_dir results
 
-      - name: Commit results
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-experiment-results
+          path: results/
+
+      - name: Commit results to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/*.json || true
-          git commit -m "Add sqlite test results [ci skip]" || echo "No changes to commit"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git add results/*.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "experiment: sqlite results [skip ci]"
+          git push || true
