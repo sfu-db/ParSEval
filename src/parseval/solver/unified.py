@@ -453,7 +453,6 @@ class Solver:
 
     def solve(self, constraint: SolverConstraint) -> SolveResult:
         """Satisfy constraints using domain-based CSP solving + SMT fallback."""
-        from .value_space import DomainSolver
 
         tables = constraint.target_tables
         outcome = constraint.target_outcome
@@ -470,22 +469,31 @@ class Solver:
                 return SolveResult(sat=True, assignments=validated)
             return SolveResult(sat=False, reason="NULL target violates NOT NULL")
 
-        # --- Domain Solver (CSP-lite: replaces Tier 0 + Tier 1) ---
+        # --- Domain Solver (CSP-lite with Union-Find) ---
+        from .value_space import DomainSolver
+        from .lowering import ColumnUnionFind
+
         ds = DomainSolver(self.instance, self.dialect)
         fixed_values: Dict[str, Dict[str, Any]] = {}
         predicates: List[Tuple[str, str, str, Any]] = []
-        shared_keys: Dict[str, List[Tuple[str, str]]] = {}
+        equivalences = ColumnUnionFind()
 
-        # Extract from atom + path predicates.
-        self._extract_expr_constraints(constraint.atom, tables, fixed_values, predicates)
-        for pred in constraint.path_predicates:
-            self._extract_expr_constraints(pred, tables, fixed_values, predicates)
+        # Extract from atom + path predicates using centralized lowering.
+        from .lowering import lower_predicates
+        all_exprs = [constraint.atom] + list(constraint.path_predicates)
+        for expr in all_exprs:
+            lowered, _ = lower_predicates(expr, self.instance, tables)
+            for lp in lowered:
+                if lp.op == "=":
+                    fixed_values.setdefault(lp.table, {})[lp.column] = lp.value
+                else:
+                    predicates.append((lp.table, lp.column, lp.op, lp.value))
 
-        # JOIN equalities → shared keys.
-        for i, (lt, lc, rt, rc) in enumerate(constraint.join_equalities):
-            kid = f"join_{i}"
-            shared_keys.setdefault(kid, []).append((self._resolve(lt), lc))
-            shared_keys.setdefault(kid, []).append((self._resolve(rt), rc))
+        # JOIN equalities → Union-Find equivalences.
+        for lt, lc, rt, rc in constraint.join_equalities:
+            lt_real = self._resolve(lt)
+            rt_real = self._resolve(rt)
+            equivalences.union(f"{lt_real}.{lc}", f"{rt_real}.{rc}")
 
         # FK: use existing parent values.
         for child_t, child_c, parent_t, parent_c in constraint.foreign_keys:
@@ -499,7 +507,7 @@ class Solver:
             tables=tables,
             fixed_values=fixed_values,
             predicates=predicates,
-            shared_keys=shared_keys,
+            equivalences=equivalences,
             not_null=list(constraint.not_null_columns),
             must_null=[],
             avoid_values=dict(constraint.avoid_values),
@@ -523,48 +531,6 @@ class Solver:
 
         return SolveResult(sat=False, reason="all tiers exhausted")
 
-    def _extract_expr_constraints(
-        self, expr: exp.Expression, tables: Tuple[str, ...],
-        fixed_values: Dict[str, Dict[str, Any]],
-        predicates: List[Tuple[str, str, str, Any]],
-    ) -> None:
-        """Extract column constraints from an expression."""
-        if isinstance(expr, exp.And):
-            self._extract_expr_constraints(expr.left, tables, fixed_values, predicates)
-            self._extract_expr_constraints(expr.right, tables, fixed_values, predicates)
-            return
-        if isinstance(expr, exp.Paren):
-            self._extract_expr_constraints(expr.this, tables, fixed_values, predicates)
-            return
-        col, val, op = None, None, ""
-        if isinstance(expr, exp.EQ):
-            col, val = self._col_lit(expr); op = "="
-        elif isinstance(expr, exp.GT):
-            col, val = self._col_lit(expr); op = ">"
-        elif isinstance(expr, exp.GTE):
-            col, val = self._col_lit(expr); op = ">="
-        elif isinstance(expr, exp.LT):
-            col, val = self._col_lit(expr); op = "<"
-        elif isinstance(expr, exp.LTE):
-            col, val = self._col_lit(expr); op = "<="
-        elif isinstance(expr, exp.NEQ):
-            col, val = self._col_lit(expr); op = "!="
-        if col and val is not None and op:
-            table = _resolve_table(col, tables, self.instance)
-            matched = next((s for s in self.instance.tables.get(table, {}) if s.lower() == col.name.lower()), None)
-            if matched:
-                if op == "=":
-                    fixed_values.setdefault(table, {})[matched] = val
-                else:
-                    predicates.append((table, matched, op, val))
-
-    def _col_lit(self, node: exp.Expression) -> Tuple[Optional[exp.Column], Optional[Any]]:
-        left, right = node.this, node.expression
-        if isinstance(left, exp.Column) and _is_literal(right):
-            return left, concrete(right)
-        if isinstance(right, exp.Column) and _is_literal(left):
-            return right, concrete(left)
-        return None, None
 
     def _apply_join_equalities(
         self, result: Dict[str, Dict[str, Any]], constraint: SolverConstraint

@@ -1,6 +1,7 @@
 site_name: ParSEval Docs
 nav:
   - Home: index.md
+  - Domain: domain.md
   - ParSEval: parseval.md
   - Dev: dev.md
 theme:

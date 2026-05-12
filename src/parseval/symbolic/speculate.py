@@ -27,6 +27,15 @@ from parseval.plan.planner import (
     Aggregate, Filter, Having, Join, Limit, Project, Scan, Sort, SubPlan,
 )
 from parseval.plan.rex import concrete
+from parseval.solver.lowering import (
+    ColumnPredicate,
+    ColumnUnionFind,
+    lower_predicates,
+    match_column as _match_col,
+    negate_predicate_value,
+    resolve_table as _resolve_col_table,
+    resolve_table_name as _resolve_tbl,
+)
 
 
 # =============================================================================
@@ -46,57 +55,7 @@ class TableRequirement:
     duplicate_columns: List[str] = field(default_factory=list)
 
 
-class ColumnUnionFind:
-    """Union-Find for column equivalence classes.
-
-    Tracks which columns must share the same value. When we say
-    ``union("a.id", "b.a_id")``, both columns will get the same
-    concrete value during resolution.
-
-    Handles:
-    - Multi-table JOINs (A.id = B.fk = C.fk2 → one value)
-    - GROUP BY on a JOIN key (same group, no conflict)
-    - Self-joins (qualified with alias: "t1.id" vs "t2.id")
-    - Transitive equality (A=B, B=C → A=C automatically)
-    """
-
-    def __init__(self):
-        self._parent: Dict[str, str] = {}
-        self._rank: Dict[str, int] = {}
-
-    def find(self, x: str) -> str:
-        if x not in self._parent:
-            self._parent[x] = x
-            self._rank[x] = 0
-        if self._parent[x] != x:
-            self._parent[x] = self.find(self._parent[x])
-        return self._parent[x]
-
-    def union(self, x: str, y: str) -> None:
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self._rank[rx] < self._rank[ry]:
-            self._parent[rx] = ry
-        elif self._rank[rx] > self._rank[ry]:
-            self._parent[ry] = rx
-        else:
-            self._parent[ry] = rx
-            self._rank[rx] += 1
-
-    def same(self, x: str, y: str) -> bool:
-        return self.find(x) == self.find(y)
-
-    def groups(self) -> Dict[str, List[str]]:
-        """Return equivalence classes: representative → list of members."""
-        result: Dict[str, List[str]] = {}
-        for x in self._parent:
-            rep = self.find(x)
-            result.setdefault(rep, []).append(x)
-        return result
-
-    def members(self) -> Set[str]:
-        return set(self._parent.keys())
+# ColumnUnionFind imported from solver.lowering
 
 
 @dataclass
@@ -138,13 +97,10 @@ class Propagator:
     def _resolve_table(self, name: str) -> str:
         if not name:
             return ""
-        real = self.alias_map.get(name.lower(), name)
-        return real if real in self.instance.tables else name
+        return _resolve_tbl(name, self.instance, self.alias_map)
 
     def _match_column(self, table: str, col_name: str) -> Optional[str]:
-        if table not in self.instance.tables:
-            return None
-        return next((s for s in self.instance.tables[table] if s.lower() == col_name.lower()), None)
+        return _match_col(self.instance, table, col_name)
 
     def propagate(self) -> List[BranchSpec]:
         """Produce specs for positive + all negative branches."""
@@ -306,49 +262,31 @@ class Propagator:
         return None
 
     def _extract_predicates(self, condition: exp.Expression, spec: BranchSpec):
-        """Extract value constraints from a predicate into the spec."""
-        for atom in self._iter_atoms(condition):
-            col, op, value = self._atom_to_constraint(atom)
-            if col and value is not None:
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
-                if matched:
-                    if op == "=":
-                        spec.require(table).fixed_values[matched] = value
-                    elif op == "is_null":
-                        spec.require(table).must_null.add(matched)
-                    else:
-                        spec.require(table).predicates.append((matched, op, value))
+        """Extract value constraints from a predicate using centralized lowering."""
+        tables = tuple(spec.requirements.keys()) or tuple(
+            v for v in self.alias_map.values() if v in self.instance.tables
+        )
+        preds, _ = lower_predicates(condition, self.instance, tables, self.alias_map)
+        for pred in preds:
+            if pred.op == "=":
+                spec.require(pred.table).fixed_values[pred.column] = pred.value
+            elif pred.op == "is_null":
+                spec.require(pred.table).must_null.add(pred.column)
+            else:
+                spec.require(pred.table).predicates.append((pred.column, pred.op, pred.value))
 
     def _extract_negated_predicates(self, condition: exp.Expression, spec: BranchSpec):
-        """Extract NEGATED constraints (for negative branches)."""
-        for atom in self._iter_atoms(condition):
-            col, op, value = self._atom_to_constraint(atom)
-            if col and value is not None:
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
-                if matched:
-                    neg_op, neg_val = self._negate_constraint(op, value)
-                    if neg_op == "=":
-                        spec.require(table).fixed_values[matched] = neg_val
-                    else:
-                        spec.require(table).predicates.append((matched, neg_op, neg_val))
-
-    def _negate_constraint(self, op: str, value: Any) -> Tuple[str, Any]:
-        """Negate a constraint for negative branch generation."""
-        if op == "=" and isinstance(value, (int, float)):
-            return "=", value + 1
-        if op == "=" and isinstance(value, str):
-            return "=", value + "_neg"
-        if op == ">":
-            return "<=", value
-        if op == ">=":
-            return "<", value
-        if op == "<":
-            return ">=", value
-        if op == "<=":
-            return ">", value
-        return "=", value
+        """Extract NEGATED constraints for negative branches."""
+        tables = tuple(spec.requirements.keys()) or tuple(
+            v for v in self.alias_map.values() if v in self.instance.tables
+        )
+        preds, _ = lower_predicates(condition, self.instance, tables, self.alias_map)
+        for pred in preds:
+            neg_op, neg_val = negate_predicate_value(pred.op, pred.value)
+            if neg_op == "=":
+                spec.require(pred.table).fixed_values[pred.column] = neg_val
+            else:
+                spec.require(pred.table).predicates.append((pred.column, neg_op, neg_val))
 
     def _extract_min_group_size(self, condition: exp.Expression) -> int:
         """Extract minimum group size from HAVING (e.g., COUNT(*) > 3 → 4)."""
@@ -372,112 +310,6 @@ class Propagator:
                     cols.append(col.name)
         return cols
 
-    def _iter_atoms(self, predicate: exp.Expression):
-        """Yield atoms, taking first OR branch."""
-        if isinstance(predicate, exp.And):
-            yield from self._iter_atoms(predicate.left)
-            yield from self._iter_atoms(predicate.right)
-        elif isinstance(predicate, exp.Or):
-            yield from self._iter_atoms(predicate.left)
-        elif isinstance(predicate, exp.Paren):
-            yield from self._iter_atoms(predicate.this)
-        elif isinstance(predicate, exp.Not):
-            pass  # Skip NOT
-        else:
-            if not predicate.find(exp.Subquery):
-                yield predicate
-
-    def _atom_to_constraint(self, atom: exp.Expression) -> Tuple[Optional[exp.Column], str, Any]:
-        """Extract (column, operator, value) from an atom."""
-        if isinstance(atom, exp.EQ):
-            col, val = self._extract_col_literal(atom)
-            if col and val is not None:
-                return col, "=", val
-            # strftime pattern
-            col, val = self._extract_temporal_func(atom)
-            if col and val is not None:
-                return col, "=", val
-        elif isinstance(atom, exp.GT):
-            col, val = self._extract_col_literal(atom)
-            if col and isinstance(val, (int, float)):
-                return col, ">", val
-            col, val = self._extract_temporal_func(atom)
-            if col and val is not None:
-                # strftime > 'year' → date in year+1
-                if isinstance(val, date):
-                    val = date(val.year + 1, val.month, val.day)
-                return col, "=", val
-        elif isinstance(atom, exp.GTE):
-            col, val = self._extract_col_literal(atom)
-            if col and isinstance(val, (int, float)):
-                return col, ">=", val
-        elif isinstance(atom, exp.LT):
-            col, val = self._extract_col_literal(atom)
-            if col and isinstance(val, (int, float)):
-                return col, "<", val
-            col, val = self._extract_temporal_func(atom)
-            if col and val is not None:
-                # strftime < 'year' → date in year-1
-                if isinstance(val, date):
-                    val = date(val.year - 1, val.month, val.day)
-                return col, "=", val
-        elif isinstance(atom, exp.LTE):
-            col, val = self._extract_col_literal(atom)
-            if col and isinstance(val, (int, float)):
-                return col, "<=", val
-        elif isinstance(atom, exp.Between):
-            col = atom.this
-            low = atom.args.get("low")
-            if isinstance(col, exp.Column) and isinstance(low, exp.Literal):
-                return col, ">=", concrete(low)
-            # Temporal function BETWEEN
-            if isinstance(col, (exp.TimeToStr, exp.Anonymous)):
-                inner_col = next(col.find_all(exp.Column), None)
-                if inner_col and isinstance(low, exp.Literal):
-                    val = concrete(low)
-                    if isinstance(val, str) and val.isdigit():
-                        return inner_col, "=", date(int(val), 6, 15)
-        elif isinstance(atom, exp.Like):
-            col = atom.this
-            pattern = atom.expression
-            if isinstance(col, exp.Column) and isinstance(pattern, exp.Literal):
-                pat = str(pattern.this).replace("%", "x").replace("_", "a")
-                return col, "=", pat
-        elif isinstance(atom, exp.Is):
-            left = atom.this
-            right = atom.expression
-            if isinstance(left, exp.Column) and isinstance(right, exp.Null):
-                return left, "is_null", True
-        return None, "", None
-
-    def _extract_col_literal(self, node: exp.Expression) -> Tuple[Optional[exp.Column], Any]:
-        left, right = node.this, node.expression
-        if isinstance(left, exp.Column) and isinstance(right, (exp.Literal, exp.Boolean)):
-            return left, concrete(right)
-        if isinstance(right, exp.Column) and isinstance(left, (exp.Literal, exp.Boolean)):
-            return right, concrete(left)
-        return None, None
-
-    def _extract_temporal_func(self, node: exp.Expression) -> Tuple[Optional[exp.Column], Any]:
-        """Handle strftime('%Y', col) patterns."""
-        left, right = node.this, getattr(node, "expression", None)
-        func_side, lit_side = None, None
-        if isinstance(left, (exp.TimeToStr, exp.Anonymous)):
-            func_side, lit_side = left, right
-        elif right and isinstance(right, (exp.TimeToStr, exp.Anonymous)):
-            func_side, lit_side = right, left
-        if func_side and lit_side:
-            inner_col = next(func_side.find_all(exp.Column), None)
-            if inner_col and isinstance(lit_side, exp.Literal):
-                val = concrete(lit_side)
-                if isinstance(val, str) and val.isdigit():
-                    return inner_col, date(int(val), 6, 15)
-        return None, None
-
-
-# =============================================================================
-# Resolver: turn requirements into concrete row values
-# =============================================================================
 
 
 class Resolver:

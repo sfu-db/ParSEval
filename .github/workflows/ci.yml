@@ -1,0 +1,87 @@
+name: CI - Matrix DB tests
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  test-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres, mysql]
+
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: parseval_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=10s --health-timeout=5s --health-retries=5
+
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: parseval_test
+          MYSQL_USER: mysql
+          MYSQL_PASSWORD: mysql
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -p$${MYSQL_ROOT_PASSWORD}" --health-interval=10s --health-timeout=5s --health-retries=5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpq-dev default-libmysqlclient-dev
+
+      - name: Install uv and Python dependencies via uv
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+
+          # create uv virtual environment and sync dependencies
+          uv venv
+          uv sync || true
+
+          # install package in editable mode inside uv env
+          uv pip install -e .
+
+          # install DB client drivers into the uv-managed env
+          uv pip install psycopg2-binary PyMySQL
+
+      - name: Make test script executable
+        run: chmod +x ./scripts/run_tests_backend.sh || true
+
+      - name: Run tests for ${{ matrix.backend }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: parseval_test
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: parseval_test
+          MYSQL_USER: mysql
+          MYSQL_PASSWORD: mysql
+        run: |
+          ./scripts/run_tests_backend.sh ${{ matrix.backend }}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.backend }}
+          path: test-results/

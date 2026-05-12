@@ -189,3 +189,6 @@ web/node_modules
 
 web/.next/
 web/dist/
+AGENTS.md
+tmp/
+legacy/

@@ -198,18 +198,34 @@ class DomainSolver:
         tables: Tuple[str, ...],
         fixed_values: Dict[str, Dict[str, Any]],
         predicates: List[Tuple[str, str, str, Any]],  # (table, col, op, value)
-        shared_keys: Dict[str, List[Tuple[str, str]]],  # key_id → [(table, col)]
-        not_null: List[Tuple[str, str]],
-        must_null: List[Tuple[str, str]],
-        avoid_values: Dict[str, Set[Any]],  # "table.col" → existing values
+        equivalences: Optional["ColumnUnionFind"] = None,
+        shared_keys: Optional[Dict[str, List[Tuple[str, str]]]] = None,
+        not_null: List[Tuple[str, str]] = None,
+        must_null: List[Tuple[str, str]] = None,
+        avoid_values: Dict[str, Set[Any]] = None,
     ) -> Optional[Dict[str, Dict[str, Any]]]:
         """Solve the constraint set and return assignments per table.
 
-        Returns None if UNSAT.
+        Accepts either a ``ColumnUnionFind`` (preferred) or legacy
+        ``shared_keys`` dict for column equivalence.
         """
+        not_null = not_null or []
+        must_null = must_null or []
+        avoid_values = avoid_values or {}
+
+        # Convert legacy shared_keys to ColumnUnionFind if needed.
+        if equivalences is None:
+            from .lowering import ColumnUnionFind
+            equivalences = ColumnUnionFind()
+            if shared_keys:
+                for key_id, cols in shared_keys.items():
+                    if len(cols) >= 2:
+                        first = f"{cols[0][0]}.{cols[0][1]}"
+                        for table, col in cols[1:]:
+                            equivalences.union(first, f"{table}.{col}")
         # Phase 1: BUILD
         variables, constraints = self._build(
-            tables, fixed_values, predicates, shared_keys,
+            tables, fixed_values, predicates, equivalences,
             not_null, must_null, avoid_values,
         )
 
@@ -221,7 +237,7 @@ class DomainSolver:
         return self._assign(variables, constraints)
 
     def _build(
-        self, tables, fixed_values, predicates, shared_keys,
+        self, tables, fixed_values, predicates, equivalences,
         not_null, must_null, avoid_values,
     ) -> Tuple[Dict[str, CSPVariable], List[CSPConstraint]]:
         """Build CSP variables and constraints."""
@@ -270,18 +286,17 @@ class DomainSolver:
             elif op == "is_null":
                 space.must_null = True
             elif op == ">" and isinstance(val, str):
-                # String comparison: just use a value that's "greater"
                 space.narrow_eq(val + "z")
             elif op == "<" and isinstance(val, str):
                 space.narrow_eq(val[:-1] if len(val) > 1 else "a")
 
-        # Apply shared keys (equality constraints between variables).
-        for key_id, cols in shared_keys.items():
-            if len(cols) >= 2:
-                first = f"{cols[0][0]}.{cols[0][1]}"
-                for table, col in cols[1:]:
-                    other = f"{table}.{col}"
-                    constraints.append(CSPConstraint(kind="eq", left=first, right=other))
+        # Apply equivalences from Union-Find.
+        for representative, members in equivalences.groups().items():
+            if len(members) >= 2:
+                first = members[0]
+                for other in members[1:]:
+                    if first in variables and other in variables:
+                        constraints.append(CSPConstraint(kind="eq", left=first, right=other))
 
         # Apply NOT NULL.
         for table, col in not_null:

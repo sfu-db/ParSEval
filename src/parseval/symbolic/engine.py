@@ -22,7 +22,6 @@ from parseval.plan import Plan
 from parseval.plan.planner import Aggregate, Filter, Join, Project, Scan
 from parseval.plan.rex import Variable
 from parseval.query import preprocess_sql
-from parseval.solver import Solver, SolveResult
 
 from .constraints import ConstraintGenerator, SolverConstraint
 from .evaluator import PlanEvaluator
@@ -52,7 +51,7 @@ class SymbolicEngine:
         sql: str,
         dialect: str = "sqlite",
         *,
-        solver: Optional[Solver] = None,
+        solver = None,
         max_iterations: int = 50,
         max_rows_per_table: Optional[int] = None,
     ):
@@ -61,7 +60,7 @@ class SymbolicEngine:
         self.dialect = dialect
         self.expr = preprocess_sql(sql, instance, dialect=dialect)
         self.plan = Plan(self.expr)
-        self.solver = solver or Solver(instance, dialect=dialect)
+        from parseval.solver.unified import Solver; self.solver = solver or Solver(instance, dialect=dialect)
         self.max_iterations = max_iterations
         # Build alias → real table name mapping from the Plan's Scan steps.
         self.alias_map = _build_alias_map(self.plan)
