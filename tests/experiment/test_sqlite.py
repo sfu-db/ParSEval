@@ -44,7 +44,9 @@ def main(args):
     tmp_dir = os.path.join("tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    for index in tqdm(range(len(gold)), desc="Processing"):
+    for index in range(len(gold)):
+        if index % 100 == 0:
+            print(f"Processing pair {index}/{len(gold)}...")
         row = gold[index]
         gold_sql = row.get("SQL")
         pred_sql = preds[index] if index < len(preds) else ""
