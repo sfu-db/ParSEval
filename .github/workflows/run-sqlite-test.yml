@@ -43,10 +43,10 @@ jobs:
           name: sqlite-experiment-results
           path: results/
 
-      - name: Commit results to repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/*.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "experiment: sqlite results [skip ci]"
-          git push || true
+      # - name: Commit results to repo
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add results/*.json 2>/dev/null || true
+      #     git diff --cached --quiet || git commit -m "experiment: sqlite results [skip ci]"
+      #     git push || true
