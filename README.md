@@ -1,75 +1,93 @@
 # ParSEval: Plan-aware Test Database Generation for SQL Equivalence Evaluation
 
-ParSEval considers the specific behaviors of each query operator and covers all possible execution branches of the logical query plan by adapting the notion of branch coverage to query plans.
+ParSEval generates minimal test database instances that exercise all execution branches of a SQL query's logical plan. It uses branch-coverage-driven symbolic reasoning, speculative data generation, and SMT solving (Z3) to produce databases that make queries return non-empty, distinguishing results.
 
-
-## File Structure
-
-The repo contains following supplemental materials:
-- source code of ParSEval
-- Source code of query parser
-```
-├── src # Source code of ParSEval
-├── requirements.txt # pip requirements
-└── README.md
-```
-
-
-## Getting Started
-
-### Environment Setup with uv
-To set up your environment:
+## Quick Start
 
 ```bash
-# Create a virtual environment (if you don't have one)
 uv venv
-
-# Install all dependencies from requirements.txt or pyproject.toml
 uv sync
-
-# Install ParSEval in editable mode
 uv pip install -e .
 ```
 
-If you prefer, you can use `python -m venv` or conda.
-
-
-### Usage
-
-#### As a Library
-To generate test database instances for an input query:
+### Generate a Test Database
 
 ```python
 from parseval import instantiate_db
-instantiate_db(sql, schema, host_or_path, db_id, dialect, **kwargs)
+
+result = instantiate_db(
+    sql="SELECT name FROM users WHERE age > 25",
+    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    connection_string="sqlite:////tmp/test.db",
+    dialect="sqlite",
+)
+print(result.success, result.generation.rows_generated)
 ```
 
-To test the equivalence of two queries:
+### Disprove Query Equivalence
 
 ```python
-from parseval import disprove
-disprove(sql1, sql2, schema, host_or_path="/tmp", dialect="sqlite", **kwargs)
+from parseval import disprove, Semantics
+
+result = disprove(
+    sql1="SELECT name FROM users WHERE age > 25",
+    sql2="SELECT name FROM users WHERE age >= 26",
+    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    connection_string="sqlite:////tmp/test.db",
+    dialect="sqlite",
+    semantics=Semantics.BAG,  # or Semantics.SET
+)
+print(result.verdict)  # Verdict.EQ or Verdict.NEQ
 ```
 
+### Supported Dialects
+
+- `sqlite` — full support
+- `mysql` — supported via DBManager
+- `postgres` — supported via DBManager
+
+## File Structure
+
+```
+src/parseval/
+├── main.py              # Public API: instantiate_db, disprove
+├── symbolic/
+│   ├── engine.py        # SymbolicEngine — orchestrates generation
+│   ├── speculate.py     # Speculative data generation (Propagator + Resolver)
+│   ├── evaluator.py     # Branch coverage evaluation
+│   ├── uexpr.py         # UExprToConstraint — Z3-based constraint solver
+│   ├── constraints.py   # Coverage gap → solver constraint translation
+│   └── types.py         # BranchType, CoverageTarget, BranchTree
+├── solver/
+│   ├── unified.py       # Tiered solver (Trivial → Heuristic → CSP → SMT)
+│   ├── smt.py           # Z3 SMT solver with SQL-to-Z3 translation
+│   ├── lowering.py      # Predicate lowering (SQL → column constraints)
+│   └── value_space.py   # CSP domain narrowing
+├── plan/
+│   ├── planner.py       # Query plan builder (Scan, Join, Filter, etc.)
+│   ├── rex.py           # Concrete expression evaluation + Symbol types
+│   └── context.py       # Row/Environment for plan evaluation
+├── instance/
+│   ├── core.py          # Instance — in-memory row management
+│   ├── io.py            # Persistence (to_db)
+│   └── loader.py        # SQLAlchemy-based DB writer
+├── domain/              # Type-aware value generation
+├── db_manager.py        # Multi-backend connection management
+├── logger.py            # Configurable logging
+└── states.py            # Result types (Verdict, DisproveResult, etc.)
+```
+
+## Running Experiments
+
+```bash
+python tests/experiment/test_sqlite.py \
+    --schema_fp data/sqlite/schema.json \
+    --gold_fp data/sqlite/dev.json \
+    --preds_fp data/sqlite/dail.txt \
+    --output_dir results
+```
 
 ## Updates
-- Replaced Calcite with SQLGlot.
-- Integrated symbolic expressions with SQLGlot classes.
-- Handled special functions from SQLite and MySQL.
-- For simple queries (e.g., `SELECT count(*) FROM singers`), randomly generate a database instance.
 
-## To Be Done (TBD)
-- Refactor the database manager to support more database backends.
-- Load existing data first when using non-SQLite databases (e.g., Postgres, MySQL) to avoid wiping all existing data.
-- Model more dialect-specific functions and keywords with symbolic expressions.
-
-
-### Experiment Setup
-- [Install Docker](https://docs.docker.com/engine/install/)
-- Datasets:
-    - Download Leetcode/Literature/Bird/Spider datasets [here](https://drive.google.com/drive/folders/12y5tR2JeSf2cVpp_woHn6CiQ9YiY7J25?usp=drive_link).
-    - You can also download official database instances for [Bird](https://bird-bench.github.io/) and [Spider](https://yale-lily.github.io/spider).
-
-
-
-
+- See the `dev` branch for the latest features and ongoing development.
+- See the `webui` branch for the frontend web interface of ParSEval.
