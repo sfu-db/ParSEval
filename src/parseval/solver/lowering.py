@@ -232,7 +232,14 @@ def _lower_atom(
             return _make_pred(col, ">", val, instance, tables, alias_map)
         col, val = _extract_temporal_func(atom)
         if col and val is not None:
-            if isinstance(val, date):
+            if isinstance(val, str) and len(val) >= 10 and '-' in val:
+                # Date string: for GT, use a date one year later
+                try:
+                    year = int(val[:4])
+                    val = f"{year + 1}-06-15"
+                except ValueError:
+                    pass
+            elif isinstance(val, date):
                 val = date(val.year + 1, val.month, val.day)
             return _make_pred(col, "=", val, instance, tables, alias_map)
 
@@ -249,7 +256,13 @@ def _lower_atom(
             return _make_pred(col, "<", val, instance, tables, alias_map)
         col, val = _extract_temporal_func(atom)
         if col and val is not None:
-            if isinstance(val, date):
+            if isinstance(val, str) and len(val) >= 10 and '-' in val:
+                try:
+                    year = int(val[:4])
+                    val = f"{year - 1}-06-15"
+                except ValueError:
+                    pass
+            elif isinstance(val, date):
                 val = date(val.year - 1, val.month, val.day)
             return _make_pred(col, "=", val, instance, tables, alias_map)
 
@@ -269,21 +282,25 @@ def _lower_atom(
     elif isinstance(atom, exp.Between):
         col = atom.this
         low = atom.args.get("low")
+        high = atom.args.get("high")
         if isinstance(col, exp.Column) and isinstance(low, exp.Literal):
-            return _make_pred(col, ">=", concrete(low), instance, tables, alias_map)
+            low_val = concrete(low)
+            # Use the low bound as equality — it's always within the range
+            return _make_pred(col, "=", low_val, instance, tables, alias_map)
         # Temporal BETWEEN
         if isinstance(col, (exp.TimeToStr, exp.Anonymous)):
             inner_col = next(col.find_all(exp.Column), None)
             if inner_col and isinstance(low, exp.Literal):
                 val = concrete(low)
                 if isinstance(val, str) and val.isdigit():
-                    return _make_pred(inner_col, "=", date(int(val), 6, 15), instance, tables, alias_map)
+                    return _make_pred(inner_col, "=", f"{val}-06-15", instance, tables, alias_map)
+                elif isinstance(val, str):
+                    return _make_pred(inner_col, "=", val, instance, tables, alias_map)
         # Function-wrapped column: date(SUBSTR(col, ...)) BETWEEN 'date1' AND 'date2'
         inner_col = next(col.find_all(exp.Column), None) if not isinstance(col, exp.Column) else None
         if inner_col and isinstance(low, exp.Literal):
             low_val = concrete(low)
             if isinstance(low_val, str):
-                # Use the low bound as the value (it's within the range)
                 return _make_pred(inner_col, "=", low_val, instance, tables, alias_map)
 
     # LIKE
@@ -407,9 +424,13 @@ def _extract_col_literal(node: exp.Expression) -> Tuple[Optional[exp.Column], Op
 
 
 def _extract_temporal_func(node: exp.Expression) -> Tuple[Optional[exp.Column], Optional[Any]]:
-    """Extract column and value from temporal function patterns like strftime('%Y', col) = '2024'.
+    """Extract column and value from temporal function patterns.
 
-    Returns (None, None) if the expression is not a temporal function comparison.
+    Handles:
+    - STRFTIME('%Y', col) = '2024' → col = '2024-06-15'
+    - STRFTIME('%m', col) = '10' → col = '2024-10-15'
+    - STRFTIME('%Y', col) = '1991' → col = '1991-06-15'
+    - TIME_TO_STR(col, '%Y') = '2024' → same as above
     """
     left = node.this
     right = getattr(node, "expression", None)
@@ -426,8 +447,27 @@ def _extract_temporal_func(node: exp.Expression) -> Tuple[Optional[exp.Column], 
         inner_col = next(func_side.find_all(exp.Column), None)
         if inner_col and isinstance(lit_side, exp.Literal):
             val = concrete(lit_side)
-            if isinstance(val, str) and val.isdigit():
-                return inner_col, date(int(val), 6, 15)
+            if not isinstance(val, str):
+                return None, None
+            # Determine format from TimeToStr
+            fmt = None
+            if isinstance(func_side, exp.TimeToStr):
+                fmt_node = func_side.args.get("format")
+                if isinstance(fmt_node, exp.Literal):
+                    fmt = fmt_node.this
+                elif fmt_node:
+                    fmt = str(fmt_node).strip("'\"")
+            # Generate appropriate date based on format
+            if fmt == "%Y" and val.isdigit():
+                return inner_col, f"{val}-06-15"
+            elif fmt == "%m" and val.isdigit():
+                return inner_col, f"2024-{val.zfill(2)}-15"
+            elif fmt == "%d" and val.isdigit():
+                return inner_col, f"2024-06-{val.zfill(2)}"
+            elif fmt == "%Y-%m" and len(val) >= 6:
+                return inner_col, f"{val}-15"
+            elif val.isdigit():
+                return inner_col, f"{val}-06-15"
     return None, None
 
 

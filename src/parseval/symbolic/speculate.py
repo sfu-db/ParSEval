@@ -46,14 +46,14 @@ from parseval.solver.lowering import (
 @dataclass
 class TableRequirement:
     """What one table needs to contribute for a specific branch."""
-    table: str
+    table: str  # physical table name
+    alias: Optional[str] = None  # alias (for self-joins, distinguishes rows)
     min_rows: int = 1
     fixed_values: Dict[str, Any] = field(default_factory=dict)
     not_null: Set[str] = field(default_factory=set)
     must_null: Set[str] = field(default_factory=set)
     predicates: List[Tuple[str, str, Any]] = field(default_factory=list)
     duplicate_columns: List[str] = field(default_factory=list)
-    # Phase 5: columns that must share the same value across all min_rows
     group_key_columns: List[str] = field(default_factory=list)
 
 
@@ -429,7 +429,14 @@ class Propagator:
             if self._is_self_join_table(pred.table):
                 continue
             if pred.op == "=":
-                spec.require(pred.table).fixed_values[pred.column] = pred.value
+                # Merge temporal values: if column already has a date string,
+                # combine year/month/day components
+                existing = spec.require(pred.table).fixed_values.get(pred.column)
+                if existing and isinstance(existing, str) and isinstance(pred.value, str):
+                    merged = self._merge_date_values(existing, pred.value)
+                    spec.require(pred.table).fixed_values[pred.column] = merged
+                else:
+                    spec.require(pred.table).fixed_values[pred.column] = pred.value
             elif pred.op == "is_null":
                 spec.require(pred.table).must_null.add(pred.column)
             elif pred.op == "like":
@@ -447,22 +454,42 @@ class Propagator:
         count = sum(1 for v in self.alias_map.values() if v == table)
         return count > 1
 
+    def _merge_date_values(self, existing: str, new: str) -> str:
+        """Merge two date-like strings by combining their year/month/day components.
+
+        E.g., '1991-06-15' + '2024-10-15' → '1991-10-15' (year from first, month from second).
+        """
+        import re
+        date_pat = re.compile(r'^(\d{4})-(\d{2})-(\d{2})')
+        m_existing = date_pat.match(existing)
+        m_new = date_pat.match(new)
+        if not m_existing or not m_new:
+            return new  # Can't merge, use new value
+        # Take non-default components from each
+        ey, em, ed = m_existing.groups()
+        ny, nm, nd = m_new.groups()
+        # "Default" values from the lowering: year=2024, month=06, day=15
+        year = ey if ey != "2024" else ny
+        month = em if em != "06" else nm
+        day = ed if ed != "15" else nd
+        return f"{year}-{month}-{day}"
+
     def _extract_self_join_predicates(self, condition: exp.Expression, spec: BranchSpec):
-        """For self-joins: extract per-alias constraints using alias as requirement key.
+        """For self-joins: extract per-alias constraints using alias field.
 
         When T2.colour = 'Blue' AND T3.colour = 'Blond' and both T2/T3 map to
-        the same table, we create separate requirements keyed by 'colour__t2'
-        and 'colour__t3' so each alias gets its own fixed_values.
+        the same table, we create separate requirements with distinct aliases
+        so each gets its own fixed_values.
         """
         from parseval.plan.rex import concrete as _concrete
 
         # Detect self-join aliases
-        self_join_tables = {}
+        self_join_tables: Dict[str, List[str]] = {}
         if hasattr(self.alias_map, 'self_join_tables'):
             self_join_tables = self.alias_map.self_join_tables()
         else:
             from collections import defaultdict
-            groups = defaultdict(list)
+            groups: Dict[str, List[str]] = defaultdict(list)
             for a, t in self.alias_map.items():
                 groups[t].append(a)
             self_join_tables = {t: aliases for t, aliases in groups.items() if len(aliases) > 1}
@@ -483,19 +510,17 @@ class Propagator:
             table = self._resolve_table(alias)
             if table not in self_join_tables:
                 continue
-            # This column belongs to a self-joined table — use alias-keyed requirement
             col_name = self._match_column(table, col.name)
             if not col_name:
                 continue
             val = _concrete(lit)
             if val is None:
                 continue
-            # Use "table__alias" as the requirement key to keep them separate
+            # Use physical table as key but with alias field set
             req_key = f"{table}__{alias}"
-            req = spec.require(req_key) if req_key in spec.requirements else TableRequirement(table=req_key)
-            spec.requirements[req_key] = req
-            req.table = req_key
-            req.fixed_values[col_name] = val
+            if req_key not in spec.requirements:
+                spec.requirements[req_key] = TableRequirement(table=table, alias=alias)
+            spec.requirements[req_key].fixed_values[col_name] = val
 
         # Also handle LIKE on self-joined aliases
         for like_node in condition.find_all(exp.Like):
@@ -513,9 +538,9 @@ class Propagator:
             if isinstance(pat_node, exp.Literal) and pat_node.is_string:
                 pat = str(pat_node.this).replace("%", "x").replace("_", "a")
                 req_key = f"{table}__{alias}"
-                req = spec.requirements.get(req_key, TableRequirement(table=req_key))
-                spec.requirements[req_key] = req
-                req.fixed_values[col_name] = pat
+                if req_key not in spec.requirements:
+                    spec.requirements[req_key] = TableRequirement(table=table, alias=alias)
+                spec.requirements[req_key].fixed_values[col_name] = pat
 
     def _extract_column_equalities(self, condition: exp.Expression, spec: BranchSpec):
         """Extract col1 = col2 patterns and link them via Union-Find."""
@@ -735,17 +760,18 @@ class Resolver:
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
-        # Resolve equivalence classes: one value per group.
         shared_values = self._resolve_equivalences(spec)
         order = self._creation_order(spec)
         result: Dict[str, List[Dict[str, Any]]] = {}
 
-        for table in order:
-            if table not in spec.requirements:
+        for table_key in order:
+            if table_key not in spec.requirements:
                 continue
-            req = spec.requirements[table]
-            # Handle alias-keyed requirements (e.g., "colour__t2")
-            physical_table = table.split("__")[0] if "__" in table else table
+            req = spec.requirements[table_key]
+            # Resolve physical table name (use alias field or strip suffix)
+            physical_table = req.table if not req.alias else req.table
+            if "__" in physical_table:
+                physical_table = physical_table.split("__")[0]
             rows = self._resolve_table(physical_table, req, shared_values)
             result.setdefault(physical_table, []).extend(rows)
 
