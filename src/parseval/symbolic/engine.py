@@ -339,11 +339,34 @@ class SymbolicEngine:
             condition = step.condition
             has_subquery = bool(condition.find(exp.Subquery))
 
-            # Check if this specific condition involves self-join aliases
+            # Quick satisfaction check: if predicate is already satisfied, skip
             condition_aliases = set()
             for col in condition.find_all(exp.Column):
                 if col.table:
                     condition_aliases.add(normalize_name(col.table))
+
+            if not condition_aliases:
+                continue
+
+            # Build environment from current rows and check
+            env = Environment()
+            all_satisfied = False
+            for alias in condition_aliases:
+                table = normalize_name(self.alias_map.get(alias, alias))
+                if table not in self.instance.tables:
+                    continue
+                row_idx = self.alias_map.row_index(alias)
+                rows = self.instance.get_rows(table)
+                if row_idx < len(rows):
+                    for col_name, sym in rows[row_idx].items():
+                        env.bind(f"{alias}.{col_name}", sym.concrete)
+                        env.bind(col_name, sym.concrete)
+            if not has_subquery:
+                result = concrete(condition, env)
+                if result is True:
+                    continue  # Already satisfied, skip SMT
+
+            # Check if this specific condition involves self-join aliases
             self_join_tables = self.alias_map.self_join_tables()
             condition_has_self_join = any(
                 len([a for a in aliases if a in condition_aliases]) >= 2
