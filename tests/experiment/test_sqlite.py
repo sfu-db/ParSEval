@@ -3,8 +3,8 @@
 import json
 import os
 import argparse
-from datetime import datetime
 
+import datetime
 from parseval.main import disprove
 from parseval.states import Semantics
 
@@ -91,7 +91,7 @@ def main(args):
             pass
 
     # Write results
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     results_fname = f"sqlite_results_{ts}.json"
     metrics_fname = f"sqlite_metrics_{ts}.json"
 
