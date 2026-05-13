@@ -94,9 +94,11 @@ class SymbolicEngine:
         rows_before = self._total_rows()
 
         # Phase 0: Speculate all branches (positive + negatives) at once.
+        # This is the primary generation path — handles self-joins, HAVING
+        # COUNT, NOT IN, and all common patterns via heuristics.
         self._speculate_all_branches()
 
-        # Phase 0b: Ensure every plan-referenced table has at least one row.
+        # Phase 0b: Ensure every alias has a row (self-join aware).
         self._ensure_base_rows()
 
         # Phase 0c: If query has OFFSET, generate enough rows.
@@ -105,12 +107,12 @@ class SymbolicEngine:
         # Phase 0d: Handle subquery predicates.
         self._resolve_subquery_predicates()
 
-        # Phase 0e: SMT-based WHERE repair — use Z3 to solve the full WHERE
-        # clause and update rows that don't satisfy it.
-        self._smt_repair_where()
-
-        # Phase 0f: Create coordinated rows for HAVING COUNT > N.
+        # Phase 0e: Create coordinated rows for HAVING COUNT > N.
         self._create_having_count_rows()
+
+        # Phase 0f: SMT repair — for self-joins, NOT IN, and complex OR
+        # predicates that the speculative layer cannot handle.
+        self._smt_repair_where()
 
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
@@ -153,9 +155,6 @@ class SymbolicEngine:
             else:
                 self.instance.rollback(cp)
                 tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
-
-        # Phase 2: Final ensure non-empty (catches cases coverage loop broke)
-        self._ensure_nonempty_via_uexpr()
 
         return GenerationResult(
             tree=tree,
@@ -569,7 +568,7 @@ class SymbolicEngine:
                 yield predicate
 
     def _resolve_one_subquery_atom(self, atom: exp.Expression) -> None:
-        """Resolve a subquery atom using our own plan evaluator (not SQLite).
+        """Resolve a subquery atom using our own plan evaluator.
 
         For col OP (SELECT ...): evaluate the subquery against the current
         instance using concrete(), then adjust the outer row to satisfy.
@@ -750,37 +749,22 @@ class SymbolicEngine:
         return values[0] if values else None
 
     def _ensure_base_rows(self) -> None:
-        """Ensure every table referenced in the Plan has at least one row."""
+        """Ensure every alias has a row (self-join aware).
+        
+        For self-joins, creates separate rows per alias so each alias
+        binds to a distinct row in the physical table.
+        """
+        self.alias_map.ensure_rows_exist(self.instance)
+        # Also ensure FK-linked rows exist
         for alias, real_table in self.alias_map.items():
             if real_table not in self.instance.tables:
                 continue
-            if self.instance.get_rows(real_table):
-                continue
-            try:
-                values = self._fill_fk_values(real_table, {})
-                self.instance.create_row(real_table, values=values)
-            except Exception:
-                pass
-
-    def _ensure_nonempty_via_uexpr(self) -> None:
-        """Use UExprToConstraint to ensure the query returns non-empty results.
-        
-        Only invoked if the query currently returns empty results.
-        """
-        # Quick check: does the query already return non-empty?
-        if self._query_produces_rows():
-            return
-        try:
-            from .uexpr import UExprToConstraint
-            cp = self.instance.checkpoint()
-            uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
-            if not uexpr.ensure_nonempty():
-                self.instance.rollback(cp)
-            elif not self._query_produces_rows():
-                # Z3 solved but result still empty — rollback
-                self.instance.rollback(cp)
-        except Exception:
-            pass
+            if not self.instance.get_rows(real_table):
+                try:
+                    values = self._fill_fk_values(real_table, {})
+                    self.instance.create_row(real_table, values=values)
+                except Exception:
+                    pass
 
     def _repair_not_in_simple(self, condition: exp.Expression) -> None:
         """Simple NOT IN repair: set the outer column to a fresh value not in inner results."""
@@ -922,45 +906,6 @@ class SymbolicEngine:
                 self.instance.create_row(child_table, values={child_fk: fk_value})
             except Exception:
                 pass
-
-    def _query_produces_rows(self) -> bool:
-        """Check if the query returns non-empty results against current Instance."""
-        import sqlite3
-        conn = sqlite3.connect(":memory:")
-        try:
-            for ddl in self.instance.ddls.split(";"):
-                ddl = ddl.strip()
-                if ddl:
-                    try:
-                        conn.execute(ddl)
-                    except Exception:
-                        pass
-            for table_name in self.instance.tables:
-                rows = self.instance.get_rows(table_name)
-                if not rows:
-                    continue
-                cols = list(self.instance.tables[table_name].keys())
-                placeholders = ",".join(["?"] * len(cols))
-                col_names = ",".join(f'"{c}"' for c in cols)
-                stmt = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
-                for row in rows:
-                    values = []
-                    for c in cols:
-                        v = row[c].concrete if c in row.columns else None
-                        if v is not None and not isinstance(v, (int, float, str, bytes)):
-                            v = str(v)
-                        values.append(v)
-                    try:
-                        conn.execute(stmt, values)
-                    except Exception:
-                        pass
-            conn.commit()
-            result = conn.execute(self.sql).fetchone()
-            return result is not None
-        except Exception:
-            return False
-        finally:
-            conn.close()
 
 
 # =============================================================================
