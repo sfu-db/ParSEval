@@ -508,6 +508,13 @@ def negate_predicate_value(op: str, value: Any) -> Tuple[str, Any]:
     if op == "=" and isinstance(value, (int, float)):
         return "=", value + 1
     if op == "=" and isinstance(value, str):
+        # For date-like strings, change the value rather than appending _neg
+        if len(value) >= 10 and value[4:5] == '-' and value[7:8] == '-':
+            try:
+                year = int(value[:4])
+                return "=", f"{year + 1}{value[4:]}"
+            except ValueError:
+                pass
         return "=", value + "_neg"
     if op == "=" and isinstance(value, bool):
         return "=", not value
