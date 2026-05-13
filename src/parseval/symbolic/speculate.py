@@ -420,20 +420,102 @@ class Propagator:
         )
         # Handle two-column equalities (col1 = col2) via Union-Find.
         self._extract_column_equalities(condition, spec)
+        # Self-join aware: extract per-alias constraints directly from columns
+        # that reference self-joined tables, before lowering collapses them.
+        self._extract_self_join_predicates(condition, spec)
         preds, _ = lower_predicates(condition, self.instance, tables, self.alias_map)
         for pred in preds:
+            # Skip if already handled by self-join extraction
+            if self._is_self_join_table(pred.table):
+                continue
             if pred.op == "=":
                 spec.require(pred.table).fixed_values[pred.column] = pred.value
             elif pred.op == "is_null":
                 spec.require(pred.table).must_null.add(pred.column)
             elif pred.op == "like":
-                # Generate a matching string from the pattern.
                 pat = str(pred.value).replace("%", "x").replace("_", "a")
                 spec.require(pred.table).fixed_values[pred.column] = pat
             elif pred.op == "not_null":
                 spec.require(pred.table).not_null.add(pred.column)
             else:
                 spec.require(pred.table).predicates.append((pred.column, pred.op, pred.value))
+
+    def _is_self_join_table(self, table: str) -> bool:
+        """Check if a table is involved in a self-join."""
+        if hasattr(self.alias_map, 'has_self_join'):
+            return self.alias_map.has_self_join(table)
+        count = sum(1 for v in self.alias_map.values() if v == table)
+        return count > 1
+
+    def _extract_self_join_predicates(self, condition: exp.Expression, spec: BranchSpec):
+        """For self-joins: extract per-alias constraints using alias as requirement key.
+
+        When T2.colour = 'Blue' AND T3.colour = 'Blond' and both T2/T3 map to
+        the same table, we create separate requirements keyed by 'colour__t2'
+        and 'colour__t3' so each alias gets its own fixed_values.
+        """
+        from parseval.plan.rex import concrete as _concrete
+
+        # Detect self-join aliases
+        self_join_tables = {}
+        if hasattr(self.alias_map, 'self_join_tables'):
+            self_join_tables = self.alias_map.self_join_tables()
+        else:
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for a, t in self.alias_map.items():
+                groups[t].append(a)
+            self_join_tables = {t: aliases for t, aliases in groups.items() if len(aliases) > 1}
+
+        if not self_join_tables:
+            return
+
+        # Find EQ atoms with column references to self-joined aliases
+        for eq_node in condition.find_all(exp.EQ):
+            left, right = eq_node.this, eq_node.expression
+            col = left if isinstance(left, exp.Column) else (right if isinstance(right, exp.Column) else None)
+            lit = right if col is left else left
+            if col is None or isinstance(lit, exp.Column):
+                continue
+            if not col.table:
+                continue
+            alias = normalize_name(col.table)
+            table = self._resolve_table(alias)
+            if table not in self_join_tables:
+                continue
+            # This column belongs to a self-joined table — use alias-keyed requirement
+            col_name = self._match_column(table, col.name)
+            if not col_name:
+                continue
+            val = _concrete(lit)
+            if val is None:
+                continue
+            # Use "table__alias" as the requirement key to keep them separate
+            req_key = f"{table}__{alias}"
+            req = spec.require(req_key) if req_key in spec.requirements else TableRequirement(table=req_key)
+            spec.requirements[req_key] = req
+            req.table = req_key
+            req.fixed_values[col_name] = val
+
+        # Also handle LIKE on self-joined aliases
+        for like_node in condition.find_all(exp.Like):
+            col = like_node.this
+            if not isinstance(col, exp.Column) or not col.table:
+                continue
+            alias = normalize_name(col.table)
+            table = self._resolve_table(alias)
+            if table not in self_join_tables:
+                continue
+            col_name = self._match_column(table, col.name)
+            if not col_name:
+                continue
+            pat_node = like_node.expression
+            if isinstance(pat_node, exp.Literal) and pat_node.is_string:
+                pat = str(pat_node.this).replace("%", "x").replace("_", "a")
+                req_key = f"{table}__{alias}"
+                req = spec.requirements.get(req_key, TableRequirement(table=req_key))
+                spec.requirements[req_key] = req
+                req.fixed_values[col_name] = pat
 
     def _extract_column_equalities(self, condition: exp.Expression, spec: BranchSpec):
         """Extract col1 = col2 patterns and link them via Union-Find."""
@@ -662,8 +744,10 @@ class Resolver:
             if table not in spec.requirements:
                 continue
             req = spec.requirements[table]
-            rows = self._resolve_table(table, req, shared_values)
-            result[table] = rows
+            # Handle alias-keyed requirements (e.g., "colour__t2")
+            physical_table = table.split("__")[0] if "__" in table else table
+            rows = self._resolve_table(physical_table, req, shared_values)
+            result.setdefault(physical_table, []).extend(rows)
 
         return result
 
@@ -787,7 +871,11 @@ class Resolver:
         tables = list(spec.requirements.keys())
         deps: Dict[str, Set[str]] = {t: set() for t in tables}
         for table in tables:
-            for fk in self.instance.get_foreign_key(table):
+            # Get physical table name (strip alias suffix)
+            physical = table.split("__")[0] if "__" in table else table
+            if physical not in self.instance.tables:
+                continue
+            for fk in self.instance.get_foreign_key(physical):
                 ref = fk.args.get("reference")
                 if ref:
                     ref_table = ref.find(exp.Table)
