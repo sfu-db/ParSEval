@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Optional
 import uuid
 
-from ..coercion import coerce_reference_value
 from ..compiler import ColumnDomainPlan
 from ..types import TypeFamily, TypeProfile
 from .base import ValueProvider
@@ -25,12 +24,9 @@ class UUIDProvider(ValueProvider):
         null_rate: float = 0.0,
     ) -> Any:
         state = runtime.column_state(spec.table, spec.column)
-        if spec.foreign_key:
-            referenced = runtime.referenced_values(spec)
-            if referenced:
-                return coerce_reference_value(
-                    runtime.rng.choice(referenced), spec.datatype, dialect=spec.dialect
-                )
+        fk_value = self._resolve_foreign_key(spec, runtime)
+        if fk_value is not None:
+            return fk_value
         if domain_plan and domain_plan.allowed_values:
             return runtime.rng.choice(domain_plan.allowed_values)
         candidate = uuid.UUID(int=runtime.rng.getrandbits(128))
