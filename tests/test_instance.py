@@ -141,7 +141,6 @@ class TestInstance(unittest.TestCase):
 
     @unittest.skip("skipping for now")
     def test_uexprs(self):
-        from src.parseval.uexpr.uexprs import UExprToConstraint, Constraint
         import random
 
         random.seed(42)
@@ -241,7 +240,6 @@ class TestInstance(unittest.TestCase):
             find_all_in_scope,
             build_scope,
         )
-        from src.parseval.uexpr.uexprs import UExprToConstraint
 
         instance = Instance(ddls=schema, name="test", dialect="sqlite")
         for tbl_name in instance.tables:
