@@ -89,7 +89,7 @@ def _get_inner_query_values(
 
 
 def _translate_non_subquery_parts(
-    smt, condition: exp.Expression, ctx: dict
+    smt, condition: exp.Expression, ctx: Dict[str, Any]
 ) -> None:
     """Translate parts of a condition that don't contain subqueries."""
     if isinstance(condition, exp.And):
@@ -104,7 +104,7 @@ def _translate_non_subquery_parts(
 
 
 def _add_not_in_constraints(
-    smt, condition: exp.Expression, ctx: dict, instance: Instance, alias_map
+    smt, condition: exp.Expression, ctx: Dict[str, Any], instance: Instance, alias_map
 ) -> None:
     """Add NOT IN anti-value constraints from a condition."""
     from parseval.helper import normalize_name
@@ -619,13 +619,9 @@ class SymbolicEngine:
                         var_symbols[var_name] = sym
 
                 # Translate and solve
-                if has_subquery:
-                    _translate_non_subquery_parts(smt, condition, ctx)
-                    _add_not_in_constraints(smt, condition, ctx, self.instance, self.alias_map)
-                else:
-                    z3_pred = smt.translate(condition, ctx=ctx)
-                    if z3_pred is not None:
-                        smt.add_raw(z3_pred)
+                z3_pred = smt.translate(condition, ctx=ctx)
+                if z3_pred is not None:
+                    smt.add_raw(z3_pred)
 
                 # Add JOIN constraints between aliases
                 for jstep in self.plan.ordered_steps:
