@@ -88,6 +88,7 @@ class SymbolicEngine:
         from .speculate import build_spec, resolve_spec
 
         thresholds = thresholds or CoverageThresholds()
+        self._thresholds = thresholds
         evaluator = PlanEvaluator(self.plan, self.instance, self.dialect)
         constraint_gen = ConstraintGenerator(self.plan, self.instance, self.dialect)
 
@@ -941,6 +942,8 @@ class SymbolicEngine:
         if not targets.duplicate_columns and not targets.null_columns:
             return
 
+        dup_count = getattr(self._thresholds, 'atom_dup', 1)
+
         # Generate rows with NULLs for COUNT/SUM/AVG columns
         for table, column in targets.null_columns:
             real_table = self.alias_map.get(table, table)
@@ -957,7 +960,8 @@ class SymbolicEngine:
                 continue
             existing_rows = self.instance.get_rows(real_table)
             if existing_rows:
-                self._generate_duplicate_row(real_table, column, existing_rows[0])
+                for _ in range(dup_count):
+                    self._generate_duplicate_row(real_table, column, existing_rows[0])
 
     def _generate_null_row(self, table: str, null_column: str) -> None:
         """Generate a row with NULL in the specified column."""

@@ -40,6 +40,7 @@ def instantiate_db(
     db_id: str = "parseval",
     max_iterations: int = 10,
     atom_null: int = 0,
+    atom_dup: int = 1,
     **kwargs: Any,
 ) -> InstantiateResult:
     """Generate a test database instance for a SQL query and persist it."""
@@ -47,7 +48,7 @@ def instantiate_db(
     _log.info("instantiate_db: dialect=%s, sql=%.80s", dialect, sql)
     try:
         instance = Instance(ddls=schema, name=db_id, dialect=dialect)
-        thresholds = CoverageThresholds(atom_null=atom_null)
+        thresholds = CoverageThresholds(atom_null=atom_null, atom_dup=atom_dup)
         engine = SymbolicEngine(
             instance, sql, dialect=dialect, max_iterations=max_iterations, **kwargs
         )
@@ -85,6 +86,7 @@ def disprove(
     max_iterations: int = 10,
     semantics: Semantics = Semantics.BAG,
     atom_null: int = 0,
+    atom_dup: int = 1,
     timeout: int = 15,
     **kwargs: Any,
 ) -> DisproveResult:
@@ -116,7 +118,7 @@ def disprove(
     try:
         instance = Instance(ddls=schema, name=db_id, dialect=dialect)
         engine1 = SymbolicEngine(instance, sql1, dialect=dialect, max_iterations=max_iterations, **kwargs)
-        engine1.generate(thresholds=CoverageThresholds(atom_null=atom_null))
+        engine1.generate(thresholds=CoverageThresholds(atom_null=atom_null, atom_dup=atom_dup))
     except Exception as e:
         return DisproveResult(
             verdict=Verdict.UNKNOWN, semantics=semantics,
@@ -161,7 +163,7 @@ def disprove(
     # 3. Generate targeting sql2 on same instance, try again
     try:
         engine2 = SymbolicEngine(instance, sql2, dialect=dialect, max_iterations=max_iterations, **kwargs)
-        gen_result = engine2.generate(thresholds=CoverageThresholds(atom_null=atom_null))
+        gen_result = engine2.generate(thresholds=CoverageThresholds(atom_null=atom_null, atom_dup=atom_dup))
     except Exception:
         # If sql2 generation fails, return EQ from round 1
         return DisproveResult(
