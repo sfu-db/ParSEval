@@ -100,5 +100,12 @@ class TestCompiler(unittest.TestCase):
         plan = self.compiler.compile(spec)
         self.assertEqual(plan.allowed_values, (first, second))
 
+def test_intersect_preserving_order_method():
+    """_intersect_preserving_order must be a method on ConstraintCompiler."""
+    from parseval.domain.compiler import ConstraintCompiler
+    compiler = ConstraintCompiler.__new__(ConstraintCompiler)
+    result = compiler._intersect_preserving_order([1, 2, 3], [2, 3, 4])
+    assert result == (2, 3)
+
 if __name__ == "__main__":
     unittest.main()
