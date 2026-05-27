@@ -34,6 +34,21 @@ def load_preds(preds_fp: str):
     return lines
 
 
+def _has_likely_syntax_error(sql: str) -> bool:
+    """Quick heuristic to detect obviously broken SQL."""
+    # Unbalanced single quotes (handles escaped '' by subtracting pairs)
+    s = sql.replace("''", "")  # Remove escaped quotes
+    if s.count("'") % 2 != 0:
+        return True
+    # Unbalanced parentheses
+    if sql.count("(") != sql.count(")"):
+        return True
+    # Empty SQL
+    if not sql.strip():
+        return True
+    return False
+
+
 def main(args):
     schemas = load_schema(args.schema_fp)
     gold = load_gold(args.gold_fp)
@@ -55,6 +70,18 @@ def main(args):
 
         db_path = os.path.abspath(os.path.join(tmp_dir, f"{db_id}_{index}.db"))
         connection_string = f"sqlite:///{db_path}"
+
+        # Skip pairs where either query likely has syntax issues
+        if _has_likely_syntax_error(gold_sql) or _has_likely_syntax_error(pred_sql):
+            entry = {
+                "index": index,
+                "db_id": db_id,
+                "gold_sql": gold_sql,
+                "pred_sql": pred_sql,
+                "result": {"verdict": "syntax_error", "error_msg": "Skipped: likely syntax error"},
+            }
+            results.append(entry)
+            continue
 
         try:
             result = disprove(
