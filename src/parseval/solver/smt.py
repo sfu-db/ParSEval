@@ -153,6 +153,18 @@ class SMTValue:
         return self.expr is not None and not self.is_null_literal
 
 
+@dataclass
+class _VarRef:
+    """Lightweight stand-in for a sqlglot Column in z3_to_variable context.
+
+    _z3_to_python expects context["z3_to_variable"][name] to have a .type
+    attribute for temporal decoding. This wraps a DataType so declare_variable
+    entries satisfy that contract without importing sqlglot Column.
+    """
+
+    type: DataType
+
+
 class UnsupportedSMTError(NotImplementedError):
     """Raised when an expression or operation is not supported by the SMT solver."""
 
@@ -644,6 +656,7 @@ class SMTSolver:
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ] = None,
         timeout_ms: Optional[int] = None,
+        instance=None,
     ):
         """Initialize the SMT solver.
 
@@ -664,6 +677,7 @@ class SMTSolver:
             except Exception:
                 pass
         self.timeout_ms = timeout_ms
+        self.instance = instance
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False
@@ -725,6 +739,35 @@ class SMTSolver:
             "NEG": self._translate_neg,
             "DPIPE": self._translate_dpipe,
         }
+
+    def declare_variable(self, name: str, datatype: DataType) -> z3.ExprRef:
+        """Declare an Option-wrapped Z3 variable with a custom name.
+
+        Unlike _declare_or_get_column (which takes sqlglot Column objects),
+        this accepts a string name and DataType directly. The variable is
+        stored in the solver's context so translate() and solve() can find it.
+
+        Returns the Option-wrapped Z3 expression.
+        """
+        if name in self.context.get("variable_to_z3", {}):
+            return self.context["variable_to_z3"][name]
+        type_info = normalize_dtype(datatype, self.z3ctx)
+        option_type = OptionTypeRegistry.get(type_info.payload_sort, self.z3ctx)
+        z3_var = z3.Const(name, option_type)
+        self.context.setdefault("variable_to_z3", {})[name] = z3_var
+        # Store _VarRef so _z3_to_python can access .type for temporal decoding
+        self.context.setdefault("z3_to_variable", {})[name] = _VarRef(type=datatype)
+        return z3_var
+
+    def col_sort_datatype(self, table: str, col: str) -> DataType:
+        """Resolve a column's DataType from the Instance schema.
+
+        Returns DataType.build("TEXT") for unknown columns.
+        """
+        if self.instance is None:
+            return DataType.build("TEXT")
+        col_type = str(self.instance.tables.get(table, {}).get(col, "TEXT"))
+        return DataType.build(col_type)
 
     def add(self, constraint, track_vars: bool = True):
         """Add a constraint expression to the Z3 solver.
