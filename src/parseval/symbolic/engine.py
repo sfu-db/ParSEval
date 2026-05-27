@@ -936,6 +936,7 @@ class SymbolicEngine:
 
     def _enrich_for_semantics(self) -> None:
         """Generate additional rows with duplicates and NULLs to expose semantic differences."""
+        from collections import defaultdict
         from .enrichment import analyze_plan_for_enrichment
 
         targets = analyze_plan_for_enrichment(self.plan)
@@ -953,15 +954,35 @@ class SymbolicEngine:
                 continue
             self._generate_null_row(real_table, column)
 
-        # Generate duplicate rows for DISTINCT/GROUP BY columns
+        # Group duplicate targets by resolved table name
+        dup_by_table: Dict[str, List[str]] = defaultdict(list)
         for table, column in targets.duplicate_columns:
             real_table = self.alias_map.get(table, table)
-            if real_table not in self.instance.tables:
-                continue
+            if real_table in self.instance.tables:
+                dup_by_table[real_table].append(column)
+
+        # For each table, generate atom_dup rows with ALL target columns
+        # duplicated at once — one create_row call per iteration, not per column.
+        for real_table, columns in dup_by_table.items():
             existing_rows = self.instance.get_rows(real_table)
-            if existing_rows:
-                for _ in range(dup_count):
-                    self._generate_duplicate_row(real_table, column, existing_rows[0])
+            if not existing_rows:
+                continue
+            source = existing_rows[0]
+            dup_values = {}
+            for col in columns:
+                try:
+                    val = source[col]
+                except KeyError:
+                    continue
+                if val is not None and val.concrete is not None:
+                    dup_values[col] = val.concrete
+            if not dup_values:
+                continue
+            for _ in range(dup_count):
+                try:
+                    self.instance.create_row(real_table, values=dup_values)
+                except Exception:
+                    pass
 
     def _generate_null_row(self, table: str, null_column: str) -> None:
         """Generate a row with NULL in the specified column."""
@@ -969,19 +990,6 @@ class SymbolicEngine:
             self.instance.create_row(table, values={null_column: None})
         except Exception:
             pass  # Schema constraint may prevent NULL
-
-    def _generate_duplicate_row(self, table: str, dup_column: str, source_row) -> None:
-        """Generate a row with same value in dup_column as source_row."""
-        try:
-            source_val = source_row[dup_column]
-        except KeyError:
-            return
-        if source_val is None or source_val.concrete is None:
-            return
-        try:
-            self.instance.create_row(table, values={dup_column: source_val.concrete})
-        except Exception:
-            pass  # UNIQUE constraint may prevent duplicate
 
 
 # =============================================================================
