@@ -666,6 +666,7 @@ class SMTSolver:
             verbose: If True, log each added constraint via the ``parseval.smt`` logger.
             function_models: Optional custom function translators (list or dict).
             timeout_ms: Optional solver timeout in milliseconds.
+            instance: Optional Instance with .tables dict for column type resolution.
         """
         self.variables = variables
         self.verbose = verbose
