@@ -591,5 +591,37 @@ def test_in_list_single_pass_evaluation():
     assert solver is not None
 
 
+def test_declare_variable_creates_option_wrapped_z3_var():
+    """declare_variable returns an Option-wrapped Z3 variable stored in context."""
+    from parseval.solver.smt import SMTSolver
+
+    solver = SMTSolver(variables=[], timeout_ms=1000)
+    var = solver.declare_variable("t1[0].id", DataType.build("INT"))
+
+    # Should be Option-wrapped (DatatypeSortRef)
+    assert isinstance(var.sort(), z3.DatatypeSortRef)
+    # Should be stored in context
+    assert "t1[0].id" in solver.context.get("variable_to_z3", {})
+    # Calling again returns the same object
+    var2 = solver.declare_variable("t1[0].id", DataType.build("INT"))
+    assert var is var2
+
+
+def test_col_sort_datatype_resolves_from_instance():
+    """col_sort_datatype resolves DataType from Instance schema."""
+    from parseval.solver.smt import SMTSolver
+
+    class MockTables:
+        tables = {"users": {"id": "INTEGER", "name": "TEXT", "score": "REAL"}}
+
+    solver = SMTSolver(variables=[], timeout_ms=1000, instance=MockTables())
+
+    assert solver.col_sort_datatype("users", "id") == DataType.build("INTEGER")
+    assert solver.col_sort_datatype("users", "name") == DataType.build("TEXT")
+    assert solver.col_sort_datatype("users", "score") == DataType.build("REAL")
+    # Unknown column defaults to TEXT
+    assert solver.col_sort_datatype("users", "missing") == DataType.build("TEXT")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
