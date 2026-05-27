@@ -343,7 +343,12 @@ def _try_heuristic(
         expressions = atom.args.get("expressions") or []
         if isinstance(col, exp.Column) and expressions:
             table = _resolve_table(col, tables, instance)
-            values = [concrete(e) for e in expressions if concrete(e) is not None]
+            evaluated = []
+            for e in expressions:
+                val = concrete(e)
+                if val is not None:
+                    evaluated.append(val)
+            values = evaluated
             if target_outcome == BranchType.ATOM_TRUE and values:
                 return {table: {col.name: values[0]}}
             elif target_outcome == BranchType.ATOM_FALSE:
