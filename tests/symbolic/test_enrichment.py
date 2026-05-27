@@ -10,6 +10,41 @@ from parseval.symbolic.enrichment import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Integration tests: SymbolicEngine enrichment
+# ---------------------------------------------------------------------------
+
+
+def test_engine_generates_null_for_count_column():
+    """Engine should generate NULL values for COUNT(col) columns."""
+    from parseval.instance import Instance
+    from parseval.symbolic.engine import SymbolicEngine
+
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    engine = SymbolicEngine(instance, "SELECT COUNT(name) FROM t", dialect="sqlite")
+    result = engine.generate()
+
+    rows = instance.get_rows("t")
+    assert len(rows) > 0
+    has_null = any(r["name"].concrete is None for r in rows)
+    assert has_null, "Expected at least one NULL in name column for COUNT(name)"
+
+
+def test_engine_generates_duplicates_for_distinct():
+    """Engine should generate duplicate rows for DISTINCT queries."""
+    from parseval.instance import Instance
+    from parseval.symbolic.engine import SymbolicEngine
+
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    engine = SymbolicEngine(instance, "SELECT DISTINCT name FROM t", dialect="sqlite")
+    result = engine.generate()
+
+    rows = instance.get_rows("t")
+    assert len(rows) >= 2, "Expected at least 2 rows for DISTINCT testing"
+
+
 class TestEnrichmentTargets:
     def test_empty_plan(self):
         """Plan with no DISTINCT/GROUP BY/aggregates has no targets."""

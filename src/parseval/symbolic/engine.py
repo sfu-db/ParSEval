@@ -114,6 +114,9 @@ class SymbolicEngine:
         # predicates that the speculative layer cannot handle.
         self._smt_repair_where()
 
+        # Phase 0g: Targeted enrichment for DISTINCT/GROUP BY/aggregate patterns.
+        self._enrich_for_semantics()
+
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
         tree = evaluator.evaluate(tree)
@@ -929,6 +932,52 @@ class SymbolicEngine:
                 self.instance.create_row(child_table, values={child_fk: fk_value})
             except Exception:
                 pass
+
+    def _enrich_for_semantics(self) -> None:
+        """Generate additional rows with duplicates and NULLs to expose semantic differences."""
+        from .enrichment import analyze_plan_for_enrichment
+
+        targets = analyze_plan_for_enrichment(self.plan)
+        if not targets.duplicate_columns and not targets.null_columns:
+            return
+
+        # Generate rows with NULLs for COUNT/SUM/AVG columns
+        for table, column in targets.null_columns:
+            real_table = self.alias_map.get(table, table)
+            if real_table not in self.instance.tables:
+                continue
+            if not self.instance.nullable(real_table, column):
+                continue
+            self._generate_null_row(real_table, column)
+
+        # Generate duplicate rows for DISTINCT/GROUP BY columns
+        for table, column in targets.duplicate_columns:
+            real_table = self.alias_map.get(table, table)
+            if real_table not in self.instance.tables:
+                continue
+            existing_rows = self.instance.get_rows(real_table)
+            if existing_rows:
+                self._generate_duplicate_row(real_table, column, existing_rows[0])
+
+    def _generate_null_row(self, table: str, null_column: str) -> None:
+        """Generate a row with NULL in the specified column."""
+        try:
+            self.instance.create_row(table, values={null_column: None})
+        except Exception:
+            pass  # Schema constraint may prevent NULL
+
+    def _generate_duplicate_row(self, table: str, dup_column: str, source_row) -> None:
+        """Generate a row with same value in dup_column as source_row."""
+        try:
+            source_val = source_row[dup_column]
+        except KeyError:
+            return
+        if source_val is None or source_val.concrete is None:
+            return
+        try:
+            self.instance.create_row(table, values={dup_column: source_val.concrete})
+        except Exception:
+            pass  # UNIQUE constraint may prevent duplicate
 
 
 # =============================================================================
