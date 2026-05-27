@@ -837,6 +837,7 @@ class SMTSolver:
             return ("unsat", {})
 
         model = self.solver.model()
+        self.model = model
         solution = {}
         for var_name in var_symbols:
             z3_var = self.context.get("variable_to_z3", {}).get(var_name)
