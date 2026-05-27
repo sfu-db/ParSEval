@@ -272,7 +272,7 @@ class ConstraintCompiler:
             return True
         return bool(re.search(pattern, str(value)))
 
-def _intersect_preserving_order(
+    def _intersect_preserving_order(
         self, current: Iterable[Any], incoming: Iterable[Any]
     ) -> Tuple[Any, ...]:
         """Intersect two iterables, preserving the order of ``current``."""
