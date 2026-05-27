@@ -35,6 +35,119 @@ from .types import (
 )
 
 
+def _get_inner_query_values(
+    in_node: exp.In,
+    instance: Instance,
+    alias_map,
+) -> list:
+    """Evaluate the inner query of an IN expression against current instance.
+
+    Pure query execution — no Z3 involved. Returns list of concrete values
+    from the inner subquery's projected column.
+    """
+    from parseval.plan.rex import concrete, Environment
+    from parseval.helper import normalize_name
+
+    subq = in_node.find(exp.Subquery)
+    if not subq:
+        return []
+    inner_select = subq.this
+    if not isinstance(inner_select, exp.Select):
+        return []
+    from_clause = inner_select.args.get("from")
+    if not from_clause:
+        return []
+    from_table = from_clause.this
+    if not isinstance(from_table, exp.Table):
+        return []
+    table_name = normalize_name(from_table.alias_or_name)
+    table_name = alias_map.get(table_name, table_name)
+    if table_name not in instance.tables:
+        return []
+    projections = inner_select.expressions
+    if not projections:
+        return []
+    proj_col = None
+    for col in projections[0].find_all(exp.Column):
+        proj_col = normalize_name(col.name)
+        break
+    if not proj_col:
+        return []
+    rows = instance.get_rows(table_name)
+    where = inner_select.args.get("where")
+    values = []
+    for row in rows:
+        if where:
+            env = Environment({c: s.concrete for c, s in row.items()})
+            if concrete(where.this, env) is not True:
+                continue
+        if proj_col in row.columns:
+            v = row[proj_col].concrete
+            if v is not None:
+                values.append(v)
+    return values
+
+
+def _translate_non_subquery_parts(
+    smt, condition: exp.Expression, ctx: dict
+) -> None:
+    """Translate parts of a condition that don't contain subqueries."""
+    if isinstance(condition, exp.And):
+        _translate_non_subquery_parts(smt, condition.left, ctx)
+        _translate_non_subquery_parts(smt, condition.right, ctx)
+    elif isinstance(condition, exp.Paren):
+        _translate_non_subquery_parts(smt, condition.this, ctx)
+    elif not condition.find(exp.Subquery):
+        z3_p = smt.translate(condition, ctx=ctx)
+        if z3_p is not None:
+            smt.add_raw(z3_p)
+
+
+def _add_not_in_constraints(
+    smt, condition: exp.Expression, ctx: dict, instance: Instance, alias_map
+) -> None:
+    """Add NOT IN anti-value constraints from a condition."""
+    from parseval.helper import normalize_name
+    from parseval.solver.smt import encode_literal
+    from sqlglot.expressions import DataType
+
+    for in_node in condition.find_all(exp.In):
+        if not in_node.find(exp.Subquery):
+            continue
+        parent = in_node.parent
+        is_not_in = isinstance(parent, exp.Not)
+        if not is_not_in:
+            continue
+        outer_col = in_node.this
+        if not isinstance(outer_col, exp.Column):
+            continue
+        col_name = normalize_name(outer_col.name)
+        alias_key = (
+            f"{normalize_name(outer_col.table)}.{col_name}"
+            if outer_col.table
+            else None
+        )
+        var = ctx.get(alias_key) if alias_key else None
+        if var is None:
+            for k, v in ctx.items():
+                if k.endswith(f".{col_name}"):
+                    var = v
+                    break
+        if var is None:
+            continue
+        inner_vals = _get_inner_query_values(in_node, instance, alias_map)
+        col_type = DataType.build(str(instance.tables.get(
+            alias_map.get(normalize_name(outer_col.table or ""), ""),
+            {}
+        ).get(col_name, "TEXT")))
+        for v in inner_vals:
+            try:
+                const = encode_literal(col_type, v, smt.z3ctx).expr
+                smt.add_raw(var != const)
+            except Exception:
+                pass
+
+
 class SymbolicEngine:
     """Drive test-database generation to cover all branches of a query plan.
 
@@ -468,14 +581,14 @@ class SymbolicEngine:
             if result is True:
                 continue
 
-            # Not satisfied — use UExprToConstraint with per-alias awareness
+            # Not satisfied — use SMTSolver with per-alias awareness
             try:
-                from .uexpr import UExprToConstraint
-                uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
+                from parseval.solver.smt import SMTSolver
 
-                # Build per-alias Z3 context
-                import z3
+                smt = SMTSolver(variables=[], timeout_ms=10000, instance=self.instance)
                 ctx: Dict[str, Any] = {}
+                var_symbols: Dict[str, Any] = {}
+
                 # Include all aliases involved in JOINs with WHERE aliases
                 all_aliases = set(aliases_in_condition)
                 for jstep in self.plan.ordered_steps:
@@ -488,6 +601,7 @@ class SymbolicEngine:
                             all_aliases.add(src_alias)
                             all_aliases.add(jn_alias)
 
+                # Declare per-alias variables
                 for alias in all_aliases:
                     table = normalize_name(self.alias_map.get(alias, alias))
                     if table not in self.instance.tables:
@@ -499,63 +613,62 @@ class SymbolicEngine:
                     row = rows[row_idx]
                     for col_name, sym in row.items():
                         var_name = f"{alias}[{row_idx}].{col_name}"
-                        var = uexpr._declare_var(var_name, table, col_name)
+                        datatype = smt.col_sort_datatype(table, col_name)
+                        var = smt.declare_variable(var_name, datatype)
                         ctx[f"{alias}.{col_name}"] = var
-                        uexpr._var_to_symbol[var_name] = sym
+                        var_symbols[var_name] = sym
 
-                # Translate and solve (handle subquery-containing conditions)
+                # Translate and solve
                 if has_subquery:
-                    # Only translate non-subquery conjuncts
-                    uexpr._translate_non_subquery_parts_to_solver(condition, ctx)
-                    # Handle NOT IN: add anti-value constraints
-                    uexpr._add_not_in_constraints(condition, ctx)
+                    _translate_non_subquery_parts(smt, condition, ctx)
+                    _add_not_in_constraints(smt, condition, ctx, self.instance, self.alias_map)
                 else:
-                    z3_pred = uexpr._translate(condition, ctx)
+                    z3_pred = smt.translate(condition, ctx=ctx)
                     if z3_pred is not None:
-                        uexpr.solver.add(z3_pred)
+                        smt.add_raw(z3_pred)
 
-                if True:  # always add JOIN + distinctness
+                # Add JOIN constraints between aliases
+                for jstep in self.plan.ordered_steps:
+                    if not isinstance(jstep, Join):
+                        continue
+                    src_alias = normalize_name(jstep.source_name or jstep.name)
+                    for jn, jd in (jstep.joins or {}).items():
+                        jn_alias = normalize_name(jn)
+                        for sk, jk in zip(jd.get("source_key", []), jd.get("join_key", [])):
+                            sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
+                            jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
+                            sk_key = f"{src_alias}.{sk_name}"
+                            jk_key = f"{jn_alias}.{jk_name}"
+                            if sk_key in ctx and jk_key in ctx:
+                                try:
+                                    smt.add_raw(ctx[sk_key] == ctx[jk_key])
+                                except Exception:
+                                    pass
 
-                    # Add JOIN constraints between aliases
-                    for jstep in self.plan.ordered_steps:
-                        if not isinstance(jstep, Join):
-                            continue
-                        src_alias = normalize_name(jstep.source_name or jstep.name)
-                        for jn, jd in (jstep.joins or {}).items():
-                            jn_alias = normalize_name(jn)
-                            for sk, jk in zip(jd.get("source_key", []), jd.get("join_key", [])):
-                                sk_name = normalize_name(sk.name if hasattr(sk, "name") else str(sk))
-                                jk_name = normalize_name(jk.name if hasattr(jk, "name") else str(jk))
-                                sk_key = f"{src_alias}.{sk_name}"
-                                jk_key = f"{jn_alias}.{jk_name}"
-                                if sk_key in ctx and jk_key in ctx:
+                # Self-join: distinct PK values
+                for table, aliases in self.alias_map.self_join_tables().items():
+                    active = [a for a in aliases if a in aliases_in_condition]
+                    if len(active) < 2:
+                        continue
+                    pk_col = next(
+                        (c for c in self.instance.tables.get(table, {}) if 'id' in c.lower()),
+                        None
+                    )
+                    if pk_col:
+                        for i in range(len(active)):
+                            for j in range(i + 1, len(active)):
+                                ki = f"{active[i]}.{pk_col}"
+                                kj = f"{active[j]}.{pk_col}"
+                                if ki in ctx and kj in ctx:
                                     try:
-                                        uexpr.solver.add(ctx[sk_key] == ctx[jk_key])
+                                        smt.add_raw(ctx[ki] != ctx[kj])
                                     except Exception:
                                         pass
 
-                    # Self-join: distinct PK values
-                    for table, aliases in self.alias_map.self_join_tables().items():
-                        active = [a for a in aliases if a in aliases_in_condition]
-                        if len(active) < 2:
-                            continue
-                        pk_col = next(
-                            (c for c in self.instance.tables.get(table, {}) if 'id' in c.lower()),
-                            None
-                        )
-                        if pk_col:
-                            for i in range(len(active)):
-                                for j in range(i + 1, len(active)):
-                                    ki = f"{active[i]}.{pk_col}"
-                                    kj = f"{active[j]}.{pk_col}"
-                                    if ki in ctx and kj in ctx:
-                                        try:
-                                            uexpr.solver.add(ctx[ki] != ctx[kj])
-                                        except Exception:
-                                            pass
-
-                    if uexpr.solver.check() == z3.sat:
-                        uexpr._apply_model(uexpr.solver.model())
+                # Solve and apply
+                status, solution = smt.solve_raw(var_symbols)
+                if status == "sat":
+                    SMTSolver.apply_solution(var_symbols, solution)
             except Exception:
                 pass
 
@@ -821,9 +934,7 @@ class SymbolicEngine:
                 continue
 
             # Get inner query values
-            from .uexpr import UExprToConstraint
-            uexpr = UExprToConstraint(self.plan, self.instance, self.dialect)
-            inner_vals = set(uexpr._get_inner_query_values(in_node))
+            inner_vals = set(_get_inner_query_values(in_node, self.instance, self.alias_map))
 
             # Find a value not in inner_vals and set it on the first row
             row = rows[0]
