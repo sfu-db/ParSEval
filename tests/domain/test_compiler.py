@@ -107,5 +107,24 @@ def test_intersect_preserving_order_method():
     result = compiler._intersect_preserving_order([1, 2, 3], [2, 3, 4])
     assert result == (2, 3)
 
+def test_pattern_constraint_precompiled():
+    """PatternConstraint should pre-compile the regex, not recompile on each validate()."""
+    from parseval.domain.compiler import ConstraintValidator, ColumnDomainPlan
+    import re
+
+    plan = ColumnDomainPlan(
+        pattern=r"^[a-z]+$", nullable=True
+    )
+    validator = ConstraintValidator()
+
+    # Should work correctly
+    validator.validate(plan, "abc", "test_col")
+
+    # Should raise on non-match
+    import pytest
+    with pytest.raises(Exception):
+        validator.validate(plan, "123", "test_col")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,13 @@ class ColumnDomainPlan:
     # Opaque predicates that must be checked after generation (CheckConstraint lambdas)
     residual_predicates: Tuple[Callable[[Any], bool], ...] = field(default_factory=tuple)
 
+    # Pre-compiled regex for pattern validation (not passed to constructor)
+    _compiled_pattern: Optional[re.Pattern] = field(default=None, repr=False, init=False)
+
+    def __post_init__(self):
+        if self.pattern is not None and self._compiled_pattern is None:
+            object.__setattr__(self, '_compiled_pattern', re.compile(self.pattern))
+
 
 class ConstraintCompiler:
     """Compiles ColumnSpec constraints into a normalized ColumnDomainPlan.
@@ -343,8 +350,8 @@ class ConstraintValidator:
                 pass
 
         # 5. Pattern
-        if plan.pattern is not None:
-            if not re.search(plan.pattern, str(value)):
+        if plan._compiled_pattern is not None:
+            if not plan._compiled_pattern.search(str(value)):
                 raise ConstraintViolationError(f"Value {value!r} for {column_name} does not match pattern {plan.pattern}")
 
         if plan.prefix is not None and not str(value).startswith(plan.prefix):
