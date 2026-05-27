@@ -68,6 +68,8 @@ from sqlglot import exp, generator
 from sqlglot.executor.env import ENV as _SQLGLOT_ENV
 from sqlglot.optimizer.simplify import simplify
 
+import functools
+
 from parseval.dtype import DataType
 from parseval.helper import like_to_pattern, normalize_name
 
@@ -959,15 +961,21 @@ def _eval_ilike(node: exp.ILike, env: Environment) -> Optional[bool]:
     return _like(_eval(node.this, env), _eval(node.expression, env), case_insensitive=True)
 
 
+@functools.lru_cache(maxsize=256)
+def _cached_like_pattern(pattern: str, case_insensitive: bool):
+    """Cache compiled LIKE patterns — they're fixed per AST node."""
+    compiled = like_to_pattern(pattern)
+    if case_insensitive:
+        return re.compile(compiled.pattern, re.IGNORECASE)
+    return compiled
+
+
 def _like(value: Any, pattern: Any, *, case_insensitive: bool) -> Optional[bool]:
     if value is None or pattern is None:
         return None
     try:
-        compiled = like_to_pattern(str(pattern))
-        text = str(value)
-        if case_insensitive:
-            text = text.lower()
-        return bool(compiled.match(text))
+        compiled = _cached_like_pattern(str(pattern), case_insensitive)
+        return bool(compiled.match(str(value)))
     except re.error:  # pragma: no cover - defensive
         return False
 

@@ -606,5 +606,23 @@ class TestRealisticExpressions(unittest.TestCase):
         self.assertIsNone(concrete(expr))
 
 
+def test_like_pattern_cached():
+    """like_to_pattern should be called once per unique pattern, not per row."""
+    from unittest.mock import patch
+
+    import parseval.plan.rex as rex_module
+    from parseval.plan.rex import _like
+
+    # First call should compile the pattern
+    result1 = _like("hello", "%ell%", case_insensitive=False)
+    assert result1 is True
+
+    # Second call with same pattern should reuse cached result
+    with patch.object(rex_module, "like_to_pattern") as mock_compile:
+        result2 = _like("world", "%ell%", case_insensitive=False)
+        # like_to_pattern should NOT be called again for same pattern
+        mock_compile.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
