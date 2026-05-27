@@ -251,5 +251,27 @@ class TestTreeShape(unittest.TestCase):
             # print(f"Plan for query {index}:\n{plan}\n")
             # break
 
+def test_topological_order_preserved_with_heap():
+    """Topological order should be correct after switching to heapq."""
+    from parseval.plan.planner import Plan, _topological_order
+    from sqlglot import parse_one
+
+    sql = "SELECT a FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.x > 0 ORDER BY a LIMIT 5"
+    plan = Plan(parse_one(sql))
+    ordered = _topological_order(plan)
+
+    # Verify all steps are present
+    step_types = [type(s).__name__ for s in ordered]
+    assert "Scan" in step_types
+    assert "Project" in step_types
+
+    # Verify topological order: dependencies before dependents
+    step_to_idx = {id(s): i for i, s in enumerate(ordered)}
+    for step in ordered:
+        for dep in step.dependencies:
+            assert step_to_idx[id(dep)] < step_to_idx[id(step)], \
+                f"{type(dep).__name__} must come before {type(step).__name__}"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,7 @@ subquery do so by walking ``subplan.inner`` explicitly.
 from __future__ import annotations
 
 import enum
+import heapq
 import math
 import typing as t
 from dataclasses import dataclass, field
@@ -1255,20 +1256,19 @@ def _topological_order(plan: "Plan") -> t.List["Step"]:
     indegree: t.Dict["Step", int] = {
         step: len(step.dependencies) for step in plan.dag
     }
-    ready: t.List["Step"] = sorted(
-        [step for step, degree in indegree.items() if degree == 0],
-        key=sort_key,
-    )
+    heap = [
+        (sort_key(step), step)
+        for step, degree in indegree.items() if degree == 0
+    ]
+    heapq.heapify(heap)
     ordered: t.List["Step"] = []
-    while ready:
-        current = ready.pop(0)
+    while heap:
+        _, current = heapq.heappop(heap)
         ordered.append(current)
-        newly_ready: t.List["Step"] = []
-        for dependent in sorted(current.dependents, key=sort_key):
+        for dependent in current.dependents:
             if dependent not in indegree:
                 continue
             indegree[dependent] -= 1
             if indegree[dependent] == 0:
-                newly_ready.append(dependent)
-        ready = sorted(ready + newly_ready, key=sort_key)
+                heapq.heappush(heap, (sort_key(dependent), dependent))
     return ordered
