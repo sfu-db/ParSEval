@@ -683,6 +683,7 @@ class SMTSolver:
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False
         self.constrained_var_names = set()
+        self._translate_ctx = None
         self.function_models = self._build_function_models(function_models)
         self.core_registry = self._build_core_registry()
 
@@ -769,6 +770,40 @@ class SMTSolver:
             return DataType.build("TEXT")
         col_type = str(self.instance.tables.get(table, {}).get(col, "TEXT"))
         return DataType.build(col_type)
+
+    def translate(
+        self, expr: exp.Expression, ctx: Optional[Dict[str, z3.ExprRef]] = None
+    ) -> Optional[z3.BoolRef]:
+        """Translate a sqlglot AST expression to Z3.
+
+        If ctx is provided, Column nodes are resolved from ctx (keyed as
+        "normalized_table.normalized_name") before the solver's default context.
+        Returns a raw z3.BoolRef, or None on failure.
+        """
+        self._translate_ctx = ctx
+        try:
+            result = self._to_z3_expr(expr, ctx=ctx)
+            if isinstance(result, SMTValue):
+                return self._as_predicate(result)
+            return result
+        except Exception:
+            return None
+        finally:
+            self._translate_ctx = None
+
+    def _infer_type_info(self, col: exp.Column) -> SMTTypeInfo:
+        """Infer SMTTypeInfo for a Column, using its .type attribute or Instance schema."""
+        dtype = getattr(col, "type", None)
+        if dtype is None or str(dtype) in ("", "UNKNOWN"):
+            if self.instance is not None:
+                from parseval.helper import normalize_name
+                table = normalize_name(col.table or "")
+                name = normalize_name(col.name)
+                if table in self.instance.tables and name in self.instance.tables[table]:
+                    dtype = DataType.build(str(self.instance.tables[table][name]))
+            if dtype is None or str(dtype) in ("", "UNKNOWN"):
+                dtype = DataType.build("TEXT")
+        return normalize_dtype(dtype, self.z3ctx)
 
     def add(self, constraint, track_vars: bool = True):
         """Add a constraint expression to the Z3 solver.
@@ -1374,15 +1409,29 @@ class SMTSolver:
         args = [self._to_z3_expr(arg) for arg in self._function_args(expression) if arg is not None]
         return model.translator(self, expression, args)
 
-    def _to_z3_expr(self, condition: exp.Expression):
+    def _to_z3_expr(self, condition: exp.Expression, ctx: Optional[Dict[str, z3.ExprRef]] = None):
         """Recursively translate a sqlglot AST node into a Z3 expression.
 
         Handles: Paren, Column, Null, Boolean, Literal, Const, and any
         node matching a registered special function or core registry key.
         """
+        # Use explicit ctx or fall back to instance-level context set by translate()
+        effective_ctx = ctx if ctx is not None else getattr(self, '_translate_ctx', None)
         if isinstance(condition, exp.Paren):
-            return self._to_z3_expr(condition.this)
+            return self._to_z3_expr(condition.this, ctx=effective_ctx)
         if isinstance(condition, exp.Column):
+            # Check caller's context first
+            if effective_ctx is not None:
+                from parseval.helper import normalize_name
+                col_key = (
+                    f"{normalize_name(condition.table)}.{normalize_name(condition.name)}"
+                    if condition.table
+                    else normalize_name(condition.name)
+                )
+                if col_key in effective_ctx:
+                    raw = effective_ctx[col_key]
+                    type_info = self._infer_type_info(condition)
+                    return SMTValue(raw, type_info)
             return self._declare_or_get_column(condition)
         if isinstance(condition, exp.Null):
             dtype = condition.args.get("_type") or DataType.build("NULL")
