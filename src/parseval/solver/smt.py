@@ -780,16 +780,90 @@ class SMTSolver:
         "normalized_table.normalized_name") before the solver's default context.
         Returns a raw z3.BoolRef, or None on failure.
         """
+        prev_ctx = self._translate_ctx
         self._translate_ctx = ctx
         try:
             result = self._to_z3_expr(expr, ctx=ctx)
             if isinstance(result, SMTValue):
                 return self._as_predicate(result)
             return result
-        except Exception:
+        except Exception as e:
+            logger.debug("translate failed: %s", e)
             return None
         finally:
-            self._translate_ctx = None
+            self._translate_ctx = prev_ctx
+
+    def add_raw(self, constraint: z3.BoolRef) -> None:
+        """Add a raw Z3 boolean expression directly to the solver.
+
+        Unlike add(), this does not convert SMTValue or track variables
+        via get_vars. Use for constraints built outside translate()
+        (e.g., JOIN equalities between declared variables).
+        """
+        self.solver.add(constraint)
+
+    def _infer_type_from_context(self, var_name: str) -> Optional[SMTTypeInfo]:
+        """Infer SMTTypeInfo for a declared variable from its _VarRef in context."""
+        ref = self.context.get("z3_to_variable", {}).get(var_name)
+        if ref is not None and hasattr(ref, "type"):
+            return normalize_dtype(ref.type, self.z3ctx)
+        return None
+
+    def solve_raw(
+        self, var_symbols: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Solve and extract values for variables declared via declare_variable.
+
+        Args:
+            var_symbols: Maps variable name (str) to Variable symbol.
+                Only variables in this dict are extracted from the model.
+
+        Returns:
+            ("sat", {var_name: python_value}) or ("unsat", {})
+        """
+        if not self._domain_constraints_applied:
+            for var_name, z3var in self.context.get("variable_to_z3", {}).items():
+                typeinfo = self._infer_type_from_context(var_name)
+                if typeinfo is not None:
+                    if typeinfo.family in {"date", "time", "datetime", "timestamp"}:
+                        self._ensure_temporal_bounds(z3var, typeinfo)
+                    if typeinfo.family == "text":
+                        self._ensure_str_printable(z3var)
+                        self._ensure_str_length(z3var, 0)
+            self._domain_constraints_applied = True
+
+        status = self.solver.check()
+        if status != z3.sat:
+            return ("unsat", {})
+
+        model = self.solver.model()
+        solution = {}
+        for var_name in var_symbols:
+            z3_var = self.context.get("variable_to_z3", {}).get(var_name)
+            if z3_var is None:
+                continue
+            z3_val = model.evaluate(z3_var, model_completion=True)
+            python_val = self._z3_to_python(z3_val, var_name)
+            if python_val is not None:
+                solution[var_name] = python_val
+        return ("sat", solution)
+
+    @staticmethod
+    def apply_solution(
+        var_symbols: Dict[str, Any], solution: Dict[str, Any]
+    ) -> None:
+        """Write solution values back into Variable symbols.
+
+        Args:
+            var_symbols: Maps variable name -> Variable symbol (has .set method).
+            solution: Maps variable name -> Python value (from solve_raw).
+        """
+        for var_name, value in solution.items():
+            sym = var_symbols.get(var_name)
+            if sym is not None and value is not None:
+                sym.set("concrete", value)
+                sym.set("is_bound", True)
+                sym.set("is_null", False)
 
     def _infer_type_info(self, col: exp.Column) -> SMTTypeInfo:
         """Infer SMTTypeInfo for a Column, using its .type attribute or Instance schema."""

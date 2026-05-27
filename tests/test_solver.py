@@ -646,5 +646,46 @@ def test_translate_with_custom_context():
     assert z3.is_bool(result)
 
 
+def test_add_raw_and_solve_raw():
+    """add_raw adds constraints directly; solve_raw extracts solutions."""
+    solver = SMTSolver(variables=[], timeout_ms=5000)
+
+    var_a = solver.declare_variable("t[0].x", DataType.build("INT"))
+    var_b = solver.declare_variable("t[0].y", DataType.build("INT"))
+
+    # Add constraint: t[0].x = 42 (Option-wrapped)
+    const_42 = encode_literal(DataType.build("INT"), 42).expr
+    solver.add_raw(var_a == const_42)
+
+    # Add constraint: t[0].y = t[0].x (Option equality)
+    solver.add_raw(var_b == var_a)
+
+    var_symbols = {"t[0].x": None, "t[0].y": None}
+    status, solution = solver.solve_raw(var_symbols)
+
+    assert status == "sat"
+    assert solution.get("t[0].x") == 42
+    assert solution.get("t[0].y") == 42
+
+
+def test_apply_solution():
+    """apply_solution writes values into Variable symbols."""
+    class FakeSymbol:
+        def __init__(self):
+            self.values = {}
+        def set(self, key, val):
+            self.values[key] = val
+
+    sym_x = FakeSymbol()
+    sym_y = FakeSymbol()
+    var_symbols = {"t[0].x": sym_x, "t[0].y": sym_y}
+    solution = {"t[0].x": 42, "t[0].y": 99}
+
+    SMTSolver.apply_solution(var_symbols, solution)
+
+    assert sym_x.values == {"concrete": 42, "is_bound": True, "is_null": False}
+    assert sym_y.values == {"concrete": 99, "is_bound": True, "is_null": False}
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
