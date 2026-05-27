@@ -3,7 +3,6 @@ from __future__ import annotations
 import string
 from typing import Any, Optional
 
-from ..coercion import coerce_reference_value
 from ..compiler import ColumnDomainPlan
 from parseval.dtype import DataType
 from ..types import TypeFamily, TypeProfile
@@ -27,12 +26,9 @@ class StringProvider(ValueProvider):
         null_rate: float = 0.0,
     ) -> Any:
         state = runtime.column_state(spec.table, spec.column)
-        if spec.foreign_key:
-            referenced = runtime.referenced_values(spec)
-            if referenced:
-                return coerce_reference_value(
-                    runtime.rng.choice(referenced), spec.datatype, dialect=spec.dialect
-                )
+        fk_value = self._resolve_foreign_key(spec, runtime)
+        if fk_value is not None:
+            return fk_value
 
         # Use domain_plan if available
         if domain_plan and domain_plan.allowed_values:

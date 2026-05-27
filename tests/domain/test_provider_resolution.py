@@ -47,5 +47,11 @@ class ProviderResolutionTests(unittest.TestCase):
         self.assertEqual(provider.__class__.__name__, "EnumProvider")
 
 
+def test_fk_resolution_in_base_provider():
+    """Base ValueProvider should have a helper for FK resolution."""
+    from parseval.domain.providers.base import ValueProvider
+    assert hasattr(ValueProvider, '_resolve_foreign_key')
+
+
 if __name__ == "__main__":
     unittest.main()
