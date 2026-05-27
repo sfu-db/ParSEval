@@ -623,5 +623,28 @@ def test_col_sort_datatype_resolves_from_instance():
     assert solver.col_sort_datatype("users", "missing") == DataType.build("TEXT")
 
 
+def test_translate_with_custom_context():
+    """translate() uses caller-provided variable context for Column resolution."""
+    solver = SMTSolver(variables=[], timeout_ms=1000)
+
+    # Declare variables with custom names
+    var_a = solver.declare_variable("alias1[0].x", DataType.build("INT"))
+    var_b = solver.declare_variable("alias2[1].x", DataType.build("INT"))
+
+    ctx = {"alias1.x": var_a, "alias2.x": var_b}
+
+    # Build: alias1.x = alias2.x
+    col_a = exp.column("x", "alias1")
+    col_a.set("type", DataType.build("INT"))
+    col_b = exp.column("x", "alias2")
+    col_b.set("type", DataType.build("INT"))
+    eq_expr = exp.EQ(this=col_a, expression=col_b)
+
+    result = solver.translate(eq_expr, ctx=ctx)
+    assert result is not None
+    # Result should be a Z3 BoolRef
+    assert z3.is_bool(result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
