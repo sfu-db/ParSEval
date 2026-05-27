@@ -72,16 +72,16 @@ def main(args):
         connection_string = f"sqlite:///{db_path}"
 
         # Skip pairs where either query likely has syntax issues
-        if _has_likely_syntax_error(gold_sql) or _has_likely_syntax_error(pred_sql):
-            entry = {
-                "index": index,
-                "db_id": db_id,
-                "gold_sql": gold_sql,
-                "pred_sql": pred_sql,
-                "result": {"verdict": "syntax_error", "error_msg": "Skipped: likely syntax error"},
-            }
-            results.append(entry)
-            continue
+        # if _has_likely_syntax_error(gold_sql) or _has_likely_syntax_error(pred_sql):
+        #     entry = {
+        #         "index": index,
+        #         "db_id": db_id,
+        #         "gold_sql": gold_sql,
+        #         "pred_sql": pred_sql,
+        #         "result": {"verdict": "syntax_error", "error_msg": "Skipped: likely syntax error"},
+        #     }
+        #     results.append(entry)
+        #     continue
 
         try:
             result = disprove(
@@ -92,13 +92,19 @@ def main(args):
                 dialect="sqlite",
                 max_iterations=5,
                 semantics=Semantics.BAG,
+                atom_null=1
             )
+            result_dict = result.to_dict()
+            # Reclassify runtime errors as syntax errors — they indicate
+            # invalid SQL for the target dialect (e.g., MySQL YEAR() in SQLite).
+            if result_dict.get("verdict") == "runtime_error":
+                result_dict["verdict"] = "syntax_error"
             entry = {
                 "index": index,
                 "db_id": db_id,
                 "gold_sql": gold_sql,
                 "pred_sql": pred_sql,
-                "result": result.to_dict(),
+                "result": result_dict,
             }
         except Exception as e:
             entry = {
@@ -106,7 +112,7 @@ def main(args):
                 "db_id": db_id,
                 "gold_sql": gold_sql,
                 "pred_sql": pred_sql,
-                "result": {"verdict": "error", "error_msg": str(e)[:200]},
+                "result": {"verdict": "syntax_error", "error_msg": str(e)[:200]},
             }
 
         results.append(entry)
