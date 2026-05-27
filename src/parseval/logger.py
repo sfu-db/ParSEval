@@ -37,7 +37,6 @@ COMPONENTS = {
     "instance": "Instance row management",
     "db": "Database operations (dump/execute)",
     "coverage": "Branch coverage tracking",
-    "uexpr": "UExprToConstraint SMT solving",
 }
 
 _configured = False
