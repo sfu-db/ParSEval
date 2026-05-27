@@ -50,9 +50,15 @@ def _collect_distinct_targets(
 ) -> None:
     """Collect projected columns as duplicate targets for DISTINCT."""
     annotation = plan.annotation_for(step)
+    # Build a map of column name -> table from referenced columns
+    col_table_map: dict[str, str] = {}
+    for col in annotation.referenced_columns:
+        if col.table:
+            col_table_map[col.name] = col.table
+
+    fallback_table = annotation.source_tables[0] if annotation.source_tables else ""
     for col in annotation.projected_columns:
-        # Resolve to table.column
-        table = annotation.source_tables[0] if annotation.source_tables else ""
+        table = col_table_map.get(col, fallback_table)
         targets.duplicate_columns.append((table, col))
 
 
@@ -69,11 +75,17 @@ def _collect_aggregate_targets(
     # Detect COUNT(*) synthetic aliases: the planner rewrites COUNT(*)
     # into COUNT("_a_N") and records the Star->alias mapping in operands.
     star_aliases: set[str] = set()
+    # Detect COUNT(DISTINCT col) aliases: the planner rewrites
+    # COUNT(DISTINCT a) into COUNT("_a_N") with operand DISTINCT a AS _a_N.
+    distinct_aliases: set[str] = set()
     for operand in step.operands:
-        if isinstance(operand, exp.Alias) and isinstance(operand.this, exp.Star):
-            star_aliases.add(operand.alias)
+        if isinstance(operand, exp.Alias):
+            if isinstance(operand.this, exp.Star):
+                star_aliases.add(operand.alias)
+            elif isinstance(operand.this, exp.Distinct):
+                distinct_aliases.add(operand.alias)
 
-    # Aggregate operands need NULLs (except COUNT(*))
+    # Aggregate operands need NULLs (except COUNT(*) and COUNT(DISTINCT col))
     for agg_expr in step.aggregations:
         for agg_func in agg_expr.find_all(exp.Func):
             func_name = agg_func.sql_name().upper()
@@ -83,6 +95,9 @@ def _collect_aggregate_targets(
                     if isinstance(operand, exp.Column):
                         # Skip COUNT(*) -- the column is a synthetic alias
                         if func_name == "COUNT" and operand.name in star_aliases:
+                            continue
+                        # Skip COUNT(DISTINCT col) -- DISTINCT ignores NULLs
+                        if func_name == "COUNT" and operand.name in distinct_aliases:
                             continue
                         table = operand.table or ""
                         targets.null_columns.append((table, operand.name))
