@@ -92,7 +92,8 @@ def main(args):
                 dialect="sqlite",
                 max_iterations=5,
                 semantics=Semantics.BAG,
-                atom_null=1
+                atom_null=1,
+                atom_dup=3
             )
             result_dict = result.to_dict()
             # Reclassify runtime errors as syntax errors — they indicate

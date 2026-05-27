@@ -162,6 +162,7 @@ class CoverageThresholds:
     group_multi: int = 1
     distinct_unique: int = 0
     distinct_duplicate: int = 0
+    atom_dup: int = 1
 
     def threshold_for(self, branch_type: BranchType) -> int:
         return getattr(self, branch_type.value, 0)
