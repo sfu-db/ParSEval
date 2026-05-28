@@ -446,6 +446,16 @@ class Propagator:
                 spec.require(pred.table).not_null.add(pred.column)
             else:
                 spec.require(pred.table).predicates.append((pred.column, pred.op, pred.value))
+        # Extract upper bound for BETWEEN (lowering returns >= for low bound)
+        for atom in condition.find_all(exp.Between):
+            col = atom.this
+            high = atom.args.get("high")
+            if isinstance(col, exp.Column) and isinstance(high, exp.Literal):
+                table = self._resolve_table(col.table if hasattr(col, 'table') else "")
+                matched = self._match_column(table, col.name)
+                if matched:
+                    high_val = concrete(high)
+                    spec.require(table).predicates.append((matched, "<=", high_val))
 
     def _is_self_join_table(self, table: str) -> bool:
         """Check if a table is involved in a self-join."""
@@ -868,14 +878,61 @@ class Resolver:
                 row[col] = shared[key]
         # Fixed values override equivalences (WHERE constraints are more specific).
         row.update(req.fixed_values)
-        # Predicates (only for columns not already set).
+        # Predicates: collect per-column, then satisfy all.
+        col_preds: Dict[str, List[Tuple[str, Any]]] = {}
         for col, op, value in req.predicates:
             if col not in row:
-                row[col] = self._satisfy(op, value)
+                col_preds.setdefault(col, []).append((op, value))
+        for col, preds in col_preds.items():
+            row[col] = self._satisfy_all(preds)
         # Must NULL.
         for col in req.must_null:
             row[col] = None
         return row
+
+    def _satisfy_all(self, preds: List[Tuple[str, Any]]) -> Any:
+        """Satisfy all predicates for a single column.
+
+        For numeric ranges, finds a value satisfying all bounds.
+        For mixed predicates, satisfies the first and hopes for the best.
+        """
+        if not preds:
+            return None
+        if len(preds) == 1:
+            return self._satisfy(preds[0][0], preds[0][1])
+
+        # Separate into lower bounds, upper bounds, and other
+        lower = []  # (op, value) where op is > or >=
+        upper = []  # (op, value) where op is < or <=
+        other = []
+
+        for op, value in preds:
+            if op in (">", ">=") and isinstance(value, (int, float)):
+                lower.append((op, value))
+            elif op in ("<", "<=") and isinstance(value, (int, float)):
+                upper.append((op, value))
+            else:
+                other.append((op, value))
+
+        # If we have both lower and upper bounds, find a value in range
+        if lower and upper:
+            lo_val = max(v for _, v in lower)
+            lo_op = ">" if any(op == ">" for op, v in lower if v == lo_val) else ">="
+            hi_val = min(v for _, v in upper)
+            hi_op = "<" if any(op == "<" for op, v in upper if v == hi_val) else "<="
+
+            # Adjust for strict inequalities
+            if lo_op == ">":
+                lo_val = lo_val + 1
+            if hi_op == "<":
+                hi_val = hi_val - 1
+
+            if lo_val <= hi_val:
+                mid = (lo_val + hi_val) // 2 if isinstance(lo_val, int) else (lo_val + hi_val) / 2
+                return mid
+
+        # Fallback: satisfy the first predicate
+        return self._satisfy(preds[0][0], preds[0][1])
 
     def _satisfy(self, op: str, value: Any) -> Any:
         """Generate a value satisfying the predicate."""
@@ -889,6 +946,14 @@ class Resolver:
             return value
         if op == "=":
             return value
+        if op == "!=":
+            if isinstance(value, (int, float)):
+                return value + 1
+            if isinstance(value, str):
+                return value + "_neq"
+            return value
+        if op == "in":
+            return value  # lowering already picks first value
         return value
 
 
