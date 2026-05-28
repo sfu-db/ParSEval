@@ -61,5 +61,50 @@ class TestExistsEvaluation(unittest.TestCase):
         self.assertIn(BranchType.EXISTS_FALSE, outcomes)
 
 
+class TestInEvaluation(unittest.TestCase):
+    def test_in_records_match_when_value_in_set(self):
+        """IN should record IN_MATCH when outer value is in inner result set."""
+        instance = Instance(ddls=SCHEMA, name="test", dialect="sqlite")
+        instance.create_row("t2", values={"x": 1, "y": 10})
+        instance.create_row("t2", values={"x": 2, "y": 20})
+        instance.create_row("t1", values={"x": 1})  # x=1 is in t2.x
+
+        sql = "SELECT * FROM t1 WHERE t1.x IN (SELECT t2.x FROM t2)"
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance, "sqlite")
+        tree = BranchTree(thresholds=CoverageThresholds(in_match=1, in_no_match=1))
+
+        tree = evaluator.evaluate(tree)
+
+        in_nodes = [n for n in tree.nodes if n.site == "in"]
+        self.assertTrue(len(in_nodes) > 0, "No IN branch node found")
+
+        in_node = in_nodes[0]
+        outcomes = in_node.observed_outcomes(0)
+        self.assertIn(BranchType.IN_MATCH, outcomes)
+
+    def test_in_records_no_match_when_value_not_in_set(self):
+        """IN should record IN_NO_MATCH when outer value is not in inner result set."""
+        instance = Instance(ddls=SCHEMA, name="test", dialect="sqlite")
+        instance.create_row("t2", values={"x": 1, "y": 10})
+        instance.create_row("t1", values={"x": 999})  # x=999 not in t2.x
+
+        sql = "SELECT * FROM t1 WHERE t1.x IN (SELECT t2.x FROM t2)"
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        evaluator = PlanEvaluator(plan, instance, "sqlite")
+        tree = BranchTree(thresholds=CoverageThresholds(in_match=1, in_no_match=1))
+
+        tree = evaluator.evaluate(tree)
+
+        in_nodes = [n for n in tree.nodes if n.site == "in"]
+        self.assertTrue(len(in_nodes) > 0, "No IN branch node found")
+
+        in_node = in_nodes[0]
+        outcomes = in_node.observed_outcomes(0)
+        self.assertIn(BranchType.IN_NO_MATCH, outcomes)
+
+
 if __name__ == "__main__":
     unittest.main()
