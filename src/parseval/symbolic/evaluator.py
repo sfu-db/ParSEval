@@ -345,6 +345,45 @@ class PlanEvaluator:
                                 tree.record_observation(
                                     node, AtomObservation(atom_id=atom_id, outcome=outcome)
                                 )
+
+        # Track DISTINCT
+        if step.distinct:
+            distinct_node = tree.get_or_create_node(
+                step_id=annotation.step_id,
+                step_type="Project",
+                site="distinct",
+                predicate=exp.Literal.string("DISTINCT"),
+                atoms=(exp.Literal.string("DISTINCT"),),
+                tables=annotation.source_tables,
+            )
+
+            # Extract projected column names to check only those for duplicates.
+            proj_cols = set()
+            for proj in step.projections:
+                if isinstance(proj, exp.Alias):
+                    proj = proj.this
+                if isinstance(proj, exp.Column):
+                    proj_cols.add(proj.name)
+
+            seen = set()
+            has_duplicates = False
+            for table_name, table in ctx.tables.items():
+                for row in table.rows:
+                    key = tuple(
+                        sym.concrete if isinstance(sym, (Variable, Const)) else sym
+                        for col, sym in row.items()
+                        if not proj_cols or col in proj_cols
+                    )
+                    if key in seen:
+                        has_duplicates = True
+                        break
+                    seen.add(key)
+                if has_duplicates:
+                    break
+
+            outcome = BranchType.DISTINCT_DUPLICATE if has_duplicates else BranchType.DISTINCT_UNIQUE
+            tree.record_observation(distinct_node, AtomObservation(atom_id=0, outcome=outcome))
+
         return ctx
 
     def _eval_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
