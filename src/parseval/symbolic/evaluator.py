@@ -427,8 +427,98 @@ class PlanEvaluator:
 
         return len(rows) > 0
 
+    def _inner_plan_values(self, root: Step) -> set:
+        """Evaluate inner plan and return the set of projected column values."""
+        scans: List[Scan] = []
+        filters: List[Filter] = []
+        projects: List[Project] = []
+
+        def _collect(s: Step) -> None:
+            if isinstance(s, Scan):
+                scans.append(s)
+            if isinstance(s, Filter):
+                filters.append(s)
+            if isinstance(s, Project):
+                projects.append(s)
+            for dep in s.chain_dependencies:
+                _collect(dep)
+
+        _collect(root)
+
+        if not scans:
+            return set()
+
+        # Get table name from the scan.
+        scan = scans[0]
+        source = scan.source
+        if isinstance(source, exp.Table):
+            table_name = source.name
+        else:
+            table_name = scan.name
+
+        if table_name not in self.instance.tables:
+            return set()
+
+        rows = self.instance.get_rows(table_name)
+        if not rows:
+            return set()
+
+        # Apply any filter conditions.
+        for filt in filters:
+            if filt.condition is None:
+                continue
+            passing: List[Row] = []
+            for row in rows:
+                env = _env_from_row(row, table_name)
+                if concrete(filt.condition, env) is True:
+                    passing.append(row)
+            rows = passing
+
+        # Determine the projected column from the inner Project step.
+        if not projects or not projects[0].projections:
+            return set()
+
+        projection = projects[0].projections[0]
+        if isinstance(projection, exp.Alias):
+            projection = projection.this
+
+        # Collect the projected column value from each surviving row.
+        values: set = set()
+        for row in rows:
+            env = _env_from_row(row, table_name)
+            val = concrete(projection, env)
+            values.add(val)
+        return values
+
     def _eval_in_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
-        """Evaluate IN (SELECT ...) -- placeholder for Task 5."""
+        """Evaluate col IN (SELECT ...) and record IN_MATCH/IN_NO_MATCH."""
+        annotation = self.plan.annotation_for(step)
+        step_id = annotation.step_id
+
+        node = tree.get_or_create_node(
+            step_id=step_id,
+            step_type="SubPlan",
+            site="in",
+            predicate=step.anchor,
+            atoms=(step.anchor,),
+            tables=(),
+        )
+
+        # Get inner query values.
+        inner_values = self._inner_plan_values(step.inner)
+
+        # Check each outer row against the inner result set.
+        if isinstance(step.anchor, exp.In):
+            outer_col = step.anchor.this
+            if isinstance(outer_col, exp.Column):
+                for table_name, table in ctx.tables.items():
+                    for row in table.rows:
+                        env = _env_from_row(row, table_name)
+                        outer_val = concrete(outer_col, env)
+
+                        outcome = BranchType.IN_MATCH if outer_val in inner_values else BranchType.IN_NO_MATCH
+                        tree.record_observation(node, AtomObservation(atom_id=0, outcome=outcome))
+
         return ctx
 
     def _eval_scalar_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
