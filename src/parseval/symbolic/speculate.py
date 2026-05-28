@@ -446,16 +446,6 @@ class Propagator:
                 spec.require(pred.table).not_null.add(pred.column)
             else:
                 spec.require(pred.table).predicates.append((pred.column, pred.op, pred.value))
-        # Extract upper bound for BETWEEN (lowering returns >= for low bound)
-        for atom in condition.find_all(exp.Between):
-            col = atom.this
-            high = atom.args.get("high")
-            if isinstance(col, exp.Column) and isinstance(high, exp.Literal):
-                table = self._resolve_table(col.table if hasattr(col, 'table') else "")
-                matched = self._match_column(table, col.name)
-                if matched:
-                    high_val = concrete(high)
-                    spec.require(table).predicates.append((matched, "<=", high_val))
 
     def _is_self_join_table(self, table: str) -> bool:
         """Check if a table is involved in a self-join."""
