@@ -285,8 +285,8 @@ def _lower_atom(
         high = atom.args.get("high")
         if isinstance(col, exp.Column) and isinstance(low, exp.Literal):
             low_val = concrete(low)
-            # Use the low bound as equality — it's always within the range
-            return _make_pred(col, "=", low_val, instance, tables, alias_map)
+            # Use >= for lower bound (inclusive range)
+            return _make_pred(col, ">=", low_val, instance, tables, alias_map)
         # Temporal BETWEEN
         if isinstance(col, (exp.TimeToStr, exp.Anonymous)):
             inner_col = next(col.find_all(exp.Column), None)
