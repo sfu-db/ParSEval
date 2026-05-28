@@ -27,6 +27,7 @@ from parseval.plan.planner import (
     SetOperation,
     Sort,
     SubPlan,
+    SubPlanKind,
 )
 from parseval.plan.context import Context, DerivedSchema, Row, build_context_from_instance
 from parseval.plan.rex import Const, Environment, Variable, concrete
@@ -134,6 +135,11 @@ class PlanEvaluator:
 
         input_ctx = Context(tables=dep_contexts) if dep_contexts else ctx
 
+        # Walk subplan dependencies (EXISTS, IN, scalar subqueries) for
+        # branch observation recording.  They don't transform the context.
+        for sub in step.subplan_dependencies:
+            self._walk(sub, input_ctx, tree)
+
         if isinstance(step, Scan):
             return self._eval_scan(step, ctx)
         elif isinstance(step, Filter):
@@ -146,7 +152,9 @@ class PlanEvaluator:
             return self._eval_having(step, input_ctx, tree)
         elif isinstance(step, Project):
             return self._eval_project(step, input_ctx, tree)
-        elif isinstance(step, (Sort, Limit, SetOperation, SubPlan)):
+        elif isinstance(step, SubPlan):
+            return self._eval_subplan(step, input_ctx, tree)
+        elif isinstance(step, (Sort, Limit, SetOperation)):
             return input_ctx
         return input_ctx
 
@@ -337,6 +345,94 @@ class PlanEvaluator:
                                 tree.record_observation(
                                     node, AtomObservation(atom_id=atom_id, outcome=outcome)
                                 )
+        return ctx
+
+    def _eval_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
+        """Evaluate a SubPlan and record branch observations."""
+        if step.kind is SubPlanKind.EXISTS:
+            return self._eval_exists_subplan(step, ctx, tree)
+        elif step.kind is SubPlanKind.IN:
+            return self._eval_in_subplan(step, ctx, tree)
+        elif step.kind is SubPlanKind.SCALAR:
+            return self._eval_scalar_subplan(step, ctx, tree)
+        return ctx
+
+    def _eval_exists_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
+        """Evaluate EXISTS (SELECT ...) and record EXISTS_TRUE/EXISTS_FALSE."""
+        annotation = self.plan.annotation_for(step)
+        step_id = annotation.step_id
+
+        node = tree.get_or_create_node(
+            step_id=step_id,
+            step_type="SubPlan",
+            site="exists",
+            predicate=step.anchor,
+            atoms=(step.anchor,),
+            tables=(),
+        )
+
+        # Evaluate inner plan directly (inner plan steps are not in the
+        # outer plan's annotation map, so we cannot use _walk).
+        has_rows = self._inner_plan_has_rows(step.inner)
+
+        outcome = BranchType.EXISTS_TRUE if has_rows else BranchType.EXISTS_FALSE
+        tree.record_observation(node, AtomObservation(atom_id=0, outcome=outcome))
+
+        return ctx  # SubPlan doesn't transform the outer context
+
+    def _inner_plan_has_rows(self, root: Step) -> bool:
+        """Check whether an inner plan would produce at least one row."""
+        # Collect Scan and Filter steps from the inner plan.
+        scans: List[Scan] = []
+        filters: List[Filter] = []
+
+        def _collect(s: Step) -> None:
+            if isinstance(s, Scan):
+                scans.append(s)
+            if isinstance(s, Filter):
+                filters.append(s)
+            for dep in s.chain_dependencies:
+                _collect(dep)
+
+        _collect(root)
+
+        if not scans:
+            return False
+
+        # For simple single-table EXISTS subqueries, evaluate directly.
+        scan = scans[0]
+        source = scan.source
+        if isinstance(source, exp.Table):
+            table_name = source.name
+        else:
+            table_name = scan.name
+
+        if table_name not in self.instance.tables:
+            return False
+
+        rows = self.instance.get_rows(table_name)
+        if not rows:
+            return False
+
+        # Apply any filter conditions.
+        for filt in filters:
+            if filt.condition is None:
+                continue
+            passing: List[Row] = []
+            for row in rows:
+                env = _env_from_row(row, table_name)
+                if concrete(filt.condition, env) is True:
+                    passing.append(row)
+            rows = passing
+
+        return len(rows) > 0
+
+    def _eval_in_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
+        """Evaluate IN (SELECT ...) -- placeholder for Task 5."""
+        return ctx
+
+    def _eval_scalar_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
+        """Evaluate scalar subquery -- placeholder."""
         return ctx
 
 
