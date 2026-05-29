@@ -760,6 +760,7 @@ class Resolver:
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
+        self._discover_fk_parents(spec)
         shared_values = self._resolve_equivalences(spec)
         order = self._creation_order(spec)
         result: Dict[str, List[Dict[str, Any]]] = {}
@@ -948,12 +949,18 @@ class Resolver:
 
 
 
-    def _creation_order(self, spec: BranchSpec) -> List[str]:
-        tables = list(spec.requirements.keys())
+    def _discover_fk_parents(self, spec: BranchSpec) -> None:
+        """Discover FK-referenced parent tables transitively.
 
-        # Discover FK-referenced tables not in spec.requirements.
-        # These are parent tables that must exist before child rows can be inserted.
-        for table in list(tables):
+        For each table in spec.requirements, walk its foreign keys and add
+        parent tables as requirements (with min_rows=1).  Uses a while-loop
+        so that grandparent (and deeper) tables are also discovered.
+        """
+        tables = list(spec.requirements.keys())
+        i = 0
+        while i < len(tables):
+            table = tables[i]
+            i += 1
             physical = table.split("__")[0] if "__" in table else table
             if physical not in self.instance.tables:
                 continue
@@ -967,6 +974,9 @@ class Resolver:
                             req = TableRequirement(table=ref_table, min_rows=1)
                             spec.requirements[ref_table] = req
                             tables.append(ref_table)
+
+    def _creation_order(self, spec: BranchSpec) -> List[str]:
+        tables = list(spec.requirements.keys())
 
         # Build dependency graph
         deps: Dict[str, Set[str]] = {t: set() for t in tables}
