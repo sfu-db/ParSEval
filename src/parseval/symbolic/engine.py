@@ -199,7 +199,6 @@ class SymbolicEngine:
         Phase 3: Re-evaluate. Repeat Phase 2 until covered or budget exhausted.
         """
         thresholds = thresholds or CoverageThresholds()
-        self._thresholds = thresholds
         evaluator = PlanEvaluator(self.plan, self.instance, self.dialect)
         constraint_gen = ConstraintGenerator(self.plan, self.instance, self.dialect)
 
@@ -216,9 +215,6 @@ class SymbolicEngine:
         # Phase 0f: SMT repair — for self-joins, NOT IN, and complex OR
         # predicates that the speculative layer cannot handle.
         self._smt_repair_where()
-
-        # Phase 0g: Targeted enrichment for DISTINCT/GROUP BY/aggregate patterns.
-        self._enrich_for_semantics()
 
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
@@ -907,63 +903,6 @@ class SymbolicEngine:
                         if rows:
                             rows[0][col_name].set("concrete", val)
                             rows[0][col_name].set("is_bound", True)
-
-    def _enrich_for_semantics(self) -> None:
-        """Generate additional rows with duplicates and NULLs to expose semantic differences."""
-        from collections import defaultdict
-        from .enrichment import analyze_plan_for_enrichment
-
-        targets = analyze_plan_for_enrichment(self.plan)
-        if not targets.duplicate_columns and not targets.null_columns:
-            return
-
-        dup_count = getattr(self._thresholds, 'atom_dup', 1)
-
-        # Generate rows with NULLs for COUNT/SUM/AVG columns
-        for table, column in targets.null_columns:
-            real_table = self.alias_map.get(table, table)
-            if real_table not in self.instance.tables:
-                continue
-            if not self.instance.nullable(real_table, column):
-                continue
-            self._generate_null_row(real_table, column)
-
-        # Group duplicate targets by resolved table name
-        dup_by_table: Dict[str, List[str]] = defaultdict(list)
-        for table, column in targets.duplicate_columns:
-            real_table = self.alias_map.get(table, table)
-            if real_table in self.instance.tables:
-                dup_by_table[real_table].append(column)
-
-        # For each table, generate atom_dup rows with ALL target columns
-        # duplicated at once — one create_row call per iteration, not per column.
-        for real_table, columns in dup_by_table.items():
-            existing_rows = self.instance.get_rows(real_table)
-            if not existing_rows:
-                continue
-            source = existing_rows[0]
-            dup_values = {}
-            for col in columns:
-                try:
-                    val = source[col]
-                except KeyError:
-                    continue
-                if val is not None and val.concrete is not None:
-                    dup_values[col] = val.concrete
-            if not dup_values:
-                continue
-            for _ in range(dup_count):
-                try:
-                    self.instance.create_row(real_table, values=dup_values)
-                except Exception:
-                    pass
-
-    def _generate_null_row(self, table: str, null_column: str) -> None:
-        """Generate a row with NULL in the specified column."""
-        try:
-            self.instance.create_row(table, values={null_column: None})
-        except Exception:
-            pass  # Schema constraint may prevent NULL
 
 
 # =============================================================================
