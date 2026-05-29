@@ -165,10 +165,17 @@ class Propagator:
                 self._propagate_step(dep, spec, negate_step)
             if step.condition and step is not negate_step:
                 self._extract_predicates(step.condition, spec)
-                # HAVING with aggregate: derive min group size.
+                # HAVING with aggregate: derive min group size for counted table only.
+                counted_table = self._find_counted_table(step.condition)
                 min_size = self._extract_min_group_size(step.condition)
-                for req in spec.requirements.values():
-                    req.min_rows = max(req.min_rows, min_size)
+                if counted_table and counted_table in spec.requirements:
+                    spec.requirements[counted_table].min_rows = max(
+                        spec.requirements[counted_table].min_rows, min_size
+                    )
+                else:
+                    # Fallback: apply globally if we can't identify the counted table.
+                    for req in spec.requirements.values():
+                        req.min_rows = max(req.min_rows, min_size)
                 # Derive per-row value constraints from aggregate thresholds.
                 self._extract_having_value_constraints(step.condition, spec, min_size)
 
@@ -660,6 +667,33 @@ class Propagator:
         else:
             parts.append(expr)
         return parts
+
+    def _find_counted_table(self, condition: exp.Expression) -> Optional[str]:
+        """Find the table containing the column inside COUNT(col).
+
+        For HAVING COUNT(child.id) > 3, returns 'child'.
+        Returns None for COUNT(*) or COUNT(DISTINCT col) where table can't be resolved.
+        """
+        for step in self.plan.ordered_steps:
+            if isinstance(step, Aggregate):
+                for agg_expr in step.aggregations:
+                    for count_node in agg_expr.find_all(exp.Count):
+                        # Skip COUNT(*)
+                        if isinstance(count_node.this, exp.Star):
+                            continue
+                        for col in count_node.find_all(exp.Column):
+                            table = self._resolve_table(col.table or "")
+                            if table and table in self.instance.tables:
+                                return table
+        # Also check the HAVING condition directly
+        for count_node in condition.find_all(exp.Count):
+            if isinstance(count_node.this, exp.Star):
+                continue
+            for col in count_node.find_all(exp.Column):
+                table = self._resolve_table(col.table or "")
+                if table and table in self.instance.tables:
+                    return table
+        return None
 
     def _extract_min_group_size(self, condition: exp.Expression) -> int:
         """Extract minimum group size from HAVING (e.g., COUNT(*) > 3 → 4).
