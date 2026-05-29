@@ -950,6 +950,25 @@ class Resolver:
 
     def _creation_order(self, spec: BranchSpec) -> List[str]:
         tables = list(spec.requirements.keys())
+
+        # Discover FK-referenced tables not in spec.requirements.
+        # These are parent tables that must exist before child rows can be inserted.
+        for table in list(tables):
+            physical = table.split("__")[0] if "__" in table else table
+            if physical not in self.instance.tables:
+                continue
+            for fk in self.instance.get_foreign_key(physical):
+                ref = fk.args.get("reference")
+                if ref:
+                    ref_table_node = ref.find(exp.Table)
+                    if ref_table_node:
+                        ref_table = normalize_name(ref_table_node.name)
+                        if ref_table not in spec.requirements and ref_table in self.instance.tables:
+                            req = TableRequirement(table=ref_table, min_rows=1)
+                            spec.requirements[ref_table] = req
+                            tables.append(ref_table)
+
+        # Build dependency graph
         deps: Dict[str, Set[str]] = {t: set() for t in tables}
         for table in tables:
             # Get physical table name (strip alias suffix)
@@ -962,6 +981,8 @@ class Resolver:
                     ref_table = ref.find(exp.Table)
                     if ref_table and normalize_name(ref_table.name) in deps:
                         deps[table].add(normalize_name(ref_table.name))
+
+        # Topological sort
         ordered: List[str] = []
         ready = [t for t in tables if not deps[t]]
         while ready:
