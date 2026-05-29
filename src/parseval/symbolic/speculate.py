@@ -878,6 +878,10 @@ class Resolver:
             rows = self._resolve_table(physical_table, req, shared_values)
             result.setdefault(physical_table, []).extend(rows)
 
+        # Resolve deferred scalar subqueries after initial rows are generated.
+        if spec.deferred:
+            self._resolve_deferred(spec)
+
         return result
 
     def _resolve_equivalences(self, spec: BranchSpec) -> Dict[str, Any]:
@@ -1135,6 +1139,122 @@ class Resolver:
             if t not in ordered:
                 ordered.append(t)
         return ordered
+
+    def _resolve_deferred(self, spec: BranchSpec):
+        """Evaluate deferred scalar subqueries and adjust outer rows.
+
+        For atoms like `col > (SELECT AVG(val) FROM t)`:
+        1. Evaluate the subquery against the current instance.
+        2. Adjust the outer row's column value to satisfy the comparison.
+        """
+        for atom in spec.deferred:
+            if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+                continue
+
+            left, right = atom.this, atom.expression
+            subq_side, outer_side = None, None
+            if right and right.find(exp.Subquery):
+                subq_side, outer_side = right, left
+            elif left and left.find(exp.Subquery):
+                subq_side, outer_side = left, right
+            if subq_side is None:
+                continue
+
+            # Evaluate the subquery
+            subq_result = self._evaluate_scalar_subquery(subq_side)
+            if subq_result is None:
+                continue
+
+            # Find the outer column and adjust its value
+            if not isinstance(outer_side, exp.Column):
+                continue
+            table = normalize_name(outer_side.table or "")
+            col_name = outer_side.name
+            if table not in self.instance.tables:
+                continue
+
+            rows = self.instance.get_rows(table)
+            if not rows:
+                continue
+
+            # Compute the target value based on the comparison operator
+            target = self._compute_target_value(atom, subq_result)
+            if target is not None:
+                # Adjust the first row
+                if col_name in rows[0].columns:
+                    rows[0][col_name].set("concrete", target)
+                    rows[0][col_name].set("is_bound", True)
+
+    def _evaluate_scalar_subquery(self, subq_node: exp.Expression) -> Optional[Any]:
+        """Evaluate a scalar subquery against the current instance."""
+        subq = subq_node if isinstance(subq_node, exp.Subquery) else subq_node.find(exp.Subquery)
+        if subq is None:
+            subq = subq_node
+        inner_select = subq.this if isinstance(subq, exp.Subquery) else subq
+        if not isinstance(inner_select, exp.Select):
+            return None
+
+        from_clause = inner_select.args.get("from")
+        if not from_clause:
+            return None
+        from_table = from_clause.this
+        if not isinstance(from_table, exp.Table):
+            return None
+
+        table_name = normalize_name(from_table.alias_or_name)
+        if table_name not in self.instance.tables:
+            return None
+
+        rows = self.instance.get_rows(table_name)
+        if not rows:
+            return None
+
+        projections = inner_select.expressions
+        if not projections:
+            return None
+
+        proj = projections[0]
+        values = []
+        for row in rows:
+            for col in proj.find_all(exp.Column):
+                if col.name in row.columns:
+                    v = row[col.name].concrete
+                    if v is not None:
+                        values.append(v)
+
+        if not values:
+            return None
+
+        if proj.find(exp.Avg):
+            return sum(values) / len(values)
+        elif proj.find(exp.Count):
+            return len(values)
+        elif proj.find(exp.Sum):
+            return sum(values)
+        elif proj.find(exp.Max):
+            return max(values)
+        elif proj.find(exp.Min):
+            return min(values)
+
+        return values[0] if values else None
+
+    def _compute_target_value(self, atom: exp.Expression, subq_result: Any) -> Optional[Any]:
+        """Compute a value that satisfies the comparison atom."""
+        if isinstance(atom, exp.GT):
+            if isinstance(subq_result, (int, float)):
+                return int(subq_result) + 1
+        elif isinstance(atom, exp.GTE):
+            if isinstance(subq_result, (int, float)):
+                return int(subq_result)
+        elif isinstance(atom, exp.LT):
+            if isinstance(subq_result, (int, float)):
+                return int(subq_result) - 1
+        elif isinstance(atom, exp.LTE):
+            if isinstance(subq_result, (int, float)):
+                return int(subq_result)
+        elif isinstance(atom, exp.EQ):
+            return subq_result
+        return None
 
 
 # =============================================================================

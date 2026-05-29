@@ -214,3 +214,29 @@ class TestScalarSubqueryDetection(unittest.TestCase):
             "BranchSpec should have a 'deferred' field")
         self.assertGreater(len(pos_spec.deferred), 0,
             "Should have at least one deferred subquery atom")
+
+
+class TestDeferredSubqueryResolution(unittest.TestCase):
+    """Resolver should evaluate deferred scalar subqueries and adjust outer rows."""
+
+    def test_deferred_subquery_adjusts_outer_value(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import speculate
+
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, val INT);"
+        instance = Instance(ddls=schema, name="test_deferred", dialect="sqlite")
+        # Insert a row with val=10 so AVG(val)=10
+        instance.create_row("t", values={"val": 10})
+
+        sql = "SELECT * FROM t WHERE val > (SELECT AVG(val) FROM t)"
+        plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"))
+        result = speculate(plan, instance, plan.alias_map, "sqlite")
+
+        # After deferred resolution, there should be a row with val > 10
+        t_rows = instance.get_rows("t")
+        vals = [r["val"].concrete for r in t_rows if r["val"].concrete is not None]
+        has_gt_avg = any(v > 10 for v in vals if isinstance(v, (int, float)))
+        self.assertTrue(has_gt_avg,
+            f"Should have a row with val > 10 (AVG), got vals={vals}")
