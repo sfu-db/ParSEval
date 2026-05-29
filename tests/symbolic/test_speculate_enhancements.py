@@ -133,3 +133,31 @@ class TestOffsetTableSpecific(unittest.TestCase):
         if child_req:
             self.assertLess(child_req.min_rows, 15,
                 f"child min_rows should be < 15, got {child_req.min_rows}")
+
+
+class TestAggregateNullColumns(unittest.TestCase):
+    """Propagator should mark COUNT/SUM/AVG columns as must_null."""
+
+    def test_count_column_marked_must_null(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import Propagator
+
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);"
+        sql = "SELECT COUNT(name) FROM t"
+        instance = Instance(ddls=schema, name="test_agg_null", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        alias_map = plan.alias_map
+
+        propagator = Propagator(plan, instance, alias_map, "sqlite")
+        specs = propagator.propagate()
+
+        pos_spec = specs[0]
+        t_req = pos_spec.requirements.get("t")
+        self.assertIsNotNone(t_req)
+        self.assertIn("name", t_req.must_null,
+            f"'name' should be in must_null for COUNT(name), got must_null={t_req.must_null}")
+        self.assertGreaterEqual(t_req.min_rows, 2,
+            f"min_rows should be >= 2 (one NULL + one non-NULL), got {t_req.min_rows}")

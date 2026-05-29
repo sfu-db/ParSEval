@@ -206,6 +206,10 @@ class Propagator:
                             # Mark as group key so Resolver coordinates values
                             if matched not in req.group_key_columns:
                                 req.group_key_columns.append(matched)
+            # Aggregate NULL detection: COUNT/SUM/AVG columns need a NULL row
+            # to test NULL-handling semantics.
+            for agg_expr in step.aggregations:
+                self._mark_aggregate_null_columns(agg_expr, spec)
 
         elif isinstance(step, Filter):
             for dep in step.chain_dependencies:
@@ -703,6 +707,44 @@ class Propagator:
                 if table and table in self.instance.tables:
                     return table
         return None
+
+    def _mark_aggregate_null_columns(self, agg_expr: exp.Expression, spec: BranchSpec):
+        """Mark columns inside COUNT/SUM/AVG as must_null.
+
+        Skips COUNT(*) and COUNT(DISTINCT col) — those don't need NULL testing.
+        """
+        for count_node in agg_expr.find_all(exp.Count):
+            # Skip COUNT(*)
+            if isinstance(count_node.this, exp.Star):
+                continue
+            # Skip COUNT(DISTINCT col) — DISTINCT ignores NULLs
+            if count_node.args.get("distinct"):
+                continue
+            for col in count_node.find_all(exp.Column):
+                table = self._resolve_table(col.table or "")
+                matched = self._match_column(table, col.name)
+                if matched and table in self.instance.tables:
+                    req = spec.require(table)
+                    req.must_null.add(matched)
+                    req.min_rows = max(req.min_rows, 2)
+
+        for sum_node in agg_expr.find_all(exp.Sum):
+            for col in sum_node.find_all(exp.Column):
+                table = self._resolve_table(col.table or "")
+                matched = self._match_column(table, col.name)
+                if matched and table in self.instance.tables:
+                    req = spec.require(table)
+                    req.must_null.add(matched)
+                    req.min_rows = max(req.min_rows, 2)
+
+        for avg_node in agg_expr.find_all(exp.Avg):
+            for col in avg_node.find_all(exp.Column):
+                table = self._resolve_table(col.table or "")
+                matched = self._match_column(table, col.name)
+                if matched and table in self.instance.tables:
+                    req = spec.require(table)
+                    req.must_null.add(matched)
+                    req.min_rows = max(req.min_rows, 2)
 
     def _extract_min_group_size(self, condition: exp.Expression) -> int:
         """Extract minimum group size from HAVING (e.g., COUNT(*) > 3 → 4).
