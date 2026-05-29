@@ -13,14 +13,13 @@ Given an Instance and a SQL query, the engine:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from sqlglot import exp
 
 from parseval.instance import Instance
 from parseval.plan import Plan
 from parseval.plan.planner import Aggregate, Filter, Join, Project
-from parseval.plan.rex import Variable
 from parseval.query import preprocess_sql
 
 from .constraints import ConstraintGenerator, SolverConstraint
@@ -208,9 +207,6 @@ class SymbolicEngine:
         # This is the primary generation path — handles self-joins, HAVING
         # COUNT, NOT IN, and all common patterns via heuristics.
         self._speculate_all_branches()
-
-        # Phase 0d: Handle subquery predicates.
-        self._resolve_subquery_predicates()
 
         # Phase 0f: SMT repair — for self-joins, NOT IN, and complex OR
         # predicates that the speculative layer cannot handle.
@@ -607,222 +603,6 @@ class SymbolicEngine:
                     SMTSolver.apply_solution(var_symbols, solution)
             except Exception:
                 pass
-
-    def _resolve_subquery_predicates(self) -> None:
-        """Evaluate subquery predicates against the instance and adjust rows.
-
-        For predicates like ``outer_expr > (SELECT AVG(...) FROM ...)``:
-        1. Execute the subquery against the current instance data.
-        2. Get the scalar result.
-        3. Create/update an outer row that satisfies the comparison.
-
-        This handles the case where the witness can't statically determine
-        what value the subquery will produce — we generate data first,
-        then adapt.
-        """
-
-        for step in self.plan.ordered_steps:
-            if not isinstance(step, Filter) or step.condition is None:
-                continue
-
-            # Find atoms that contain subqueries.
-            for atom in self._iter_subquery_atoms(step.condition):
-                self._resolve_one_subquery_atom(atom)
-
-    def _iter_subquery_atoms(self, predicate: exp.Expression):
-        """Yield atoms that contain a subquery comparison."""
-        if isinstance(predicate, exp.And):
-            yield from self._iter_subquery_atoms(predicate.left)
-            yield from self._iter_subquery_atoms(predicate.right)
-        elif isinstance(predicate, exp.Paren):
-            yield from self._iter_subquery_atoms(predicate.this)
-        elif isinstance(predicate, exp.Or):
-            yield from self._iter_subquery_atoms(predicate.left)
-        else:
-            # Check if this atom has a subquery
-            if predicate.find(exp.Subquery):
-                yield predicate
-
-    def _resolve_one_subquery_atom(self, atom: exp.Expression) -> None:
-        """Resolve a subquery atom using our own plan evaluator.
-
-        For col OP (SELECT ...): evaluate the subquery against the current
-        instance using concrete(), then adjust the outer row to satisfy.
-        """
-        if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
-            return
-
-        left, right = atom.this, atom.expression
-        subq_side, outer_side = None, None
-        if right and right.find(exp.Subquery):
-            subq_side, outer_side = right, left
-        elif left and left.find(exp.Subquery):
-            subq_side, outer_side = left, right
-        if subq_side is None:
-            return
-
-        # Evaluate the subquery against the current instance.
-        subq_value = self._evaluate_subquery(subq_side)
-        if subq_value is None:
-            return
-
-        # Find the outer column(s).
-        outer_columns = list(outer_side.find_all(exp.Column))
-        if not outer_columns:
-            return
-
-        target_col = outer_columns[0]
-        table = (target_col.table or "").lower()
-        table = self.alias_map.get(table, table)
-        if table not in self.instance.tables:
-            return
-
-        col_name = target_col.name.lower()
-        matched_col = next(
-            (s for s in self.instance.tables[table] if s.lower() == col_name), None
-        )
-        if not matched_col:
-            return
-
-        # Determine needed value based on comparison operator.
-        if isinstance(atom, exp.GT):
-            needed = subq_value + 1 if isinstance(subq_value, (int, float)) else subq_value
-        elif isinstance(atom, exp.GTE):
-            needed = subq_value
-        elif isinstance(atom, exp.LT):
-            needed = subq_value - 1 if isinstance(subq_value, (int, float)) else subq_value
-        elif isinstance(atom, exp.LTE):
-            needed = subq_value
-        elif isinstance(atom, exp.EQ):
-            needed = subq_value
-        else:
-            return
-
-        # For compound expressions (col1 - col2): set col1 high, col2 low.
-        if len(outer_columns) >= 2 and isinstance(atom, (exp.GT, exp.GTE)):
-            values = {matched_col: abs(subq_value) + 1000 if isinstance(subq_value, (int, float)) else 1000}
-            col2 = outer_columns[1]
-            col2_matched = next(
-                (s for s in self.instance.tables[table] if s.lower() == col2.name.lower()), None
-            )
-            if col2_matched:
-                values[col2_matched] = 0
-        else:
-            values = {matched_col: needed}
-
-        # Update existing row or create new one.
-        existing_rows = self.instance.get_rows(table)
-        if existing_rows:
-            row = existing_rows[0]
-            for col, val in values.items():
-                if col in row.columns and val is not None:
-                    row[col].set("concrete", val)
-            # Also create a second row with low values for aggregate subqueries.
-            if len(outer_columns) >= 2:
-                low_values = {col: 0 for col, val in values.items() if isinstance(val, (int, float))}
-                if low_values:
-                    low_values = self._fill_fk_values(table, low_values)
-                    try:
-                        self.instance.create_row(table, values=low_values)
-                    except Exception:
-                        pass
-
-    def _evaluate_subquery(self, subq_expr: exp.Expression) -> Any:
-        """Evaluate a subquery expression against the current instance.
-
-        Uses concrete() with an Environment built from instance rows.
-        Falls back to direct row scanning for simple patterns.
-        """
-        from parseval.plan.rex import concrete, Environment
-        from parseval.plan.context import build_context_from_instance
-
-        subq_node = subq_expr.find(exp.Subquery) or subq_expr
-        inner_select = subq_node.this if isinstance(subq_node, exp.Subquery) else subq_node
-
-        if not isinstance(inner_select, exp.Select):
-            return None
-
-        # Get the FROM table.
-        from_clause = inner_select.args.get("from")
-        if not from_clause:
-            return None
-        from_table = from_clause.this
-        if not isinstance(from_table, exp.Table):
-            return None
-
-        table_name = from_table.alias_or_name.lower()
-        table_name = self.alias_map.get(table_name, table_name)
-        if table_name not in self.instance.tables:
-            return None
-
-        rows = self.instance.get_rows(table_name)
-        if not rows:
-            return None
-
-        # Get the SELECT expression.
-        projections = inner_select.expressions
-        if not projections:
-            return None
-        select_expr = projections[0]
-        if isinstance(select_expr, exp.Alias):
-            select_expr = select_expr.this
-
-        # Evaluate the WHERE clause to filter rows.
-        where = inner_select.args.get("where")
-        passing_rows = []
-        for row in rows:
-            env = Environment({
-                col: sym.concrete for col, sym in row.items()
-            })
-            # Also add table-qualified names.
-            for col, sym in row.items():
-                env.bind(f"{table_name}.{col}", sym.concrete)
-            if where:
-                cond_val = concrete(where.this, env)
-                if cond_val is not True:
-                    continue
-            passing_rows.append(row)
-
-        if not passing_rows:
-            return None
-
-        # Evaluate the SELECT expression on passing rows.
-        values = []
-        for row in passing_rows:
-            env = Environment({col: sym.concrete for col, sym in row.items()})
-            for col, sym in row.items():
-                env.bind(f"{table_name}.{col}", sym.concrete)
-            val = concrete(select_expr, env)
-            if val is not None:
-                values.append(val)
-
-        if not values:
-            return None
-
-        # Handle aggregates.
-        if select_expr.find(exp.AggFunc):
-            if select_expr.find(exp.Max):
-                return max(values)
-            elif select_expr.find(exp.Min):
-                return min(values)
-            elif select_expr.find(exp.Avg):
-                return sum(values) / len(values)
-            elif select_expr.find(exp.Sum):
-                return sum(values)
-            elif select_expr.find(exp.Count):
-                return len(values)
-            # Compound: MAX(...) - MIN(...)
-            return values[0]
-
-        # Non-aggregate: return first value (for LIMIT 1 patterns).
-        # Handle ORDER BY + LIMIT.
-        order = inner_select.args.get("order")
-        if order:
-            # Sort values (simplified: just return first/last based on DESC).
-            desc = any(o.args.get("desc") for o in order.expressions)
-            values.sort(reverse=bool(desc))
-
-        return values[0] if values else None
 
     def _repair_not_in_simple(self, condition: exp.Expression) -> None:
         """Simple NOT IN repair: set the outer column to a fresh value not in inner results."""
