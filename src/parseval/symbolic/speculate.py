@@ -66,6 +66,7 @@ class BranchSpec:
     branch: str
     requirements: Dict[str, TableRequirement] = field(default_factory=dict)
     equivalences: ColumnUnionFind = field(default_factory=ColumnUnionFind)
+    deferred: List[exp.Expression] = field(default_factory=list)
 
     def require(self, table: str) -> TableRequirement:
         if table not in self.requirements:
@@ -219,6 +220,9 @@ class Propagator:
                     self._extract_negated_predicates(step.condition, spec)
                 else:
                     self._extract_predicates(step.condition, spec)
+                # Detect scalar subquery atoms for deferred evaluation.
+                for atom in self._iter_scalar_subquery_atoms(step.condition):
+                    spec.deferred.append(atom)
 
         elif isinstance(step, Join):
             # Process chain dependencies first.
@@ -681,6 +685,19 @@ class Propagator:
             parts.append(expr)
         return parts
 
+    def _iter_scalar_subquery_atoms(self, predicate: exp.Expression):
+        """Yield atoms that contain a scalar subquery comparison."""
+        if isinstance(predicate, exp.And):
+            yield from self._iter_scalar_subquery_atoms(predicate.left)
+            yield from self._iter_scalar_subquery_atoms(predicate.right)
+        elif isinstance(predicate, exp.Paren):
+            yield from self._iter_scalar_subquery_atoms(predicate.this)
+        elif isinstance(predicate, exp.Or):
+            yield from self._iter_scalar_subquery_atoms(predicate.left)
+        else:
+            if predicate.find(exp.Subquery) and isinstance(predicate, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+                yield predicate
+
     def _find_counted_table(self, condition: exp.Expression) -> Optional[str]:
         """Find the table containing the column inside COUNT(col).
 
@@ -945,25 +962,51 @@ class Resolver:
 
         return rows
 
-    def _build_row(self, table: str, req: TableRequirement, shared: Dict[str, Any]) -> Dict[str, Any]:
-        row: Dict[str, Any] = {}
-        # Equivalence class values (JOIN/GROUP BY coordination).
-        for col in self.instance.tables.get(table, {}):
-            key = f"{table}.{col}"
-            if key in shared:
-                row[col] = shared[key]
-        # Fixed values override equivalences (WHERE constraints are more specific).
-        row.update(req.fixed_values)
-        # Predicates: collect per-column, then satisfy all.
-        col_preds: Dict[str, List[Tuple[str, Any]]] = {}
+    def _validate_row(self, table: str, req: TableRequirement, row: Dict[str, Any]) -> bool:
+        """Check that generated row values satisfy all predicates."""
         for col, op, value in req.predicates:
-            if col not in row:
-                col_preds.setdefault(col, []).append((op, value))
-        for col, preds in col_preds.items():
-            row[col] = self._satisfy_all(preds)
-        # Must NULL.
-        for col in req.must_null:
-            row[col] = None
+            if col not in row or row[col] is None:
+                continue
+            actual = row[col]
+            if op == ">" and isinstance(value, (int, float)):
+                if not (isinstance(actual, (int, float)) and actual > value):
+                    return False
+            elif op == ">=" and isinstance(value, (int, float)):
+                if not (isinstance(actual, (int, float)) and actual >= value):
+                    return False
+            elif op == "<" and isinstance(value, (int, float)):
+                if not (isinstance(actual, (int, float)) and actual < value):
+                    return False
+            elif op == "<=" and isinstance(value, (int, float)):
+                if not (isinstance(actual, (int, float)) and actual <= value):
+                    return False
+            elif op == "=":
+                if actual != value:
+                    return False
+        return True
+
+    def _build_row(self, table: str, req: TableRequirement, shared: Dict[str, Any]) -> Dict[str, Any]:
+        for _attempt in range(3):
+            row: Dict[str, Any] = {}
+            # Equivalence class values (JOIN/GROUP BY coordination).
+            for col in self.instance.tables.get(table, {}):
+                key = f"{table}.{col}"
+                if key in shared:
+                    row[col] = shared[key]
+            # Fixed values override equivalences (WHERE constraints are more specific).
+            row.update(req.fixed_values)
+            # Predicates: collect per-column, then satisfy all.
+            col_preds: Dict[str, List[Tuple[str, Any]]] = {}
+            for col, op, value in req.predicates:
+                if col not in row:
+                    col_preds.setdefault(col, []).append((op, value))
+            for col, preds in col_preds.items():
+                row[col] = self._satisfy_all(preds)
+            # Must NULL.
+            for col in req.must_null:
+                row[col] = None
+            if self._validate_row(table, req, row):
+                return row
         return row
 
     def _satisfy_all(self, preds: List[Tuple[str, Any]]) -> Any:

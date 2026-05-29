@@ -161,3 +161,56 @@ class TestAggregateNullColumns(unittest.TestCase):
             f"'name' should be in must_null for COUNT(name), got must_null={t_req.must_null}")
         self.assertGreaterEqual(t_req.min_rows, 2,
             f"min_rows should be >= 2 (one NULL + one non-NULL), got {t_req.min_rows}")
+
+
+class TestRowValidation(unittest.TestCase):
+    """Resolver should validate generated rows and retry on predicate failure."""
+
+    def test_row_satisfies_predicates(self):
+        from parseval.instance import Instance
+        from parseval.symbolic.speculate import Resolver, TableRequirement
+
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, val INT);"
+        instance = Instance(ddls=schema, name="test_validate", dialect="sqlite")
+        resolver = Resolver(instance, dialect="sqlite")
+
+        spec = BranchSpec(branch="positive")
+        spec.requirements["t"] = TableRequirement(
+            table="t",
+            min_rows=1,
+            predicates=[("val", ">", 10), ("val", "<", 20)],
+        )
+
+        rows = resolver.resolve(spec)
+        self.assertIn("t", rows, "Resolver should produce rows for table t")
+        t_rows = rows["t"]
+        self.assertGreater(len(t_rows), 0)
+        val = t_rows[0]["val"]
+        self.assertGreater(val, 10, f"val should be > 10, got {val}")
+        self.assertLess(val, 20, f"val should be < 20, got {val}")
+
+
+class TestScalarSubqueryDetection(unittest.TestCase):
+    """Propagator should detect scalar subqueries in Filter atoms and mark them for deferred evaluation."""
+
+    def test_scalar_subquery_detected(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import Propagator
+
+        schema = "CREATE TABLE t (id INT PRIMARY KEY, val INT);"
+        sql = "SELECT * FROM t WHERE val > (SELECT AVG(val) FROM t)"
+        instance = Instance(ddls=schema, name="test_scalar", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        alias_map = plan.alias_map
+
+        propagator = Propagator(plan, instance, alias_map, "sqlite")
+        specs = propagator.propagate()
+
+        pos_spec = specs[0]
+        self.assertTrue(hasattr(pos_spec, 'deferred'),
+            "BranchSpec should have a 'deferred' field")
+        self.assertGreater(len(pos_spec.deferred), 0,
+            "Should have at least one deferred subquery atom")
