@@ -699,42 +699,51 @@ class Propagator:
                 yield predicate
 
     def _find_counted_table(self, condition: exp.Expression) -> Optional[str]:
-        """Find the table containing the column inside COUNT(col).
+        """Find the table containing the column inside COUNT(col) in a HAVING comparison.
 
         For HAVING COUNT(child.id) > 3, returns 'child'.
         Returns None for COUNT(*) or COUNT(DISTINCT col) where table can't be resolved.
+
+        Strategy: find COUNT nodes that are inside a GT/GTE comparison (these are the
+        HAVING thresholds), and return their table. This avoids picking up COUNT nodes
+        from the SELECT projection.
         """
         for step in self.plan.ordered_steps:
             if isinstance(step, Aggregate):
                 for agg_expr in step.aggregations:
-                    for count_node in agg_expr.find_all(exp.Count):
-                        # Skip COUNT(*)
-                        if isinstance(count_node.this, exp.Star):
-                            continue
-                        for col in count_node.find_all(exp.Column):
-                            table = self._resolve_table(col.table or "")
-                            if table and table in self.instance.tables:
-                                return table
-        # Also check the HAVING condition directly
-        for count_node in condition.find_all(exp.Count):
-            if isinstance(count_node.this, exp.Star):
-                continue
-            for col in count_node.find_all(exp.Column):
-                table = self._resolve_table(col.table or "")
-                if table and table in self.instance.tables:
-                    return table
+                    # Look for COUNT inside a comparison (GT/GTE) — this is the HAVING threshold
+                    for comp_node in agg_expr.find_all((exp.GT, exp.GTE)):
+                        count_side = comp_node.this
+                        for count_node in count_side.find_all(exp.Count):
+                            if isinstance(count_node.this, exp.Star):
+                                continue
+                            if count_node.args.get("distinct"):
+                                continue
+                            for col in count_node.find_all(exp.Column):
+                                table = self._resolve_table(col.table or "")
+                                if table and table in self.instance.tables:
+                                    return table
+        # Fallback: check the HAVING condition directly
+        for comp_node in condition.find_all((exp.GT, exp.GTE)):
+            count_side = comp_node.this
+            for count_node in count_side.find_all(exp.Count):
+                if isinstance(count_node.this, exp.Star):
+                    continue
+                for col in count_node.find_all(exp.Column):
+                    table = self._resolve_table(col.table or "")
+                    if table and table in self.instance.tables:
+                        return table
         return None
 
     def _mark_aggregate_null_columns(self, agg_expr: exp.Expression, spec: BranchSpec):
         """Mark columns inside COUNT/SUM/AVG as must_null.
 
         Skips COUNT(*) and COUNT(DISTINCT col) — those don't need NULL testing.
+        Skips columns that already have fixed_values from WHERE (they can't be NULL).
         """
         for count_node in agg_expr.find_all(exp.Count):
-            # Skip COUNT(*)
             if isinstance(count_node.this, exp.Star):
                 continue
-            # Skip COUNT(DISTINCT col) — DISTINCT ignores NULLs
             if count_node.args.get("distinct"):
                 continue
             for col in count_node.find_all(exp.Column):
@@ -742,8 +751,9 @@ class Propagator:
                 matched = self._match_column(table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
-                    req.must_null.add(matched)
-                    req.min_rows = max(req.min_rows, 2)
+                    if matched not in req.fixed_values:
+                        req.must_null.add(matched)
+                        req.min_rows = max(req.min_rows, 2)
 
         for sum_node in agg_expr.find_all(exp.Sum):
             for col in sum_node.find_all(exp.Column):
@@ -751,8 +761,9 @@ class Propagator:
                 matched = self._match_column(table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
-                    req.must_null.add(matched)
-                    req.min_rows = max(req.min_rows, 2)
+                    if matched not in req.fixed_values:
+                        req.must_null.add(matched)
+                        req.min_rows = max(req.min_rows, 2)
 
         for avg_node in agg_expr.find_all(exp.Avg):
             for col in avg_node.find_all(exp.Column):
@@ -760,8 +771,9 @@ class Propagator:
                 matched = self._match_column(table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
-                    req.must_null.add(matched)
-                    req.min_rows = max(req.min_rows, 2)
+                    if matched not in req.fixed_values:
+                        req.must_null.add(matched)
+                        req.min_rows = max(req.min_rows, 2)
 
     def _extract_min_group_size(self, condition: exp.Expression) -> int:
         """Extract minimum group size from HAVING (e.g., COUNT(*) > 3 → 4).
@@ -962,9 +974,30 @@ class Resolver:
             for col in req.group_key_columns:
                 if col in base_row:
                     row[col] = base_row[col]
+            # Generate unique values for UNIQUE columns to avoid insertion failures.
+            for col in self.instance.tables.get(table, {}):
+                if self.instance.is_unique(table, col) and col in row:
+                    existing_vals = {r.get(col) for r in rows}
+                    if row[col] in existing_vals:
+                        row[col] = self._unique_value(table, col, i, existing_vals)
             rows.append(row)
 
         return rows
+
+    def _unique_value(self, table: str, col: str, index: int, existing: set) -> Any:
+        """Generate a unique value for a column, avoiding existing values."""
+        col_type = str(self.instance.tables.get(table, {}).get(col, "TEXT")).upper()
+        if "INT" in col_type:
+            v = index + 1
+            while v in existing:
+                v += 1
+            return v
+        else:
+            v = f"val_{index}"
+            while v in existing:
+                index += 1
+                v = f"val_{index}"
+            return v
 
     def _validate_row(self, table: str, req: TableRequirement, row: Dict[str, Any]) -> bool:
         """Check that generated row values satisfy all predicates."""
