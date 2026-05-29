@@ -45,6 +45,44 @@ class TestFKReferencedTableRows(unittest.TestCase):
         child_rows = rows["child"]
         self.assertGreater(len(child_rows), 0)
 
+SCHEMA_JOIN = (
+    "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);"
+    "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id), val INT);"
+)
+
+
+class TestHavingCountTableSpecific(unittest.TestCase):
+    """HAVING COUNT > N should set min_rows only on the counted table."""
+
+    def test_min_rows_applied_to_counted_table_only(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import Propagator
+
+        schema = SCHEMA_JOIN
+        sql = "SELECT parent.id, COUNT(child.id) FROM parent JOIN child ON parent.id = child.parent_id GROUP BY parent.id HAVING COUNT(child.id) > 3"
+        instance = Instance(ddls=schema, name="test_having", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        alias_map = plan.alias_map
+
+        propagator = Propagator(plan, instance, alias_map, "sqlite")
+        specs = propagator.propagate()
+
+        pos_spec = specs[0]  # positive branch
+        # child table should have min_rows >= 4 (COUNT > 3 → need 4)
+        child_req = pos_spec.requirements.get("child")
+        self.assertIsNotNone(child_req, "child table should be in requirements")
+        self.assertGreaterEqual(child_req.min_rows, 4,
+            f"child min_rows should be >= 4 for COUNT > 3, got {child_req.min_rows}")
+        # parent table should NOT be forced to 4 rows
+        parent_req = pos_spec.requirements.get("parent")
+        if parent_req:
+            self.assertLess(parent_req.min_rows, 4,
+                f"parent min_rows should be < 4, got {parent_req.min_rows}")
+
+
     def test_transitive_fk_chain_grandparent_discovered(self):
         """Resolver should discover grandparent via parent FK chain (child -> parent -> grandparent)."""
         instance = Instance(ddls=SCHEMA_FK_CHAIN, name="test_fk_chain", dialect="sqlite")
