@@ -210,9 +210,6 @@ class SymbolicEngine:
         # COUNT, NOT IN, and all common patterns via heuristics.
         self._speculate_all_branches()
 
-        # Phase 0c: If query has OFFSET, generate enough rows.
-        self._seed_for_offset()
-
         # Phase 0d: Handle subquery predicates.
         self._resolve_subquery_predicates()
 
@@ -383,29 +380,6 @@ class SymbolicEngine:
 
     def _total_rows(self) -> int:
         return sum(len(self.instance.get_rows(t)) for t in self.instance.tables)
-
-    def _seed_for_offset(self) -> None:
-        """If the query has LIMIT with OFFSET, generate enough rows."""
-        from parseval.plan.planner import Limit as LimitStep
-        for step in self.plan.ordered_steps:
-            if isinstance(step, LimitStep):
-                offset = getattr(step, "offset", 0) or 0
-                if offset > 0:
-                    needed = offset + int(step.limit if step.limit != float("inf") else 1)
-                    main_table = next(
-                        (v for v in self.alias_map.values() if v in self.instance.tables), ""
-                    )
-                    if not main_table:
-                        return
-                    current = len(self.instance.get_rows(main_table))
-                    # Cap at 500 rows to avoid excessive generation time.
-                    to_create = min(needed - current, 500 - current)
-                    for _ in range(max(to_create, 0)):
-                        try:
-                            self.instance.create_row(main_table, values={})
-                        except Exception:
-                            break
-
 
     def _smt_repair_where(self) -> None:
         """Use Z3 to solve the full WHERE clause and repair rows.
