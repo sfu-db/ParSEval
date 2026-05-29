@@ -19,7 +19,7 @@ from sqlglot import exp
 
 from parseval.instance import Instance
 from parseval.plan import Plan
-from parseval.plan.planner import Aggregate, Filter, Join, Project, Scan
+from parseval.plan.planner import Aggregate, Filter, Join, Project
 from parseval.plan.rex import Variable
 from parseval.query import preprocess_sql
 
@@ -172,11 +172,11 @@ class SymbolicEngine:
         self.sql = sql
         self.dialect = dialect
         self.expr = preprocess_sql(sql, instance, dialect=dialect)
-        self.plan = Plan(self.expr)
+        self.plan = Plan(self.expr, self.instance)
         from parseval.solver.unified import Solver; self.solver = solver or Solver(instance, dialect=dialect)
         self.max_iterations = max_iterations
-        # Build alias → real table name mapping from the Plan's Scan steps.
-        self.alias_map = _build_alias_map(self.plan)
+        # Alias → real table name mapping from the Plan's Scan steps.
+        self.alias_map = self.plan.alias_map
         # Dynamic row budget: scale with query complexity if not specified.
         if max_rows_per_table is not None:
             self.max_rows_per_table = max_rows_per_table
@@ -198,8 +198,6 @@ class SymbolicEngine:
                  and materialize it.
         Phase 3: Re-evaluate. Repeat Phase 2 until covered or budget exhausted.
         """
-        from .speculate import build_spec, resolve_spec
-
         thresholds = thresholds or CoverageThresholds()
         self._thresholds = thresholds
         evaluator = PlanEvaluator(self.plan, self.instance, self.dialect)
@@ -211,9 +209,6 @@ class SymbolicEngine:
         # This is the primary generation path — handles self-joins, HAVING
         # COUNT, NOT IN, and all common patterns via heuristics.
         self._speculate_all_branches()
-
-        # Phase 0b: Ensure every alias has a row (self-join aware).
-        self._ensure_base_rows()
 
         # Phase 0c: If query has OFFSET, generate enough rows.
         self._seed_for_offset()
@@ -367,28 +362,6 @@ class SymbolicEngine:
                     values[local_col] = parent_key
 
         return values
-
-    def _speculate(self, target: str = "positive", negate_atom=None) -> bool:
-        """Backward-compat single-branch speculate."""
-        from .speculate import build_spec, resolve_spec
-        spec = build_spec(self.plan, self.instance, alias_map=self.alias_map, target_outcome=target, negate_atom=negate_atom)
-        if not spec.requirements:
-            return False
-        assignments = resolve_spec(spec, self.instance, self.dialect)
-        success = False
-        for table, row_values in assignments.items():
-            if table not in self.instance.tables:
-                continue
-            fk_fill = self._fill_fk_values(table, {})
-            for col, val in fk_fill.items():
-                if col not in row_values:
-                    row_values[col] = val
-            try:
-                self.instance.create_row(table, values=row_values)
-                success = True
-            except Exception:
-                pass
-        return success
 
     def _speculate_all_branches(self) -> None:
         """Generate rows for ALL branches (positive + negatives) at once."""
@@ -884,24 +857,6 @@ class SymbolicEngine:
 
         return values[0] if values else None
 
-    def _ensure_base_rows(self) -> None:
-        """Ensure every alias has a row (self-join aware).
-        
-        For self-joins, creates separate rows per alias so each alias
-        binds to a distinct row in the physical table.
-        """
-        self.alias_map.ensure_rows_exist(self.instance)
-        # Also ensure FK-linked rows exist
-        for alias, real_table in self.alias_map.items():
-            if real_table not in self.instance.tables:
-                continue
-            if not self.instance.get_rows(real_table):
-                try:
-                    values = self._fill_fk_values(real_table, {})
-                    self.instance.create_row(real_table, values=values)
-                except Exception:
-                    pass
-
     def _repair_not_in_simple(self, condition: exp.Expression) -> None:
         """Simple NOT IN repair: set the outer column to a fresh value not in inner results."""
         from parseval.helper import normalize_name
@@ -1097,124 +1052,6 @@ class SymbolicEngine:
             self.instance.create_row(table, values={null_column: None})
         except Exception:
             pass  # Schema constraint may prevent NULL
-
-
-# =============================================================================
-# Alias resolution
-# =============================================================================
-
-
-class AliasMap(dict):
-    """Alias → physical table mapping that also tracks per-alias row indices.
-
-    Backward-compatible with Dict[str, str] (alias → table_name).
-    Additionally tracks which row index each alias should bind to when
-    multiple aliases reference the same physical table (self-joins).
-
-    Usage:
-        alias_map['t1']  → 'superhero'  (dict-compatible)
-        alias_map['t2']  → 'colour'
-        alias_map['t3']  → 'colour'
-        alias_map.row_index('t2')  → 0  (first row of colour)
-        alias_map.row_index('t3')  → 1  (second row of colour)
-        alias_map.self_join_aliases('colour')  → ['t2', 't3']
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._row_indices: Dict[str, int] = {}
-        self._compute_row_indices()
-
-    def _compute_row_indices(self):
-        """Assign row indices: each alias to the same table gets a unique index."""
-        table_counters: Dict[str, int] = {}
-        # Sort aliases for determinism
-        for alias in sorted(self.keys()):
-            table = self[alias]
-            idx = table_counters.get(table, 0)
-            self._row_indices[alias] = idx
-            table_counters[table] = idx + 1
-
-    def row_index(self, alias: str) -> int:
-        """Return the row index this alias binds to within its physical table."""
-        return self._row_indices.get(alias, 0)
-
-    def self_join_aliases(self, table: str) -> List[str]:
-        """Return all aliases that reference the given physical table."""
-        return [a for a, t in self.items() if t == table]
-
-    def has_self_join(self, table: str) -> bool:
-        """True if multiple aliases reference the same physical table."""
-        return sum(1 for t in self.values() if t == table) > 1
-
-    def self_join_tables(self) -> Dict[str, List[str]]:
-        """Return {table: [aliases]} for tables with multiple aliases."""
-        from collections import defaultdict
-        groups: Dict[str, List[str]] = defaultdict(list)
-        for alias, table in self.items():
-            groups[table].append(alias)
-        return {t: aliases for t, aliases in groups.items() if len(aliases) > 1}
-
-    def ensure_rows_exist(self, instance) -> None:
-        """Ensure the Instance has enough rows for all aliases (self-joins need multiple rows)."""
-        from collections import Counter
-        table_needs = Counter(self.values())
-        for table, needed in table_needs.items():
-            if table not in instance.tables:
-                continue
-            existing = len(instance.get_rows(table))
-            for _ in range(max(0, needed - existing)):
-                try:
-                    instance.create_row(table, values={})
-                except Exception:
-                    pass
-
-
-def _build_alias_map(plan: Plan) -> AliasMap:
-    """Build alias → real table name mapping from the Plan's Scan steps.
-
-    Walks all steps in the plan (including SubPlan inner plans) to find
-    every base table reference. For FROM-subquery patterns, the real
-    tables are inside the SubPlan's inner plan.
-    """
-    from parseval.helper import normalize_name
-    raw: Dict[str, str] = {}
-
-    def _walk_steps(steps):
-        for step in steps:
-            if isinstance(step, Scan) and step.source is not None:
-                if isinstance(step.source, exp.Table):
-                    alias = step.source.alias_or_name
-                    real = step.source.name
-                    if alias and real:
-                        raw[alias] = real
-                        raw[normalize_name(alias)] = normalize_name(real)
-            # Walk into SubPlan inner plans.
-            for sub in step.subplan_dependencies:
-                if sub.inner:
-                    _walk_inner(sub.inner)
-
-    def _walk_inner(step):
-        """Recursively walk an inner plan's steps."""
-        visited = set()
-        stack = [step]
-        while stack:
-            current = stack.pop()
-            if id(current) in visited:
-                continue
-            visited.add(id(current))
-            if isinstance(current, Scan) and current.source is not None:
-                if isinstance(current.source, exp.Table):
-                    alias = current.source.alias_or_name
-                    real = current.source.name
-                    if alias and real:
-                        raw[alias] = real
-                        raw[normalize_name(alias)] = normalize_name(real)
-            for dep in current.dependencies:
-                stack.append(dep)
-
-    _walk_steps(plan.ordered_steps)
-    return AliasMap(raw)
 
 
 # =============================================================================
