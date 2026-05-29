@@ -135,9 +135,18 @@ class Propagator:
             needed = offset + int(limit_val)
             for dep in step.chain_dependencies:
                 self._propagate_step(dep, spec, negate_step)
-            # Increase min_rows for all tables.
-            for req in spec.requirements.values():
-                req.min_rows = max(req.min_rows, needed)
+            # Apply min_rows to the driving table only (the Limit's source table).
+            driving_alias = getattr(step, "source", None)
+            driving_table = self.alias_map.get(driving_alias, driving_alias) if driving_alias else None
+            if driving_table and driving_table in spec.requirements:
+                spec.requirements[driving_table].min_rows = max(
+                    spec.requirements[driving_table].min_rows, needed
+                )
+            elif driving_table:
+                # Table not yet in spec — add it with the needed rows.
+                spec.requirements[driving_table] = TableRequirement(
+                    table=driving_table, min_rows=needed
+                )
 
         elif isinstance(step, Project):
             # NOT NULL for projected columns + duplicate requirement.

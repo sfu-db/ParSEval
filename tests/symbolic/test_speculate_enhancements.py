@@ -101,3 +101,35 @@ class TestHavingCountTableSpecific(unittest.TestCase):
             "Resolver should discover parent via FK chain")
         self.assertGreater(len(rows["parent"]), 0,
             "Parent should have at least one row")
+
+
+class TestOffsetTableSpecific(unittest.TestCase):
+    """OFFSET should set min_rows on the driving table only, not all tables."""
+
+    def test_offset_applies_to_driving_table_only(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import Propagator
+
+        schema = SCHEMA_JOIN
+        sql = "SELECT parent.id FROM parent JOIN child ON parent.id = child.parent_id LIMIT 5 OFFSET 10"
+        instance = Instance(ddls=schema, name="test_offset", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+        alias_map = plan.alias_map
+
+        propagator = Propagator(plan, instance, alias_map, "sqlite")
+        specs = propagator.propagate()
+
+        pos_spec = specs[0]
+        # Driving table (parent) should have min_rows >= 15 (offset 10 + limit 5)
+        parent_req = pos_spec.requirements.get("parent")
+        self.assertIsNotNone(parent_req)
+        self.assertGreaterEqual(parent_req.min_rows, 15,
+            f"parent (driving table) min_rows should be >= 15, got {parent_req.min_rows}")
+        # Non-driving table (child) should NOT be forced to 15
+        child_req = pos_spec.requirements.get("child")
+        if child_req:
+            self.assertLess(child_req.min_rows, 15,
+                f"child min_rows should be < 15, got {child_req.min_rows}")
