@@ -187,6 +187,30 @@ def test_self_join_preserves_alias_rows():
     assert "people" not in result.assignments
 
 
+def test_smt_self_join_preserves_alias_rows():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("a", "b"),
+        constraints=[
+            exp.GT(
+                this=exp.Add(
+                    this=_col("a", "age", "INT"),
+                    expression=_col("b", "age", "INT"),
+                ),
+                expression=exp.Literal.number(10),
+            ),
+        ],
+        alias_map={"a": "people", "b": "people"},
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert "a" in result.assignments
+    assert "b" in result.assignments
+    assert "age" in result.assignments["a"]
+    assert "age" in result.assignments["b"]
+    assert "people" not in result.assignments
+
+
 def test_rejects_unannotated_columns():
     """Solver should reject columns without type annotations."""
     solver = Solver()
