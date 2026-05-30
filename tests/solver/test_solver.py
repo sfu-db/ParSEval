@@ -170,6 +170,23 @@ def test_result_uses_physical_table_names():
     assert "a" not in result.assignments
 
 
+def test_self_join_preserves_alias_rows():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("a", "b"),
+        constraints=[
+            exp.EQ(this=_col("a", "name", "TEXT"), expression=exp.Literal.string("Alice")),
+            exp.EQ(this=_col("b", "name", "TEXT"), expression=exp.Literal.string("Bob")),
+        ],
+        alias_map={"a": "people", "b": "people"},
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["a"]["name"] == "Alice"
+    assert result.assignments["b"]["name"] == "Bob"
+    assert "people" not in result.assignments
+
+
 def test_rejects_unannotated_columns():
     """Solver should reject columns without type annotations."""
     solver = Solver()
