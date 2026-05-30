@@ -98,6 +98,46 @@ def test_domain_returns_unsat_for_or_with_two_unsat_branches():
     assert result.assignments is None
 
 
+def test_domain_top_level_unknown_does_not_mask_unsat():
+    unsupported = exp.GT(
+        this=exp.Add(this=_col("t1", "a", "INT"), expression=_col("t1", "b", "INT")),
+        expression=exp.Literal.number(1000),
+    )
+    unsat = exp.And(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+    )
+    result = DomainSolver().solve(_constraint(("t1",), [unsupported, unsat]))
+    assert result.status == "unsat"
+    assert result.assignments is None
+    assert result.reason == "contradictory_bounds"
+
+
+def test_domain_returns_sat_for_or_with_two_sat_branches():
+    expr = exp.Or(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+    )
+    result = DomainSolver().solve(_constraint(("t1",), [expr]))
+    assignments = _sat_assignments(result)
+    assert assignments["t1"]["x"] in {1, 2}
+
+
+def test_domain_returns_unknown_for_unsat_or_unknown():
+    unsat = exp.And(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+    )
+    unknown = exp.GT(
+        this=exp.Add(this=_col("t1", "a", "INT"), expression=_col("t1", "b", "INT")),
+        expression=exp.Literal.number(1000),
+    )
+    result = DomainSolver().solve(_constraint(("t1",), [exp.Or(this=unsat, expression=unknown)]))
+    assert result.status == "unknown"
+    assert result.assignments is None
+    assert result.reason == "unsupported_arithmetic"
+
+
 def test_domain_preserves_alias_assignment_keys():
     expr = exp.EQ(this=_col("a", "name", "TEXT"), expression=exp.Literal.string("Alice"))
     result = DomainSolver().solve(_constraint(

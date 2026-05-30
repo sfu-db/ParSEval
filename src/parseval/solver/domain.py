@@ -225,7 +225,7 @@ class DomainSolver:
                 analysis,
                 self._analyze_expression(expr, target_tables, alias_map),
             )
-            if analysis.status != "sat":
+            if analysis.status == "unsat":
                 break
 
         if analysis.status == "unknown":
@@ -313,15 +313,17 @@ class DomainSolver:
         ))
 
     def _merge_or(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
+        if left.status == "sat":
+            return left
+        if right.status == "sat":
+            return right
         if left.status == "unsat" and right.status == "unsat":
             return LoweringOutcome(status="unsat", reason=left.reason or right.reason)
-        if left.status == "sat" and right.status == "unsat":
-            return left
-        if right.status == "sat" and left.status == "unsat":
-            return right
-        if left.status == "sat" and right.status == "sat":
-            return LoweringOutcome(status="unknown", reason="unsupported_or")
-        return LoweringOutcome(status="unknown", reason=left.reason or right.reason or "unsupported_or")
+        if left.status == "unknown":
+            return LoweringOutcome(status="unknown", reason=left.reason or right.reason or "unsupported_or")
+        if right.status == "unknown":
+            return LoweringOutcome(status="unknown", reason=right.reason or left.reason or "unsupported_or")
+        return LoweringOutcome(status="unknown", reason="unsupported_or")
 
     def _classify_supported(self, outcome: LoweringOutcome) -> LoweringOutcome:
         if outcome.status != "sat":
