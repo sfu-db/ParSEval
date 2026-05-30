@@ -1,0 +1,154 @@
+"""Tests for the unified Solver — domain + SMT orchestrator."""
+from sqlglot import exp
+from sqlglot.expressions import DataType
+
+from parseval.solver.unified import Solver, SolverConstraint, SolveResult
+
+
+def _col(table: str, name: str, dtype: str) -> exp.Column:
+    node = exp.column(name, table=table)
+    node.type = DataType.build(dtype)
+    return node
+
+
+def test_solve_simple_equality():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "age", "INT"), expression=exp.Literal.number(25)),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["age"] == 25
+
+
+def test_solve_gt():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(18)),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["age"] > 18
+
+
+def test_solve_empty():
+    solver = Solver()
+    constraint = SolverConstraint(target_tables=("t1",))
+    result = solver.solve(constraint)
+    assert result.sat
+
+
+def test_solve_join_equality():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1", "t2"),
+        constraints=[
+            exp.GT(this=_col("t1", "id", "INT"), expression=exp.Literal.number(0)),
+        ],
+        join_equalities=[("t1", "id", "t2", "t1_id")],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["id"] == result.assignments["t2"]["t1_id"]
+
+
+def test_solve_is_null():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.Is(this=_col("t1", "name", "TEXT"), expression=exp.Null()),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["name"] is None
+
+
+def test_solve_conjunction():
+    solver = Solver()
+    gt = exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(10))
+    lt = exp.LT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(20))
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[exp.And(this=gt, expression=lt)],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert 10 < result.assignments["t1"]["age"] < 20
+
+
+def test_solve_complex_expression():
+    """Test that complex expressions fall through to SMT."""
+    solver = Solver()
+    add = exp.Add(
+        this=_col("t1", "a", "INT"),
+        expression=_col("t1", "b", "INT"),
+    )
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.GT(this=add, expression=exp.Literal.number(10)),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+
+
+def test_solve_multiple_constraints():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "name", "TEXT"), expression=exp.Literal.string("Alice")),
+            exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(20)),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["name"] == "Alice"
+    assert result.assignments["t1"]["age"] > 20
+
+
+def test_solve_result_structure():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(42)),
+        ],
+    )
+    result = solver.solve(constraint)
+    assert isinstance(result, SolveResult)
+    assert result.sat
+    assert isinstance(result.assignments, dict)
+    assert "t1" in result.assignments
+
+
+def test_solver_no_instance():
+    """Verify Solver does not accept instance parameter."""
+    solver = Solver()
+    assert not hasattr(solver, "instance")
+
+
+def test_result_uses_physical_table_names():
+    """When alias_map maps aliases to physical tables, result keys should be physical names."""
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("a", "b"),
+        constraints=[
+            exp.EQ(this=_col("a", "name", "TEXT"), expression=exp.Literal.string("Alice")),
+        ],
+        alias_map={"a": "people", "b": "people"},
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    # Keys should be physical table names, not aliases
+    assert "people" in result.assignments
+    assert "a" not in result.assignments

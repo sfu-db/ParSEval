@@ -215,7 +215,8 @@ class Solver:
             if status != "sat" or not solutions:
                 return None
 
-            # Group assignments by table.
+            # Group assignments by table (using physical names).
+            alias_map = constraint.alias_map or {}
             assignments: Dict[str, Dict[str, Any]] = {}
             for var_name, value in solutions.items():
                 parts = var_name.split(".")
@@ -224,7 +225,8 @@ class Solver:
                 else:
                     table = constraint.target_tables[0] if constraint.target_tables else ""
                     col = var_name
-                assignments.setdefault(table, {})[col] = value
+                physical = alias_map.get(table, table)
+                assignments.setdefault(physical, {})[col] = value
             return assignments if assignments else None
         except Exception:
             return None
