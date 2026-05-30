@@ -59,6 +59,45 @@ def test_domain_returns_unknown_for_arithmetic_predicate():
     assert result.reason == "unsupported_arithmetic"
 
 
+def test_domain_returns_unknown_for_mixed_supported_and_unsupported_and():
+    supported = exp.EQ(this=_col("t1", "name", "TEXT"), expression=exp.Literal.string("Alice"))
+    unsupported = exp.GT(
+        this=exp.Add(this=_col("t1", "a", "INT"), expression=_col("t1", "b", "INT")),
+        expression=exp.Literal.number(1000),
+    )
+    result = DomainSolver().solve(
+        _constraint(("t1",), [exp.And(this=supported, expression=unsupported)]),
+    )
+    assert result.status == "unknown"
+    assert result.assignments is None
+    assert result.reason == "unsupported_arithmetic"
+
+
+def test_domain_returns_unknown_for_not_or_expression():
+    expr = exp.Not(this=exp.Or(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+    ))
+    result = DomainSolver().solve(_constraint(("t1",), [expr]))
+    assert result.status == "unknown"
+    assert result.assignments is None
+    assert result.reason == "unsupported_not"
+
+
+def test_domain_returns_unsat_for_or_with_two_unsat_branches():
+    left = exp.And(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+    )
+    right = exp.And(
+        this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(3)),
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(4)),
+    )
+    result = DomainSolver().solve(_constraint(("t1",), [exp.Or(this=left, expression=right)]))
+    assert result.status == "unsat"
+    assert result.assignments is None
+
+
 def test_domain_preserves_alias_assignment_keys():
     expr = exp.EQ(this=_col("a", "name", "TEXT"), expression=exp.Literal.string("Alice"))
     result = DomainSolver().solve(_constraint(
@@ -286,4 +325,4 @@ def test_returns_unknown_for_complex_expressions():
     result = solver.solve(_constraint(("t1",), [expr]))
     assert result.status == "unknown"
     assert result.assignments is None
-    assert result.reason == "unsupported_expression"
+    assert result.reason == "unsupported_arithmetic"
