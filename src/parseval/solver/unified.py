@@ -51,14 +51,12 @@ class SolverConstraint:
         join_equalities: Cross-table equalities ``(left_table, left_col,
             right_table, right_col)`` that the solver enforces.
         alias_map: Table alias → real name mapping for column resolution.
-        atom: Optional specific target atom (for Phase 2 targeted generation).
     """
 
     target_tables: Tuple[str, ...]
     constraints: List[exp.Expression] = field(default_factory=list)
     join_equalities: List[Tuple[str, str, str, str]] = field(default_factory=list)
     alias_map: Dict[str, str] = field(default_factory=dict)
-    atom: Optional[exp.Expression] = None
 
 
 @dataclass
