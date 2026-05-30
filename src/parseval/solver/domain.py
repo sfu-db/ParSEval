@@ -129,6 +129,28 @@ def _lower_atom(
             col = atom.this
             val = str(atom.expression.this)
             op = "like"
+    elif isinstance(atom, exp.In):
+        in_col = atom.this
+        expressions = atom.args.get("expressions") or []
+        if isinstance(in_col, exp.Column) and expressions:
+            values = []
+            for e in expressions:
+                v = _literal_value(e)
+                if v is not None:
+                    values.append(v)
+            if values:
+                table = _resolve_table(in_col, tables, alias_map)
+                return ColumnPredicate(table=table, column=in_col.name, op="in", value=values)
+    elif isinstance(atom, exp.Between):
+        bw_col = atom.this
+        low = atom.args.get("low")
+        high = atom.args.get("high")
+        if isinstance(bw_col, exp.Column) and low and high:
+            low_val = _literal_value(low)
+            high_val = _literal_value(high)
+            if low_val is not None and high_val is not None:
+                table = _resolve_table(bw_col, tables, alias_map)
+                return ColumnPredicate(table=table, column=bw_col.name, op="between", value=(low_val, high_val))
 
     if col is not None and val is not None and op is not None:
         table = _resolve_table(col, tables, alias_map)
@@ -268,6 +290,11 @@ class DomainSolver:
                 space.must_null = True
             elif op == "not_null":
                 space.not_null = True
+            elif op == "in" and isinstance(val, list):
+                space.narrow_in(set(val))
+            elif op == "between" and isinstance(val, tuple):
+                space.narrow_min(val[0])
+                space.narrow_max(val[1])
 
     def _build_equivalences(
         self,
