@@ -235,6 +235,10 @@ class DomainSolver:
         for expr in expressions:
             all_preds.extend(_lower_expression(expr, target_tables, alias_map))
 
+        # If expressions exist but no predicates, no col-col eqs, and no join eqs — can't solve
+        if expressions and not all_preds and not self._col_col_eqs and not join_equalities:
+            return None
+
         # 3. Apply predicates to variables
         self._apply_predicates(variables, all_preds)
 

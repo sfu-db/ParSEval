@@ -220,3 +220,15 @@ def test_column_column_equality():
     result = solver.solve(_constraint(("a", "b"), [expr]))
     assert result is not None
     assert result["a"]["x"] == result["b"]["y"]
+
+
+def test_returns_none_for_complex_expressions():
+    """Domain solver can't handle arithmetic — should return None."""
+    add = exp.Add(
+        this=_col("t1", "x", "INT"),
+        expression=_col("t1", "y", "INT"),
+    )
+    expr = exp.GT(this=add, expression=exp.Literal.number(10))
+    solver = DomainSolver()
+    result = solver.solve(_constraint(("t1",), [expr]))
+    assert result is None
