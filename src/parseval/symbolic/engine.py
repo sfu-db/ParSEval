@@ -22,7 +22,8 @@ from parseval.plan import Plan
 from parseval.plan.planner import Aggregate, Filter, Join, Project
 from parseval.query import preprocess_sql
 
-from .constraints import ConstraintGenerator, SolverConstraint
+from .constraints import ConstraintGenerator
+from parseval.solver.unified import SolverConstraint
 from .evaluator import PlanEvaluator
 from .infeasibility import is_infeasible
 from .types import (
@@ -462,19 +463,15 @@ class SymbolicEngine:
                 if concrete(condition, env) is True:
                     continue
                 try:
-                    from parseval.solver.unified import _try_smt
-                    from parseval.symbolic.constraints import SolverConstraint
-                    from parseval.symbolic.types import BranchType
                     tables_in_condition = set(
                         normalize_name(self.alias_map.get(a, a)) for a in aliases_in_condition
                     ) & set(self.instance.tables.keys())
                     smt_constraint = SolverConstraint(
                         target_tables=tuple(tables_in_condition),
+                        constraints=[condition],
                         atom=condition,
-                        target_outcome=BranchType.ATOM_TRUE,
-                        path_predicates=[], join_equalities=[],
                     )
-                    smt_result = _try_smt(smt_constraint, self.instance, self.dialect, timeout_ms=3000)
+                    smt_result = self.solver._try_smt(smt_constraint)
                     if smt_result:
                         for table, col_values in smt_result.items():
                             real_table = normalize_name(self.alias_map.get(table, table))

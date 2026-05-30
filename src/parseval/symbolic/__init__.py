@@ -9,7 +9,8 @@ Public API::
     print(result.coverage, result.rows_generated)
 """
 
-from .constraints import ConstraintGenerator, SolverConstraint
+from parseval.solver.unified import SolverConstraint
+from .constraints import ConstraintGenerator
 from .engine import SymbolicEngine
 from .evaluator import PlanEvaluator, decompose_atoms
 from .infeasibility import is_infeasible
