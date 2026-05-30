@@ -152,3 +152,23 @@ def test_result_uses_physical_table_names():
     # Keys should be physical table names, not aliases
     assert "people" in result.assignments
     assert "a" not in result.assignments
+
+
+def test_rejects_unannotated_columns():
+    """Solver should reject columns without type annotations."""
+    solver = Solver()
+    col = exp.column("age", table="t1")
+    expr = exp.GT(this=col, expression=exp.Literal.number(18))
+    constraint = SolverConstraint(target_tables=("t1",), constraints=[expr])
+    result = solver.solve(constraint)
+    assert not result.sat
+    assert "type annotation" in result.reason
+
+
+def test_accepts_annotated_columns():
+    """Solver should accept columns with type annotations."""
+    solver = Solver()
+    expr = exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(18))
+    constraint = SolverConstraint(target_tables=("t1",), constraints=[expr])
+    result = solver.solve(constraint)
+    assert result.sat

@@ -103,53 +103,32 @@ class Solver:
         if not constraint.constraints and not constraint.join_equalities:
             return SolveResult(sat=True, assignments={})
 
-        # --- Lower constraints to detect residuals ---
-        _, residuals = self._lower(constraint)
+        # Validate type annotations
+        ok, reason = self._validate_types(constraint)
+        if not ok:
+            return SolveResult(sat=False, reason=reason)
 
-        # --- Tier 1: Domain solver ---
+        # Tier 1: Domain solver
         domain_result = self._try_domain(constraint)
-
-        if domain_result is not None and not residuals:
+        if domain_result is not None:
             return SolveResult(sat=True, assignments=domain_result)
 
-        # --- Tier 2: SMT solver ---
+        # Tier 2: SMT solver
         smt_result = self._try_smt(constraint)
         if smt_result is not None:
             return SolveResult(sat=True, assignments=smt_result)
 
-        # --- Fallback: domain result even if residuals unresolved ---
-        if domain_result is not None:
-            return SolveResult(sat=True, assignments=domain_result)
-
         return SolveResult(sat=False, reason="all tiers exhausted")
 
-    # ── Lowering ────────────────────────────────────────────────
+    # ── Validation ──────────────────────────────────────────────
 
-    def _lower(
-        self, constraint: SolverConstraint
-    ) -> Tuple[List, List[exp.Expression]]:
-        """Lower expressions into simple predicates + residuals.
-
-        Simple predicates are ``(table, col, op, value)`` tuples for the
-        domain solver.  Residuals are expressions that need SMT.
-        """
-        from .domain import _lower_expression, ColumnPredicate
-
-        simple: List[ColumnPredicate] = []
-        residuals: List[exp.Expression] = []
-
+    def _validate_types(self, constraint: SolverConstraint) -> Tuple[bool, str]:
+        """Check that all Column nodes have type annotations."""
         for expr in constraint.constraints:
-            preds = _lower_expression(expr, constraint.target_tables, constraint.alias_map or {})
-            simple.extend(preds)
-            # If no preds were extracted and it's not a simple expression,
-            # it's a residual for SMT.
-            if not preds and not isinstance(expr, (
-                exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE,
-                exp.Is, exp.Like, exp.And, exp.Or, exp.Paren,
-            )):
-                residuals.append(expr)
-
-        return simple, residuals
+            for col in expr.find_all(exp.Column):
+                if col_type(col) is None:
+                    return False, f"Column {col.table or '?'}.{col.name} has no type annotation"
+        return True, ""
 
     # ── Domain solver ───────────────────────────────────────────
 
