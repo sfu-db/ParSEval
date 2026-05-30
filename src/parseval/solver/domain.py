@@ -236,7 +236,7 @@ class DomainSolver:
             return None
 
         # 6. Assign
-        return self._assign(variables, target_tables)
+        return self._assign(variables, target_tables, alias_map)
 
     def _extract_variables(
         self,
@@ -352,12 +352,30 @@ class DomainSolver:
                     left = variables.get(c.left)
                     right = variables.get(c.right)
                     if left and right:
+                        # Propagate equals
                         if left.space.equals is not None and right.space.equals is None:
                             right.space.narrow_eq(left.space.equals)
                             changed = True
                         elif right.space.equals is not None and left.space.equals is None:
                             left.space.narrow_eq(right.space.equals)
                             changed = True
+                        # Propagate bounds (bidirectional)
+                        if left.space.min_val is not None:
+                            if right.space.min_val is None or left.space.min_val > right.space.min_val:
+                                right.space.narrow_min(left.space.min_val)
+                                changed = True
+                        if right.space.min_val is not None:
+                            if left.space.min_val is None or right.space.min_val > left.space.min_val:
+                                left.space.narrow_min(right.space.min_val)
+                                changed = True
+                        if left.space.max_val is not None:
+                            if right.space.max_val is None or left.space.max_val < right.space.max_val:
+                                right.space.narrow_max(left.space.max_val)
+                                changed = True
+                        if right.space.max_val is not None:
+                            if left.space.max_val is None or right.space.max_val < left.space.max_val:
+                                left.space.narrow_max(right.space.max_val)
+                                changed = True
             for var in variables.values():
                 if var.space.is_empty():
                     return False
@@ -377,14 +395,18 @@ class DomainSolver:
         self,
         variables: Dict[str, CSPVariable],
         target_tables: Tuple[str, ...],
+        alias_map: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Dict[str, Any]]]:
+        alias_map = alias_map or {}
         result: Dict[str, Dict[str, Any]] = {}
         for var in variables.values():
             val = var.space.pick()
             var.assigned = val
-            result.setdefault(var.table, {})[var.column] = val
+            physical = alias_map.get(var.table, var.table)
+            result.setdefault(physical, {})[var.column] = val
         if not result:
             # No variables to assign -- return empty per-table structure
             for t in target_tables:
-                result[t] = {}
+                physical = alias_map.get(t, t)
+                result[physical] = {}
         return result
