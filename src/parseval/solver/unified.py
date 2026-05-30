@@ -214,7 +214,8 @@ class Solver:
             if status != "sat" or not solutions:
                 return None
 
-            # Group assignments by table (using physical names).
+            # Group assignments by solver table key first, then apply the same
+            # lossless alias-to-physical remap rule as the domain path.
             alias_map = constraint.alias_map or {}
             assignments: Dict[str, Dict[str, Any]] = {}
             for var_name, value in solutions.items():
@@ -224,9 +225,10 @@ class Solver:
                 else:
                     table = constraint.target_tables[0] if constraint.target_tables else ""
                     col = var_name
-                physical = alias_map.get(table, table)
-                assignments.setdefault(physical, {})[col] = value
-            return assignments if assignments else None
+                assignments.setdefault(table, {})[col] = value
+            if not assignments:
+                return None
+            return self._remap_assignments(assignments, alias_map)
         except Exception:
             return None
 
