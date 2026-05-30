@@ -170,22 +170,26 @@ class TestAggregateNullColumns(unittest.TestCase):
 
 
 class TestRowValidation(unittest.TestCase):
-    """Resolver should validate generated rows and retry on predicate failure."""
+    """Resolver should produce rows satisfying constraints via the solver."""
 
     def test_row_satisfies_predicates(self):
         from parseval.instance import Instance
-        from parseval.symbolic.speculate import Resolver, TableRequirement
+        from parseval.solver.unified import Solver
+        from parseval.symbolic.speculate import Resolver, TableConstraint
+        from sqlglot import exp
 
         schema = "CREATE TABLE t (id INT PRIMARY KEY, val INT);"
         instance = Instance(ddls=schema, name="test_validate", dialect="sqlite")
-        resolver = Resolver(instance, dialect="sqlite")
+        solver = Solver(dialect="sqlite")
+        resolver = Resolver(instance, dialect="sqlite", solver=solver)
 
         spec = BranchSpec(branch="positive")
-        spec.requirements["t"] = TableRequirement(
-            table="t",
-            min_rows=1,
-            predicates=[("val", ">", 10), ("val", "<", 20)],
-        )
+        req = TableConstraint(table="t", min_rows=1)
+        val_col = exp.Column(this=exp.to_identifier("val"), table=exp.to_identifier("t"))
+        val_col.type = exp.DataType.build("INT")
+        req.constraints.append(exp.GT(this=val_col, expression=exp.Literal.number(10)))
+        req.constraints.append(exp.LT(this=val_col.copy(), expression=exp.Literal.number(20)))
+        spec.requirements["t"] = req
 
         rows = resolver.resolve(spec)
         self.assertIn("t", rows, "Resolver should produce rows for table t")
@@ -305,3 +309,29 @@ class TestPropagatorExpressionConstraints(unittest.TestCase):
         self.assertIs(TableRequirement, TableConstraint)
         req = TableRequirement(table="t")
         self.assertIsInstance(req, TableConstraint)
+
+
+class TestResolverDelegatestoSolver(unittest.TestCase):
+    """Resolver should delegate constraint satisfaction to the Solver."""
+
+    def test_resolver_delegates_to_solver(self):
+        from parseval.instance import Instance
+        from parseval.solver.unified import Solver
+        from parseval.symbolic.speculate import BranchSpec, Resolver, TableConstraint
+        from sqlglot import exp
+
+        schema = "CREATE TABLE t1 (id INT PRIMARY KEY, val INT);"
+        instance = Instance(ddls=schema, name="test_res", dialect="sqlite")
+        solver = Solver(dialect="sqlite")
+        resolver = Resolver(instance, dialect="sqlite", solver=solver)
+
+        spec = BranchSpec(branch="positive")
+        req = TableConstraint(table="t1")
+        col = exp.Column(this=exp.to_identifier("val"), table=exp.to_identifier("t1"))
+        col.type = exp.DataType.build("INT")
+        req.constraints.append(exp.GT(this=col, expression=exp.Literal.number(5)))
+        spec.requirements["t1"] = req
+
+        rows = resolver.resolve(spec)
+        assert "t1" in rows
+        assert rows["t1"][0]["val"] > 5
