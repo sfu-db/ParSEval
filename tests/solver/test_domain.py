@@ -199,3 +199,24 @@ def test_between():
     result = solver.solve(_constraint(("t1",), [expr]))
     assert result is not None
     assert 18 <= result["t1"]["age"] <= 65
+
+
+def test_bounds_propagation_across_eq():
+    """a.x > 10 AND a.x = b.y → b.y should also be > 10."""
+    solver = DomainSolver()
+    result = solver.solve(_constraint(
+        ("a", "b"),
+        [exp.GT(this=_col("a", "x", "INT"), expression=exp.Literal.number(10))],
+        join_equalities=[("a", "x", "b", "y")],
+    ))
+    assert result is not None
+    assert result["b"]["y"] > 10
+
+
+def test_column_column_equality():
+    """a.x = b.y without join_equalities — should create eq constraint."""
+    solver = DomainSolver()
+    expr = exp.EQ(this=_col("a", "x", "INT"), expression=_col("b", "y", "INT"))
+    result = solver.solve(_constraint(("a", "b"), [expr]))
+    assert result is not None
+    assert result["a"]["x"] == result["b"]["y"]
