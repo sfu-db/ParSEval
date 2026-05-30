@@ -151,10 +151,16 @@ class Solver:
         assignments: Dict[str, Dict[str, Any]],
         alias_map: Dict[str, str],
     ) -> Dict[str, Dict[str, Any]]:
+        target_counts: Dict[str, int] = {}
+        for table in assignments:
+            physical = alias_map.get(table, table)
+            target_counts[physical] = target_counts.get(physical, 0) + 1
+
         remapped: Dict[str, Dict[str, Any]] = {}
         for table, cols in assignments.items():
             physical = alias_map.get(table, table)
-            remapped.setdefault(physical, {}).update(cols)
+            result_key = physical if target_counts[physical] == 1 else table
+            remapped[result_key] = dict(cols)
         return remapped
 
     # ── SMT solver ──────────────────────────────────────────────
