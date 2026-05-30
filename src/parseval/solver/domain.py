@@ -167,6 +167,14 @@ def _extract_col_literal(node: exp.Expression):
     return None, None
 
 
+def _extract_col_col(node: exp.Expression):
+    """Extract (left_col, right_col) from a column-column comparison."""
+    left, right = node.this, node.expression
+    if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+        return left, right
+    return None, None
+
+
 def _literal_value(node: exp.Expression):
     if isinstance(node, exp.Literal):
         if node.is_int:
@@ -217,6 +225,8 @@ class DomainSolver:
         join_equalities = constraint.join_equalities or []
         alias_map = constraint.alias_map or {}
 
+        self._col_col_eqs = []
+
         # 1. Extract variables from expressions
         variables = self._extract_variables(target_tables, expressions, alias_map)
 
@@ -230,6 +240,11 @@ class DomainSolver:
 
         # 4. Build equivalences from join equalities
         constraints = self._build_equivalences(variables, join_equalities, alias_map)
+
+        # 4b. Add col-col equalities from expressions
+        for left_key, right_key in self._col_col_eqs:
+            if left_key in variables and right_key in variables:
+                constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
 
         # 5. Propagate
         if not self._propagate(variables, constraints):
@@ -245,6 +260,7 @@ class DomainSolver:
         alias_map: Dict[str, str],
     ) -> Dict[str, CSPVariable]:
         variables: Dict[str, CSPVariable] = {}
+        col_col_eqs: List[Tuple[str, str]] = []
         for expr in expressions:
             for col in expr.find_all(exp.Column):
                 table = _resolve_table(col, tables, alias_map)
@@ -256,6 +272,14 @@ class DomainSolver:
                     variables[name] = CSPVariable(
                         name=name, table=table, column=col.name, space=space,
                     )
+            # Detect col-col equalities
+            if isinstance(expr, exp.EQ):
+                left_col, right_col = _extract_col_col(expr)
+                if left_col and right_col:
+                    lt = _resolve_table(left_col, tables, alias_map)
+                    rt = _resolve_table(right_col, tables, alias_map)
+                    col_col_eqs.append((f"{lt}.{left_col.name}", f"{rt}.{right_col.name}"))
+        self._col_col_eqs = col_col_eqs
         return variables
 
     def _apply_predicates(
