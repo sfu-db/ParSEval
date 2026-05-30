@@ -55,7 +55,7 @@ class TestExistsConstraintGeneration(unittest.TestCase):
         constraint = gen.generate(target)
 
         self.assertIsNotNone(constraint, "Constraint should not be None")
-        self.assertIsNotNone(constraint.atom, "Atom constraint should not be None")
+        self.assertGreater(len(constraint.constraints), 0, "Should have constraints")
 
 
 class TestDistinctConstraintGeneration(unittest.TestCase):

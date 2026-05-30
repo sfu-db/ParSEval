@@ -222,7 +222,6 @@ class ConstraintGenerator:
             target_tables=tables,
             constraints=constraints,
             join_equalities=join_equalities,
-            atom=atom_constraint,
         )
 
     def _generate_exists_constraint(self, target: CoverageTarget) -> SolverConstraint:
@@ -258,14 +257,12 @@ class ConstraintGenerator:
                     return SolverConstraint(
                         target_tables=(outer_table,),
                         constraints=[atom],
-                        atom=atom,
                     )
 
         # Non-correlated or EXISTS_TRUE — return minimal constraint
         return SolverConstraint(
             target_tables=target.node.tables,
             constraints=[target.atom] if target.atom else [],
-            atom=target.atom,
         )
 
     def _generate_in_constraint(self, target: CoverageTarget) -> SolverConstraint:
@@ -273,7 +270,6 @@ class ConstraintGenerator:
         return SolverConstraint(
             target_tables=target.node.tables,
             constraints=[target.atom] if target.atom else [],
-            atom=target.atom,
         )
 
     def _generate_distinct_constraint(self, target: CoverageTarget) -> SolverConstraint:
@@ -282,7 +278,6 @@ class ConstraintGenerator:
         return SolverConstraint(
             target_tables=target.node.tables,
             constraints=[atom],
-            atom=atom,
         )
 
     def _generate_group_constraint(self, target: CoverageTarget) -> SolverConstraint:
@@ -291,7 +286,6 @@ class ConstraintGenerator:
         return SolverConstraint(
             target_tables=target.node.tables,
             constraints=[atom],
-            atom=atom,
         )
 
     def _find_subplan_for_target(self, target: CoverageTarget):
