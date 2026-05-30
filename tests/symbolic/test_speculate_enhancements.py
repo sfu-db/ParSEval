@@ -7,7 +7,7 @@ Each test targets a specific enhancement to the Propagator or Resolver.
 
 import unittest
 from parseval.instance import Instance
-from parseval.symbolic.speculate import BranchSpec, Resolver, TableRequirement
+from parseval.symbolic.speculate import BranchSpec, Resolver, TableConstraint, TableRequirement
 
 
 SCHEMA_FK = (
@@ -136,13 +136,14 @@ class TestOffsetTableSpecific(unittest.TestCase):
 
 
 class TestAggregateNullColumns(unittest.TestCase):
-    """Propagator should mark COUNT/SUM/AVG columns as must_null."""
+    """Propagator should add IS NULL constraint for COUNT/SUM/AVG columns."""
 
-    def test_count_column_marked_must_null(self):
+    def test_count_column_gets_is_null_constraint(self):
         from parseval.instance import Instance
         from parseval.plan import Plan
         from parseval.query import preprocess_sql
         from parseval.symbolic.speculate import Propagator
+        from sqlglot import exp
 
         schema = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);"
         sql = "SELECT COUNT(name) FROM t"
@@ -157,8 +158,13 @@ class TestAggregateNullColumns(unittest.TestCase):
         pos_spec = specs[0]
         t_req = pos_spec.requirements.get("t")
         self.assertIsNotNone(t_req)
-        self.assertIn("name", t_req.must_null,
-            f"'name' should be in must_null for COUNT(name), got must_null={t_req.must_null}")
+        # New approach: IS NULL stored as exp.Is expression in constraints
+        has_is_null = any(
+            isinstance(e, exp.Is) and isinstance(e.expression, exp.Null) and not e.args.get("not")
+            for e in t_req.constraints
+        )
+        self.assertTrue(has_is_null,
+            f"should have IS NULL constraint for COUNT(name), got constraints={t_req.constraints}")
         self.assertGreaterEqual(t_req.min_rows, 2,
             f"min_rows should be >= 2 (one NULL + one non-NULL), got {t_req.min_rows}")
 
@@ -240,3 +246,62 @@ class TestDeferredSubqueryResolution(unittest.TestCase):
         has_gt_avg = any(v > 10 for v in vals if isinstance(v, (int, float)))
         self.assertTrue(has_gt_avg,
             f"Should have a row with val > 10 (AVG), got vals={vals}")
+
+
+class TestPropagatorExpressionConstraints(unittest.TestCase):
+    """Propagator should build exp.Expression constraints directly."""
+
+    def test_propagator_builds_expression_constraints(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import Propagator
+        from sqlglot import exp
+
+        schema = "CREATE TABLE t1 (id INT PRIMARY KEY, val INT NOT NULL);"
+        sql = "SELECT * FROM t1 WHERE t1.val > 5"
+        instance = Instance(ddls=schema, name="test_prop", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+
+        propagator = Propagator(plan, instance, plan.alias_map, "sqlite")
+        specs = propagator.propagate()
+
+        pos = specs[0]
+        t1 = pos.requirements.get("t1")
+        self.assertIsNotNone(t1, "t1 should be in requirements")
+        has_gt = any(isinstance(e, exp.GT) for e in t1.constraints)
+        self.assertTrue(has_gt, "should have GT for val > 5")
+        has_not_null = any(
+            isinstance(e, exp.Is)
+            and isinstance(e.expression, exp.Null)
+            and e.args.get("not")
+            for e in t1.constraints
+        )
+        self.assertTrue(has_not_null, "should have IS NOT NULL for NOT NULL column")
+
+    def test_table_constraint_dataclass(self):
+        """TableConstraint should have the constraints field."""
+        from sqlglot import exp
+
+        tc = TableConstraint(table="t1")
+        self.assertEqual(tc.table, "t1")
+        self.assertEqual(tc.constraints, [])
+        self.assertEqual(tc.min_rows, 1)
+        self.assertEqual(tc.duplicate_columns, [])
+        self.assertEqual(tc.group_key_columns, [])
+
+        # Add an expression constraint
+        gt = exp.GT(
+            this=exp.column("val", "t1"),
+            expression=exp.Literal.number(5),
+        )
+        tc.constraints.append(gt)
+        self.assertEqual(len(tc.constraints), 1)
+        self.assertIsInstance(tc.constraints[0], exp.GT)
+
+    def test_backward_compat_alias(self):
+        """TableRequirement should be an alias for TableConstraint."""
+        self.assertIs(TableRequirement, TableConstraint)
+        req = TableRequirement(table="t")
+        self.assertIsInstance(req, TableConstraint)
