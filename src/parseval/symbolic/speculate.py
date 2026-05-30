@@ -443,16 +443,18 @@ class Propagator:
         for table_key, tc in spec.requirements.items():
             for constraint in tc.constraints:
                 for col in constraint.find_all(exp.Column):
+                    if getattr(col, "type", None) is not None:
+                        continue
                     meta = column_meta(col)
                     if meta and "domain" in meta:
-                        col.set("type", meta["domain"])
+                        col.type = meta["domain"]
                     else:
                         col_table = self._resolve_table(col.table or table_key)
                         if col_table and col_table in self.instance.tables:
                             col_type_str = self.instance.tables[col_table].get(col.name)
                             if col_type_str:
                                 try:
-                                    col.set("type", DataType.build(col_type_str))
+                                    col.type = DataType.build(col_type_str)
                                 except Exception:
                                     pass
 
@@ -1036,7 +1038,12 @@ class Resolver:
         )
         solve_result = self.solver.solve(constraint)
         if solve_result.sat:
-            return solve_result.assignments.get(table, {})
+            raw = solve_result.assignments.get(table, {})
+            # Filter to columns that belong to this table.
+            if table in self.instance.tables:
+                valid_cols = set(self.instance.tables[table].keys())
+                return {k: v for k, v in raw.items() if k in valid_cols}
+            return raw
         return {}
 
     def _fallback_row(self, table, req):
