@@ -278,8 +278,8 @@ class TestPropagatorExpressionConstraints(unittest.TestCase):
         self.assertTrue(has_gt, "should have GT for val > 5")
         has_not_null = any(
             isinstance(e, exp.Is)
-            and isinstance(e.expression, exp.Null)
-            and e.args.get("not")
+            and isinstance(e.expression, exp.Not)
+            and isinstance(e.expression.this, exp.Null)
             for e in t1.constraints
         )
         self.assertTrue(has_not_null, "should have IS NOT NULL for NOT NULL column")
@@ -335,3 +335,25 @@ class TestResolverDelegatestoSolver(unittest.TestCase):
         rows = resolver.resolve(spec)
         assert "t1" in rows
         assert rows["t1"][0]["val"] > 5
+
+
+class TestSpeculateEndToEnd(unittest.TestCase):
+    """speculate() should create a Solver and produce valid rows end-to-end."""
+
+    def test_speculate_end_to_end(self):
+        from parseval.instance import Instance
+        from parseval.plan import Plan
+        from parseval.query import preprocess_sql
+        from parseval.symbolic.speculate import speculate
+
+        schema = "CREATE TABLE t1 (id INT PRIMARY KEY, val INT);"
+        sql = "SELECT * FROM t1 WHERE t1.val > 5"
+        instance = Instance(ddls=schema, name="test_e2e", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr)
+
+        results = speculate(plan, instance, plan.alias_map, dialect="sqlite")
+        self.assertGreaterEqual(len(results), 1)
+        branch, rows = results[0]
+        self.assertEqual(branch, "positive")
+        self.assertGreater(rows["t1"][0]["val"], 5)
