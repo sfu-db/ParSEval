@@ -469,7 +469,6 @@ class SymbolicEngine:
                     smt_constraint = SolverConstraint(
                         target_tables=tuple(tables_in_condition),
                         constraints=[condition],
-                        atom=condition,
                     )
                     smt_result = self.solver._try_smt(smt_constraint)
                     if smt_result:
