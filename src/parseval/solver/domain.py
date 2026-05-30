@@ -45,9 +45,48 @@ def _lower_recursive(
     if isinstance(expr, exp.Or):
         _lower_recursive(expr.left, tables, alias_map, out)
         return
+    if isinstance(expr, exp.Not):
+        _lower_not(expr.this, tables, alias_map, out)
+        return
     pred = _lower_atom(expr, tables, alias_map)
     if pred:
         out.append(pred)
+
+
+_NEGATED_OPS = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+
+_OP_MAP = {
+    exp.EQ: "=", exp.NEQ: "!=", exp.GT: ">",
+    exp.GTE: ">=", exp.LT: "<", exp.LTE: "<=",
+}
+
+
+def _lower_not(inner, tables, alias_map, out):
+    """Lower NOT(inner) by negating the predicate."""
+    # NOT(IS NULL) -> IS NOT NULL
+    if isinstance(inner, exp.Is):
+        if isinstance(inner.this, exp.Column) and isinstance(inner.expression, exp.Null):
+            table = _resolve_table(inner.this, tables, alias_map)
+            out.append(ColumnPredicate(table=table, column=inner.this.name, op="not_null", value=True))
+            return
+    # NOT(IS NOT NULL) -> IS NULL
+    if isinstance(inner, exp.Is):
+        right = inner.expression
+        if isinstance(inner.this, exp.Column) and isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
+            table = _resolve_table(inner.this, tables, alias_map)
+            out.append(ColumnPredicate(table=table, column=inner.this.name, op="is_null", value=True))
+            return
+    # NOT(comparison) -> flip operator
+    for cls, op in _OP_MAP.items():
+        if isinstance(inner, cls):
+            col, val = _extract_col_literal(inner)
+            if col is not None and val is not None:
+                neg_op = _NEGATED_OPS.get(op, op)
+                table = _resolve_table(col, tables, alias_map)
+                out.append(ColumnPredicate(table=table, column=col.name, op=neg_op, value=val))
+                return
+    # Fallback: lower the inner expression as-is
+    _lower_recursive(inner, tables, alias_map, out)
 
 
 def _lower_atom(
@@ -76,10 +115,15 @@ def _lower_atom(
         op = "<="
     elif isinstance(atom, exp.Is):
         right = atom.expression
-        if isinstance(atom.this, exp.Column) and isinstance(right, exp.Null):
-            col = atom.this
-            val = True
-            op = "is_null"
+        if isinstance(atom.this, exp.Column):
+            if isinstance(right, exp.Null):
+                col = atom.this
+                val = True
+                op = "is_null"
+            elif isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
+                col = atom.this
+                val = True
+                op = "not_null"
     elif isinstance(atom, exp.Like):
         if isinstance(atom.this, exp.Column) and isinstance(atom.expression, exp.Literal):
             col = atom.this
@@ -222,6 +266,8 @@ class DomainSolver:
                 space.like_pattern = val
             elif op == "is_null":
                 space.must_null = True
+            elif op == "not_null":
+                space.not_null = True
 
     def _build_equivalences(
         self,
