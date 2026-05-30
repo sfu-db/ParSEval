@@ -1,7 +1,7 @@
 """CSP-lite constraint solver using value-space narrowing."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
@@ -18,43 +18,8 @@ from .types import (
     type_family,
 )
 
-
-def _lower_expression(
-    expr: exp.Expression,
-    tables: Tuple[str, ...],
-    alias_map: Dict[str, str],
-) -> List[ColumnPredicate]:
-    """Lower a sqlglot expression into simple column predicates."""
-    preds: List[ColumnPredicate] = []
-    _lower_recursive(expr, tables, alias_map, preds)
-    return preds
-
-
-def _lower_recursive(
-    expr: exp.Expression,
-    tables: Tuple[str, ...],
-    alias_map: Dict[str, str],
-    out: List[ColumnPredicate],
-) -> None:
-    if isinstance(expr, exp.And):
-        _lower_recursive(expr.left, tables, alias_map, out)
-        _lower_recursive(expr.right, tables, alias_map, out)
-        return
-    if isinstance(expr, exp.Paren):
-        _lower_recursive(expr.this, tables, alias_map, out)
-        return
-    if isinstance(expr, exp.Or):
-        _lower_recursive(expr.left, tables, alias_map, out)
-        return
-    if isinstance(expr, exp.Not):
-        _lower_not(expr.this, tables, alias_map, out)
-        return
-    pred = _lower_atom(expr, tables, alias_map)
-    if pred:
-        out.append(pred)
-
-
 _NEGATED_OPS = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+_ARITHMETIC_NODES = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
 
 _OP_MAP = {
     exp.EQ: "=", exp.NEQ: "!=", exp.GT: ">",
@@ -62,21 +27,23 @@ _OP_MAP = {
 }
 
 
-def _lower_not(inner, tables, alias_map, out):
-    """Lower NOT(inner) by negating the predicate."""
+def _lower_negated_atom(
+    inner: exp.Expression,
+    tables: Tuple[str, ...],
+    alias_map: Dict[str, str],
+) -> Optional[ColumnPredicate]:
+    """Lower NOT(atom) by negating a directly supported predicate."""
     # NOT(IS NULL) -> IS NOT NULL
     if isinstance(inner, exp.Is):
         if isinstance(inner.this, exp.Column) and isinstance(inner.expression, exp.Null):
             table = _resolve_table(inner.this, tables, alias_map)
-            out.append(ColumnPredicate(table=table, column=inner.this.name, op="not_null", value=True))
-            return
+            return ColumnPredicate(table=table, column=inner.this.name, op="not_null", value=True)
     # NOT(IS NOT NULL) -> IS NULL
     if isinstance(inner, exp.Is):
         right = inner.expression
         if isinstance(inner.this, exp.Column) and isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
             table = _resolve_table(inner.this, tables, alias_map)
-            out.append(ColumnPredicate(table=table, column=inner.this.name, op="is_null", value=True))
-            return
+            return ColumnPredicate(table=table, column=inner.this.name, op="is_null", value=True)
     # NOT(comparison) -> flip operator
     for cls, op in _OP_MAP.items():
         if isinstance(inner, cls):
@@ -84,10 +51,8 @@ def _lower_not(inner, tables, alias_map, out):
             if col is not None and val is not None:
                 neg_op = _NEGATED_OPS.get(op, op)
                 table = _resolve_table(col, tables, alias_map)
-                out.append(ColumnPredicate(table=table, column=col.name, op=neg_op, value=val))
-                return
-    # Fallback: lower the inner expression as-is
-    _lower_recursive(inner, tables, alias_map, out)
+                return ColumnPredicate(table=table, column=col.name, op=neg_op, value=val)
+    return None
 
 
 def _lower_atom(
@@ -212,10 +177,28 @@ def _resolve_table(col: exp.Column, tables: Tuple[str, ...], alias_map: Dict[str
     return tables[0] if tables else ""
 
 
+def _unsupported_reason(expr: exp.Expression) -> str:
+    if any(expr.find(node_type) is not None for node_type in _ARITHMETIC_NODES):
+        return "unsupported_arithmetic"
+    if isinstance(expr, exp.Not):
+        return "unsupported_not"
+    if isinstance(expr, exp.Or):
+        return "unsupported_or"
+    return "unsupported_expression"
+
+
 @dataclass
 class DomainResult:
     status: str
     assignments: Optional[Dict[str, Dict[str, Any]]] = None
+    reason: str = ""
+
+
+@dataclass
+class LoweringOutcome:
+    status: str
+    predicates: List[ColumnPredicate] = field(default_factory=list)
+    equalities: List[Tuple[str, str]] = field(default_factory=list)
     reason: str = ""
 
 
@@ -233,40 +216,138 @@ class DomainSolver:
         join_equalities = constraint.join_equalities or []
         alias_map = constraint.alias_map or {}
 
-        self._col_col_eqs = []
+        if not expressions and not join_equalities:
+            return DomainResult(status="sat", assignments={t: {} for t in target_tables})
+
+        analysis = LoweringOutcome(status="sat")
+        for expr in expressions:
+            analysis = self._merge_and(
+                analysis,
+                self._analyze_expression(expr, target_tables, alias_map),
+            )
+            if analysis.status != "sat":
+                break
+
+        if analysis.status == "unknown":
+            return DomainResult(status="unknown", reason=analysis.reason or "unsupported_expression")
+        if analysis.status == "unsat":
+            return DomainResult(status="unsat", reason=analysis.reason or "contradictory_bounds")
 
         # 1. Extract variables from expressions
         variables = self._extract_variables(target_tables, expressions, alias_map)
 
-        # 2. Lower expressions to predicates
-        all_preds: List[ColumnPredicate] = []
-        for expr in expressions:
-            all_preds.extend(_lower_expression(expr, target_tables, alias_map))
+        # 2. Apply predicates to variables
+        self._apply_predicates(variables, analysis.predicates)
 
-        # If expressions exist but no predicates, no col-col eqs, and no join eqs — can't solve
-        if expressions and not all_preds and not self._col_col_eqs and not join_equalities:
-            return DomainResult(status="unknown", reason="unsupported_expression")
-
-        # 3. Apply predicates to variables
-        self._apply_predicates(variables, all_preds)
-
-        # 4. Build equivalences from join equalities
+        # 3. Build equivalences from join equalities
         constraints = self._build_equivalences(variables, join_equalities, alias_map)
 
-        # 4b. Add col-col equalities from expressions
-        for left_key, right_key in self._col_col_eqs:
+        # 3b. Add supported col-col equalities from expressions
+        for left_key, right_key in analysis.equalities:
             if left_key in variables and right_key in variables:
                 constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
 
-        # 5. Propagate
+        # 4. Propagate
         if not self._propagate(variables, constraints):
             return DomainResult(status="unsat", reason="contradictory_bounds")
 
-        # 6. Assign
+        # 5. Assign
         return DomainResult(
             status="sat",
             assignments=self._assign(variables, target_tables),
         )
+
+    def _analyze_expression(
+        self,
+        expr: exp.Expression,
+        tables: Tuple[str, ...],
+        alias_map: Dict[str, str],
+    ) -> LoweringOutcome:
+        if isinstance(expr, exp.And):
+            return self._merge_and(
+                self._analyze_expression(expr.left, tables, alias_map),
+                self._analyze_expression(expr.right, tables, alias_map),
+            )
+        if isinstance(expr, exp.Paren):
+            return self._analyze_expression(expr.this, tables, alias_map)
+        if isinstance(expr, exp.Or):
+            return self._merge_or(
+                self._analyze_expression(expr.left, tables, alias_map),
+                self._analyze_expression(expr.right, tables, alias_map),
+            )
+        if isinstance(expr, exp.Not):
+            if isinstance(expr.this, exp.Not):
+                return self._analyze_expression(expr.this.this, tables, alias_map)
+            pred = _lower_negated_atom(expr.this, tables, alias_map)
+            if pred is None:
+                return LoweringOutcome(status="unknown", reason="unsupported_not")
+            return self._classify_supported(LoweringOutcome(status="sat", predicates=[pred]))
+        if isinstance(expr, exp.EQ):
+            left_col, right_col = _extract_col_col(expr)
+            if left_col and right_col:
+                left_table = _resolve_table(left_col, tables, alias_map)
+                right_table = _resolve_table(right_col, tables, alias_map)
+                return self._classify_supported(LoweringOutcome(
+                    status="sat",
+                    equalities=[(f"{left_table}.{left_col.name}", f"{right_table}.{right_col.name}")],
+                ))
+
+        pred = _lower_atom(expr, tables, alias_map)
+        if pred is None:
+            return LoweringOutcome(status="unknown", reason=_unsupported_reason(expr))
+        return self._classify_supported(LoweringOutcome(status="sat", predicates=[pred]))
+
+    def _merge_and(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
+        if left.status == "unsat":
+            return left
+        if right.status == "unsat":
+            return right
+        if left.status == "unknown":
+            return left
+        if right.status == "unknown":
+            return right
+        return self._classify_supported(LoweringOutcome(
+            status="sat",
+            predicates=[*left.predicates, *right.predicates],
+            equalities=[*left.equalities, *right.equalities],
+        ))
+
+    def _merge_or(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
+        if left.status == "unsat" and right.status == "unsat":
+            return LoweringOutcome(status="unsat", reason=left.reason or right.reason)
+        if left.status == "sat" and right.status == "unsat":
+            return left
+        if right.status == "sat" and left.status == "unsat":
+            return right
+        if left.status == "sat" and right.status == "sat":
+            return LoweringOutcome(status="unknown", reason="unsupported_or")
+        return LoweringOutcome(status="unknown", reason=left.reason or right.reason or "unsupported_or")
+
+    def _classify_supported(self, outcome: LoweringOutcome) -> LoweringOutcome:
+        if outcome.status != "sat":
+            return outcome
+        if not outcome.predicates and not outcome.equalities:
+            return outcome
+
+        variables: Dict[str, CSPVariable] = {}
+        self._apply_predicates(variables, outcome.predicates)
+
+        constraints: List[CSPConstraint] = []
+        for left_key, right_key in outcome.equalities:
+            for key in (left_key, right_key):
+                if key not in variables:
+                    table, column = key.split(".", 1)
+                    variables[key] = CSPVariable(
+                        name=key,
+                        table=table,
+                        column=column,
+                        space=ValueSpace(),
+                    )
+            constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
+
+        if not self._propagate(variables, constraints):
+            return LoweringOutcome(status="unsat", reason="contradictory_bounds")
+        return outcome
 
     def _extract_variables(
         self,
@@ -275,7 +356,6 @@ class DomainSolver:
         alias_map: Dict[str, str],
     ) -> Dict[str, CSPVariable]:
         variables: Dict[str, CSPVariable] = {}
-        col_col_eqs: List[Tuple[str, str]] = []
         for expr in expressions:
             for col in expr.find_all(exp.Column):
                 table = _resolve_table(col, tables, alias_map)
@@ -287,14 +367,6 @@ class DomainSolver:
                     variables[name] = CSPVariable(
                         name=name, table=table, column=col.name, space=space,
                     )
-            # Detect col-col equalities
-            if isinstance(expr, exp.EQ):
-                left_col, right_col = _extract_col_col(expr)
-                if left_col and right_col:
-                    lt = _resolve_table(left_col, tables, alias_map)
-                    rt = _resolve_table(right_col, tables, alias_map)
-                    col_col_eqs.append((f"{lt}.{left_col.name}", f"{rt}.{right_col.name}"))
-        self._col_col_eqs = col_col_eqs
         return variables
 
     def _apply_predicates(
