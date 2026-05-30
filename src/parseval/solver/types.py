@@ -6,6 +6,10 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Optional, Set
 
+from sqlglot import exp
+
+from parseval.dtype import DataType
+
 
 class TypeFamily(Enum):
     INTEGER = "integer"
@@ -152,3 +156,49 @@ class ColumnPredicate:
     column: str
     op: str
     value: Any
+
+
+def col_type(col: exp.Column) -> Optional[DataType]:
+    """Read the annotated type from a Column node, or None."""
+    dtype = getattr(col, "type", None)
+    if dtype is None:
+        return None
+    if isinstance(dtype, DataType):
+        return dtype
+    try:
+        return DataType.build(str(dtype))
+    except Exception:
+        return None
+
+
+def type_family(dtype: DataType) -> TypeFamily:
+    """Map a DataType to a TypeFamily."""
+    if dtype.is_type(*DataType.INTEGER_TYPES):
+        return TypeFamily.INTEGER
+    if dtype.is_type(*DataType.REAL_TYPES):
+        return TypeFamily.DECIMAL
+    if dtype.is_type(DataType.Type.BOOLEAN):
+        return TypeFamily.BOOLEAN
+    if dtype.is_type(
+        DataType.Type.DATETIME, DataType.Type.DATETIME64,
+        DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMPLTZ,
+        DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMP_MS,
+        DataType.Type.TIMESTAMP_NS, DataType.Type.TIMESTAMP_S,
+    ):
+        return TypeFamily.DATETIME
+    if dtype.is_type(DataType.Type.DATE):
+        return TypeFamily.DATE
+    if dtype.is_type(DataType.Type.TIME, DataType.Type.TIMETZ):
+        return TypeFamily.TIME
+    return TypeFamily.TEXT
+
+
+__all__ = [
+    "TypeFamily",
+    "ValueSpace",
+    "CSPVariable",
+    "CSPConstraint",
+    "ColumnPredicate",
+    "col_type",
+    "type_family",
+]

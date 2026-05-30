@@ -1,8 +1,12 @@
 """Tests for solver shared types: ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate."""
 import unittest
 
+from sqlglot import exp
+
+from parseval.dtype import DataType
 from parseval.solver.types import (
     ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate, TypeFamily,
+    col_type, type_family,
 )
 
 
@@ -143,6 +147,68 @@ class TestCSPConstraint(unittest.TestCase):
         self.assertEqual(c.kind, "eq")
         self.assertEqual(c.left, "t1.id")
         self.assertEqual(c.right, "t2.t1_id")
+
+
+class TestColType(unittest.TestCase):
+    def test_returns_none_when_no_type_annotation(self):
+        col = exp.column("age")
+        self.assertIsNone(col_type(col))
+
+    def test_returns_datatype_when_annotated(self):
+        col = exp.column("age")
+        col.type = DataType.build("INT")
+        result = col_type(col)
+        self.assertIsInstance(result, DataType)
+        self.assertTrue(result.is_type(*DataType.INTEGER_TYPES))
+
+    def test_handles_string_type_annotation(self):
+        col = exp.column("name")
+        col.type = "VARCHAR"
+        result = col_type(col)
+        self.assertIsInstance(result, DataType)
+
+    def test_returns_none_for_unbuildable_type(self):
+        col = exp.column("x")
+        # Bypass the property setter by writing directly to __dict__
+        object.__setattr__(col, "_type", object())
+        result = col_type(col)
+        self.assertIsNone(result)
+
+
+class TestTypeFamily(unittest.TestCase):
+    def test_integer_types(self):
+        for t in ("TINYINT", "SMALLINT", "INT", "BIGINT", "INTEGER"):
+            dtype = DataType.build(t)
+            self.assertEqual(type_family(dtype), TypeFamily.INTEGER, msg=t)
+
+    def test_decimal_types(self):
+        for t in ("FLOAT", "DOUBLE", "DECIMAL", "REAL"):
+            dtype = DataType.build(t)
+            self.assertEqual(type_family(dtype), TypeFamily.DECIMAL, msg=t)
+
+    def test_boolean(self):
+        dtype = DataType.build("BOOLEAN")
+        self.assertEqual(type_family(dtype), TypeFamily.BOOLEAN)
+
+    def test_date(self):
+        dtype = DataType.build("DATE")
+        self.assertEqual(type_family(dtype), TypeFamily.DATE)
+
+    def test_time(self):
+        dtype = DataType.build("TIME")
+        self.assertEqual(type_family(dtype), TypeFamily.TIME)
+
+    def test_datetime(self):
+        dtype = DataType.build("TIMESTAMP")
+        self.assertEqual(type_family(dtype), TypeFamily.DATETIME)
+
+    def test_text_fallback(self):
+        dtype = DataType.build("TEXT")
+        self.assertEqual(type_family(dtype), TypeFamily.TEXT)
+
+    def test_varchar_is_text(self):
+        dtype = DataType.build("VARCHAR")
+        self.assertEqual(type_family(dtype), TypeFamily.TEXT)
 
 
 if __name__ == "__main__":

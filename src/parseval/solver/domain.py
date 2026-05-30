@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.dtype import DataType
 from parseval.helper import normalize_name
 
 from .types import (
@@ -14,42 +13,9 @@ from .types import (
     ColumnPredicate,
     TypeFamily,
     ValueSpace,
+    col_type,
+    type_family,
 )
-
-
-def _col_type(col: exp.Column) -> Optional[DataType]:
-    """Read the annotated type from a Column node, or None."""
-    dtype = getattr(col, "type", None)
-    if dtype is None:
-        return None
-    if isinstance(dtype, DataType):
-        return dtype
-    try:
-        return DataType.build(str(dtype))
-    except Exception:
-        return None
-
-
-def _type_family(dtype: DataType) -> TypeFamily:
-    """Map a DataType to a TypeFamily."""
-    if dtype.is_type(*DataType.INTEGER_TYPES):
-        return TypeFamily.INTEGER
-    if dtype.is_type(*DataType.REAL_TYPES):
-        return TypeFamily.DECIMAL
-    if dtype.is_type(DataType.Type.BOOLEAN):
-        return TypeFamily.BOOLEAN
-    if dtype.is_type(
-        DataType.Type.DATETIME, DataType.Type.DATETIME64,
-        DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMPLTZ,
-        DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMP_MS,
-        DataType.Type.TIMESTAMP_NS, DataType.Type.TIMESTAMP_S,
-    ):
-        return TypeFamily.DATETIME
-    if dtype.is_type(DataType.Type.DATE):
-        return TypeFamily.DATE
-    if dtype.is_type(DataType.Type.TIME, DataType.Type.TIMETZ):
-        return TypeFamily.TIME
-    return TypeFamily.TEXT
 
 
 def _lower_expression(
@@ -148,11 +114,25 @@ def _literal_value(node: exp.Expression):
 
 
 def _resolve_table(col: exp.Column, tables: Tuple[str, ...], alias_map: Dict[str, str]) -> str:
+    """Resolve a column's table qualifier to a key in target_tables.
+
+    Returns the alias (from target_tables) that matches, so variables
+    stay in alias-namespace.  Falls back to the first table if no match.
+    """
     if col.table:
-        name = normalize_name(col.table)
-        name = alias_map.get(name, name)
+        raw = normalize_name(col.table)
+        # Direct match against target_tables (covers alias case).
         for t in tables:
-            if normalize_name(t) == name:
+            if normalize_name(t) == raw:
+                return t
+        # alias_map resolved to physical name — find which alias maps to it.
+        resolved = alias_map.get(raw, raw)
+        for t in tables:
+            t_norm = normalize_name(t)
+            if t_norm == resolved:
+                return t
+            # Check if t is an alias that maps to the same physical table.
+            if alias_map.get(t_norm, t_norm) == resolved:
                 return t
     return tables[0] if tables else ""
 
@@ -160,16 +140,16 @@ def _resolve_table(col: exp.Column, tables: Tuple[str, ...], alias_map: Dict[str
 class DomainSolver:
     """CSP-lite solver using value-space narrowing."""
 
-    def solve(
-        self,
-        target_tables: Tuple[str, ...],
-        expressions: List[exp.Expression],
-        join_equalities: List[Tuple[str, str, str, str]] = None,
-        alias_map: Dict[str, str] = None,
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Solve constraints and return assignments per table."""
-        join_equalities = join_equalities or []
-        alias_map = alias_map or {}
+    def solve(self, constraint) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Solve constraints and return assignments per table.
+
+        Args:
+            constraint: A :class:`SolverConstraint` with typed expressions.
+        """
+        target_tables = constraint.target_tables
+        expressions = constraint.constraints
+        join_equalities = constraint.join_equalities or []
+        alias_map = constraint.alias_map or {}
 
         # 1. Extract variables from expressions
         variables = self._extract_variables(target_tables, expressions, alias_map)
@@ -204,8 +184,8 @@ class DomainSolver:
                 table = _resolve_table(col, tables, alias_map)
                 name = f"{table}.{col.name}"
                 if name not in variables:
-                    dtype = _col_type(col)
-                    family = _type_family(dtype) if dtype else TypeFamily.TEXT
+                    dtype = col_type(col)
+                    family = type_family(dtype) if dtype else TypeFamily.TEXT
                     space = ValueSpace(family=family)
                     variables[name] = CSPVariable(
                         name=name, table=table, column=col.name, space=space,
@@ -251,14 +231,13 @@ class DomainSolver:
     ) -> List[CSPConstraint]:
         constraints: List[CSPConstraint] = []
         for lt, lc, rt, rc in join_equalities:
-            lt_real = normalize_name(lt)
-            rt_real = normalize_name(rt)
-            lt_real = alias_map.get(lt_real, lt_real)
-            rt_real = alias_map.get(rt_real, rt_real)
-            left_key = f"{lt_real}.{lc}"
-            right_key = f"{rt_real}.{rc}"
+            # Resolve to alias namespace (same as variables from expressions).
+            lt_key = self._resolve_alias(lt, variables, alias_map)
+            rt_key = self._resolve_alias(rt, variables, alias_map)
+            left_key = f"{lt_key}.{lc}"
+            right_key = f"{rt_key}.{rc}"
             # Create variables for join columns not yet in scope
-            for key, table, column in [(left_key, lt_real, lc), (right_key, rt_real, rc)]:
+            for key, table, column in [(left_key, lt_key, lc), (right_key, rt_key, rc)]:
                 if key not in variables:
                     variables[key] = CSPVariable(
                         name=key, table=table, column=column,
@@ -266,6 +245,24 @@ class DomainSolver:
                     )
             constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
         return constraints
+
+    def _resolve_alias(
+        self, name: str, variables: Dict[str, CSPVariable], alias_map: Dict[str, str],
+    ) -> str:
+        """Resolve a table name to the alias used in variable keys."""
+        raw = normalize_name(name)
+        # Check if any existing variable uses this as a table prefix.
+        for var_key in variables:
+            if var_key.startswith(f"{raw}."):
+                return raw
+        # Check alias_map: name might be a physical name, find the alias.
+        for alias, physical in alias_map.items():
+            if normalize_name(physical) == raw:
+                # Check if this alias is used in variables.
+                for var_key in variables:
+                    if var_key.startswith(f"{alias}."):
+                        return alias
+        return raw
 
     def _propagate(
         self,
