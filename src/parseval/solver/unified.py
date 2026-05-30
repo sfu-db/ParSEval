@@ -110,8 +110,13 @@ class Solver:
 
         # Tier 1: Domain solver
         domain_result = self._try_domain(constraint)
-        if domain_result is not None:
-            return SolveResult(sat=True, assignments=domain_result)
+        if domain_result.status == "sat":
+            return SolveResult(
+                sat=True,
+                assignments=self._remap_assignments(domain_result.assignments or {}, constraint.alias_map),
+            )
+        if domain_result.status == "unsat":
+            return SolveResult(sat=False, reason=domain_result.reason)
 
         # Tier 2: SMT solver
         smt_result = self._try_smt(constraint)
@@ -134,12 +139,23 @@ class Solver:
 
     def _try_domain(
         self, constraint: SolverConstraint,
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
+    ):
         """Attempt to solve with the domain solver (CSP-lite)."""
         from .domain import DomainSolver
 
         ds = DomainSolver()
         return ds.solve(constraint)
+
+    def _remap_assignments(
+        self,
+        assignments: Dict[str, Dict[str, Any]],
+        alias_map: Dict[str, str],
+    ) -> Dict[str, Dict[str, Any]]:
+        remapped: Dict[str, Dict[str, Any]] = {}
+        for table, cols in assignments.items():
+            physical = alias_map.get(table, table)
+            remapped.setdefault(physical, {}).update(cols)
+        return remapped
 
     # ── SMT solver ──────────────────────────────────────────────
 

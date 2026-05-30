@@ -1,6 +1,7 @@
 """CSP-lite constraint solver using value-space narrowing."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
@@ -211,10 +212,17 @@ def _resolve_table(col: exp.Column, tables: Tuple[str, ...], alias_map: Dict[str
     return tables[0] if tables else ""
 
 
+@dataclass
+class DomainResult:
+    status: str
+    assignments: Optional[Dict[str, Dict[str, Any]]] = None
+    reason: str = ""
+
+
 class DomainSolver:
     """CSP-lite solver using value-space narrowing."""
 
-    def solve(self, constraint) -> Optional[Dict[str, Dict[str, Any]]]:
+    def solve(self, constraint) -> DomainResult:
         """Solve constraints and return assignments per table.
 
         Args:
@@ -237,7 +245,7 @@ class DomainSolver:
 
         # If expressions exist but no predicates, no col-col eqs, and no join eqs — can't solve
         if expressions and not all_preds and not self._col_col_eqs and not join_equalities:
-            return None
+            return DomainResult(status="unknown", reason="unsupported_expression")
 
         # 3. Apply predicates to variables
         self._apply_predicates(variables, all_preds)
@@ -252,10 +260,13 @@ class DomainSolver:
 
         # 5. Propagate
         if not self._propagate(variables, constraints):
-            return None
+            return DomainResult(status="unsat", reason="contradictory_bounds")
 
         # 6. Assign
-        return self._assign(variables, target_tables, alias_map)
+        return DomainResult(
+            status="sat",
+            assignments=self._assign(variables, target_tables),
+        )
 
     def _extract_variables(
         self,
@@ -301,6 +312,8 @@ class DomainSolver:
             space = variables[name].space
             op, val = pred.op, pred.value
             if op == "=":
+                if space.equals is not None and space.equals != val:
+                    space.narrow_neq(val)
                 space.narrow_eq(val)
             elif op == ">" and isinstance(val, (int, float)):
                 space.narrow_min(val + 1 if isinstance(val, int) else val + 0.01)
@@ -423,18 +436,14 @@ class DomainSolver:
         self,
         variables: Dict[str, CSPVariable],
         target_tables: Tuple[str, ...],
-        alias_map: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Dict[str, Any]]]:
-        alias_map = alias_map or {}
         result: Dict[str, Dict[str, Any]] = {}
         for var in variables.values():
             val = var.space.pick()
             var.assigned = val
-            physical = alias_map.get(var.table, var.table)
-            result.setdefault(physical, {})[var.column] = val
+            result.setdefault(var.table, {})[var.column] = val
         if not result:
             # No variables to assign -- return empty per-table structure
             for t in target_tables:
-                physical = alias_map.get(t, t)
-                result[physical] = {}
+                result[t] = {}
         return result
