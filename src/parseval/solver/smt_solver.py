@@ -11,8 +11,6 @@ import z3
 from sqlglot import exp
 from sqlglot.expressions import DataType
 
-from parseval.plan.rex import Const
-
 from .smt_types import (
     SMTTypeInfo,
     SMTValue,
@@ -931,7 +929,7 @@ class SMTSolver:
     def _to_z3_expr(self, condition: exp.Expression, ctx: Optional[Dict[str, z3.ExprRef]] = None):
         """Recursively translate a sqlglot AST node into a Z3 expression.
 
-        Handles: Paren, Column, Null, Boolean, Literal, Const, and any
+        Handles: Paren, Column, Null, Boolean, Literal, and any
         node matching a registered special function or core registry key.
         """
         # Use explicit ctx or fall back to instance-level context set by translate()
@@ -957,8 +955,15 @@ class SMTSolver:
             return encode_literal(dtype, None, self.z3ctx)
         if isinstance(condition, exp.Boolean):
             return z3.BoolVal(bool(condition.this), ctx=self.z3ctx)
-        if isinstance(condition, (exp.Literal, Const)):
-            datatype = condition.datatype
+        if isinstance(condition, exp.Literal) or condition.key == "const":
+            datatype = getattr(condition, 'datatype', None)
+            if datatype is None:
+                if condition.is_string:
+                    datatype = DataType.build("TEXT")
+                elif condition.is_int:
+                    datatype = DataType.build("INT")
+                else:
+                    datatype = DataType.build("FLOAT")
             literal_value = condition.this
             if datatype.is_type(*DataType.TEMPORAL_TYPES) and isinstance(literal_value, str):
                 return encode_literal(datatype, literal_value, self.z3ctx)
