@@ -176,3 +176,26 @@ def test_not_eq():
     result = solver.solve(_constraint(("t1",), [expr]))
     assert result is not None
     assert result["t1"]["x"] != 5
+
+
+def test_in_list():
+    expr = exp.In(
+        this=_col("t1", "status", "TEXT"),
+        expressions=[exp.Literal.string("active"), exp.Literal.string("pending")],
+    )
+    solver = DomainSolver()
+    result = solver.solve(_constraint(("t1",), [expr]))
+    assert result is not None
+    assert result["t1"]["status"] in ("active", "pending")
+
+
+def test_between():
+    expr = exp.Between(
+        this=_col("t1", "age", "INT"),
+        low=exp.Literal.number(18),
+        high=exp.Literal.number(65),
+    )
+    solver = DomainSolver()
+    result = solver.solve(_constraint(("t1",), [expr]))
+    assert result is not None
+    assert 18 <= result["t1"]["age"] <= 65
