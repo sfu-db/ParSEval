@@ -944,16 +944,21 @@ class Propagator:
 
 
 class Resolver:
-    """Turn TableRequirements into concrete row values."""
+    """Turn TableRequirements into concrete row values.
 
-    def __init__(self, instance: Instance, dialect: str = "sqlite"):
+    Delegates constraint satisfaction to the Solver (domain + SMT).
+    Falls back to heuristic satisfaction when no solver is provided.
+    """
+
+    def __init__(self, instance: Instance, dialect: str = "sqlite", solver=None):
         self.instance = instance
         self.dialect = dialect
+        self.solver = solver
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
         self._discover_fk_parents(spec)
-        shared_values = self._resolve_equivalences(spec)
+        join_equalities = self._equivalences_to_join_equalities(spec)
         order = self._creation_order(spec)
         result: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -961,236 +966,95 @@ class Resolver:
             if table_key not in spec.requirements:
                 continue
             req = spec.requirements[table_key]
-            # Resolve physical table name (use alias field or strip suffix)
-            physical_table = req.table if not req.alias else req.table
-            if "__" in physical_table:
-                physical_table = physical_table.split("__")[0]
-            rows = self._resolve_table(physical_table, req, shared_values)
-            result.setdefault(physical_table, []).extend(rows)
+            physical = req.table
+            if "__" in physical:
+                physical = physical.split("__")[0]
 
-        # Resolve deferred scalar subqueries after initial rows are generated.
+            for i in range(req.min_rows):
+                row = self._solve_row(physical, req, spec, join_equalities, result)
+                if row:
+                    if req.duplicate_columns and i > 0 and physical in result:
+                        base = result[physical][0]
+                        for col in req.duplicate_columns:
+                            if col in base:
+                                row[col] = base[col]
+                    if req.group_key_columns and i > 0 and physical in result:
+                        base = result[physical][0]
+                        for col in req.group_key_columns:
+                            if col in base:
+                                row[col] = base[col]
+                    result.setdefault(physical, []).append(row)
+
         if spec.deferred:
-            self._resolve_deferred(spec)
+            self._resolve_deferred(spec, result)
 
         return result
 
-    def _resolve_equivalences(self, spec: BranchSpec) -> Dict[str, Any]:
-        """Resolve each equivalence class to a single concrete value."""
-        shared: Dict[str, Any] = {}  # "table.col" → value
-        groups = spec.equivalences.groups()
+    def _solve_row(self, table, req, spec, join_equalities, result):
+        """Build a SolverConstraint and call solver.solve() to get a row."""
+        if self.solver is None:
+            return self._fallback_row(table, req)
 
-        for representative, members in groups.items():
-            # Check if any member already has a fixed value.
-            fixed_val = None
-            for member in members:
-                parts = member.split(".", 1)
-                if len(parts) == 2:
-                    table, col = parts
-                    req = spec.requirements.get(table)
-                    if req and col in req.fixed_values:
-                        fixed_val = req.fixed_values[col]
-                        break
+        from parseval.solver.unified import SolverConstraint
 
-            if fixed_val is not None:
-                value = fixed_val
-            else:
-                # Generate a value based on the first member's type.
-                value = self._generate_equiv_value(members, spec)
+        all_constraints = list(req.constraints)
+        # Cross-table coordination: add EQ for join-relevant columns only
+        for lt, lc, rt, rc in join_equalities:
+            # Check if this join equality involves the current table
+            if lt == table and rt in result and result[rt]:
+                val = result[rt][0].get(rc)
+                all_constraints.append(exp.EQ(
+                    this=exp.Column(
+                        this=exp.to_identifier(lc),
+                        table=exp.to_identifier(table),
+                    ),
+                    expression=exp.Literal(val) if val is not None else exp.Null(),
+                ))
+            elif rt == table and lt in result and result[lt]:
+                val = result[lt][0].get(lc)
+                all_constraints.append(exp.EQ(
+                    this=exp.Column(
+                        this=exp.to_identifier(rc),
+                        table=exp.to_identifier(table),
+                    ),
+                    expression=exp.Literal(val) if val is not None else exp.Null(),
+                ))
 
-            for member in members:
-                shared[member] = value
+        constraint = SolverConstraint(
+            target_tables=(table,),
+            constraints=all_constraints,
+            join_equalities=join_equalities,
+        )
+        solve_result = self.solver.solve(constraint)
+        if solve_result.sat:
+            return solve_result.assignments.get(table, {})
+        return {}
 
-        return shared
-
-    def _generate_equiv_value(self, members: List[str], spec: BranchSpec) -> Any:
-        """Generate a value for an equivalence class."""
-        # Use the first member's column type.
-        for member in members:
-            parts = member.split(".", 1)
-            if len(parts) != 2:
-                continue
-            table, col = parts
-            if table not in self.instance.tables:
-                continue
-            col_type = self.instance.tables[table].get(col, "TEXT")
-            type_str = str(col_type).upper()
-
-            # Avoid existing unique values.
-            existing: Set[Any] = set()
-            if self.instance.is_unique(table, col):
-                existing = {s.concrete for s in self.instance.get_column_data(table, col) if s.concrete is not None}
-
-            if "INT" in type_str:
-                v = 1
-                while v in existing:
-                    v += 1
-                return v
-            elif "TEXT" in type_str or "CHAR" in type_str:
-                v = "key_1"
-                i = 1
-                while v in existing:
-                    i += 1
-                    v = f"key_{i}"
-                return v
-            else:
-                return 1
-        return 1
-
-    def _resolve_table(self, table: str, req: TableConstraint, shared: Dict[str, Any]) -> List[Dict[str, Any]]:
-        rows = []
-        base_row = self._build_row(table, req, shared)
-        rows.append(base_row)
-
-        for i in range(1, req.min_rows):
-            row = self._build_row(table, req, shared)
-            # For duplicate columns: copy values from base row.
-            if req.duplicate_columns and i == 1:
-                for col in req.duplicate_columns:
-                    if col in base_row:
-                        row[col] = base_row[col]
-            # Group key columns must share the same value across all rows.
-            for col in req.group_key_columns:
-                if col in base_row:
-                    row[col] = base_row[col]
-            # Generate unique values for UNIQUE columns to avoid insertion failures.
-            for col in self.instance.tables.get(table, {}):
-                if self.instance.is_unique(table, col) and col in row:
-                    existing_vals = {r.get(col) for r in rows}
-                    if row[col] in existing_vals:
-                        row[col] = self._unique_value(table, col, i, existing_vals)
-            rows.append(row)
-
-        return rows
-
-    def _unique_value(self, table: str, col: str, index: int, existing: set) -> Any:
-        """Generate a unique value for a column, avoiding existing values."""
-        col_type = str(self.instance.tables.get(table, {}).get(col, "TEXT")).upper()
-        if "INT" in col_type:
-            v = index + 1
-            while v in existing:
-                v += 1
-            return v
-        else:
-            v = f"val_{index}"
-            while v in existing:
-                index += 1
-                v = f"val_{index}"
-            return v
-
-    def _validate_row(self, table: str, req: TableConstraint, row: Dict[str, Any]) -> bool:
-        """Check that generated row values satisfy all predicates."""
-        for col, op, value in req.predicates:
-            if col not in row or row[col] is None:
-                continue
-            actual = row[col]
-            if op == ">" and isinstance(value, (int, float)):
-                if not (isinstance(actual, (int, float)) and actual > value):
-                    return False
-            elif op == ">=" and isinstance(value, (int, float)):
-                if not (isinstance(actual, (int, float)) and actual >= value):
-                    return False
-            elif op == "<" and isinstance(value, (int, float)):
-                if not (isinstance(actual, (int, float)) and actual < value):
-                    return False
-            elif op == "<=" and isinstance(value, (int, float)):
-                if not (isinstance(actual, (int, float)) and actual <= value):
-                    return False
-            elif op == "=":
-                if actual != value:
-                    return False
-        return True
-
-    def _build_row(self, table: str, req: TableConstraint, shared: Dict[str, Any]) -> Dict[str, Any]:
-        for _attempt in range(3):
-            row: Dict[str, Any] = {}
-            # Equivalence class values (JOIN/GROUP BY coordination).
-            for col in self.instance.tables.get(table, {}):
-                key = f"{table}.{col}"
-                if key in shared:
-                    row[col] = shared[key]
-            # Fixed values override equivalences (WHERE constraints are more specific).
-            row.update(req.fixed_values)
-            # Predicates: collect per-column, then satisfy all.
-            col_preds: Dict[str, List[Tuple[str, Any]]] = {}
-            for col, op, value in req.predicates:
-                if col not in row:
-                    col_preds.setdefault(col, []).append((op, value))
-            for col, preds in col_preds.items():
-                row[col] = self._satisfy_all(preds)
-            # Must NULL.
-            for col in req.must_null:
-                row[col] = None
-            if self._validate_row(table, req, row):
-                return row
+    def _fallback_row(self, table, req):
+        """Simple row generation when no solver is provided (backward compat)."""
+        row: Dict[str, Any] = {}
+        row.update(req.fixed_values)
+        for col in self.instance.tables.get(table, {}):
+            if col not in row:
+                col_type = str(self.instance.tables[table].get(col, "TEXT")).upper()
+                if "INT" in col_type:
+                    row[col] = 1
+                else:
+                    row[col] = "val"
+        for col in req.must_null:
+            row[col] = None
         return row
 
-    def _satisfy_all(self, preds: List[Tuple[str, Any]]) -> Any:
-        """Satisfy all predicates for a single column.
-
-        For numeric ranges, finds a value satisfying all bounds.
-        For mixed predicates, satisfies the first and hopes for the best.
-        """
-        if not preds:
-            return None
-        if len(preds) == 1:
-            return self._satisfy(preds[0][0], preds[0][1])
-
-        # Separate into lower bounds, upper bounds, and other
-        lower = []  # (op, value) where op is > or >=
-        upper = []  # (op, value) where op is < or <=
-        other = []
-
-        for op, value in preds:
-            if op in (">", ">=") and isinstance(value, (int, float)):
-                lower.append((op, value))
-            elif op in ("<", "<=") and isinstance(value, (int, float)):
-                upper.append((op, value))
-            else:
-                other.append((op, value))
-
-        # If we have both lower and upper bounds, find a value in range
-        if lower and upper:
-            lo_val = max(v for _, v in lower)
-            lo_op = ">" if any(op == ">" for op, v in lower if v == lo_val) else ">="
-            hi_val = min(v for _, v in upper)
-            hi_op = "<" if any(op == "<" for op, v in upper if v == hi_val) else "<="
-
-            # Adjust for strict inequalities
-            if lo_op == ">":
-                lo_val = lo_val + 1
-            if hi_op == "<":
-                hi_val = hi_val - 1
-
-            if lo_val <= hi_val:
-                mid = (lo_val + hi_val) // 2 if isinstance(lo_val, int) else (lo_val + hi_val) / 2
-                return mid
-
-        # Fallback: satisfy the first predicate
-        return self._satisfy(preds[0][0], preds[0][1])
-
-    def _satisfy(self, op: str, value: Any) -> Any:
-        """Generate a value satisfying the predicate."""
-        if op == ">" and isinstance(value, (int, float)):
-            return value + 1
-        if op == ">=" and isinstance(value, (int, float)):
-            return value
-        if op == "<" and isinstance(value, (int, float)):
-            return value - 1
-        if op == "<=" and isinstance(value, (int, float)):
-            return value
-        if op == "=":
-            return value
-        if op == "!=":
-            if isinstance(value, (int, float)):
-                return value + 1
-            if isinstance(value, str):
-                return value + "_neq"
-            return value
-        if op == "in":
-            return value  # lowering already picks first value
-        return value
-
-
+    def _equivalences_to_join_equalities(self, spec):
+        """Convert ColumnUnionFind equivalences to join_equalities tuples."""
+        equalities = []
+        for rep, members in spec.equivalences.groups().items():
+            if len(members) >= 2:
+                for i in range(len(members) - 1):
+                    t1, c1 = members[i].split(".", 1)
+                    t2, c2 = members[i + 1].split(".", 1)
+                    equalities.append((t1, c1, t2, c2))
+        return equalities
 
     def _discover_fk_parents(self, spec: BranchSpec) -> None:
         """Discover FK-referenced parent tables transitively.
@@ -1251,7 +1115,7 @@ class Resolver:
                 ordered.append(t)
         return ordered
 
-    def _resolve_deferred(self, spec: BranchSpec):
+    def _resolve_deferred(self, spec: BranchSpec, result=None):
         """Evaluate deferred scalar subqueries and adjust outer rows.
 
         For atoms like `col > (SELECT AVG(val) FROM t)`:
