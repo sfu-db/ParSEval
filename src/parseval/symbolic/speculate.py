@@ -186,8 +186,7 @@ class Propagator:
                     matched = self._match_column(table, col)
                     if matched:
                         col_node = exp.column(matched, table)
-                        is_not_null = exp.Is(this=col_node, expression=exp.Null())
-                        is_not_null.set("not", True)
+                        is_not_null = exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
                         if not self._has_is_not_null(tc.constraints, matched):
                             tc.constraints.append(is_not_null)
                 dup_cols = [c for c in projected if self._match_column(table, c)]
@@ -364,8 +363,7 @@ class Propagator:
             for col_name in self.instance.tables[table]:
                 if not self.instance.nullable(table, col_name):
                     col_node = exp.column(col_name, table)
-                    is_not_null = exp.Is(this=col_node, expression=exp.Null())
-                    is_not_null.set("not", True)
+                    is_not_null = exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
                     if not self._has_is_not_null(tc.constraints, col_name):
                         tc.constraints.append(is_not_null)
 
@@ -931,7 +929,7 @@ class Propagator:
     def _has_is_not_null(self, constraints: List[exp.Expression], col_name: str) -> bool:
         """Check if constraints already have IS NOT NULL for the given column."""
         for expr in constraints:
-            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null) and expr.args.get("not"):
+            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Not) and isinstance(expr.expression.this, exp.Null):
                 for col in expr.find_all(exp.Column):
                     if col.name == col_name:
                         return True
@@ -1248,8 +1246,10 @@ def speculate(
     Returns one entry per branch (positive + negatives). The engine
     materializes each one.
     """
+    from parseval.solver.unified import Solver
     propagator = Propagator(plan, instance, alias_map, dialect)
-    resolver = Resolver(instance, dialect)
+    solver = Solver(dialect=dialect)
+    resolver = Resolver(instance, dialect, solver=solver)
     branch_specs = propagator.propagate()
 
     results = []
@@ -1272,7 +1272,9 @@ def build_spec(plan, instance, *, alias_map, target_outcome="positive", negate_a
 
 def resolve_spec(spec, instance, dialect="sqlite"):
     """Backward-compatible wrapper."""
-    resolver = Resolver(instance, dialect)
+    from parseval.solver.unified import Solver
+    solver = Solver(dialect=dialect)
+    resolver = Resolver(instance, dialect, solver=solver)
     rows = resolver.resolve(spec)
     # Flatten to {table: first_row_values}
     return {table: row_list[0] if row_list else {} for table, row_list in rows.items()}
