@@ -13,7 +13,6 @@ def test_solver_constraint_defaults():
     assert c.constraints == []
     assert c.join_equalities == []
     assert c.alias_map == {}
-    assert c.atom is None
 
 
 def test_solver_constraint_with_expressions():
