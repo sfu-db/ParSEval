@@ -101,6 +101,22 @@ def test_solve_complex_expression():
     assert result.sat
 
 
+def test_complex_expression_uses_smt():
+    """Arithmetic expressions should fall through to SMT solver."""
+    solver = Solver()
+    add = exp.Add(
+        this=_col("t1", "a", "INT"),
+        expression=_col("t1", "b", "INT"),
+    )
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[exp.GT(this=add, expression=exp.Literal.number(10))],
+    )
+    result = solver.solve(constraint)
+    assert result.sat
+    assert result.assignments["t1"]["a"] + result.assignments["t1"]["b"] > 10
+
+
 def test_solve_multiple_constraints():
     solver = Solver()
     constraint = SolverConstraint(
