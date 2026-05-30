@@ -311,10 +311,12 @@ class Propagator:
             # Check for self-join: store on alias-specific key
             if self._store_conjunct_for_self_join(conjunct, spec):
                 continue
-            table = self._find_table_for_expr(conjunct)
+            # Resolve column table qualifiers to physical names.
+            resolved = self._resolve_columns(conjunct.copy())
+            table = self._find_table_for_expr(resolved)
             if table:
                 tc = spec.require(table)
-                tc.constraints.append(conjunct)
+                tc.constraints.append(resolved)
         # Extract temporal/age constraints for backward compat.
         self._extract_temporal_age_constraints(expr, spec)
 
@@ -345,6 +347,15 @@ class Propagator:
             if table and table in self.instance.tables:
                 return table
         return None
+
+    def _resolve_columns(self, expr: exp.Expression) -> exp.Expression:
+        """Resolve column table qualifiers to physical table names."""
+        for col in expr.find_all(exp.Column):
+            if col.table:
+                resolved = self._resolve_table(col.table)
+                if resolved and resolved in self.instance.tables and resolved != col.table:
+                    col.set("table", exp.to_identifier(resolved))
+        return expr
 
     # -----------------------------------------------------------------
     # Schema constraints
@@ -1006,7 +1017,7 @@ class Resolver:
                         this=exp.to_identifier(lc),
                         table=exp.to_identifier(table),
                     ),
-                    expression=exp.Literal(val) if val is not None else exp.Null(),
+                    expression=_make_literal(val) if val is not None else exp.Null(),
                 ))
             elif rt == table and lt in result and result[lt]:
                 val = result[lt][0].get(lc)
@@ -1015,7 +1026,7 @@ class Resolver:
                         this=exp.to_identifier(rc),
                         table=exp.to_identifier(table),
                     ),
-                    expression=exp.Literal(val) if val is not None else exp.Null(),
+                    expression=_make_literal(val) if val is not None else exp.Null(),
                 ))
 
         constraint = SolverConstraint(
@@ -1233,6 +1244,17 @@ class Resolver:
 # =============================================================================
 # Top-level API
 # =============================================================================
+
+
+def _make_literal(val: Any) -> exp.Literal:
+    """Create a sqlglot Literal from a Python value."""
+    if isinstance(val, bool):
+        return exp.Literal.number(1 if val else 0)
+    if isinstance(val, int):
+        return exp.Literal.number(val)
+    if isinstance(val, float):
+        return exp.Literal.number(val)
+    return exp.Literal.string(str(val))
 
 
 def speculate(

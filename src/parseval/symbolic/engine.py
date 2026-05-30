@@ -173,7 +173,7 @@ class SymbolicEngine:
         self.dialect = dialect
         self.expr = preprocess_sql(sql, instance, dialect=dialect)
         self.plan = Plan(self.expr, self.instance)
-        from parseval.solver.unified import Solver; self.solver = solver or Solver(instance, dialect=dialect)
+        from parseval.solver.unified import Solver; self.solver = solver or Solver(dialect=dialect)
         self.max_iterations = max_iterations
         # Alias → real table name mapping from the Plan's Scan steps.
         self.alias_map = self.plan.alias_map
