@@ -111,6 +111,13 @@ class TestValueSpaceBoolean(unittest.TestCase):
         val = vs.pick()
         self.assertIn(val, (True, False))
 
+    def test_pick_boolean_returns_none_when_exhausted(self):
+        vs = ValueSpace(family=TypeFamily.BOOLEAN)
+        vs.narrow_neq(True)
+        vs.narrow_neq(False)
+        self.assertTrue(vs.is_empty())
+        self.assertIsNone(vs.pick())
+
 
 class TestColumnPredicate(unittest.TestCase):
     def test_basic_fields(self):
