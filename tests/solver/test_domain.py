@@ -323,6 +323,32 @@ def test_boolean_or_branch_prefers_sat_branch_when_other_is_unsat():
     assert result.reason == ""
 
 
+def test_left_associated_boolean_or_branch_prefers_sat_branch():
+    solver = DomainSolver()
+    left = exp.Paren(this=exp.And(
+        this=exp.And(
+            this=exp.Is(
+                this=_col("t1", "flag", "BOOLEAN"),
+                expression=exp.Not(this=exp.Null()),
+            ),
+            expression=exp.NEQ(
+                this=_col("t1", "flag", "BOOLEAN"),
+                expression=exp.Boolean(this=True),
+            ),
+        ),
+        expression=exp.NEQ(
+            this=_col("t1", "flag", "BOOLEAN"),
+            expression=exp.Boolean(this=False),
+        ),
+    ))
+    right = exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1))
+    result = solver.solve(_constraint(("t1",), [exp.Or(this=left, expression=right)]))
+    assert result.status == "sat"
+    assert result.assignments is not None
+    assert result.assignments["t1"]["x"] == 1
+    assert result.reason == ""
+
+
 def test_null_and_not_null_conflict_is_unsat():
     solver = DomainSolver()
     result = solver.solve(_constraint(

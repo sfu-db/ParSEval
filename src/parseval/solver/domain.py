@@ -208,6 +208,7 @@ class LoweringOutcome:
     status: str
     predicates: List[ColumnPredicate] = field(default_factory=list)
     equalities: List[Tuple[str, str]] = field(default_factory=list)
+    families: Dict[str, TypeFamily] = field(default_factory=dict)
     reason: str = ""
 
 
@@ -290,7 +291,11 @@ class DomainSolver:
             pred = _lower_negated_atom(expr.this, tables, alias_map)
             if pred is None:
                 return LoweringOutcome(status="unknown", reason="unsupported_not")
-            return self._classify_supported(LoweringOutcome(status="sat", predicates=[pred]))
+            return self._classify_supported(LoweringOutcome(
+                status="sat",
+                predicates=[pred],
+                families=self._expression_families(expr, tables, alias_map),
+            ))
         if isinstance(expr, exp.EQ):
             left_col, right_col = _extract_col_col(expr)
             if left_col and right_col:
@@ -299,12 +304,17 @@ class DomainSolver:
                 return self._classify_supported(LoweringOutcome(
                     status="sat",
                     equalities=[(f"{left_table}.{left_col.name}", f"{right_table}.{right_col.name}")],
+                    families=self._expression_families(expr, tables, alias_map),
                 ))
 
         pred = _lower_atom(expr, tables, alias_map)
         if pred is None:
             return LoweringOutcome(status="unknown", reason=_unsupported_reason(expr))
-        return self._classify_supported(LoweringOutcome(status="sat", predicates=[pred]))
+        return self._classify_supported(LoweringOutcome(
+            status="sat",
+            predicates=[pred],
+            families=self._expression_families(expr, tables, alias_map),
+        ))
 
     def _merge_and(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
         if left.status == "unsat":
@@ -319,6 +329,7 @@ class DomainSolver:
             status="sat",
             predicates=[*left.predicates, *right.predicates],
             equalities=[*left.equalities, *right.equalities],
+            families={**left.families, **right.families},
         ))
 
     def _merge_or(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
@@ -342,7 +353,15 @@ class DomainSolver:
         if not outcome.predicates and not outcome.equalities:
             return outcome
 
-        variables: Dict[str, CSPVariable] = {}
+        variables: Dict[str, CSPVariable] = {
+            name: CSPVariable(
+                name=name,
+                table=name.split(".", 1)[0],
+                column=name.split(".", 1)[1],
+                space=ValueSpace(family=family),
+            )
+            for name, family in outcome.families.items()
+        }
         self._apply_predicates(variables, outcome.predicates)
 
         constraints: List[CSPConstraint] = []
@@ -354,13 +373,27 @@ class DomainSolver:
                         name=key,
                         table=table,
                         column=column,
-                        space=ValueSpace(),
+                        space=ValueSpace(family=outcome.families.get(key, TypeFamily.TEXT)),
                     )
             constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
 
         if not self._propagate(variables, constraints):
             return LoweringOutcome(status="unsat", reason="contradictory_bounds")
         return outcome
+
+    def _expression_families(
+        self,
+        expr: exp.Expression,
+        tables: Tuple[str, ...],
+        alias_map: Dict[str, str],
+    ) -> Dict[str, TypeFamily]:
+        families: Dict[str, TypeFamily] = {}
+        for col in expr.find_all(exp.Column):
+            table = _resolve_table(col, tables, alias_map)
+            name = f"{table}.{col.name}"
+            dtype = col_type(col)
+            families[name] = type_family(dtype) if dtype else TypeFamily.TEXT
+        return families
 
     def _extract_variables(
         self,
