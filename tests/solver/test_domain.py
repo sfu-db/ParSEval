@@ -404,6 +404,21 @@ def test_column_column_equality():
     assert assignments["a"]["x"] == assignments["b"]["y"]
 
 
+def test_boolean_equality_exclusions_can_make_eq_unsat():
+    solver = DomainSolver()
+    result = solver.solve(_constraint(
+        ("a", "b"),
+        [
+            exp.EQ(this=_col("a", "flag", "BOOLEAN"), expression=_col("b", "flag", "BOOLEAN")),
+            exp.NEQ(this=_col("a", "flag", "BOOLEAN"), expression=exp.Boolean(this=True)),
+            exp.NEQ(this=_col("b", "flag", "BOOLEAN"), expression=exp.Boolean(this=False)),
+        ],
+    ))
+    assert result.status == "unsat"
+    assert result.assignments is None
+    assert result.reason == "contradictory_bounds"
+
+
 def test_returns_unknown_for_complex_expressions():
     """Domain solver can't handle arithmetic — should return unknown."""
     add = exp.Add(
