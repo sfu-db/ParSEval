@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import z3
@@ -328,7 +328,7 @@ def _from_seconds(seconds: int) -> time:
 
 def _from_epoch_second(value: int) -> datetime:
     """Convert Unix epoch seconds back to a timezone-naive ``datetime``."""
-    return datetime.fromtimestamp(value, tz=UTC).replace(tzinfo=None)
+    return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
 
 
 def normalize_dtype(

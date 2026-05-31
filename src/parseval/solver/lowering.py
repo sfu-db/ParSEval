@@ -27,11 +27,20 @@ from parseval.plan.rex import concrete
 # =============================================================================
 
 
+def _resolve_name(name: str, alias_map) -> str:
+    """Resolve a name through the alias map (supports both AliasMap and plain dict)."""
+    if alias_map and hasattr(alias_map, 'resolve'):
+        return alias_map.resolve(name)
+    alias_map = alias_map or {}
+    real = alias_map.get(name.lower(), alias_map.get(name, name))
+    return normalize_name(real)
+
+
 def resolve_table(
     col: exp.Column,
     candidate_tables: Tuple[str, ...],
     instance: Instance,
-    alias_map: Optional[Dict[str, str]] = None,
+    alias_map=None,
 ) -> str:
     """Resolve which real table a column belongs to.
 
@@ -39,36 +48,24 @@ def resolve_table(
     1. Column's own table qualifier, checked against alias_map and instance tables.
     2. Column-name lookup across all candidate tables (for unqualified columns).
 
-    Args:
-        col: A sqlglot Column expression.
-        candidate_tables: Tuple of table names to search.
-        instance: The Instance providing real table names and column info.
-        alias_map: Optional mapping of alias names to real table names.
-
     Returns:
         The resolved real table name, or the first candidate if resolution fails.
     """
-    alias_map = alias_map or {}
-
     if col.table:
-        # Try alias resolution.
-        table = alias_map.get(col.table.lower(), col.table)
-        table = normalize_name(table)
+        table = _resolve_name(col.table, alias_map)
         if table in instance.tables:
             return table
         # Try column-name matching across candidates.
         col_name = col.name.lower()
         for candidate in candidate_tables:
-            real = alias_map.get(candidate.lower(), candidate)
-            real = normalize_name(real)
+            real = _resolve_name(candidate, alias_map)
             if real in instance.tables and _has_column(instance, real, col_name):
                 return real
 
     # No table qualifier — find first table with this column.
     col_name = col.name.lower()
     for candidate in candidate_tables:
-        real = alias_map.get(candidate.lower(), candidate)
-        real = normalize_name(real)
+        real = _resolve_name(candidate, alias_map)
         if real in instance.tables and _has_column(instance, real, col_name):
             return real
 
@@ -92,14 +89,9 @@ def match_column(instance: Instance, table: str, col_name: str) -> Optional[str]
     return next((s for s in instance.tables[table] if s.lower() == lower), None)
 
 
-def resolve_table_name(name: str, instance: Instance, alias_map: Optional[Dict[str, str]] = None) -> str:
-    """Resolve a table name or alias to the real instance table name.
-
-    Uses alias_map first, then falls back to normalize_name matching.
-    """
-    alias_map = alias_map or {}
-    real = alias_map.get(name.lower(), name)
-    real = normalize_name(real)
+def resolve_table_name(name: str, instance: Instance, alias_map=None) -> str:
+    """Resolve a table name or alias to the real instance table name."""
+    real = _resolve_name(name, alias_map)
     return real if real in instance.tables else name
 
 
@@ -169,7 +161,8 @@ def _lower_recursive(
     """Recursively decompose and lower predicates into column constraints.
 
     AND expressions are flattened; OR takes the left branch for satisfiability;
-    NOT and subqueries are pushed to residuals.
+    NOT expressions are negated into complementary predicates when possible
+    (e.g., ``NOT(col > 5)`` → ``col <= 5``), otherwise pushed to residuals.
     """
     if isinstance(expr, exp.And):
         _lower_recursive(expr.left, instance, tables, alias_map, predicates, residuals)
@@ -183,8 +176,7 @@ def _lower_recursive(
         _lower_recursive(expr.left, instance, tables, alias_map, predicates, residuals)
         return
     if isinstance(expr, exp.Not):
-        # Skip NOT — can't easily extract positive assignments.
-        residuals.append(expr)
+        _lower_not_expr(expr, instance, tables, alias_map, predicates, residuals)
         return
     # Skip atoms with subqueries.
     if expr.find(exp.Subquery):
@@ -197,6 +189,108 @@ def _lower_recursive(
         predicates.append(pred)
     else:
         residuals.append(expr)
+
+
+_NEGATED_OPS = {
+    "=": "!=",
+    "!=": "=",
+    ">": "<=",
+    ">=": "<",
+    "<": ">=",
+    "<=": ">",
+}
+
+_SQLGLOT_KEY_TO_OP = {
+    "EQ": "=",
+    "NEQ": "!=",
+    "GT": ">",
+    "GTE": ">=",
+    "LT": "<",
+    "LTE": "<=",
+}
+
+
+def _negate_op(op: str) -> str:
+    """Return the complementary operator for a given predicate operator.
+
+    Used when lowering ``NOT(atom)`` to produce the flipped predicate
+    that satisfies the negated branch.
+    """
+    return _NEGATED_OPS.get(op, op)
+
+
+def _lower_not_expr(
+    expr: exp.Not,
+    instance: Instance,
+    tables: Tuple[str, ...],
+    alias_map: Dict[str, str],
+    predicates: List[ColumnPredicate],
+    residuals: List[exp.Expression],
+) -> None:
+    """Lower a ``NOT(inner)`` expression by negating the inner predicate.
+
+    Handles:
+    - ``NOT(col IS NULL)`` → ``is_not_null``
+    - ``NOT(col IS NOT NULL)`` → ``is_null``
+    - ``NOT(col op val)`` → ``col negate(op) val`` (flipped operator)
+    - ``NOT(NOT expr)`` → unwrap double negation, recurse
+    - Anything else → push to residuals
+    """
+    inner = expr.this
+
+    # Double negation: NOT(NOT expr) → unwrap and lower the inner expression.
+    if isinstance(inner, exp.Not):
+        _lower_recursive(inner.this, instance, tables, alias_map, predicates, residuals)
+        return
+
+    # NOT(col IS NULL) → is_not_null
+    if isinstance(inner, exp.Is):
+        left = inner.this
+        right = inner.expression
+        if isinstance(left, exp.Column):
+            if isinstance(right, exp.Null):
+                pred = _make_pred(left, "not_null", True, instance, tables, alias_map)
+                if pred:
+                    predicates.append(pred)
+                    return
+            # NOT(col IS NOT NULL) → is_null
+            if isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
+                pred = _make_pred(left, "is_null", True, instance, tables, alias_map)
+                if pred:
+                    predicates.append(pred)
+                    return
+        residuals.append(expr)
+        return
+
+    # NOT(comparison) → flip the operator.
+    if isinstance(inner, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        op_str = _SQLGLOT_KEY_TO_OP.get(inner.key.upper(), inner.key.upper())
+        col, val = _extract_col_literal(inner)
+        if col is not None and val is not None:
+            flipped = _negate_op(op_str)
+            pred = _make_pred(col, flipped, val, instance, tables, alias_map)
+            if pred:
+                predicates.append(pred)
+                return
+        # Temporal function: NOT(STRFTIME('%Y', col) = '2024')
+        col, val = _extract_temporal_func(inner)
+        if col is not None and val is not None:
+            flipped = _negate_op(op_str)
+            pred = _make_pred(col, flipped, val, instance, tables, alias_map)
+            if pred:
+                predicates.append(pred)
+                return
+        # Function-wrapped: NOT(SUBSTR(col, ...) = 'val')
+        col, val = _extract_func_column(inner)
+        if col is not None and val is not None:
+            flipped = _negate_op(op_str)
+            pred = _make_pred(col, flipped, val, instance, tables, alias_map)
+            if pred:
+                predicates.append(pred)
+                return
+
+    # Fallback: can't lower this NOT expression.
+    residuals.append(expr)
 
 
 def _lower_atom(

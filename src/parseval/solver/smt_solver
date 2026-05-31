@@ -91,13 +91,14 @@ class SMTSolver:
 
     def __init__(
         self,
-        variables=None,
+        variables,
         z3ctx: Optional[z3.Context] = None,
         verbose: bool = False,
         function_models: Optional[
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ] = None,
         timeout_ms: Optional[int] = None,
+        instance=None,
     ):
         """Initialize the SMT solver.
 
@@ -107,6 +108,7 @@ class SMTSolver:
             verbose: If True, log each added constraint via the ``parseval.smt`` logger.
             function_models: Optional custom function translators (list or dict).
             timeout_ms: Optional solver timeout in milliseconds.
+            instance: Optional Instance with .tables dict for column type resolution.
         """
         self.variables = variables
         self.verbose = verbose
@@ -118,6 +120,7 @@ class SMTSolver:
             except Exception:
                 pass
         self.timeout_ms = timeout_ms
+        self.instance = instance
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False
@@ -199,6 +202,16 @@ class SMTSolver:
         # Store _VarRef so _z3_to_python can access .type for temporal decoding
         self.context.setdefault("z3_to_variable", {})[name] = _VarRef(type=datatype)
         return z3_var
+
+    def col_sort_datatype(self, table: str, col: str) -> DataType:
+        """Resolve a column's DataType from the Instance schema.
+
+        Returns DataType.build("TEXT") for unknown columns.
+        """
+        if self.instance is None:
+            return DataType.build("TEXT")
+        col_type = str(self.instance.tables.get(table, {}).get(col, "TEXT"))
+        return DataType.build(col_type)
 
     def translate(
         self, expr: exp.Expression, ctx: Optional[Dict[str, z3.ExprRef]] = None
@@ -296,10 +309,17 @@ class SMTSolver:
                 sym.set("is_null", False)
 
     def _infer_type_info(self, col: exp.Column) -> SMTTypeInfo:
-        """Infer SMTTypeInfo for a Column from its .type attribute."""
+        """Infer SMTTypeInfo for a Column, using its .type attribute or Instance schema."""
         dtype = getattr(col, "type", None)
         if dtype is None or str(dtype) in ("", "UNKNOWN"):
-            dtype = DataType.build("TEXT")
+            if self.instance is not None:
+                from parseval.helper import normalize_name
+                table = normalize_name(col.table or "")
+                name = normalize_name(col.name)
+                if table in self.instance.tables and name in self.instance.tables[table]:
+                    dtype = DataType.build(str(self.instance.tables[table][name]))
+            if dtype is None or str(dtype) in ("", "UNKNOWN"):
+                dtype = DataType.build("TEXT")
         return normalize_dtype(dtype, self.z3ctx)
 
     def add(self, constraint, track_vars: bool = True):
@@ -936,14 +956,7 @@ class SMTSolver:
         if isinstance(condition, exp.Boolean):
             return z3.BoolVal(bool(condition.this), ctx=self.z3ctx)
         if isinstance(condition, exp.Literal) or condition.key == "const":
-            datatype = getattr(condition, 'datatype', None)
-            if datatype is None:
-                if condition.is_string:
-                    datatype = DataType.build("TEXT")
-                elif condition.is_int:
-                    datatype = DataType.build("INT")
-                else:
-                    datatype = DataType.build("FLOAT")
+            datatype = condition.datatype
             literal_value = condition.this
             if datatype.is_type(*DataType.TEMPORAL_TYPES) and isinstance(literal_value, str):
                 return encode_literal(datatype, literal_value, self.z3ctx)

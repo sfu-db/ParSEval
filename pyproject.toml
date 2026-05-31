@@ -35,5 +35,6 @@ packages = ["src/parseval"]
 
 [dependency-groups]
 dev = [
+    "pytest>=8.4.2",
     "tqdm>=4.67.3",
 ]

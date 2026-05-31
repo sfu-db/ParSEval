@@ -22,7 +22,7 @@ from .smt_types import (
 )
 
 if TYPE_CHECKING:
-    from .smt_solver import SMTSolver
+    from .smt import SMTSolver
 
 
 def _coerce_numeric_sort(expr: z3.ExprRef, target_sort: z3.SortRef) -> z3.ExprRef:

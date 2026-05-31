@@ -57,10 +57,11 @@ from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from parseval.helper import normalize_name
-
+if t.TYPE_CHECKING:
+    from parseval.instance import Instance
 
 class Plan:
-    def __init__(self, expression: exp.Expression) -> None:
+    def __init__(self, expression: exp.Expression, instance: Instance | None = None) -> None:
         """Build a plan for ``expression``.
 
         Every subquery reference (``FROM (...)``, ``EXISTS``, ``IN (...)``,
@@ -76,9 +77,11 @@ class Plan:
         self.root = Step.from_expression(
             self.expression, correlations=self._correlations
         )
+        self._instance = instance
         self._dag: t.Dict["Step", t.Set["Step"]] = {}
         self._ordered_steps: t.Optional[t.Tuple["Step", ...]] = None
         self._annotations: t.Optional[t.Dict[int, "StepAnnotations"]] = None
+        self._alias_map: t.Optional[AliasMap] = None
 
     @property
     def dag(self) -> t.Dict["Step", t.Set["Step"]]:
@@ -136,17 +139,51 @@ class Plan:
         assert self._annotations is not None
         return self._annotations
 
+    @property
+    def alias_map(self) -> "AliasMap":
+        """Alias → real table name mapping, built lazily from Scan steps."""
+        if self._alias_map is None:
+            self._alias_map = _build_alias_map(self)
+        return self._alias_map
+
     def _annotate(self) -> None:
+        from parseval.plan.rex import set_column_meta
+        from parseval.dtype import DataType
+
         annotations: t.Dict[int, "StepAnnotations"] = {}
+        alias_map = self.alias_map if self._instance is not None else None
         for index, step in enumerate(self.ordered_steps):
+            exprs = _step_expressions(step)
+            source_tables = _source_tables(step)
+            if self._instance is not None:
+                for expr in exprs:
+                    for col in expr.find_all(exp.Column):
+                        # Skip columns inside subquery boundaries — they belong
+                        # to an inner scope and are enriched via SubPlan.inner.
+                        if col.find_ancestor(exp.Subquery) is not None or col.find_ancestor(exp.Exists) is not None:
+                            continue
+                        _enrich_one_column(col, source_tables, self._instance, set_column_meta, DataType, alias_map=alias_map)
+                # SubPlan inner plans live in a separate scope — recurse
+                # through all inner steps (not just the root, since the
+                # correlated condition is typically on a Filter dependency).
+                if isinstance(step, SubPlan):
+                    inner = step.inner
+                    if inner is not None:
+                        inner_steps = _collect_inner_steps(inner)
+                        for inner_step in inner_steps:
+                            inner_tables = _source_tables(inner_step)
+                            for inner_expr in _step_expressions(inner_step):
+                                for col in inner_expr.find_all(exp.Column):
+                                    _enrich_one_column(col, inner_tables, self._instance, set_column_meta, DataType, alias_map=alias_map)
+
             annotations[id(step)] = StepAnnotations(
                 step_id=f"step_{index}",
                 step_type=type(step).__name__,
                 step_name=getattr(step, "name", "") or "",
                 condition=getattr(step, "condition", None),
                 projected_columns=_projected_columns(step),
-                source_tables=_source_tables(step),
-                referenced_columns=_unique_columns(_step_expressions(step)),
+                source_tables=source_tables,
+                referenced_columns=_unique_columns(exprs),
             )
         self._annotations = annotations
 
@@ -1105,11 +1142,6 @@ def _build_correlation_map(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Annotations (formerly in parseval.plan.scope_plan)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class StepAnnotations:
     """Cached derived facts about a :class:`Step` in a :class:`Plan`.
@@ -1235,7 +1267,78 @@ def _step_expressions(step: "Step") -> t.Tuple[exp.Expression, ...]:
             agg for agg in aggregations if isinstance(agg, exp.Expression)
         )
 
+    if isinstance(step, SubPlan):
+        anchor = getattr(step, "anchor", None)
+        if isinstance(anchor, exp.Expression):
+            expressions.append(anchor)
+        for col in (getattr(step, "correlation", None) or ()):
+            if isinstance(col, exp.Expression):
+                expressions.append(col)
+
     return tuple(expressions)
+
+
+def _collect_inner_steps(root: "Step") -> t.List["Step"]:
+    """Collect all steps in a SubPlan's inner plan (root + all dependencies)."""
+    steps: t.List["Step"] = []
+    visited: t.Set[int] = set()
+
+    def _walk(s: "Step") -> None:
+        if id(s) in visited:
+            return
+        visited.add(id(s))
+        steps.append(s)
+        for dep in s.chain_dependencies:
+            _walk(dep)
+
+    _walk(root)
+    return steps
+
+
+def _enrich_one_column(
+    col: exp.Column,
+    source_tables: t.Tuple[str, ...],
+    instance: t.Any,
+    set_column_meta: t.Callable,
+    DataType: t.Any,
+    alias_map: "AliasMap | None" = None,
+) -> None:
+    """Stamp ``_parseval_meta`` on a single Column if the schema recognizes it."""
+    col_table = normalize_name(col.table) if col.table else ""
+    mapping = getattr(instance, "tables", None)
+    if mapping is None:
+        return
+
+    col_name = normalize_name(col.name)
+
+    # Resolve the real table name: prefer col.table if it's in the schema,
+    # then try the alias map, finally fall back to searching source tables
+    # by column name.
+    real_table = ""
+    if col_table and col_table in mapping:
+        real_table = col_table
+    elif col_table and alias_map is not None:
+        real = alias_map.get(col_table, "")
+        if real in mapping:
+            real_table = real
+    if not real_table:
+        for candidate in source_tables:
+            if candidate in mapping and col_name in mapping[candidate]:
+                real_table = candidate
+                break
+    if not real_table:
+        return
+
+    if col_name not in mapping[real_table]:
+        return
+
+    meta = {
+        "table": real_table,
+        "nullable": instance.nullable(real_table, col_name),
+        "unique": instance.is_unique(real_table, col_name),
+        "domain": DataType.build(mapping[real_table][col_name]),
+    }
+    set_column_meta(col, meta)
 
 
 # ---------------------------------------------------------------------------
@@ -1272,3 +1375,126 @@ def _topological_order(plan: "Plan") -> t.List["Step"]:
             if indegree[dependent] == 0:
                 heapq.heappush(heap, (sort_key(dependent), dependent))
     return ordered
+
+
+# ---------------------------------------------------------------------------
+# Alias resolution
+# ---------------------------------------------------------------------------
+
+
+class AliasMap(dict):
+    """Alias → physical table mapping that also tracks per-alias row indices.
+
+    Backward-compatible with Dict[str, str] (alias → table_name).
+    Additionally tracks which row index each alias should bind to when
+    multiple aliases reference the same physical table (self-joins).
+
+    Usage:
+        alias_map['t1']  → 'superhero'  (dict-compatible)
+        alias_map['t2']  → 'colour'
+        alias_map['t3']  → 'colour'
+        alias_map.row_index('t2')  → 0  (first row of colour)
+        alias_map.row_index('t3')  → 1  (second row of colour)
+        alias_map.self_join_aliases('colour')  → ['t2', 't3']
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._row_indices: t.Dict[str, int] = {}
+        self._compute_row_indices()
+
+    def _compute_row_indices(self):
+        """Assign row indices: each alias to the same table gets a unique index."""
+        table_counters: t.Dict[str, int] = {}
+        for alias in sorted(self.keys()):
+            table = self[alias]
+            idx = table_counters.get(table, 0)
+            self._row_indices[alias] = idx
+            table_counters[table] = idx + 1
+
+    def row_index(self, alias: str) -> int:
+        """Return the row index this alias binds to within its physical table."""
+        return self._row_indices.get(alias, 0)
+
+    def self_join_aliases(self, table: str) -> t.List[str]:
+        """Return all aliases that reference the given physical table."""
+        return [a for a, t_ in self.items() if t_ == table]
+
+    def has_self_join(self, table: str) -> bool:
+        """True if multiple aliases reference the same physical table."""
+        return sum(1 for t_ in self.values() if t_ == table) > 1
+
+    def self_join_tables(self) -> t.Dict[str, t.List[str]]:
+        """Return {table: [aliases]} for tables with multiple aliases."""
+        from collections import defaultdict
+        groups: t.Dict[str, t.List[str]] = defaultdict(list)
+        for alias, table in self.items():
+            groups[table].append(alias)
+        return {tbl: aliases for tbl, aliases in groups.items() if len(aliases) > 1}
+
+    def resolve(self, name: str) -> str:
+        """Resolve a table name or alias to the physical table name.
+
+        Case-insensitive lookup. Returns the physical name if found,
+        otherwise returns the input unchanged.
+        """
+        return self.get(name.lower(), self.get(name, name))
+
+    def ensure_rows_exist(self, instance) -> None:
+        """Ensure the Instance has enough rows for all aliases (self-joins need multiple rows)."""
+        from collections import Counter
+        table_needs = Counter(self.values())
+        for table, needed in table_needs.items():
+            if table not in instance.tables:
+                continue
+            existing = len(instance.get_rows(table))
+            for _ in range(max(0, needed - existing)):
+                try:
+                    instance.create_row(table, values={})
+                except Exception:
+                    pass
+
+
+def _build_alias_map(plan: "Plan") -> AliasMap:
+    """Build alias → real table name mapping from the Plan's Scan steps.
+
+    Walks all steps in the plan (including SubPlan inner plans) to find
+    every base table reference. For FROM-subquery patterns, the real
+    tables are inside the SubPlan's inner plan.
+    """
+    raw: t.Dict[str, str] = {}
+
+    def _walk_steps(steps):
+        for step in steps:
+            if isinstance(step, Scan) and step.source is not None:
+                if isinstance(step.source, exp.Table):
+                    alias = step.source.alias_or_name
+                    real = step.source.name
+                    if alias and real:
+                        raw[alias] = real
+                        raw[normalize_name(alias)] = normalize_name(real)
+            for sub in step.subplan_dependencies:
+                if sub.inner:
+                    _walk_inner(sub.inner)
+
+    def _walk_inner(step):
+        """Recursively walk an inner plan's steps."""
+        visited: set = set()
+        stack = [step]
+        while stack:
+            current = stack.pop()
+            if id(current) in visited:
+                continue
+            visited.add(id(current))
+            if isinstance(current, Scan) and current.source is not None:
+                if isinstance(current.source, exp.Table):
+                    alias = current.source.alias_or_name
+                    real = current.source.name
+                    if alias and real:
+                        raw[alias] = real
+                        raw[normalize_name(alias)] = normalize_name(real)
+            for dep in current.dependencies:
+                stack.append(dep)
+
+    _walk_steps(plan.ordered_steps)
+    return AliasMap(raw)

@@ -75,13 +75,34 @@ from parseval.helper import like_to_pattern, normalize_name
 
 # Re-export AST-extension predicates and runtime containers from their homes
 # so callers can still import them as ``parseval.plan.rex.Is_Null`` / etc.
-from .ast_ext import Is_Not_Null, Is_Null  # noqa: F401
+
 from .context import AggGroup, Row  # noqa: F401
 
 
 # =============================================================================
 # Symbol hierarchy
 # =============================================================================
+
+
+
+class Is_Null(exp.Unary, exp.Predicate):
+    """``<expr> IS NULL`` predicate.
+
+    sqlglot parses ``IS NULL`` as ``exp.Is(this=<expr>, expression=exp.Null())``.
+    ParSEval uses a dedicated class so the evaluator / extractor can
+    dispatch on a single concept (rather than pattern-matching the
+    generic ``exp.Is`` node) for the two common NULL predicates.
+    """
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
+
+
+class Is_Not_Null(exp.Unary, exp.Predicate):
+    """``<expr> IS NOT NULL`` predicate; see :class:`Is_Null`."""
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
 
 
 class Symbol(exp.Expression):
@@ -1241,6 +1262,34 @@ def negate_predicate(expr: exp.Expression) -> exp.Expression:
 
 
 # =============================================================================
+# Column metadata (schema hints stamped on exp.Column nodes)
+# =============================================================================
+
+
+def column_meta(col: exp.Column) -> Optional[dict]:
+    """Read schema hints stamped on a Column by :meth:`Plan._annotate`.
+
+    Returns a dict with keys ``table``, ``nullable``, ``unique``, ``domain``
+    (a :class:`DataType`), or ``None`` if the column was not enriched.
+    """
+    raw = col.args.get("_parseval_meta")
+    if raw is None:
+        return None
+    # Stored as a frozenset of (key, value) pairs for hashability.
+    return dict(raw)
+
+
+def set_column_meta(col: exp.Column, meta: dict) -> None:
+    """Stamp schema hints onto a Column node.
+
+    Internally stored as a frozenset of ``(key, value)`` pairs so the
+    Column remains hashable (required by sqlglot's ``simplify`` and other
+    passes that hash expression nodes).
+    """
+    col.set("_parseval_meta", frozenset(meta.items()))
+
+
+# =============================================================================
 # Compatibility shims (to be removed once consumers migrate)
 # =============================================================================
 
@@ -1299,4 +1348,6 @@ __all__ = [
     "DataType",
     # Utilities
     "negate_predicate",
+    "column_meta",
+    "set_column_meta",
 ]
