@@ -4,11 +4,13 @@ The solver provides a single interface to satisfy constraints expressed as
 sqlglot AST nodes. Internally it uses a two-tier resolution strategy:
 
 * **Domain solver**: CSP-lite value-space narrowing with constraint
-  propagation. Handles simple predicates (comparisons, LIKE, IN,
-  BETWEEN) and equality propagation across JOINs.
+  propagation. It returns a tri-state result: ``sat`` when it handled the
+  full formula, ``unsat`` when it proved a contradiction, and ``unknown``
+  when the formula is outside its supported fragment.
 * **SMT fallback**: Full Z3-backed constraint solving for complex
-  constraints with cross-column dependencies or arithmetic
-  relationships.
+  constraints with cross-column dependencies or arithmetic relationships.
+  It runs only for domain ``unknown`` and fails closed if any input
+  expression cannot be translated.
 
 The solver is a pure function of its inputs — it does not depend on
 ``Instance`` or any database state.  The caller is responsible for
