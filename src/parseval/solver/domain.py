@@ -187,6 +187,15 @@ def _unsupported_reason(expr: exp.Expression) -> str:
     return "unsupported_expression"
 
 
+def _predicate_family(pred: ColumnPredicate) -> TypeFamily:
+    if isinstance(pred.value, bool):
+        return TypeFamily.BOOLEAN
+    if pred.op == "in" and isinstance(pred.value, list) and pred.value:
+        if all(isinstance(value, bool) for value in pred.value):
+            return TypeFamily.BOOLEAN
+    return TypeFamily.TEXT
+
+
 @dataclass
 class DomainResult:
     status: str
@@ -381,7 +390,7 @@ class DomainSolver:
         for pred in predicates:
             name = f"{pred.table}.{pred.column}"
             if name not in variables:
-                space = ValueSpace()
+                space = ValueSpace(family=_predicate_family(pred))
                 variables[name] = CSPVariable(
                     name=name, table=pred.table, column=pred.column, space=space,
                 )
