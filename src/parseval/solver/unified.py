@@ -110,13 +110,18 @@ class Solver:
 
         # Tier 1: Domain solver
         domain_result = self._try_domain(constraint)
+        if domain_result.status == "unsat":
+            return SolveResult(sat=False, reason=domain_result.reason)
         if domain_result.status == "sat":
             return SolveResult(
                 sat=True,
                 assignments=self._remap_assignments(domain_result.assignments or {}, constraint.alias_map),
             )
-        if domain_result.status == "unsat":
-            return SolveResult(sat=False, reason=domain_result.reason)
+        if domain_result.status != "unknown":
+            return SolveResult(
+                sat=False,
+                reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",
+            )
 
         # Tier 2: SMT solver
         smt_result = self._try_smt(constraint)
@@ -193,10 +198,11 @@ class Solver:
             for expr in constraint.constraints:
                 try:
                     z3_expr = smt.translate(expr)
-                    if z3_expr is not None:
-                        smt.add(z3_expr)
                 except (UnsupportedSMTError, Exception):
-                    pass
+                    return None
+                if z3_expr is None:
+                    return None
+                smt.add(z3_expr)
 
             # Add join equalities as Z3 equalities.
             for lt, lc, rt, rc in constraint.join_equalities:
@@ -205,10 +211,11 @@ class Solver:
                     right_key = f"{normalize_name(rt)}.{normalize_name(rc)}"
                     left_z3 = smt.context.get("variable_to_z3", {}).get(left_key)
                     right_z3 = smt.context.get("variable_to_z3", {}).get(right_key)
-                    if left_z3 is not None and right_z3 is not None:
-                        smt.add_raw(left_z3 == right_z3)
+                    if left_z3 is None or right_z3 is None:
+                        return None
+                    smt.add_raw(left_z3 == right_z3)
                 except Exception:
-                    pass
+                    return None
 
             status, solutions = smt.solve()
             if status != "sat" or not solutions:
