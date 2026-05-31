@@ -124,11 +124,11 @@ class Solver:
             )
 
         # Tier 2: SMT solver
-        smt_result = self._try_smt(constraint)
+        smt_result, smt_reason = self._try_smt(constraint)
         if smt_result is not None:
             return SolveResult(sat=True, assignments=smt_result)
 
-        return SolveResult(sat=False, reason="all tiers exhausted")
+        return SolveResult(sat=False, reason=smt_reason)
 
     # ── Validation ──────────────────────────────────────────────
 
@@ -172,7 +172,7 @@ class Solver:
 
     def _try_smt(
         self, constraint: SolverConstraint,
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
+    ) -> Tuple[Optional[Dict[str, Dict[str, Any]]], str]:
         """Solve all constraint expressions with Z3."""
         try:
             from .smt import SMTSolver, UnsupportedSMTError
@@ -187,39 +187,44 @@ class Solver:
                     smt.declare_variable(col_key, dtype)
 
             # Declare variables from join equalities.
+            declared_keys = set(smt.context.get("variable_to_z3", {}))
             for lt, lc, rt, rc in constraint.join_equalities:
                 for table, col_name in [(lt, lc), (rt, rc)]:
-                    key = f"{normalize_name(table)}.{normalize_name(col_name)}"
+                    resolved_table = self._resolve_smt_table(constraint, declared_keys, table, col_name)
+                    key = f"{normalize_name(resolved_table)}.{normalize_name(col_name)}"
                     if key not in smt.context.get("variable_to_z3", {}):
-                        dtype = self._find_col_type(constraint, table, col_name)
+                        dtype = self._find_col_type(constraint, resolved_table, col_name)
                         smt.declare_variable(key, dtype)
+                    declared_keys.add(key)
 
             # Translate and add all constraint expressions.
             for expr in constraint.constraints:
                 try:
                     z3_expr = smt.translate(expr)
                 except (UnsupportedSMTError, Exception):
-                    return None
+                    return None, "unsupported_smt_expression"
                 if z3_expr is None:
-                    return None
+                    return None, "unsupported_smt_expression"
                 smt.add(z3_expr)
 
             # Add join equalities as Z3 equalities.
             for lt, lc, rt, rc in constraint.join_equalities:
                 try:
-                    left_key = f"{normalize_name(lt)}.{normalize_name(lc)}"
-                    right_key = f"{normalize_name(rt)}.{normalize_name(rc)}"
+                    left_table = self._resolve_smt_table(constraint, declared_keys, lt, lc)
+                    right_table = self._resolve_smt_table(constraint, declared_keys, rt, rc)
+                    left_key = f"{normalize_name(left_table)}.{normalize_name(lc)}"
+                    right_key = f"{normalize_name(right_table)}.{normalize_name(rc)}"
                     left_z3 = smt.context.get("variable_to_z3", {}).get(left_key)
                     right_z3 = smt.context.get("variable_to_z3", {}).get(right_key)
                     if left_z3 is None or right_z3 is None:
-                        return None
+                        return None, "all tiers exhausted"
                     smt.add_raw(left_z3 == right_z3)
                 except Exception:
-                    return None
+                    return None, "all tiers exhausted"
 
             status, solutions = smt.solve()
             if status != "sat" or not solutions:
-                return None
+                return None, "all tiers exhausted"
 
             # Group assignments by solver table key first, then apply the same
             # lossless alias-to-physical remap rule as the domain path.
@@ -234,10 +239,52 @@ class Solver:
                     col = var_name
                 assignments.setdefault(table, {})[col] = value
             if not assignments:
-                return None
-            return self._remap_assignments(assignments, alias_map)
+                return None, "all tiers exhausted"
+            return self._remap_assignments(assignments, alias_map), ""
         except Exception:
-            return None
+            return None, "all tiers exhausted"
+
+    def _resolve_smt_table(
+        self,
+        constraint: SolverConstraint,
+        declared_keys: set[str],
+        table: str,
+        col_name: str,
+    ) -> str:
+        """Resolve a join-side table name into the SMT variable namespace."""
+        table_norm = normalize_name(table)
+        col_norm = normalize_name(col_name)
+        exact_key = f"{table_norm}.{col_norm}"
+        if exact_key in declared_keys:
+            return table_norm
+
+        alias_map = constraint.alias_map or {}
+        candidates: List[str] = []
+        for key in declared_keys:
+            if "." not in key:
+                continue
+            key_table, key_col = key.split(".", 1)
+            if key_col != col_norm:
+                continue
+            if key_table == table_norm:
+                return key_table
+            physical = normalize_name(alias_map.get(key_table, key_table))
+            if physical == table_norm:
+                candidates.append(key_table)
+
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            return candidates[0]
+
+        for target in constraint.target_tables:
+            target_norm = normalize_name(target)
+            if target_norm == table_norm:
+                return target_norm
+            if normalize_name(alias_map.get(target_norm, target_norm)) == table_norm:
+                return target_norm
+
+        return table_norm
 
     def _find_col_type(
         self, constraint: SolverConstraint, table: str, col_name: str
