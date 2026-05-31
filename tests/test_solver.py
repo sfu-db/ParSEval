@@ -687,5 +687,156 @@ def test_apply_solution():
     assert sym_y.values == {"concrete": 99, "is_bound": True, "is_null": False}
 
 
+# =============================================================================
+# Tests for lowering.py — negated predicate lowering
+# =============================================================================
+
+
+class MockInstance:
+    """Minimal Instance stand-in for lowering tests."""
+
+    def __init__(self, tables):
+        self.tables = tables
+
+    def nullable(self, table, col):
+        return True
+
+
+class TestNegateOp(unittest.TestCase):
+    def test_flips_eq_to_neq(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("="), "!=")
+
+    def test_flips_neq_to_eq(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("!="), "=")
+
+    def test_flips_gt_to_lte(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op(">"), "<=")
+
+    def test_flips_gte_to_lt(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op(">="), "<")
+
+    def test_flips_lt_to_gte(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("<"), ">=")
+
+    def test_flips_lte_to_gt(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("<="), ">")
+
+
+class TestLowerNotExpr(unittest.TestCase):
+    def setUp(self):
+        self.instance = MockInstance({
+            "users": {"id": "INT", "name": "TEXT", "age": "INT"},
+        })
+        self.tables = ("users",)
+
+    def _lower(self, expr):
+        from parseval.solver.lowering import lower_predicates
+        preds, residuals = lower_predicates(expr, self.instance, self.tables)
+        return preds, residuals
+
+    def test_not_eq_flips_to_neq(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(5)
+        inner = exp.EQ(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(len(residuals), 0)
+        self.assertEqual(preds[0].op, "!=")
+        self.assertEqual(preds[0].value, 5)
+
+    def test_not_gt_flips_to_lte(self):
+        col = exp.column("age", table="users")
+        lit = exp.Literal.number(10)
+        inner = exp.GT(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "<=")
+        self.assertEqual(preds[0].value, 10)
+
+    def test_not_lt_flips_to_gte(self):
+        col = exp.column("age", table="users")
+        lit = exp.Literal.number(20)
+        inner = exp.LT(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, ">=")
+        self.assertEqual(preds[0].value, 20)
+
+    def test_not_neq_flips_to_eq(self):
+        col = exp.column("name", table="users")
+        lit = exp.Literal.string("alice")
+        inner = exp.NEQ(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "=")
+        self.assertEqual(preds[0].value, "alice")
+
+    def test_not_gte_flips_to_lt(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(3)
+        inner = exp.GTE(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "<")
+        self.assertEqual(preds[0].value, 3)
+
+    def test_not_lte_flips_to_gt(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(7)
+        inner = exp.LTE(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, ">")
+        self.assertEqual(preds[0].value, 7)
+
+    def test_not_is_null_becomes_not_null(self):
+        col = exp.column("name", table="users")
+        inner = exp.Is(this=col, expression=exp.Null())
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "not_null")
+
+    def test_double_not_unwraps(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(5)
+        inner = exp.EQ(this=col, expression=lit)
+        double_not = exp.Not(this=exp.Not(this=inner))
+
+        preds, residuals = self._lower(double_not)
+        self.assertEqual(len(preds), 1)
+        # NOT(NOT(col = 5)) → col = 5
+        self.assertEqual(preds[0].op, "=")
+        self.assertEqual(preds[0].value, 5)
+
+    def test_not_unsupported_goes_to_residuals(self):
+        # NOT(subquery) → residuals
+        inner = exp.Literal.number(1)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 0)
+        self.assertEqual(len(residuals), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

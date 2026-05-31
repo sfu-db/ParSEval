@@ -30,15 +30,13 @@ from parseval.plan.planner import (
     SubPlanKind,
 )
 from parseval.plan.context import Context, DerivedSchema, Row, build_context_from_instance
-from parseval.plan.rex import Const, Environment, Variable, concrete
+from parseval.plan.rex import Const, Environment, Variable, concrete, column_meta
 from parseval.instance import Instance
 
 from .types import (
     AtomObservation,
-    BranchNode,
     BranchTree,
     BranchType,
-    CoverageThresholds,
 )
 
 
@@ -86,18 +84,69 @@ def _classify_outcome(value: Any) -> BranchType:
     return BranchType.ATOM_FALSE
 
 
+def _try_early_classify(atom: exp.Expression) -> Optional[BranchType]:
+    """Try to classify an atom from column metadata alone.
+
+    Returns a :class:`BranchType` if the atom is trivially resolvable
+    (e.g. ``IS NULL`` on a NOT NULL column is always FALSE), or ``None``
+    if full ``concrete()`` evaluation is needed.
+    """
+    # IS NULL on a NOT NULL column → always FALSE
+    if isinstance(atom, (exp.Is,)) and isinstance(atom.expression, exp.Null):
+        col = atom.this
+        if isinstance(col, exp.Column):
+            meta = column_meta(col)
+            if meta is not None and not meta["nullable"]:
+                return BranchType.ATOM_FALSE
+
+    # IS NOT NULL on a NOT NULL column → always TRUE
+    if isinstance(atom, exp.Not):
+        inner = atom.this
+        if isinstance(inner, (exp.Is,)) and isinstance(inner.expression, exp.Null):
+            col = inner.this
+            if isinstance(col, exp.Column):
+                meta = column_meta(col)
+                if meta is not None and not meta["nullable"]:
+                    return BranchType.ATOM_TRUE
+
+    return None
+
+
 # =============================================================================
 # Environment builder
 # =============================================================================
+
+
+def _symbol_value(sym: Any) -> Any:
+    """Extract the concrete Python value from a Symbol or pass through."""
+    if isinstance(sym, (Variable, Const)):
+        return sym.concrete
+    return sym
 
 
 def _env_from_row(row: Row, table_name: str) -> Environment:
     """Build an Environment with both bare and table-qualified keys."""
     bindings: Dict[str, Any] = {}
     for col_name, symbol in row.items():
-        value = symbol.concrete if isinstance(symbol, (Variable, Const)) else symbol
+        value = _symbol_value(symbol)
         bindings[col_name] = value
         bindings[f"{table_name}.{col_name}"] = value
+    return Environment(bindings)
+
+
+def _env_from_join(
+    source_row: Row, source_name: str, join_row: Row, join_name: str
+) -> Environment:
+    """Build an Environment from two joined rows with both table qualifiers."""
+    bindings: Dict[str, Any] = {}
+    for col_name, symbol in source_row.items():
+        value = _symbol_value(symbol)
+        bindings[col_name] = value
+        bindings[f"{source_name}.{col_name}"] = value
+    for col_name, symbol in join_row.items():
+        value = _symbol_value(symbol)
+        bindings[col_name] = value
+        bindings[f"{join_name}.{col_name}"] = value
     return Environment(bindings)
 
 
@@ -193,8 +242,10 @@ class PlanEvaluator:
                 env = _env_from_row(row, table_name)
                 # Record per-atom observations.
                 for atom_id, atom in enumerate(atoms):
-                    value = concrete(atom, env)
-                    outcome = _classify_outcome(value)
+                    outcome = _try_early_classify(atom)
+                    if outcome is None:
+                        value = concrete(atom, env)
+                        outcome = _classify_outcome(value)
                     tree.record_observation(
                         node,
                         AtomObservation(
@@ -241,19 +292,13 @@ class PlanEvaluator:
 
             for source_row in source_table.rows:
                 for join_row in join_table.rows:
-                    env = Environment()
-                    for col, sym in source_row.items():
-                        val = sym.concrete if isinstance(sym, (Variable, Const)) else sym
-                        env.bind(f"{source_name}.{col}", val)
-                        env.bind(col, val)
-                    for col, sym in join_row.items():
-                        val = sym.concrete if isinstance(sym, (Variable, Const)) else sym
-                        env.bind(f"{join_name}.{col}", val)
-                        env.bind(col, val)
+                    env = _env_from_join(source_row, source_name, join_row, join_name)
 
                     for atom_id, atom in enumerate(atoms):
-                        value = concrete(atom, env)
-                        outcome = _classify_outcome(value)
+                        outcome = _try_early_classify(atom)
+                        if outcome is None:
+                            value = concrete(atom, env)
+                            outcome = _classify_outcome(value)
                         tree.record_observation(node, AtomObservation(atom_id=atom_id, outcome=outcome))
 
         return ctx
@@ -308,8 +353,10 @@ class PlanEvaluator:
             for row in table.rows:
                 env = _env_from_row(row, table_name)
                 for atom_id, atom in enumerate(atoms):
-                    value = concrete(atom, env)
-                    outcome = _classify_outcome(value)
+                    outcome = _try_early_classify(atom)
+                    if outcome is None:
+                        value = concrete(atom, env)
+                        outcome = _classify_outcome(value)
                     tree.record_observation(node, AtomObservation(atom_id=atom_id, outcome=outcome))
 
         return ctx
@@ -340,8 +387,10 @@ class PlanEvaluator:
                         for row in table.rows:
                             env = _env_from_row(row, table_name)
                             for atom_id, atom in enumerate(atoms):
-                                value = concrete(atom, env)
-                                outcome = _classify_outcome(value)
+                                outcome = _try_early_classify(atom)
+                                if outcome is None:
+                                    value = concrete(atom, env)
+                                    outcome = _classify_outcome(value)
                                 tree.record_observation(
                                     node, AtomObservation(atom_id=atom_id, outcome=outcome)
                                 )
@@ -419,55 +468,15 @@ class PlanEvaluator:
 
         return ctx  # SubPlan doesn't transform the outer context
 
-    def _inner_plan_has_rows(self, root: Step) -> bool:
-        """Check whether an inner plan would produce at least one row."""
-        # Collect Scan and Filter steps from the inner plan.
-        scans: List[Scan] = []
-        filters: List[Filter] = []
+    def _eval_inner_plan(
+        self, root: Step
+    ) -> Tuple[List[Row], str, List[Project]]:
+        """Walk an inner plan, returning (surviving_rows, table_name, projects).
 
-        def _collect(s: Step) -> None:
-            if isinstance(s, Scan):
-                scans.append(s)
-            if isinstance(s, Filter):
-                filters.append(s)
-            for dep in s.chain_dependencies:
-                _collect(dep)
-
-        _collect(root)
-
-        if not scans:
-            return False
-
-        # For simple single-table EXISTS subqueries, evaluate directly.
-        scan = scans[0]
-        source = scan.source
-        if isinstance(source, exp.Table):
-            table_name = source.name
-        else:
-            table_name = scan.name
-
-        if table_name not in self.instance.tables:
-            return False
-
-        rows = self.instance.get_rows(table_name)
-        if not rows:
-            return False
-
-        # Apply any filter conditions.
-        for filt in filters:
-            if filt.condition is None:
-                continue
-            passing: List[Row] = []
-            for row in rows:
-                env = _env_from_row(row, table_name)
-                if concrete(filt.condition, env) is True:
-                    passing.append(row)
-            rows = passing
-
-        return len(rows) > 0
-
-    def _inner_plan_values(self, root: Step) -> set:
-        """Evaluate inner plan and return the set of projected column values."""
+        Collects Scans, Filters, and Projects from the inner plan tree,
+        fetches rows from the Instance, applies filter conditions, and
+        returns the surviving rows along with the resolved table name.
+        """
         scans: List[Scan] = []
         filters: List[Filter] = []
         projects: List[Project] = []
@@ -485,24 +494,19 @@ class PlanEvaluator:
         _collect(root)
 
         if not scans:
-            return set()
+            return [], "", projects
 
-        # Get table name from the scan.
         scan = scans[0]
         source = scan.source
-        if isinstance(source, exp.Table):
-            table_name = source.name
-        else:
-            table_name = scan.name
+        table_name = source.name if isinstance(source, exp.Table) else scan.name
 
         if table_name not in self.instance.tables:
-            return set()
+            return [], table_name, projects
 
-        rows = self.instance.get_rows(table_name)
+        rows = list(self.instance.get_rows(table_name))
         if not rows:
-            return set()
+            return [], table_name, projects
 
-        # Apply any filter conditions.
         for filt in filters:
             if filt.condition is None:
                 continue
@@ -513,15 +517,23 @@ class PlanEvaluator:
                     passing.append(row)
             rows = passing
 
-        # Determine the projected column from the inner Project step.
-        if not projects or not projects[0].projections:
+        return rows, table_name, projects
+
+    def _inner_plan_has_rows(self, root: Step) -> bool:
+        """Check whether an inner plan would produce at least one row."""
+        rows, _, _ = self._eval_inner_plan(root)
+        return len(rows) > 0
+
+    def _inner_plan_values(self, root: Step) -> set:
+        """Evaluate inner plan and return the set of projected column values."""
+        rows, table_name, projects = self._eval_inner_plan(root)
+        if not rows or not projects or not projects[0].projections:
             return set()
 
         projection = projects[0].projections[0]
         if isinstance(projection, exp.Alias):
             projection = projection.this
 
-        # Collect the projected column value from each surviving row.
         values: set = set()
         for row in rows:
             env = _env_from_row(row, table_name)
