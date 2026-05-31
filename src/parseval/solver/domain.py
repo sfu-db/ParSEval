@@ -188,7 +188,7 @@ def _unsupported_reason(expr: exp.Expression) -> str:
 
 
 def _predicate_family(pred: ColumnPredicate) -> TypeFamily:
-    if isinstance(pred.value, bool):
+    if pred.op in {"=", "!="} and isinstance(pred.value, bool):
         return TypeFamily.BOOLEAN
     if pred.op == "in" and isinstance(pred.value, list) and pred.value:
         if all(isinstance(value, bool) for value in pred.value):

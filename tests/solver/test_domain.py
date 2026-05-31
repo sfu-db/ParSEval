@@ -340,6 +340,25 @@ def test_null_and_not_null_conflict_is_unsat():
     assert result.reason == "contradictory_bounds"
 
 
+def test_null_sentinel_does_not_force_text_column_boolean_family():
+    solver = DomainSolver()
+    result = solver.solve(_constraint(
+        ("t1",),
+        [
+            exp.Is(
+                this=_col("t1", "name", "TEXT"),
+                expression=exp.Not(this=exp.Null()),
+            ),
+            exp.NEQ(this=_col("t1", "name", "TEXT"), expression=exp.Boolean(this=True)),
+            exp.NEQ(this=_col("t1", "name", "TEXT"), expression=exp.Boolean(this=False)),
+        ],
+    ))
+    assert result.status == "sat"
+    assert result.assignments is not None
+    assert result.assignments["t1"]["name"] is not None
+    assert result.reason == ""
+
+
 def test_not_gt():
     """NOT(col > 10) should lower to col <= 10."""
     inner = exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(10))
