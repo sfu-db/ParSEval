@@ -57,6 +57,12 @@ class ValueSpace:
             valid = self.allowed - self.not_equals
             if not valid:
                 return True
+        if self.family == TypeFamily.BOOLEAN:
+            candidates = {True, False}
+            if self.allowed is not None:
+                candidates &= self.allowed
+            if not candidates - self.not_equals:
+                return True
         return False
 
     def pick(self) -> Any:
@@ -74,7 +80,13 @@ class ValueSpace:
         elif self.family in (TypeFamily.DATE, TypeFamily.DATETIME):
             return self._pick_temporal()
         elif self.family == TypeFamily.BOOLEAN:
-            return True if True not in self.not_equals else False
+            candidates = {True, False}
+            if self.allowed is not None:
+                candidates &= self.allowed
+            for value in (True, False):
+                if value in candidates and value not in self.not_equals:
+                    return value
+            return None
         return "value"
 
     def _pick_numeric(self) -> Any:

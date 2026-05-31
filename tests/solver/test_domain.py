@@ -295,6 +295,37 @@ def test_is_not_null():
     assert assignments["t1"]["name"] is not None
 
 
+def test_empty_boolean_domain_is_unsat():
+    solver = DomainSolver()
+    result = solver.solve(_constraint(
+        ("t1",),
+        [
+            exp.NEQ(this=_col("t1", "flag", "BOOLEAN"), expression=exp.Boolean(this=True)),
+            exp.NEQ(this=_col("t1", "flag", "BOOLEAN"), expression=exp.Boolean(this=False)),
+        ],
+    ))
+    assert result.status == "unsat"
+    assert result.assignments is None
+    assert result.reason == "contradictory_bounds"
+
+
+def test_null_and_not_null_conflict_is_unsat():
+    solver = DomainSolver()
+    result = solver.solve(_constraint(
+        ("t1",),
+        [
+            exp.Is(this=_col("t1", "name", "TEXT"), expression=exp.Null()),
+            exp.Is(
+                this=_col("t1", "name", "TEXT"),
+                expression=exp.Not(this=exp.Null()),
+            ),
+        ],
+    ))
+    assert result.status == "unsat"
+    assert result.assignments is None
+    assert result.reason == "contradictory_bounds"
+
+
 def test_not_gt():
     """NOT(col > 10) should lower to col <= 10."""
     inner = exp.GT(this=_col("t1", "age", "INT"), expression=exp.Literal.number(10))
