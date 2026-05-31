@@ -229,3 +229,69 @@ def test_accepts_annotated_columns():
     constraint = SolverConstraint(target_tables=("t1",), constraints=[expr])
     result = solver.solve(constraint)
     assert result.sat
+
+
+def test_skips_smt_when_domain_returns_unsat(monkeypatch):
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "age", "INT"), expression=exp.Literal.number(25)),
+            exp.EQ(this=_col("t1", "age", "INT"), expression=exp.Literal.number(30)),
+        ],
+    )
+
+    def fail_if_called(_constraint):
+        raise AssertionError("SMT fallback should not run for a domain unsat result")
+
+    monkeypatch.setattr(solver, "_try_smt", fail_if_called)
+
+    result = solver.solve(constraint)
+
+    assert not result.sat
+    assert result.reason == "contradictory_bounds"
+
+
+def test_uses_smt_only_for_domain_unknown():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "name", "TEXT"), expression=exp.Literal.string("Alice")),
+            exp.GT(
+                this=exp.Add(
+                    this=_col("t1", "a", "INT"),
+                    expression=_col("t1", "b", "INT"),
+                ),
+                expression=exp.Literal.number(10),
+            ),
+        ],
+    )
+
+    result = solver.solve(constraint)
+
+    assert result.sat
+    assert result.assignments["t1"]["name"] == "Alice"
+    assert result.assignments["t1"]["a"] + result.assignments["t1"]["b"] > 10
+
+
+def test_rejects_partial_smt_translation():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("t1",),
+        constraints=[
+            exp.EQ(this=_col("t1", "name", "TEXT"), expression=exp.Literal.string("Alice")),
+            exp.GT(
+                this=exp.Anonymous(
+                    this="MISSINGFUNC",
+                    expressions=[_col("t1", "age", "INT")],
+                ),
+                expression=exp.Literal.number(10),
+            ),
+        ],
+    )
+
+    result = solver.solve(constraint)
+
+    assert not result.sat
+    assert result.reason
