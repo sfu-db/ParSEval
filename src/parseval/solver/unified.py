@@ -191,6 +191,8 @@ class Solver:
             for lt, lc, rt, rc in constraint.join_equalities:
                 for table, col_name in [(lt, lc), (rt, rc)]:
                     resolved_table = self._resolve_smt_table(constraint, declared_keys, table, col_name)
+                    if resolved_table is None:
+                        return None, "all tiers exhausted"
                     key = f"{normalize_name(resolved_table)}.{normalize_name(col_name)}"
                     if key not in smt.context.get("variable_to_z3", {}):
                         dtype = self._find_col_type(constraint, resolved_table, col_name)
@@ -212,6 +214,8 @@ class Solver:
                 try:
                     left_table = self._resolve_smt_table(constraint, declared_keys, lt, lc)
                     right_table = self._resolve_smt_table(constraint, declared_keys, rt, rc)
+                    if left_table is None or right_table is None:
+                        return None, "all tiers exhausted"
                     left_key = f"{normalize_name(left_table)}.{normalize_name(lc)}"
                     right_key = f"{normalize_name(right_table)}.{normalize_name(rc)}"
                     left_z3 = smt.context.get("variable_to_z3", {}).get(left_key)
@@ -250,7 +254,7 @@ class Solver:
         declared_keys: set[str],
         table: str,
         col_name: str,
-    ) -> str:
+    ) -> Optional[str]:
         """Resolve a join-side table name into the SMT variable namespace."""
         table_norm = normalize_name(table)
         col_norm = normalize_name(col_name)
@@ -275,14 +279,20 @@ class Solver:
         if len(candidates) == 1:
             return candidates[0]
         if candidates:
-            return candidates[0]
+            return None
 
+        target_candidates: List[str] = []
         for target in constraint.target_tables:
             target_norm = normalize_name(target)
             if target_norm == table_norm:
                 return target_norm
             if normalize_name(alias_map.get(target_norm, target_norm)) == table_norm:
-                return target_norm
+                target_candidates.append(target_norm)
+
+        if len(target_candidates) == 1:
+            return target_candidates[0]
+        if target_candidates:
+            return None
 
         return table_norm
 

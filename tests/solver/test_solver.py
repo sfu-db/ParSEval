@@ -319,3 +319,27 @@ def test_smt_join_equalities_resolve_physical_tables_into_alias_space():
     result = solver.solve(constraint)
 
     assert not result.sat
+
+
+def test_smt_join_equalities_fail_closed_for_ambiguous_physical_self_join():
+    solver = Solver()
+    constraint = SolverConstraint(
+        target_tables=("a", "b"),
+        constraints=[
+            exp.EQ(this=_col("a", "id", "INT"), expression=exp.Literal.number(1)),
+            exp.EQ(this=_col("b", "id", "INT"), expression=exp.Literal.number(2)),
+            exp.GT(
+                this=exp.Add(
+                    this=_col("a", "age", "INT"),
+                    expression=_col("b", "age", "INT"),
+                ),
+                expression=exp.Literal.number(10),
+            ),
+        ],
+        join_equalities=[("people", "id", "people", "id")],
+        alias_map={"a": "people", "b": "people"},
+    )
+
+    result = solver.solve(constraint)
+
+    assert not result.sat
