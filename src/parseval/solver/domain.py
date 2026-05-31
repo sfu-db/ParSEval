@@ -502,6 +502,28 @@ class DomainSolver:
                             if left.space.max_val is None or right.space.max_val < left.space.max_val:
                                 left.space.narrow_max(right.space.max_val)
                                 changed = True
+                        # Propagate finite-domain restrictions across equality.
+                        shared_not_equals = left.space.not_equals | right.space.not_equals
+                        if shared_not_equals != left.space.not_equals:
+                            left.space.not_equals = set(shared_not_equals)
+                            changed = True
+                        if shared_not_equals != right.space.not_equals:
+                            right.space.not_equals = set(shared_not_equals)
+                            changed = True
+                        if left.space.allowed is not None and right.space.allowed is not None:
+                            shared_allowed = left.space.allowed & right.space.allowed
+                            if shared_allowed != left.space.allowed:
+                                left.space.allowed = set(shared_allowed)
+                                changed = True
+                            if shared_allowed != right.space.allowed:
+                                right.space.allowed = set(shared_allowed)
+                                changed = True
+                        elif left.space.allowed is not None and right.space.allowed is None:
+                            right.space.allowed = set(left.space.allowed)
+                            changed = True
+                        elif right.space.allowed is not None and left.space.allowed is None:
+                            left.space.allowed = set(right.space.allowed)
+                            changed = True
             for var in variables.values():
                 if var.space.is_empty():
                     return False
