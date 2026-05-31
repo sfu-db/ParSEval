@@ -313,12 +313,14 @@ class DomainSolver:
         ))
 
     def _merge_or(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
-        if left.status == "sat":
+        if left.status == "sat" and right.status == "unsat":
             return left
-        if right.status == "sat":
+        if right.status == "sat" and left.status == "unsat":
             return right
         if left.status == "unsat" and right.status == "unsat":
             return LoweringOutcome(status="unsat", reason=left.reason or right.reason)
+        if left.status == "sat" and right.status == "sat":
+            return LoweringOutcome(status="unknown", reason="unsupported_or")
         if left.status == "unknown":
             return LoweringOutcome(status="unknown", reason=left.reason or right.reason or "unsupported_or")
         if right.status == "unknown":

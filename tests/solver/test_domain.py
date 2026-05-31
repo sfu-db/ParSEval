@@ -113,14 +113,19 @@ def test_domain_top_level_unknown_does_not_mask_unsat():
     assert result.reason == "contradictory_bounds"
 
 
-def test_domain_returns_sat_for_or_with_two_sat_branches():
-    expr = exp.Or(
+def test_domain_returns_unknown_for_or_followed_by_and():
+    disjunction = exp.Or(
         this=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(1)),
-        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(2)),
+        expression=exp.EQ(this=_col("t1", "y", "INT"), expression=exp.Literal.number(2)),
     )
-    result = DomainSolver().solve(_constraint(("t1",), [expr]))
-    assignments = _sat_assignments(result)
-    assert assignments["t1"]["x"] in {1, 2}
+    conjunction = exp.And(
+        this=disjunction,
+        expression=exp.EQ(this=_col("t1", "x", "INT"), expression=exp.Literal.number(3)),
+    )
+    result = DomainSolver().solve(_constraint(("t1",), [conjunction]))
+    assert result.status == "unknown"
+    assert result.assignments is None
+    assert result.reason == "unsupported_or"
 
 
 def test_domain_returns_unknown_for_unsat_or_unknown():
