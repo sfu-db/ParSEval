@@ -26,28 +26,52 @@ from .smt_types import (
     option_of,
     unwrap_option,
     encode_literal,
-    _date_to_epoch_day,
-    _datetime_to_epoch_second,
-    _from_epoch_day,
-    _from_seconds,
-    _from_epoch_second,
+)
+from .types import (
+    date_to_epoch_day,
+    time_to_seconds,
+    datetime_to_epoch_second,
+    epoch_day_to_date,
+    seconds_to_time,
+    epoch_second_to_datetime,
 )
 from .smt_translate import (
     _coerce_numeric_sort,
-    _to_z3_sort,
-    _to_z3val,
     declare_column,
     _value_some,
     _value_null,
     _value_payload,
     _coerce_pair,
-    _bool_value,
     _null_value,
-    _zfill2,
     like_to_z3,
 )
 
 logger = logging.getLogger("parseval.smt")
+
+_TEMPORAL_FMTS = {
+    "date": ["%Y-%m-%d"],
+    "datetime": ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"],
+    "timestamp": ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"],
+    "time": ["%H:%M:%S", "%H:%M"],
+}
+
+
+def _string_to_temporal_epoch(s: str, family: str) -> Optional[int]:
+    """Convert a string to its temporal epoch value (days, seconds, etc.)."""
+    from datetime import time as dt_time
+    for fmt in _TEMPORAL_FMTS.get(family, []):
+        try:
+            if family == "date":
+                return date_to_epoch_day(datetime.strptime(s, fmt).date())
+            elif family in ("datetime", "timestamp"):
+                return datetime_to_epoch_second(datetime.strptime(s, fmt))
+            elif family == "time":
+                t = dt_time.fromisoformat(s) if hasattr(dt_time, "fromisoformat") else datetime.strptime(s, fmt).time()
+                return time_to_seconds(t)
+        except (ValueError, AttributeError):
+            continue
+    return None
+
 
 try:
     from z3.z3util import get_vars
@@ -78,7 +102,6 @@ class SMTSolver:
     and registered special functions.
 
     Attributes:
-        variables: List of columns the solver is tracking (unused, legacy).
         verbose: If True, log constraints as they are added.
         z3ctx: Optional Z3 context (defaults to global context).
         timeout_ms: Optional solver timeout in milliseconds.
@@ -91,7 +114,6 @@ class SMTSolver:
 
     def __init__(
         self,
-        variables=None,
         z3ctx: Optional[z3.Context] = None,
         verbose: bool = False,
         function_models: Optional[
@@ -102,13 +124,11 @@ class SMTSolver:
         """Initialize the SMT solver.
 
         Args:
-            variables: List of columns (legacy, currently unused for Z3 var creation).
             z3ctx: Optional Z3 context; defaults to Z3's global context.
             verbose: If True, log each added constraint via the ``parseval.smt`` logger.
             function_models: Optional custom function translators (list or dict).
             timeout_ms: Optional solver timeout in milliseconds.
         """
-        self.variables = variables
         self.verbose = verbose
         self.z3ctx = z3ctx
         self.solver = z3.Solver(ctx=self.z3ctx)
@@ -153,17 +173,17 @@ class SMTSolver:
     def _build_core_registry(self) -> Dict[str, Callable[[exp.Expression], Union[SMTValue, z3.BoolRef]]]:
         """Build the dispatch table mapping SQL expression types to translators."""
         return {
-            "ADD": self._translate_add,
-            "SUB": self._translate_sub,
-            "MUL": self._translate_mul,
+            "ADD": lambda e: self._translate_arithmetic(e, lambda a, b: a + b),
+            "SUB": lambda e: self._translate_arithmetic(e, lambda a, b: a - b),
+            "MUL": lambda e: self._translate_arithmetic(e, lambda a, b: a * b),
             "DIV": self._translate_div,
             "MOD": self._translate_mod,
-            "GT": self._translate_gt,
-            "LT": self._translate_lt,
-            "GTE": self._translate_gte,
-            "LTE": self._translate_lte,
-            "EQ": self._translate_eq,
-            "NEQ": self._translate_neq,
+            "GT": lambda e: self._translate_comparison(e, lambda a, b: a > b),
+            "LT": lambda e: self._translate_comparison(e, lambda a, b: a < b),
+            "GTE": lambda e: self._translate_comparison(e, lambda a, b: a >= b),
+            "LTE": lambda e: self._translate_comparison(e, lambda a, b: a <= b),
+            "EQ": lambda e: self._translate_comparison(e, lambda a, b: a == b),
+            "NEQ": lambda e: self._translate_comparison(e, lambda a, b: a != b),
             "LIKE": self._translate_like,
             "AND": self._translate_and,
             "OR": self._translate_or,
@@ -231,13 +251,6 @@ class SMTSolver:
         """
         self.solver.add(constraint)
 
-    def _infer_type_from_context(self, var_name: str) -> Optional[SMTTypeInfo]:
-        """Infer SMTTypeInfo for a declared variable from its _VarRef in context."""
-        ref = self.context.get("z3_to_variable", {}).get(var_name)
-        if ref is not None and hasattr(ref, "type"):
-            return normalize_dtype(ref.type, self.z3ctx)
-        return None
-
     def solve_raw(
         self, var_symbols: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
@@ -250,16 +263,7 @@ class SMTSolver:
         Returns:
             ("sat", {var_name: python_value}) or ("unsat", {})
         """
-        if not self._domain_constraints_applied:
-            for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-                typeinfo = self._infer_type_from_context(var_name)
-                if typeinfo is not None:
-                    if typeinfo.family in {"date", "time", "datetime", "timestamp"}:
-                        self._ensure_temporal_bounds(z3var, typeinfo)
-                    if typeinfo.family == "text":
-                        self._ensure_str_printable(z3var)
-                        self._ensure_str_length(z3var, 0)
-            self._domain_constraints_applied = True
+        self._apply_domain_constraints()
 
         status = self.solver.check()
         if status != z3.sat:
@@ -331,16 +335,7 @@ class SMTSolver:
         The returned dict keys are ``"table.column"`` strings. Only variables
         referenced in the added constraints are included.
         """
-        if not self._domain_constraints_applied:
-            for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-                column = self.context["z3_to_variable"][str(z3var)]
-                typeinfo = normalize_dtype(column.type, self.z3ctx)
-                if typeinfo.family in {"date", "time", "datetime", "timestamp"}:
-                    self._ensure_temporal_bounds(z3var, typeinfo)
-                if typeinfo.family == "text":
-                    self._ensure_str_printable(z3var)
-                    self._ensure_str_length(z3var, 0)
-            self._domain_constraints_applied = True
+        self._apply_domain_constraints()
 
         status = self.solver.check()
         if status != z3.sat:
@@ -551,23 +546,11 @@ class SMTSolver:
     def _translate_children(self, expression: exp.Expression):
         return [self._to_z3_expr(child) for child in expression.iter_expressions() if not isinstance(child, exp.DataType)]
 
-    def _translate_add(self, expression: exp.Expression) -> SMTValue:
-        """Translate an addition (``a + b``) with NULL propagation."""
+    def _translate_arithmetic(self, expression: exp.Expression, op: Callable) -> SMTValue:
+        """Translate a binary arithmetic operation with NULL propagation."""
         left = self._as_value(self._to_z3_expr(expression.this))
         right = self._as_value(self._to_z3_expr(expression.expression))
-        return self._nullable_numeric_binary(left, right, lambda a, b: a + b)
-
-    def _translate_sub(self, expression: exp.Expression) -> SMTValue:
-        """Translate a subtraction (``a - b``) with NULL propagation."""
-        left = self._as_value(self._to_z3_expr(expression.this))
-        right = self._as_value(self._to_z3_expr(expression.expression))
-        return self._nullable_numeric_binary(left, right, lambda a, b: a - b)
-
-    def _translate_mul(self, expression: exp.Expression) -> SMTValue:
-        """Translate a multiplication (``a * b``) with NULL propagation."""
-        left = self._as_value(self._to_z3_expr(expression.this))
-        right = self._as_value(self._to_z3_expr(expression.expression))
-        return self._nullable_numeric_binary(left, right, lambda a, b: a * b)
+        return self._nullable_numeric_binary(left, right, op)
 
     def _translate_div(self, expression: exp.Expression) -> SMTValue:
         """Translate a division (``a / b``) with NULL propagation and div-by-zero handling."""
@@ -593,53 +576,41 @@ class SMTSolver:
             null_condition=lambda _a, b: b == 0,
         )
 
-    def _translate_gt(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate a greater-than comparison (``a > b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a > b,
-        )
+    def _translate_comparison(self, expression: exp.Expression, op: Callable) -> z3.BoolRef:
+        """Translate a binary comparison with the given operator."""
+        left_expr = expression.this
+        right_expr = expression.expression
+        left = self._as_value(self._to_z3_expr(left_expr))
+        right = self._as_value(self._to_z3_expr(right_expr))
+        # Auto-coerce temporal column vs string literal.
+        left, right = self._coerce_temporal_pair(left, right, left_expr, right_expr)
+        return self._compare_values(left, right, op)
 
-    def _translate_lt(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate a less-than comparison (``a < b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a < b,
-        )
+    _TEMPORAL_FAMILIES = {"date", "time", "datetime", "timestamp"}
 
-    def _translate_gte(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate a greater-than-or-equal comparison (``a >= b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a >= b,
-        )
+    def _coerce_temporal_pair(
+        self, left: SMTValue, right: SMTValue,
+        left_expr: exp.Expression, right_expr: exp.Expression,
+    ) -> Tuple[SMTValue, SMTValue]:
+        """If one side is temporal and the other is a string literal, coerce."""
+        if left.typeinfo.family in self._TEMPORAL_FAMILIES and isinstance(right_expr, exp.Literal) and right_expr.is_string:
+            coerced = self._encode_temporal_literal(str(right_expr.this), left.typeinfo)
+            if coerced is not None:
+                return left, coerced
+        if right.typeinfo.family in self._TEMPORAL_FAMILIES and isinstance(left_expr, exp.Literal) and left_expr.is_string:
+            coerced = self._encode_temporal_literal(str(left_expr.this), right.typeinfo)
+            if coerced is not None:
+                return coerced, right
+        return left, right
 
-    def _translate_lte(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate a less-than-or-equal comparison (``a <= b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a <= b,
-        )
-
-    def _translate_eq(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate an equality comparison (``a = b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a == b,
-        )
-
-    def _translate_neq(self, expression: exp.Expression) -> z3.BoolRef:
-        """Translate a not-equal comparison (``a != b``)."""
-        return self._compare_values(
-            self._as_value(self._to_z3_expr(expression.this)),
-            self._as_value(self._to_z3_expr(expression.expression)),
-            lambda a, b: a != b,
-        )
+    def _encode_temporal_literal(self, s: str, target: SMTTypeInfo) -> Optional[SMTValue]:
+        """Encode a string as a temporal epoch value wrapped in Option."""
+        epoch = _string_to_temporal_epoch(s, target.family)
+        if epoch is None:
+            return None
+        z3val = z3.IntVal(epoch, ctx=self.z3ctx)
+        option = OptionTypeRegistry.get(target.payload_sort, self.z3ctx)
+        return SMTValue(option.Some(z3val), target)
 
     def _translate_like(self, expression: exp.Expression) -> z3.BoolRef:
         """Translate a LIKE pattern match into Z3 string constraints."""
@@ -675,7 +646,16 @@ class SMTSolver:
     def _translate_is(self, expression: exp.Expression) -> z3.BoolRef:
         """Translate an ``IS`` / ``IS NOT`` comparison (including NULL checks)."""
         left = self._as_value(self._to_z3_expr(expression.this))
-        right = self._as_value(self._to_z3_expr(expression.expression))
+        right_expr = expression.expression
+        # IS NOT NULL: col IS NOT(NULL)
+        if (isinstance(right_expr, exp.Not)
+                and isinstance(right_expr.this, exp.Null)):
+            return _value_some(left)
+        # IS NULL
+        if isinstance(right_expr, exp.Null):
+            return _value_null(left)
+        # General IS: translate right side as value
+        right = self._as_value(self._to_z3_expr(right_expr))
         if left.is_null_literal and right.is_null_literal:
             return z3.BoolVal(True, ctx=self.z3ctx)
         if right.is_null_literal:
@@ -892,8 +872,7 @@ class SMTSolver:
         """Try to translate a function call using a registered special model.
 
         Looks up the function name in ``self.function_models`` and, if a
-        matching model is found (and its ``matcher`` predicate passes),
-        invokes the model's translator.
+        matching model is found, invokes the model's translator.
 
         Returns None if no model matches.
         """
@@ -901,7 +880,7 @@ class SMTSolver:
         if not name:
             return None
         model = self.function_models.get(name)
-        if model is None or not model.matches(expression):
+        if model is None:
             return None
         args = [self._to_z3_expr(arg) for arg in self._function_args(expression) if arg is not None]
         return model.translator(self, expression, args)
@@ -966,6 +945,25 @@ class SMTSolver:
             f"{repr(condition)} not supported in SMT conversion, {type(condition)}"
         )
 
+    def _apply_domain_constraints(self) -> None:
+        """Apply printable-ASCII and temporal-bound constraints to all variables.
+
+        Called once before the first ``solver.check()``.
+        """
+        if self._domain_constraints_applied:
+            return
+        for var_name, z3var in self.context.get("variable_to_z3", {}).items():
+            column = self.context["z3_to_variable"].get(str(z3var))
+            if column is None:
+                continue
+            typeinfo = normalize_dtype(column.type, self.z3ctx)
+            if typeinfo.family in {"date", "time", "datetime", "timestamp"}:
+                self._ensure_temporal_bounds(z3var, typeinfo)
+            if typeinfo.family == "text":
+                self._ensure_str_printable(z3var)
+                self._ensure_str_length(z3var, 0)
+        self._domain_constraints_applied = True
+
     def _ensure_str_printable(self, expr: z3.ExprRef):
         """Constrain string values to printable ASCII (space through tilde)."""
         if is_option_expr(expr) and option_of(expr).value(expr).sort() == z3.StringSort():
@@ -998,13 +996,13 @@ class SMTSolver:
         opt = option_of(expr)
         value = unwrap_option(expr)
         if typeinfo.family == "date":
-            lower = _date_to_epoch_day(date(1970, 1, 1))
-            upper = _date_to_epoch_day(date(2030, 1, 1))
+            lower = date_to_epoch_day(date(1970, 1, 1))
+            upper = date_to_epoch_day(date(2030, 1, 1))
         elif typeinfo.family == "time":
             lower, upper = 0, 24 * 3600
         else:
-            lower = _datetime_to_epoch_second(datetime(1970, 1, 1, 0, 0, 0))
-            upper = _datetime_to_epoch_second(datetime(2030, 1, 1, 0, 0, 0))
+            lower = datetime_to_epoch_second(datetime(1970, 1, 1, 0, 0, 0))
+            upper = datetime_to_epoch_second(datetime(2030, 1, 1, 0, 0, 0))
         self.add(z3.Implies(opt.is_Some(expr), value > lower), track_vars=False)
         self.add(z3.Implies(opt.is_Some(expr), value < upper), track_vars=False)
 
@@ -1083,11 +1081,11 @@ class SMTSolver:
         if raw is None:
             return None
         if typeinfo.family == "date":
-            return _from_epoch_day(raw)
+            return epoch_day_to_date(raw)
         if typeinfo.family == "time":
-            return _from_seconds(raw)
+            return seconds_to_time(raw)
         if typeinfo.family in {"datetime", "timestamp"}:
-            return _from_epoch_second(raw)
+            return epoch_second_to_datetime(raw)
         return raw
 
     def _raw_payload_to_python(self, payload: z3.ExprRef) -> Any:

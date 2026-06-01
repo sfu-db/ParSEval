@@ -67,7 +67,7 @@ def instantiate_db(
             connection_string=connection_string, db_id=db_id,
         )
     except Exception as e:
-        _log.error("instantiate_db failed: %s", e)
+        _log.error("instantiate_db failed: %s", e, exc_info=True)
         return InstantiateResult(
             success=False,
             generation=GenerationResult(success=False, error_msg=str(e), elapsed_time=time.time() - t0),
@@ -106,13 +106,13 @@ def disprove(
     _log.debug("  sql2=%.100s", sql2)
 
     # 1. Textual identity check
-    if _normalize_sql(sql1) == _normalize_sql(sql2):
-        return DisproveResult(
-            verdict=Verdict.EQ, semantics=semantics,
-            q1_result=empty, q2_result=empty,
-            generation=GenerationResult(success=True, elapsed_time=0.0),
-            connection_string=connection_string, db_id=db_id,
-        )
+    # if _normalize_sql(sql1) == _normalize_sql(sql2):
+    #     return DisproveResult(
+    #         verdict=Verdict.EQ, semantics=semantics,
+    #         q1_result=empty, q2_result=empty,
+    #         generation=GenerationResult(success=True, elapsed_time=0.0),
+    #         connection_string=connection_string, db_id=db_id,
+    #     )
 
     # 2. Generate targeting sql1, check for NEQ
     try:
@@ -120,6 +120,7 @@ def disprove(
         engine1 = SymbolicEngine(instance, sql1, dialect=dialect, max_iterations=max_iterations, **kwargs)
         engine1.generate(thresholds=CoverageThresholds(atom_null=atom_null, atom_dup=atom_dup))
     except Exception as e:
+        _log.error("Generation failed for sql1: %s", e, exc_info=True)
         return DisproveResult(
             verdict=Verdict.UNKNOWN, semantics=semantics,
             q1_result=empty, q2_result=empty,
@@ -164,7 +165,8 @@ def disprove(
     try:
         engine2 = SymbolicEngine(instance, sql2, dialect=dialect, max_iterations=max_iterations, **kwargs)
         gen_result = engine2.generate(thresholds=CoverageThresholds(atom_null=atom_null, atom_dup=atom_dup))
-    except Exception:
+    except Exception as e:
+        _log.error("Generation failed for sql2: %s", e, exc_info=True)
         # If sql2 generation fails, return EQ from round 1
         return DisproveResult(
             verdict=Verdict.EQ, semantics=semantics,
@@ -176,8 +178,8 @@ def disprove(
     # Dump updated instance and re-execute
     try:
         to_db(instance, connection_string, dialect=dialect)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.error("DB write failed on round 2: %s", e, exc_info=True)
 
     q1_result = _execute(connection_string, dialect, sql1, timeout)
     q2_result = _execute(connection_string, dialect, sql2, timeout)

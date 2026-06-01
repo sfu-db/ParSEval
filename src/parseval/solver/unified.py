@@ -63,10 +63,13 @@ class SolverConstraint:
 
 @dataclass
 class SolveResult:
-    """Outcome of a solver invocation."""
+    """Outcome of a solver invocation.
+
+    Assignments use ``"table.column"`` keys mapping to concrete Python values.
+    """
 
     sat: bool
-    assignments: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    assignments: Dict[str, Any] = field(default_factory=dict)
     reason: str = ""
 
 
@@ -155,19 +158,28 @@ class Solver:
 
     def _remap_assignments(
         self,
-        assignments: Dict[str, Dict[str, Any]],
+        assignments: Dict[str, Any],
         alias_map: Dict[str, str],
-    ) -> Dict[str, Dict[str, Any]]:
-        target_counts: Dict[str, int] = {}
-        for table in assignments:
-            physical = alias_map.get(table, table)
-            target_counts[physical] = target_counts.get(physical, 0) + 1
+    ) -> Dict[str, Any]:
+        """Remap ``"table.col"`` keys: resolve aliases to physical names.
 
-        remapped: Dict[str, Dict[str, Any]] = {}
-        for table, cols in assignments.items():
+        For self-joins where multiple aliases map to the same physical table,
+        keeps the alias key to avoid collisions.
+        """
+        # Count how many aliases map to each physical table.
+        table_counts: Dict[str, int] = {}
+        for key in assignments:
+            table = key.split(".", 1)[0]
             physical = alias_map.get(table, table)
-            result_key = physical if target_counts[physical] == 1 else table
-            remapped[result_key] = dict(cols)
+            table_counts[physical] = table_counts.get(physical, 0) + 1
+
+        remapped: Dict[str, Any] = {}
+        for key, value in assignments.items():
+            table, col = key.split(".", 1)
+            physical = alias_map.get(table, table)
+            # Use physical name if unique, alias if self-join.
+            result_table = physical if table_counts[physical] == 1 else table
+            remapped[f"{result_table}.{col}"] = value
         return remapped
 
     # ── SMT solver ──────────────────────────────────────────────
@@ -177,7 +189,7 @@ class Solver:
     ) -> Tuple[Optional[Dict[str, Dict[str, Any]]], str]:
         """Solve all constraint expressions with Z3."""
         try:
-            from .smt import SMTSolver, UnsupportedSMTError
+            from .smt_solver import SMTSolver, UnsupportedSMTError
 
             smt = SMTSolver(timeout_ms=self.timeout_ms)
 
@@ -202,13 +214,18 @@ class Solver:
                     declared_keys.add(key)
 
             # Translate and add all constraint expressions.
+            # Skip constraints that fail translation instead of aborting —
+            # the remaining constraints may still produce a valid assignment.
+            skipped = 0
             for expr in constraint.constraints:
                 try:
                     z3_expr = smt.translate(expr)
                 except (UnsupportedSMTError, Exception):
-                    return None, "unsupported_smt_expression"
+                    skipped += 1
+                    continue
                 if z3_expr is None:
-                    return None, "unsupported_smt_expression"
+                    skipped += 1
+                    continue
                 smt.add(z3_expr)
 
             # Add join equalities as Z3 equalities.
@@ -232,18 +249,11 @@ class Solver:
             if status != "sat" or not solutions:
                 return None, "all tiers exhausted"
 
-            # Group assignments by solver table key first, then apply the same
-            # lossless alias-to-physical remap rule as the domain path.
+            # Return flat "table.col" → value dict.
             alias_map = constraint.alias_map or {}
-            assignments: Dict[str, Dict[str, Any]] = {}
+            assignments: Dict[str, Any] = {}
             for var_name, value in solutions.items():
-                parts = var_name.split(".")
-                if len(parts) == 2:
-                    table, col = parts
-                else:
-                    table = constraint.target_tables[0] if constraint.target_tables else ""
-                    col = var_name
-                assignments.setdefault(table, {})[col] = value
+                assignments[var_name] = value
             if not assignments:
                 return None, "all tiers exhausted"
             return self._remap_assignments(assignments, alias_map), ""
