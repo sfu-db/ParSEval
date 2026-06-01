@@ -148,3 +148,49 @@ def test_gold_non_empty_objective_returns_only_positive_rows_for_simple_filter()
     assert results
     assert [branch for branch, _rows in results] == ["positive"]
     assert _execute_candidate_rows(instance, sql, {})
+
+
+def test_gold_non_empty_row_scoped_inner_join_uses_one_solver_batch():
+    schema = (
+        "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);"
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, val INT);"
+    )
+    sql = (
+        "SELECT parent.name "
+        "FROM parent JOIN child ON parent.id = child.parent_id "
+        "WHERE child.val > 5"
+    )
+    instance, plan = _plan(sql, schema)
+
+    results = speculate(
+        plan,
+        instance,
+        plan.alias_map,
+        dialect="sqlite",
+        objective="gold_non_empty",
+    )
+
+    assert results
+    assert _execute_candidate_rows(instance, sql, {})
+
+
+def test_gold_non_empty_row_scoped_self_join_keeps_alias_rows_distinct():
+    schema = "CREATE TABLE people (id INT PRIMARY KEY, manager_id INT, name TEXT);"
+    sql = (
+        "SELECT e.name "
+        "FROM people e JOIN people m ON e.manager_id = m.id "
+        "WHERE e.name = 'Alice' AND m.name = 'Bob'"
+    )
+    instance, plan = _plan(sql, schema)
+
+    results = speculate(
+        plan,
+        instance,
+        plan.alias_map,
+        dialect="sqlite",
+        objective="gold_non_empty",
+    )
+
+    assert results
+    assert len(instance.get_rows("people")) >= 2
+    assert _execute_candidate_rows(instance, sql, {})
