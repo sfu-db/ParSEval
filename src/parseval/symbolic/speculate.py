@@ -41,6 +41,49 @@ from parseval.solver.lowering import (
 # =============================================================================
 
 
+
+@dataclass(frozen=True)
+class RowBinding:
+    """Transient mapping from a solver table key to one physical witness row."""
+    table: str
+    alias: Optional[str]
+    row: int
+
+
+def _solver_table_key(binding: RowBinding) -> str:
+    alias = normalize_name(binding.alias or binding.table)
+    table = normalize_name(binding.table)
+    return f"{table}__{alias}__r{binding.row}"
+
+
+def _split_solver_variable(name: str) -> Tuple[str, str]:
+    if "." not in name:
+        return "", normalize_name(name)
+    table_key, column = name.rsplit(".", 1)
+    return normalize_name(table_key), normalize_name(column)
+
+
+def _rows_from_solver_assignments(
+    assignments: Dict[str, Any],
+    row_bindings: Dict[str, RowBinding],
+    instance: Instance,
+) -> Dict[str, List[Dict[str, Any]]]:
+    rows_by_slot: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for variable_name, value in assignments.items():
+        table_key, column = _split_solver_variable(variable_name)
+        binding = row_bindings.get(table_key)
+        if binding is None:
+            continue
+        schema = instance.tables.get(binding.table)
+        if schema is None or column not in schema:
+            continue
+        rows_by_slot.setdefault((binding.table, binding.row), {})[column] = value
+
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    for (table, _row_index), values in sorted(rows_by_slot.items()):
+        rows.setdefault(table, []).append(values)
+    return rows
+
 @dataclass
 class TableConstraint:
     """Constraints on what one table needs for a specific branch."""
