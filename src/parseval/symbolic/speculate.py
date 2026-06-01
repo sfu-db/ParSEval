@@ -106,6 +106,52 @@ def _rows_from_solver_assignments(
     return rows
 
 
+def _physical_table_for_alias(alias_or_table: str, alias_map) -> str:
+    key = normalize_name(alias_or_table)
+    if hasattr(alias_map, "resolve"):
+        resolved = alias_map.resolve(key)
+        return normalize_name(resolved or key)
+    if hasattr(alias_map, "get"):
+        return normalize_name(alias_map.get(key, key))
+    return key
+
+
+def _binding_for_column(
+    col: exp.Column,
+    row_bindings: Dict[str, RowBinding],
+    alias_map,
+    default_row: int = 0,
+) -> Optional[RowBinding]:
+    raw_table = normalize_name(col.table or "")
+    physical = _physical_table_for_alias(raw_table, alias_map) if raw_table else ""
+    for binding in row_bindings.values():
+        if binding.row != default_row:
+            continue
+        if raw_table and normalize_name(binding.alias or "") == raw_table:
+            return binding
+        if physical and normalize_name(binding.table) == physical:
+            return binding
+    return None
+
+
+def _rewrite_expr_for_row_scope(
+    expr: exp.Expression,
+    row_bindings: Dict[str, RowBinding],
+    alias_map,
+    default_row: int = 0,
+) -> exp.Expression:
+    rewritten = expr.copy()
+    for col in rewritten.find_all(exp.Column):
+        binding = _binding_for_column(col, row_bindings, alias_map, default_row)
+        if binding is None:
+            continue
+        old_type = getattr(col, "type", None)
+        col.set("table", exp.to_identifier(_solver_table_key(binding)))
+        if old_type is not None:
+            col.type = old_type
+    return rewritten
+
+
 @dataclass
 class TableConstraint:
     """Constraints on what one table needs for a specific branch."""

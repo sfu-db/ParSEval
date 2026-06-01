@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from sqlglot import exp
+
 from parseval.instance import Instance
 
 
@@ -34,3 +36,21 @@ def test_rows_from_flat_solver_assignments_decodes_physical_rows():
     assert rows == {
         "orders": [{"id": 1, "total": 125}, {"id": 2, "total": 140}]
     }
+
+
+def test_rewrite_expr_for_row_scope_preserves_column_type():
+    from parseval.symbolic.speculate import RowBinding, _rewrite_expr_for_row_scope
+
+    col = exp.column("total", "o")
+    col.type = exp.DataType.build("INT")
+    expr = exp.GT(this=col, expression=exp.Literal.number(100))
+    bindings = {
+        "orders__o__r0": RowBinding(table="orders", alias="o", row=0),
+    }
+
+    rewritten = _rewrite_expr_for_row_scope(expr, bindings, {"o": "orders"})
+    rewritten_col = next(rewritten.find_all(exp.Column))
+
+    assert rewritten_col.table == "orders__o__r0"
+    assert rewritten_col.name == "total"
+    assert rewritten_col.type is not None
