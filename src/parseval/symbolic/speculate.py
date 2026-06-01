@@ -2806,6 +2806,81 @@ def _build_gold_solver_constraint(
     ), row_bindings
 
 
+def _gold_default_value(instance: Instance, table: str, column: str, seed: int) -> Any:
+    col_type = str(instance.tables.get(table, {}).get(column, "")).upper()
+    if "INT" in col_type:
+        return seed
+    if any(token in col_type for token in ("REAL", "FLOAT", "DOUBLE", "NUM", "DEC")):
+        return float(seed)
+    if "BLOB" in col_type or "BYTE" in col_type:
+        return f"val{seed}".encode()
+    if "DATE" in col_type or "TIME" in col_type:
+        return "2000-01-01"
+    return f"val{seed}"
+
+
+def _requirement_for_binding(
+    spec: BranchSpec,
+    binding: RowBinding,
+) -> Optional[TableConstraint]:
+    alias = normalize_name(binding.alias or binding.table)
+    for table_key, req in spec.requirements.items():
+        physical = normalize_name(req.table.split("__", 1)[0] if "__" in req.table else req.table)
+        if physical != binding.table:
+            continue
+        if req.alias and normalize_name(req.alias) == alias:
+            return req
+        if "__" in table_key and normalize_name(table_key.split("__", 1)[1]) == alias:
+            return req
+        if not req.alias and "__" not in table_key and alias == binding.table:
+            return req
+    return None
+
+
+def _complete_gold_rows(
+    rows: Dict[str, List[Dict[str, Any]]],
+    row_bindings: Dict[str, RowBinding],
+    spec: BranchSpec,
+    instance: Instance,
+) -> Dict[str, List[Dict[str, Any]]]:
+    pending_rows = {
+        table: [dict(row) for row in table_rows]
+        for table, table_rows in rows.items()
+    }
+    completed: Dict[str, List[Dict[str, Any]]] = {}
+    group_values: Dict[Tuple[str, str], Any] = {}
+
+    ordered_bindings = sorted(
+        row_bindings.values(),
+        key=lambda binding: (binding.table, normalize_name(binding.alias or ""), binding.row),
+    )
+    for binding in ordered_bindings:
+        table_rows = pending_rows.setdefault(binding.table, [])
+        row = table_rows.pop(0) if table_rows else {}
+        req = _requirement_for_binding(spec, binding)
+        if req is not None:
+            for col_name, value in req.fixed_values.items():
+                row.setdefault(col_name, value)
+            for col_name in req.group_key_columns:
+                key = (binding.table, col_name)
+                if col_name in row:
+                    group_values.setdefault(key, row[col_name])
+                    continue
+                if key not in group_values:
+                    group_values[key] = _gold_default_value(
+                        instance,
+                        binding.table,
+                        col_name,
+                        1,
+                    )
+                row[col_name] = group_values[key]
+        completed.setdefault(binding.table, []).append(row)
+
+    for table, table_rows in pending_rows.items():
+        completed.setdefault(table, []).extend(table_rows)
+    return completed
+
+
 def _materialize_rows(
     instance: Instance,
     rows: Dict[str, List[Dict[str, Any]]],
@@ -2835,6 +2910,7 @@ def _solve_and_materialize_gold(
     if not result.sat:
         return {}
     rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
+    rows = _complete_gold_rows(rows, row_bindings, spec, instance)
     checkpoint = instance.checkpoint()
     try:
         _materialize_rows(instance, rows)
