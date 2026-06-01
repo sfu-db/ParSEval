@@ -90,7 +90,7 @@ def _rows_from_solver_assignments(
     row_bindings: Dict[str, RowBinding],
     instance: Instance,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    rows_by_slot: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    rows_by_slot: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     for variable_name, value in assignments.items():
         table_key, column = _split_solver_variable(variable_name)
         binding = row_bindings.get(table_key)
@@ -99,10 +99,13 @@ def _rows_from_solver_assignments(
         schema = instance.tables.get(binding.table)
         if schema is None or column not in schema:
             continue
-        rows_by_slot.setdefault((binding.table, binding.row), {})[column] = value
+        rows_by_slot.setdefault(
+            (binding.table, normalize_name(binding.alias or ""), binding.row),
+            {},
+        )[column] = value
 
     rows: Dict[str, List[Dict[str, Any]]] = {}
-    for (table, _row_index), values in sorted(rows_by_slot.items()):
+    for (table, _alias, _row_index), values in sorted(rows_by_slot.items()):
         rows.setdefault(table, []).append(values)
     return rows
 
@@ -543,6 +546,27 @@ class Propagator:
                     sk_col = self._match_column(sk_table, sk.name if hasattr(sk, "name") else str(sk))
                     jk_col = self._match_column(join_table, jk.name if hasattr(jk, "name") else str(jk))
                     if sk_col and jk_col:
+                        sk_alias = normalize_name(sk.table or sk_table_name or "")
+                        jk_alias = normalize_name(jk.table or join_name or "")
+                        if (
+                            self.objective == "gold_non_empty"
+                            and sk_table == join_table
+                            and self._is_self_join_table(sk_table)
+                            and sk_alias
+                            and jk_alias
+                        ):
+                            sk_key = f"{sk_table}__{sk_alias}"
+                            jk_key = f"{join_table}__{jk_alias}"
+                            spec.requirements.setdefault(
+                                sk_key,
+                                TableConstraint(table=sk_table, alias=sk_alias),
+                            )
+                            spec.requirements.setdefault(
+                                jk_key,
+                                TableConstraint(table=join_table, alias=jk_alias),
+                            )
+                            spec.equate(f"{sk_key}.{sk_col}", f"{jk_key}.{jk_col}")
+                            continue
                         spec.require(sk_table)
                         spec.require(join_table)
                         spec.equate(f"{sk_table}.{sk_col}", f"{join_table}.{jk_col}")
@@ -2628,10 +2652,17 @@ def validate_gold_non_empty_rows(
 
 def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
     bindings: Dict[str, RowBinding] = {}
+    alias_scoped_tables = {
+        normalize_name(req.table.split("__", 1)[0] if "__" in req.table else req.table)
+        for table_key, req in spec.requirements.items()
+        if req.alias or "__" in table_key
+    }
     for table_key, req in spec.requirements.items():
         physical = normalize_name(
             req.table.split("__", 1)[0] if "__" in req.table else req.table
         )
+        if physical in alias_scoped_tables and not req.alias and "__" not in table_key:
+            continue
         if req.alias:
             alias = normalize_name(req.alias)
         elif "__" in table_key:
@@ -2644,24 +2675,138 @@ def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
     return bindings
 
 
+def _bindings_for_requirement(
+    table_key: str,
+    req: TableConstraint,
+    row_bindings: Dict[str, RowBinding],
+) -> List[RowBinding]:
+    physical = normalize_name(req.table.split("__", 1)[0] if "__" in req.table else req.table)
+    if req.alias:
+        alias = normalize_name(req.alias)
+    elif "__" in table_key:
+        alias = normalize_name(table_key.split("__", 1)[1])
+    else:
+        alias = physical
+    return [
+        binding
+        for binding in row_bindings.values()
+        if binding.table == physical and normalize_name(binding.alias or "") == alias
+    ]
+
+
+def _binding_for_member(
+    member_table: str,
+    member_column: str,
+    row_bindings: Dict[str, RowBinding],
+    alias_map,
+) -> Optional[RowBinding]:
+    table_key = normalize_name(member_table)
+    if "__" in table_key:
+        physical, alias = table_key.split("__", 1)
+        for binding in row_bindings.values():
+            if (
+                binding.table == physical
+                and normalize_name(binding.alias or "") == alias
+                and binding.row == 0
+            ):
+                return binding
+        return None
+    return _binding_for_column(
+        exp.column(member_column, table_key),
+        row_bindings,
+        alias_map,
+    )
+
+
+def _row_scoped_join_equalities(
+    spec: BranchSpec,
+    row_bindings: Dict[str, RowBinding],
+    alias_map,
+) -> List[Tuple[str, str, str, str]]:
+    equalities: List[Tuple[str, str, str, str]] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+    for _rep, members in spec.equivalences.groups().items():
+        if len(members) < 2:
+            continue
+        scoped: List[Tuple[str, str]] = []
+        for member in members:
+            table_name, column_name = member.split(".", 1)
+            binding = _binding_for_member(table_name, column_name, row_bindings, alias_map)
+            if binding is not None:
+                scoped.append((_solver_table_key(binding), normalize_name(column_name)))
+        for left, right in zip(scoped, scoped[1:]):
+            equality = (left[0], left[1], right[0], right[1])
+            if equality in seen:
+                continue
+            seen.add(equality)
+            equalities.append(equality)
+    return equalities
+
+
+def _join_column_type_constraints(
+    instance: Instance,
+    row_bindings: Dict[str, RowBinding],
+    join_equalities: List[Tuple[str, str, str, str]],
+) -> List[exp.Expression]:
+    from parseval.dtype import DataType
+
+    constraints: List[exp.Expression] = []
+    seen: Set[Tuple[str, str]] = set()
+    for left_table, left_col, right_table, right_col in join_equalities:
+        for table_key, column_name in ((left_table, left_col), (right_table, right_col)):
+            key = (normalize_name(table_key), normalize_name(column_name))
+            if key in seen:
+                continue
+            seen.add(key)
+            binding = row_bindings.get(key[0])
+            if binding is None:
+                continue
+            col_node = exp.column(key[1], key[0])
+            col_type_str = _lookup_col_type(instance, binding.table, key[1])
+            if col_type_str:
+                try:
+                    col_node.type = DataType.build(col_type_str)
+                except Exception:
+                    pass
+            constraints.append(exp.Is(this=col_node, expression=exp.Not(this=exp.Null())))
+    return constraints
+
+
 def _build_gold_solver_constraint(
     spec: BranchSpec,
     instance: Instance,
     alias_map,
 ) -> Tuple[SolverConstraint, Dict[str, RowBinding]]:
-    del instance
     row_bindings = _build_gold_row_bindings(spec)
     constraints: List[exp.Expression] = []
-    for req in spec.requirements.values():
+    for table_key, req in spec.requirements.items():
+        req_bindings = _bindings_for_requirement(table_key, req, row_bindings)
+        if not req_bindings:
+            continue
         for constraint in req.constraints:
             if constraint.find(exp.Subquery):
                 continue
-            rewritten = _rewrite_expr_for_row_scope(constraint, row_bindings, alias_map)
-            constraints.append(rewritten)
+            if (
+                isinstance(constraint, exp.EQ)
+                and isinstance(constraint.this, exp.Column)
+                and isinstance(constraint.expression, exp.Column)
+            ):
+                continue
+            for binding in req_bindings:
+                scoped_bindings = {_solver_table_key(binding): binding}
+                rewritten = _rewrite_expr_for_row_scope(
+                    constraint,
+                    scoped_bindings,
+                    alias_map,
+                    default_row=binding.row,
+                )
+                constraints.append(rewritten)
+    join_equalities = _row_scoped_join_equalities(spec, row_bindings, alias_map)
+    constraints.extend(_join_column_type_constraints(instance, row_bindings, join_equalities))
     return SolverConstraint(
         target_tables=tuple(row_bindings.keys()),
         constraints=constraints,
-        join_equalities=[],
+        join_equalities=join_equalities,
     ), row_bindings
 
 
