@@ -64,6 +64,17 @@ def _execute_candidate_rows(
         conn.close()
 
 
+def _gold_non_empty_results(schema: str, sql: str):
+    instance, plan = _plan(sql, schema)
+    return instance, plan, speculate(
+        plan,
+        instance,
+        plan.alias_map,
+        dialect="sqlite",
+        objective="gold_non_empty",
+    )
+
+
 def test_row_scoped_solver_key_includes_table_alias_and_row():
     from parseval.symbolic.speculate import RowBinding, _solver_table_key
 
@@ -194,3 +205,40 @@ def test_gold_non_empty_row_scoped_self_join_keeps_alias_rows_distinct():
     assert results
     assert len(instance.get_rows("people")) >= 2
     assert _execute_candidate_rows(instance, sql, {})
+
+
+def test_gold_non_empty_grouped_count_star_returns_witness_rows():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+    sql = "SELECT a, COUNT(*) FROM t GROUP BY a"
+
+    instance, _plan_obj, results = _gold_non_empty_results(schema, sql)
+
+    assert results
+    rows = _execute_candidate_rows(instance, sql, results[0][1])
+    assert rows
+
+
+def test_gold_non_empty_grouped_count_star_having_returns_witness_rows():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+    sql = "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1"
+
+    instance, _plan_obj, results = _gold_non_empty_results(schema, sql)
+
+    assert results
+    assert len(results[0][1]["t"]) >= 2
+    rows = _execute_candidate_rows(instance, sql, results[0][1])
+    assert rows
+
+
+def test_gold_non_empty_having_hidden_group_key_predicate_returns_witness_rows():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+    sql = "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1 AND a > 5"
+
+    instance, _plan_obj, results = _gold_non_empty_results(schema, sql)
+
+    assert results
+    rows_per_table = results[0][1]
+    assert len(rows_per_table["t"]) >= 2
+    assert all(row["a"] > 5 for row in rows_per_table["t"])
+    rows = _execute_candidate_rows(instance, sql, rows_per_table)
+    assert rows
