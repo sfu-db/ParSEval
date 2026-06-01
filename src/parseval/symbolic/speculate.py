@@ -29,7 +29,7 @@ from parseval.plan.planner import (
     Aggregate, Filter, Having, Join, Limit, Project, Scan, SetOperation, Sort, SubPlan,
 )
 from parseval.plan.rex import column_meta, concrete, negate_predicate
-from parseval.solver import SolverConstraint
+from parseval.solver import Solver, SolverConstraint
 
 logger = logging.getLogger("parseval.speculate")
 
@@ -1990,8 +1990,6 @@ class Resolver:
         if self.solver is None:
             return {}
 
-        from parseval.solver.unified import SolverConstraint
-
         all_constraints = list(req.constraints)
 
         # Convert fixed_values to EQ constraints.
@@ -2267,8 +2265,6 @@ class Resolver:
         """Build a row with exact boundary values for edge-case testing."""
         if self.solver is None:
             return {}
-
-        from parseval.solver.unified import SolverConstraint
 
         all_constraints = list(req.constraints)
 
@@ -2863,7 +2859,6 @@ def speculate(
     Returns one entry per branch (positive + negatives). The engine
     materializes each one.
     """
-    from parseval.solver.unified import Solver
     propagator = Propagator(plan, instance, alias_map, dialect, objective=objective)
     solver = Solver(dialect=dialect)
     resolver = Resolver(
@@ -2922,7 +2917,6 @@ def build_spec(plan, instance, *, alias_map, target_outcome="positive", negate_a
 
 def resolve_spec(spec, instance, dialect="sqlite"):
     """Backward-compatible wrapper."""
-    from parseval.solver.unified import Solver
     solver = Solver(dialect=dialect)
     resolver = Resolver(instance, dialect, solver=solver)
     rows = resolver.resolve(spec)
