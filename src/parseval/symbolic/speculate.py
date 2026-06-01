@@ -29,6 +29,7 @@ from parseval.plan.planner import (
     Aggregate, Filter, Having, Join, Limit, Project, Scan, SetOperation, Sort, SubPlan,
 )
 from parseval.plan.rex import column_meta, concrete, negate_predicate
+from parseval.solver import SolverConstraint
 
 logger = logging.getLogger("parseval.speculate")
 
@@ -2625,6 +2626,86 @@ def validate_gold_non_empty_rows(
         conn.close()
 
 
+def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
+    bindings: Dict[str, RowBinding] = {}
+    for table_key, req in spec.requirements.items():
+        physical = normalize_name(
+            req.table.split("__", 1)[0] if "__" in req.table else req.table
+        )
+        if req.alias:
+            alias = normalize_name(req.alias)
+        elif "__" in table_key:
+            alias = normalize_name(table_key.split("__", 1)[1])
+        else:
+            alias = physical
+        for row_index in range(max(req.min_rows, 1)):
+            binding = RowBinding(table=physical, alias=alias, row=row_index)
+            bindings[_solver_table_key(binding)] = binding
+    return bindings
+
+
+def _build_gold_solver_constraint(
+    spec: BranchSpec,
+    instance: Instance,
+    alias_map,
+) -> Tuple[SolverConstraint, Dict[str, RowBinding]]:
+    del instance
+    row_bindings = _build_gold_row_bindings(spec)
+    constraints: List[exp.Expression] = []
+    for req in spec.requirements.values():
+        for constraint in req.constraints:
+            if constraint.find(exp.Subquery):
+                continue
+            rewritten = _rewrite_expr_for_row_scope(constraint, row_bindings, alias_map)
+            constraints.append(rewritten)
+    return SolverConstraint(
+        target_tables=tuple(row_bindings.keys()),
+        constraints=constraints,
+        join_equalities=[],
+    ), row_bindings
+
+
+def _materialize_rows(
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    concretes = {
+        table: {
+            col: [row.get(col) for row in table_rows]
+            for col in instance.tables.get(table, {})
+        }
+        for table, table_rows in rows.items()
+    }
+    for table_name in instance._creation_order(concretes):
+        for row in rows.get(table_name, []):
+            instance.create_row(table_name, values=row)
+
+
+def _solve_and_materialize_gold(
+    spec: BranchSpec,
+    plan: Plan,
+    instance: Instance,
+    solver,
+    alias_map,
+    dialect: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    constraint, row_bindings = _build_gold_solver_constraint(spec, instance, alias_map)
+    result = solver.solve(constraint)
+    if not result.sat:
+        return {}
+    rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
+    checkpoint = instance.checkpoint()
+    try:
+        _materialize_rows(instance, rows)
+        if validate_gold_non_empty_rows(plan, instance, {}, dialect=dialect):
+            return rows
+        instance.rollback(checkpoint)
+        return {}
+    except Exception:
+        instance.rollback(checkpoint)
+        return {}
+
+
 def speculate(
     plan: Plan,
     instance: Instance,
@@ -2648,6 +2729,22 @@ def speculate(
     )
     if objective == "gold_non_empty":
         branch_specs = propagator.propagate_gold_non_empty()
+        logger.info("Generated %d branch specs", len(branch_specs))
+        results = []
+        for spec in branch_specs:
+            if not spec.requirements:
+                continue
+            rows = _solve_and_materialize_gold(
+                spec,
+                plan,
+                instance,
+                solver,
+                alias_map,
+                dialect,
+            )
+            if rows:
+                results.append((spec.branch, rows))
+        return results
     else:
         branch_specs = propagator.propagate()
     logger.info("Generated %d branch specs", len(branch_specs))
