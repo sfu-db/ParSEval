@@ -211,7 +211,7 @@ class SymbolicEngine:
 
         # Phase 0f: SMT repair — for self-joins, NOT IN, and complex OR
         # predicates that the speculative layer cannot handle.
-        self._smt_repair_where()
+        # self._smt_repair_where()
 
         # Phase 1: Initial evaluation.
         tree = BranchTree(thresholds=thresholds)
@@ -219,41 +219,41 @@ class SymbolicEngine:
 
         iteration = 0
 
-        for iteration in range(self.max_iterations):
-            if tree.fully_covered:
-                break
+        # for iteration in range(self.max_iterations):
+        #     if tree.fully_covered:
+        #         break
 
-            targets = tree.uncovered_targets
-            if not targets:
-                break
+        #     targets = tree.uncovered_targets
+        #     if not targets:
+        #         break
 
-            target = self._prioritize(targets)
+        #     target = self._prioritize(targets)
 
-            # Quick infeasibility check.
-            reason = is_infeasible(
-                target.node, target.atom_id, target.target_outcome, self.instance
-            )
-            if reason is not None:
-                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
-                continue
+        #     # Quick infeasibility check.
+        #     reason = is_infeasible(
+        #         target.node, target.atom_id, target.target_outcome, self.instance
+        #     )
+        #     if reason is not None:
+        #         tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+        #         continue
 
-            # Check row budget.
-            if self._total_rows() - rows_before >= self.max_rows_per_table * len(self.instance.tables):
-                break
+        #     # Check row budget.
+        #     if self._total_rows() - rows_before >= self.max_rows_per_table * len(self.instance.tables):
+        #         break
 
-            # Generate constraints.
-            constraint = constraint_gen.generate(target)
+        #     # Generate constraints.
+        #     constraint = constraint_gen.generate(target)
 
-            # Solve and materialize.
-            cp = self.instance.checkpoint()
-            success = self._solve_and_materialize(constraint)
+        #     # Solve and materialize.
+        #     cp = self.instance.checkpoint()
+        #     success = self._solve_and_materialize(constraint)
 
-            if success:
-                # Re-evaluate to discover newly covered branches.
-                tree = evaluator.evaluate(tree)
-            else:
-                self.instance.rollback(cp)
-                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+        #     if success:
+        #         # Re-evaluate to discover newly covered branches.
+        #         tree = evaluator.evaluate(tree)
+        #     else:
+        #         self.instance.rollback(cp)
+        #         tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
 
         return GenerationResult(
             tree=tree,
@@ -353,7 +353,15 @@ class SymbolicEngine:
     def _speculate_all_branches(self) -> None:
         """Generate rows for ALL branches (positive + negatives) at once."""
         from .speculate import speculate
-        branch_results = speculate(self.plan, self.instance, self.alias_map, self.dialect)
+        import logging
+        log = logging.getLogger("parseval.engine")
+        branch_results = speculate(
+            self.plan,
+            self.instance,
+            self.alias_map,
+            self.dialect,
+            objective="gold_non_empty",
+        )
         for branch_name, rows_per_table in branch_results:
             for table, row_list in rows_per_table.items():
                 if table not in self.instance.tables:
@@ -365,8 +373,11 @@ class SymbolicEngine:
                             row_values[col] = val
                     try:
                         self.instance.create_row(table, values=row_values)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(
+                            "Materialization failed: branch=%s table=%s error=%s",
+                            branch_name, table, str(e)[:200],
+                        )
 
     def _total_rows(self) -> int:
         return sum(len(self.instance.get_rows(t)) for t in self.instance.tables)

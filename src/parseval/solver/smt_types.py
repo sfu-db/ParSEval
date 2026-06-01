@@ -10,26 +10,23 @@ import z3
 from sqlglot import exp
 from sqlglot.expressions import DataType
 
+from parseval.solver.types import (
+    parse_date,
+    parse_time,
+    parse_datetime,
+    date_to_epoch_day,
+    time_to_seconds,
+    datetime_to_epoch_second,
+    epoch_day_to_date,
+    seconds_to_time,
+    epoch_second_to_datetime,
+    infer_type_from_value,
+)
+
 
 def infer(value: Any) -> DataType:
     """Infer a SQL DataType from a Python value's runtime type."""
-    if value is None:
-        return DataType.build("NULL")
-    if isinstance(value, bool):
-        return DataType.build("BOOLEAN")
-    if isinstance(value, int):
-        return DataType.build("INT")
-    if isinstance(value, float):
-        return DataType.build("FLOAT")
-    if isinstance(value, str):
-        return DataType.build("TEXT", length=len(value))
-    if isinstance(value, time):
-        return DataType.build("TIME")
-    if isinstance(value, datetime):
-        return DataType.build("DATETIME")
-    if isinstance(value, date):
-        return DataType.build("DATE")
-    return DataType.build("TEXT")
+    return infer_type_from_value(value)
 
 
 def make_option_type(
@@ -46,70 +43,21 @@ def make_option_type(
     return dtype.create()
 
 
-class LogicalTypeRegistry:
-    """Global cache of Z3 sort/tag definitions for SQL logical types.
-
-    Maps each SQL type name (INT, FLOAT, TEXT, etc.) to a Z3 constructor
-    within a shared ``LogicalSQLType`` datatype, ensuring a single canonical
-    representation per Z3 context.
-    """
-
-    _sort_cache: Dict[int, z3.DatatypeSortRef] = {}
-    _tag_cache: Dict[int, Dict[str, z3.ExprRef]] = {}
-
-    @classmethod
-    def _ctx_key(cls, z3ctx: Optional[z3.Context]) -> int:
-        return id(z3ctx) if z3ctx is not None else 0
-
-    @classmethod
-    def sort(cls, z3ctx: Optional[z3.Context] = None) -> z3.DatatypeSortRef:
-        key = cls._ctx_key(z3ctx)
-        if key not in cls._sort_cache:
-            dtype = z3.Datatype("LogicalSQLType", ctx=z3ctx)
-            for name in [
-                "NULL",
-                "INT",
-                "FLOAT",
-                "TEXT",
-                "BOOLEAN",
-                "DATE",
-                "TIME",
-                "DATETIME",
-                "TIMESTAMP",
-            ]:
-                dtype.declare(name)
-            cls._sort_cache[key] = dtype.create()
-        return cls._sort_cache[key]
-
-    @classmethod
-    def tag(cls, name: str, z3ctx: Optional[z3.Context] = None) -> z3.ExprRef:
-        key = cls._ctx_key(z3ctx)
-        if key not in cls._tag_cache:
-            sort = cls.sort(z3ctx)
-            cls._tag_cache[key] = {
-                sort.constructor(i).name(): getattr(sort, sort.constructor(i).name())
-                for i in range(sort.num_constructors())
-            }
-        return cls._tag_cache[key][name]
-
-
 @dataclass(frozen=True)
 class SMTTypeInfo:
     """Metadata about a SQL type as seen by the Z3 SMT solver.
 
     Attributes:
         dtype: The original DataType.
-        logical_name: Canonical type name in the LogicalTypeRegistry.
+        logical_name: Canonical type name (INT, FLOAT, TEXT, etc.).
         family: Broad family string (int, real, text, bool, date, etc.).
         payload_sort: The Z3 sort for the value payload (inside the Option wrapper).
-        logical_tag: Z3 constructor for this type's tag in the Option union.
     """
 
     dtype: DataType
     logical_name: str
     family: str
     payload_sort: z3.SortRef
-    logical_tag: z3.ExprRef
 
 
 @dataclass(frozen=True)
@@ -155,10 +103,6 @@ class SpecialFunctionModel:
         name: Canonical function name (e.g. "ABS").
         translator: Callable that translates the function into Z3 expressions.
         return_type: Optional callable that infers the return DataType.
-        arg_policy: Argument handling policy ("fixed", "variadic", etc.).
-        evaluator: Optional callable for concrete evaluation.
-        matcher: Optional predicate to filter which expressions this model handles.
-        null_propagation: How NULL inputs propagate ("any", "never", etc.).
     """
 
     name: str
@@ -167,15 +111,6 @@ class SpecialFunctionModel:
         Union["SMTValue", z3.BoolRef],
     ]
     return_type: Optional[Callable[[exp.Expression, Sequence[SMTTypeInfo]], DataType]] = None
-    arg_policy: str = "fixed"
-    evaluator: Optional[Callable[..., Any]] = None
-    matcher: Optional[Callable[[exp.Expression], bool]] = None
-    null_propagation: str = "any"
-
-    def matches(self, expression: exp.Expression) -> bool:
-        if self.matcher is None:
-            return True
-        return self.matcher(expression)
 
 
 _SPECIAL_FUNCTION_MODELS: Dict[str, SpecialFunctionModel] = {}
@@ -188,10 +123,6 @@ def register_special_function(
         Union[SMTValue, z3.BoolRef],
     ],
     return_type: Optional[Callable[[exp.Expression, Sequence[SMTTypeInfo]], DataType]] = None,
-    arg_policy: str = "fixed",
-    evaluator: Optional[Callable[..., Any]] = None,
-    matcher: Optional[Callable[[exp.Expression], bool]] = None,
-    null_propagation: str = "any",
 ) -> SpecialFunctionModel:
     """Register a custom SMT translation model for a SQL function.
 
@@ -203,10 +134,6 @@ def register_special_function(
         translator: Callable that receives the solver, the SQL expression,
             and resolved Z3 argument values, and returns an SMTValue or BoolRef.
         return_type: Optional callable to infer the return DataType.
-        arg_policy: Argument handling policy (default "fixed").
-        evaluator: Optional callable for concrete evaluation.
-        matcher: Optional predicate for custom expression filtering.
-        null_propagation: How NULL inputs are handled.
 
     Returns:
         The created SpecialFunctionModel.
@@ -215,10 +142,6 @@ def register_special_function(
         name=name.upper(),
         translator=translator,
         return_type=return_type,
-        arg_policy=arg_policy,
-        evaluator=evaluator,
-        matcher=matcher,
-        null_propagation=null_propagation,
     )
     _SPECIAL_FUNCTION_MODELS[model.name] = model
     return model
@@ -231,104 +154,15 @@ def _is_temporal_string(value: str) -> bool:
 
 def _infer_temporal_dtype(value: str) -> DataType:
     """Infer the most likely temporal DataType from a string value."""
-    if _parse_datetime(value) is not None and ("T" in value or " " in value):
+    if parse_datetime(value) is not None and ("T" in value or " " in value):
         return DataType.build("DATETIME")
-    if _parse_date(value) is not None and "-" in value and ":" not in value:
+    if parse_date(value) is not None and "-" in value and ":" not in value:
         return DataType.build("DATE")
-    if _parse_time(value) is not None and ":" in value and "-" not in value:
+    if parse_time(value) is not None and ":" in value and "-" not in value:
         return DataType.build("TIME")
     return DataType.build("TEXT")
 
 
-def _parse_date(value: Any) -> Optional[date]:
-    """Parse a value into a ``date``, or None if unparseable."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
-        try:
-            if "T" in value or " " in value:
-                return datetime.fromisoformat(value.replace(" ", "T")).date()
-            return date.fromisoformat(value)
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_time(value: Any) -> Optional[time]:
-    """Parse a value into a ``time``, or None if unparseable."""
-    if isinstance(value, datetime):
-        return value.time().replace(microsecond=0)
-    if isinstance(value, time):
-        return value.replace(microsecond=0)
-    if isinstance(value, str):
-        try:
-            if "T" in value or " " in value:
-                return datetime.fromisoformat(value.replace(" ", "T")).time().replace(
-                    microsecond=0
-                )
-            return time.fromisoformat(value[:8])
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_datetime(value: Any) -> Optional[datetime]:
-    """Parse a value into a ``datetime``, or None if unparseable."""
-    if isinstance(value, datetime):
-        return value.replace(microsecond=0)
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day)
-    if isinstance(value, str):
-        for candidate in (value.replace(" ", "T"), value):
-            try:
-                return datetime.fromisoformat(candidate).replace(microsecond=0)
-            except ValueError:
-                continue
-    return None
-
-
-def _date_to_epoch_day(value: Any) -> int:
-    """Convert a date value to days since the Unix epoch (1970-01-01)."""
-    parsed = _parse_date(value)
-    if parsed is not None:
-        return (parsed - date(1970, 1, 1)).days
-    return int(value)
-
-
-def _time_to_seconds(value: Any) -> int:
-    """Convert a time value to seconds since midnight."""
-    parsed = _parse_time(value)
-    if parsed is not None:
-        return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
-    return int(value)
-
-
-def _datetime_to_epoch_second(value: Any) -> int:
-    """Convert a datetime value to seconds since the Unix epoch."""
-    parsed = _parse_datetime(value)
-    if parsed is not None:
-        return int(parsed.timestamp())
-    return int(value)
-
-
-def _from_epoch_day(days: int) -> date:
-    """Convert days since Unix epoch back to a ``date``."""
-    return date(1970, 1, 1) + timedelta(days=days)
-
-
-def _from_seconds(seconds: int) -> time:
-    """Convert seconds since midnight back to a ``time``."""
-    seconds = max(0, seconds) % 86400
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    return time(hours, minutes, secs)
-
-
-def _from_epoch_second(value: int) -> datetime:
-    """Convert Unix epoch seconds back to a timezone-naive ``datetime``."""
-    return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
 
 
 def normalize_dtype(
@@ -398,7 +232,6 @@ def normalize_dtype(
         logical_name=logical_name,
         family=family,
         payload_sort=payload_sort,
-        logical_tag=LogicalTypeRegistry.tag(logical_name, z3ctx),
     )
 
 
@@ -461,11 +294,11 @@ def _python_to_payload(typeinfo: SMTTypeInfo, value: Any, z3ctx: Optional[z3.Con
     if typeinfo.family == "text":
         return z3.StringVal(str(value), ctx=z3ctx)
     if typeinfo.family == "date":
-        return z3.IntVal(_date_to_epoch_day(value), ctx=z3ctx)
+        return z3.IntVal(date_to_epoch_day(value), ctx=z3ctx)
     if typeinfo.family == "time":
-        return z3.IntVal(_time_to_seconds(value), ctx=z3ctx)
+        return z3.IntVal(time_to_seconds(value), ctx=z3ctx)
     if typeinfo.family in {"datetime", "timestamp"}:
-        return z3.IntVal(_datetime_to_epoch_second(value), ctx=z3ctx)
+        return z3.IntVal(datetime_to_epoch_second(value), ctx=z3ctx)
     raise RuntimeError(f"Unsupported value family: {typeinfo.family}")
 
 

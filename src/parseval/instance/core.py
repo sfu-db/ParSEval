@@ -18,7 +18,7 @@ from sqlglot.schema import (
 
 from parseval.domain import DatabaseBuilder
 from parseval.domain.exceptions import ForeignKeyResolutionError, UniqueConflictError
-from parseval.helper import normalize_name
+# from parseval.helper import normalize_name
 from parseval.plan.rex import Row, Symbol, Variable
 from parseval.states import raise_exception
 
@@ -706,7 +706,7 @@ class Instance(Catalog):
             new_values = {}
             rowid = f"{table_name}_rowid_{tuple_index}"
             for column, datatype in self.tables[table_name].items():
-                z_name = normalize_name(f"{table_name}_{column}_{datatype}_{tuple_index}")
+                z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
                 concrete = completed.get(column)
                 z_value = Variable(
                     this=z_name,

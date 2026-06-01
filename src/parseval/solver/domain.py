@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
@@ -16,10 +17,30 @@ from .types import (
     ValueSpace,
     col_type,
     type_family,
+    parse_date,
+    parse_time,
+    parse_datetime,
+    infer_type_from_string,
 )
 
 _NEGATED_OPS = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
 _ARITHMETIC_NODES = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+
+
+def _col_table(col: exp.Column, tables: Tuple[str, ...]) -> str:
+    """Resolve a column's table qualifier to a target_tables key.
+
+    Every column in solver constraints must have its .table set by the caller.
+    If the column's table isn't in target_tables, falls back to the first
+    target table (covers single-table solves where the qualifier may differ).
+    """
+    if not col.table:
+        raise ValueError(f"Column {col.name} has no table qualifier — caller must set .table")
+    raw = normalize_name(col.table)
+    for t in tables:
+        if normalize_name(t) == raw:
+            return t
+    return tables[0] if tables else raw
 
 _OP_MAP = {
     exp.EQ: "=", exp.NEQ: "!=", exp.GT: ">",
@@ -30,35 +51,30 @@ _OP_MAP = {
 def _lower_negated_atom(
     inner: exp.Expression,
     tables: Tuple[str, ...],
-    alias_map: Dict[str, str],
 ) -> Optional[ColumnPredicate]:
     """Lower NOT(atom) by negating a directly supported predicate."""
-    # NOT(IS NULL) -> IS NOT NULL
     if isinstance(inner, exp.Is):
-        if isinstance(inner.this, exp.Column) and isinstance(inner.expression, exp.Null):
-            table = _resolve_table(inner.this, tables, alias_map)
-            return ColumnPredicate(table=table, column=inner.this.name, op="not_null", value=True)
-    # NOT(IS NOT NULL) -> IS NULL
-    if isinstance(inner, exp.Is):
-        right = inner.expression
-        if isinstance(inner.this, exp.Column) and isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
-            table = _resolve_table(inner.this, tables, alias_map)
-            return ColumnPredicate(table=table, column=inner.this.name, op="is_null", value=True)
+        if isinstance(inner.this, exp.Column):
+            # NOT(IS NULL) -> IS NOT NULL
+            if isinstance(inner.expression, exp.Null):
+                return ColumnPredicate(table=_col_table(inner.this, tables), column=inner.this.name, op="not_null", value=True)
+            # NOT(IS NOT NULL) -> IS NULL
+            right = inner.expression
+            if isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
+                return ColumnPredicate(table=_col_table(inner.this, tables), column=inner.this.name, op="is_null", value=True)
     # NOT(comparison) -> flip operator
     for cls, op in _OP_MAP.items():
         if isinstance(inner, cls):
             col, val = _extract_col_literal(inner)
             if col is not None and val is not None:
                 neg_op = _NEGATED_OPS.get(op, op)
-                table = _resolve_table(col, tables, alias_map)
-                return ColumnPredicate(table=table, column=col.name, op=neg_op, value=val)
+                return ColumnPredicate(table=_col_table(col, tables), column=col.name, op=neg_op, value=val)
     return None
 
 
 def _lower_atom(
     atom: exp.Expression,
     tables: Tuple[str, ...],
-    alias_map: Dict[str, str],
 ) -> Optional[ColumnPredicate]:
     col, val, op = None, None, None
     if isinstance(atom, exp.EQ):
@@ -105,8 +121,7 @@ def _lower_atom(
                 if v is not None:
                     values.append(v)
             if values:
-                table = _resolve_table(in_col, tables, alias_map)
-                return ColumnPredicate(table=table, column=in_col.name, op="in", value=values)
+                return ColumnPredicate(table=_col_table(in_col, tables), column=in_col.name, op="in", value=values)
     elif isinstance(atom, exp.Between):
         bw_col = atom.this
         low = atom.args.get("low")
@@ -115,21 +130,71 @@ def _lower_atom(
             low_val = _literal_value(low)
             high_val = _literal_value(high)
             if low_val is not None and high_val is not None:
-                table = _resolve_table(bw_col, tables, alias_map)
-                return ColumnPredicate(table=table, column=bw_col.name, op="between", value=(low_val, high_val))
+                return ColumnPredicate(table=_col_table(bw_col, tables), column=bw_col.name, op="between", value=(low_val, high_val))
 
     if col is not None and val is not None and op is not None:
-        table = _resolve_table(col, tables, alias_map)
-        return ColumnPredicate(table=table, column=col.name, op=op, value=val)
+        return ColumnPredicate(table=_col_table(col, tables), column=col.name, op=op, value=val)
     return None
+
+
+def _coerce_value(value: Any, col: exp.Column) -> Any:
+    """Coerce a literal value based on the column's annotated type."""
+    dtype = col_type(col)
+    if dtype is None or value is None:
+        return value
+    family = type_family(dtype)
+    if family == TypeFamily.INTEGER:
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return value
+    elif family == TypeFamily.DECIMAL:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return value
+    elif family == TypeFamily.BOOLEAN:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            if value.lower() in ("1", "true", "t", "yes", "y"):
+                return True
+            if value.lower() in ("0", "false", "f", "no", "n"):
+                return False
+    elif family == TypeFamily.DATE:
+        parsed = parse_date(value)
+        if parsed is not None:
+            return parsed
+    elif family == TypeFamily.DATETIME:
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return parsed
+    elif family == TypeFamily.TIME:
+        parsed = parse_time(value)
+        if parsed is not None:
+            return parsed
+    return value
 
 
 def _extract_col_literal(node: exp.Expression):
     left, right = node.this, node.expression
-    if isinstance(left, exp.Column) and isinstance(right, (exp.Literal, exp.Boolean)):
-        return left, _literal_value(right)
-    if isinstance(right, exp.Column) and isinstance(left, (exp.Literal, exp.Boolean)):
-        return right, _literal_value(left)
+    if isinstance(left, exp.Column):
+        val = _literal_value(right)
+        if val is not None or isinstance(right, exp.Null):
+            return left, _coerce_value(val, left)
+    if isinstance(right, exp.Column):
+        val = _literal_value(left)
+        if val is not None or isinstance(left, exp.Null):
+            return right, _coerce_value(val, right)
     return None, None
 
 
@@ -142,6 +207,11 @@ def _extract_col_col(node: exp.Expression):
 
 
 def _literal_value(node: exp.Expression):
+    """Extract a Python value from a literal-like expression node.
+
+    Handles Literal, Boolean, Null, Neg (negative numbers), and Cast.
+    Returns None for expressions that can't be reduced to a value.
+    """
     if isinstance(node, exp.Literal):
         if node.is_int:
             return int(node.this)
@@ -150,31 +220,17 @@ def _literal_value(node: exp.Expression):
         return str(node.this)
     if isinstance(node, exp.Boolean):
         return bool(node.this)
+    if isinstance(node, exp.Null):
+        return None
+    if isinstance(node, exp.Neg):
+        inner = _literal_value(node.this)
+        if isinstance(inner, (int, float)):
+            return -inner
+        return None
+    if isinstance(node, exp.Cast):
+        return _literal_value(node.this)
     return None
 
-
-def _resolve_table(col: exp.Column, tables: Tuple[str, ...], alias_map: Dict[str, str]) -> str:
-    """Resolve a column's table qualifier to a key in target_tables.
-
-    Returns the alias (from target_tables) that matches, so variables
-    stay in alias-namespace.  Falls back to the first table if no match.
-    """
-    if col.table:
-        raw = normalize_name(col.table)
-        # Direct match against target_tables (covers alias case).
-        for t in tables:
-            if normalize_name(t) == raw:
-                return t
-        # alias_map resolved to physical name — find which alias maps to it.
-        resolved = alias_map.get(raw, raw)
-        for t in tables:
-            t_norm = normalize_name(t)
-            if t_norm == resolved:
-                return t
-            # Check if t is an alias that maps to the same physical table.
-            if alias_map.get(t_norm, t_norm) == resolved:
-                return t
-    return tables[0] if tables else ""
 
 
 def _unsupported_reason(expr: exp.Expression) -> str:
@@ -198,8 +254,12 @@ def _predicate_family(pred: ColumnPredicate) -> TypeFamily:
 
 @dataclass
 class DomainResult:
+    """Result from the domain solver.
+
+    Assignments use ``"table.column"`` keys mapping to concrete Python values.
+    """
     status: str
-    assignments: Optional[Dict[str, Dict[str, Any]]] = None
+    assignments: Optional[Dict[str, Any]] = None
     reason: str = ""
 
 
@@ -218,6 +278,10 @@ class DomainSolver:
     def solve(self, constraint) -> DomainResult:
         """Solve constraints and return assignments per table.
 
+        Partitions expressions into connected components by variable.
+        Each component is solved independently — a single unsupported
+        expression no longer poisons the entire batch.
+
         Args:
             constraint: A :class:`SolverConstraint` with typed expressions.
         """
@@ -227,93 +291,171 @@ class DomainSolver:
         alias_map = constraint.alias_map or {}
 
         if not expressions and not join_equalities:
-            return DomainResult(status="sat", assignments={t: {} for t in target_tables})
+            return DomainResult(status="sat", assignments={})
 
-        analysis = LoweringOutcome(status="sat")
-        for expr in expressions:
-            analysis = self._merge_and(
-                analysis,
-                self._analyze_expression(expr, target_tables, alias_map),
-            )
-            if analysis.status == "unsat":
-                break
+        # Partition expressions into connected components by variable.
+        partitions = self._partition_by_variables(expressions, target_tables)
 
-        if analysis.status == "unknown":
-            return DomainResult(status="unknown", reason=analysis.reason or "unsupported_expression")
-        if analysis.status == "unsat":
-            return DomainResult(status="unsat", reason=analysis.reason or "contradictory_bounds")
+        all_variables: Dict[str, CSPVariable] = {}
+        all_constraints: List[CSPConstraint] = []
+        unknown_reasons: List[str] = []
 
-        # 1. Extract variables from expressions
-        variables = self._extract_variables(target_tables, expressions, alias_map)
+        for partition_exprs in partitions:
+            # Analyze this partition independently.
+            analysis = LoweringOutcome(status="sat")
+            for expr in partition_exprs:
+                analysis = self._merge_and(
+                    analysis,
+                    self._analyze_expression(expr, target_tables),
+                )
+                if analysis.status == "unsat":
+                    return DomainResult(status="unsat", reason=analysis.reason or "contradictory_bounds")
+            if analysis.status == "unknown":
+                unknown_reasons.append(analysis.reason or "unsupported_expression")
+                continue
 
-        # 2. Apply predicates to variables
-        self._apply_predicates(variables, analysis.predicates)
+            # Extract variables and apply predicates for this partition.
+            part_variables = self._extract_variables(target_tables, partition_exprs)
+            self._apply_predicates(part_variables, analysis.predicates)
 
-        # 3. Build equivalences from join equalities
-        constraints = self._build_equivalences(variables, join_equalities, alias_map)
+            # Add col-col equalities from this partition.
+            for left_key, right_key in analysis.equalities:
+                if left_key in part_variables and right_key in part_variables:
+                    all_constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
 
-        # 3b. Add supported col-col equalities from expressions
-        for left_key, right_key in analysis.equalities:
-            if left_key in variables and right_key in variables:
-                constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
+            all_variables.update(part_variables)
 
-        # 4. Propagate
-        if not self._propagate(variables, constraints):
+        # If any partition was unknown, let the caller escalate to SMT.
+        if unknown_reasons:
+            return DomainResult(status="unknown", reason=unknown_reasons[0])
+
+        # Build equivalences from join equalities.
+        join_constraints = self._build_equivalences(all_variables, join_equalities, alias_map)
+        all_constraints.extend(join_constraints)
+
+        # Propagate across all variables and constraints.
+        if not self._propagate(all_variables, all_constraints):
             return DomainResult(status="unsat", reason="contradictory_bounds")
 
-        # 5. Assign
         return DomainResult(
             status="sat",
-            assignments=self._assign(variables, target_tables),
+            assignments=self._assign(all_variables, target_tables),
         )
+
+    def _partition_by_variables(
+        self,
+        expressions: List[exp.Expression],
+        tables: Tuple[str, ...],
+    ) -> List[List[exp.Expression]]:
+        """Partition expressions into connected components by variable.
+
+        Two expressions are in the same component if they share a variable
+        (directly or transitively via column-column equalities).  Each
+        component can be solved independently by the domain solver.
+        """
+        # Assign each expression an index.
+        n = len(expressions)
+        if n <= 1:
+            return [expressions] if expressions else []
+
+        # Union-Find over expression indices.
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Map variable key → first expression index that uses it.
+        var_to_expr: Dict[str, int] = {}
+        for idx, expr in enumerate(expressions):
+            for col in expr.find_all(exp.Column):
+                key = f"{_col_table(col, tables)}.{col.name}"
+                first = var_to_expr.get(key)
+                if first is not None:
+                    union(first, idx)
+                else:
+                    var_to_expr[key] = idx
+
+        # Column-column equalities connect two variables (and their expressions).
+        for idx, expr in enumerate(expressions):
+            if isinstance(expr, exp.EQ):
+                left_col, right_col = _extract_col_col(expr)
+                if left_col and right_col:
+                    left_key = f"{_col_table(left_col, tables)}.{left_col.name}"
+                    right_key = f"{_col_table(right_col, tables)}.{right_col.name}"
+                    left_idx = var_to_expr.get(left_key)
+                    right_idx = var_to_expr.get(right_key)
+                    if left_idx is not None and right_idx is not None:
+                        union(left_idx, right_idx)
+
+        # Group expressions by component.
+        groups: Dict[int, List[int]] = {}
+        for idx in range(n):
+            root = find(idx)
+            groups.setdefault(root, []).append(idx)
+
+        return [[expressions[i] for i in group] for group in groups.values()]
 
     def _analyze_expression(
         self,
         expr: exp.Expression,
         tables: Tuple[str, ...],
-        alias_map: Dict[str, str],
     ) -> LoweringOutcome:
         if isinstance(expr, exp.And):
             return self._merge_and(
-                self._analyze_expression(expr.left, tables, alias_map),
-                self._analyze_expression(expr.right, tables, alias_map),
+                self._analyze_expression(expr.left, tables),
+                self._analyze_expression(expr.right, tables),
             )
         if isinstance(expr, exp.Paren):
-            return self._analyze_expression(expr.this, tables, alias_map)
+            return self._analyze_expression(expr.this, tables)
         if isinstance(expr, exp.Or):
             return self._merge_or(
-                self._analyze_expression(expr.left, tables, alias_map),
-                self._analyze_expression(expr.right, tables, alias_map),
+                self._analyze_expression(expr.left, tables),
+                self._analyze_expression(expr.right, tables),
             )
         if isinstance(expr, exp.Not):
             if isinstance(expr.this, exp.Not):
-                return self._analyze_expression(expr.this.this, tables, alias_map)
-            pred = _lower_negated_atom(expr.this, tables, alias_map)
+                return self._analyze_expression(expr.this.this, tables)
+            pred = _lower_negated_atom(expr.this, tables)
             if pred is None:
                 return LoweringOutcome(status="unknown", reason="unsupported_not")
             return self._classify_supported(LoweringOutcome(
                 status="sat",
                 predicates=[pred],
-                families=self._expression_families(expr, tables, alias_map),
+                families=self._expression_families(expr, tables),
             ))
         if isinstance(expr, exp.EQ):
             left_col, right_col = _extract_col_col(expr)
             if left_col and right_col:
-                left_table = _resolve_table(left_col, tables, alias_map)
-                right_table = _resolve_table(right_col, tables, alias_map)
                 return self._classify_supported(LoweringOutcome(
                     status="sat",
-                    equalities=[(f"{left_table}.{left_col.name}", f"{right_table}.{right_col.name}")],
-                    families=self._expression_families(expr, tables, alias_map),
+                    equalities=[(f"{_col_table(left_col, tables)}.{left_col.name}", f"{_col_table(right_col, tables)}.{right_col.name}")],
+                    families=self._expression_families(expr, tables),
                 ))
+        if isinstance(expr, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            left_col, right_col = _extract_col_col(expr)
+            if left_col and right_col:
+                return LoweringOutcome(
+                    status="sat",
+                    predicates=[],
+                    equalities=[],
+                    families=self._expression_families(expr, tables),
+                )
 
-        pred = _lower_atom(expr, tables, alias_map)
+        pred = _lower_atom(expr, tables)
         if pred is None:
             return LoweringOutcome(status="unknown", reason=_unsupported_reason(expr))
         return self._classify_supported(LoweringOutcome(
             status="sat",
             predicates=[pred],
-            families=self._expression_families(expr, tables, alias_map),
+            families=self._expression_families(expr, tables),
         ))
 
     def _merge_and(self, left: LoweringOutcome, right: LoweringOutcome) -> LoweringOutcome:
@@ -340,7 +482,11 @@ class DomainSolver:
         if left.status == "unsat" and right.status == "unsat":
             return LoweringOutcome(status="unsat", reason=left.reason or right.reason)
         if left.status == "sat" and right.status == "sat":
-            return LoweringOutcome(status="unknown", reason="unsupported_or")
+            return left  # pick one branch — we only need one satisfying assignment
+        if left.status == "sat" and right.status == "unknown":
+            return left
+        if right.status == "sat" and left.status == "unknown":
+            return right
         if left.status == "unknown":
             return LoweringOutcome(status="unknown", reason=left.reason or right.reason or "unsupported_or")
         if right.status == "unknown":
@@ -385,11 +531,10 @@ class DomainSolver:
         self,
         expr: exp.Expression,
         tables: Tuple[str, ...],
-        alias_map: Dict[str, str],
     ) -> Dict[str, TypeFamily]:
         families: Dict[str, TypeFamily] = {}
         for col in expr.find_all(exp.Column):
-            table = _resolve_table(col, tables, alias_map)
+            table = _col_table(col, tables)
             name = f"{table}.{col.name}"
             dtype = col_type(col)
             families[name] = type_family(dtype) if dtype else TypeFamily.TEXT
@@ -399,12 +544,11 @@ class DomainSolver:
         self,
         tables: Tuple[str, ...],
         expressions: List[exp.Expression],
-        alias_map: Dict[str, str],
     ) -> Dict[str, CSPVariable]:
         variables: Dict[str, CSPVariable] = {}
         for expr in expressions:
             for col in expr.find_all(exp.Column):
-                table = _resolve_table(col, tables, alias_map)
+                table = _col_table(col, tables)
                 name = f"{table}.{col.name}"
                 if name not in variables:
                     dtype = col_type(col)
@@ -429,17 +573,55 @@ class DomainSolver:
                 )
             space = variables[name].space
             op, val = pred.op, pred.value
+            # Infer real type for string values on TEXT columns.
+            # A TEXT column storing '596' should compare numerically.
+            if isinstance(val, str) and space.family == TypeFamily.TEXT:
+                inferred = infer_type_from_string(val)
+                if not isinstance(inferred, str):
+                    val = inferred
+                    if isinstance(val, int):
+                        space.family = TypeFamily.INTEGER
+                    elif isinstance(val, float):
+                        space.family = TypeFamily.DECIMAL
+                    elif isinstance(val, datetime):
+                        space.family = TypeFamily.DATETIME
+                    elif isinstance(val, date):
+                        space.family = TypeFamily.DATE
+                    elif isinstance(val, dt_time):
+                        space.family = TypeFamily.TIME
             if op == "=":
                 if space.equals is not None and space.equals != val:
                     space.narrow_neq(val)
                 space.narrow_eq(val)
-            elif op == ">" and isinstance(val, (int, float)):
-                space.narrow_min(val + 1 if isinstance(val, int) else val + 0.01)
-            elif op == ">=" and isinstance(val, (int, float)):
+            elif op == ">":
+                if isinstance(val, int):
+                    space.narrow_min(val + 1)
+                elif isinstance(val, float):
+                    space.narrow_min(val + 0.01)
+                elif isinstance(val, date) and not isinstance(val, datetime):
+                    space.narrow_min(val + timedelta(days=1))
+                elif isinstance(val, datetime):
+                    space.narrow_min(val + timedelta(seconds=1))
+                elif isinstance(val, dt_time):
+                    space.narrow_min(val)
+                else:
+                    space.narrow_min(val)
+            elif op == ">=":
                 space.narrow_min(val)
-            elif op == "<" and isinstance(val, (int, float)):
-                space.narrow_max(val - 1 if isinstance(val, int) else val - 0.01)
-            elif op == "<=" and isinstance(val, (int, float)):
+            elif op == "<":
+                if isinstance(val, int):
+                    space.narrow_max(val - 1)
+                elif isinstance(val, float):
+                    space.narrow_max(val - 0.01)
+                elif isinstance(val, date) and not isinstance(val, datetime):
+                    space.narrow_max(val - timedelta(days=1))
+                elif isinstance(val, datetime):
+                    space.narrow_max(val - timedelta(seconds=1))
+                elif isinstance(val, dt_time):
+                    space.narrow_max(val)
+                else:
+                    space.narrow_max(val)
+            elif op == "<=":
                 space.narrow_max(val)
             elif op == "!=":
                 space.narrow_neq(val)
@@ -468,12 +650,20 @@ class DomainSolver:
             rt_key = self._resolve_alias(rt, variables, alias_map)
             left_key = f"{lt_key}.{lc}"
             right_key = f"{rt_key}.{rc}"
-            # Create variables for join columns not yet in scope
+            # Create variables for join columns not yet in scope.
+            # Inherit type family from the existing side so pick() uses
+            # the correct strategy (numeric vs text vs temporal).
+            existing_family = None
+            for key in (left_key, right_key):
+                if key in variables:
+                    existing_family = variables[key].space.family
+                    break
             for key, table, column in [(left_key, lt_key, lc), (right_key, rt_key, rc)]:
                 if key not in variables:
+                    space = ValueSpace(family=existing_family) if existing_family else ValueSpace()
                     variables[key] = CSPVariable(
                         name=key, table=table, column=column,
-                        space=ValueSpace(),
+                        space=space,
                     )
             constraints.append(CSPConstraint(kind="eq", left=left_key, right=right_key))
         return constraints
@@ -560,13 +750,21 @@ class DomainSolver:
             for var in variables.values():
                 if var.space.is_empty():
                     return False
-        # Finalize: pick values for eq-constrained pairs that still lack equals
+        # Finalize: pick values for eq-constrained pairs that still lack equals.
+        # Pick from the more constrained side; fall back to the other if pick fails.
         for c in constraints:
             if c.kind == "eq":
                 left = variables.get(c.left)
                 right = variables.get(c.right)
                 if left and right and left.space.equals is None and right.space.equals is None:
-                    val = left.space.pick()
+                    left_has_bounds = left.space.min_val is not None or left.space.max_val is not None
+                    right_has_bounds = right.space.min_val is not None or right.space.max_val is not None
+                    if right_has_bounds and not left_has_bounds:
+                        val = right.space.pick() or left.space.pick()
+                    elif left_has_bounds and not right_has_bounds:
+                        val = left.space.pick() or right.space.pick()
+                    else:
+                        val = left.space.pick() or right.space.pick()
                     if val is not None:
                         left.space.narrow_eq(val)
                         right.space.narrow_eq(val)
@@ -576,14 +774,10 @@ class DomainSolver:
         self,
         variables: Dict[str, CSPVariable],
         target_tables: Tuple[str, ...],
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
-        result: Dict[str, Dict[str, Any]] = {}
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
         for var in variables.values():
             val = var.space.pick()
             var.assigned = val
-            result.setdefault(var.table, {})[var.column] = val
-        if not result:
-            # No variables to assign -- return empty per-table structure
-            for t in target_tables:
-                result[t] = {}
+            result[f"{var.table}.{var.column}"] = val
         return result
