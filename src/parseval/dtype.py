@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Optional, Union
 from sqlglot.expressions import DataType as sqlglot_datatype
 
@@ -75,6 +76,178 @@ class TypeFamily(str, Enum):
     JSON = "json"
     BINARY = "binary"
     UNKNOWN = "unknown"
+
+
+def type_family(dtype: DataType) -> TypeFamily:
+    """Map a SQL DataType to a neutral ParSEval type family."""
+    dtype = DataType.build(dtype)
+    if dtype.is_type(DataType.Type.UUID):
+        return TypeFamily.UUID
+    if dtype.is_type(DataType.Type.JSON):
+        return TypeFamily.JSON
+    if dtype.is_type(DataType.Type.BINARY, DataType.Type.VARBINARY):
+        return TypeFamily.BINARY
+    if dtype.is_type(*DataType.INTEGER_TYPES):
+        return TypeFamily.INTEGER
+    if dtype.is_type(*DataType.REAL_TYPES):
+        return TypeFamily.DECIMAL
+    if dtype.is_type(DataType.Type.BOOLEAN):
+        return TypeFamily.BOOLEAN
+    if dtype.is_type(
+        DataType.Type.DATETIME,
+        DataType.Type.DATETIME64,
+        DataType.Type.TIMESTAMP,
+        DataType.Type.TIMESTAMPLTZ,
+        DataType.Type.TIMESTAMPTZ,
+        DataType.Type.TIMESTAMP_MS,
+        DataType.Type.TIMESTAMP_NS,
+        DataType.Type.TIMESTAMP_S,
+    ):
+        return TypeFamily.DATETIME
+    if dtype.is_type(DataType.Type.DATE, DataType.Type.DATE32):
+        return TypeFamily.DATE
+    if dtype.is_type(DataType.Type.TIME, DataType.Type.TIMETZ):
+        return TypeFamily.TIME
+    if dtype.is_type(*DataType.TEXT_TYPES):
+        return TypeFamily.TEXT
+    if dtype.is_type(DataType.Type.UNKNOWN):
+        return TypeFamily.UNKNOWN
+    return TypeFamily.TEXT
+
+
+def parse_date(value: Any) -> Optional[date]:
+    """Parse a value into a date, or None if unparseable."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            if "T" in value or " " in value:
+                return datetime.fromisoformat(value.replace(" ", "T")).date()
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_time(value: Any) -> Optional[dt_time]:
+    """Parse a value into a time, or None if unparseable."""
+    if isinstance(value, datetime):
+        return value.time().replace(microsecond=0)
+    if isinstance(value, dt_time):
+        return value.replace(microsecond=0)
+    if isinstance(value, str):
+        try:
+            if "T" in value or " " in value:
+                return datetime.fromisoformat(value.replace(" ", "T")).time().replace(
+                    microsecond=0
+                )
+            return dt_time.fromisoformat(value[:8])
+        except ValueError:
+            return None
+    return None
+
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    """Parse a value into a datetime, or None if unparseable."""
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        for candidate in (value.replace(" ", "T"), value):
+            try:
+                return datetime.fromisoformat(candidate).replace(microsecond=0)
+            except ValueError:
+                continue
+    return None
+
+
+def date_to_epoch_day(value: Any) -> int:
+    """Convert a date/datetime/string to days since Unix epoch."""
+    parsed = parse_date(value)
+    if parsed is None:
+        raise ValueError(f"Cannot parse as date: {value!r}")
+    return (parsed - date(1970, 1, 1)).days
+
+
+def time_to_seconds(value: Any) -> int:
+    """Convert a time/datetime/string to seconds since midnight."""
+    parsed = parse_time(value)
+    if parsed is None:
+        raise ValueError(f"Cannot parse as time: {value!r}")
+    return parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+
+
+def datetime_to_epoch_second(value: Any) -> int:
+    """Convert a datetime/date/string to Unix epoch seconds."""
+    parsed = parse_datetime(value)
+    if parsed is None:
+        raise ValueError(f"Cannot parse as datetime: {value!r}")
+    return int((parsed - datetime(1970, 1, 1)).total_seconds())
+
+
+def epoch_day_to_date(days: int) -> date:
+    """Convert days since Unix epoch to a date."""
+    return date(1970, 1, 1) + timedelta(days=days)
+
+
+def seconds_to_time(seconds: int) -> dt_time:
+    """Convert seconds since midnight to a time."""
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return dt_time(h, m, s)
+
+
+def epoch_second_to_datetime(value: int) -> datetime:
+    """Convert Unix epoch seconds to a timezone-naive datetime."""
+    return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+
+
+def infer_type_from_value(value: Any) -> DataType:
+    """Infer a SQL DataType from a Python value's runtime type."""
+    if value is None:
+        return DataType.build("NULL")
+    if isinstance(value, bool):
+        return DataType.build("BOOLEAN")
+    if isinstance(value, int):
+        return DataType.build("INT")
+    if isinstance(value, float):
+        return DataType.build("FLOAT")
+    if isinstance(value, str):
+        return DataType.build("TEXT", length=len(value))
+    if isinstance(value, dt_time):
+        return DataType.build("TIME")
+    if isinstance(value, datetime):
+        return DataType.build("DATETIME")
+    if isinstance(value, date):
+        return DataType.build("DATE")
+    return DataType.build("TEXT")
+
+
+def infer_type_from_string(value: str) -> Any:
+    """Try to parse a string as a typed Python value."""
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    has_time = ":" in value or (" " in value and len(value) > 10)
+    if not has_time:
+        parsed = parse_date(value)
+        if parsed is not None and not isinstance(parsed, datetime):
+            return parsed
+    parsed = parse_datetime(value)
+    if parsed is not None:
+        return parsed
+    parsed = parse_time(value)
+    if parsed is not None:
+        return parsed
+    return value
 
 # # dd = exp.DataType.build("INT", dialect= 'sqlite', precision=10)
 
