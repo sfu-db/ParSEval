@@ -15,21 +15,25 @@ Public API::
 from __future__ import annotations
 
 import logging
-import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
+from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.helper import normalize_name
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
+from parseval.plan.helper import to_literal
 from parseval.plan.planner import (
     Aggregate, Filter, Having, Join, Limit, Project, Scan, SetOperation, Sort, SubPlan,
 )
 from parseval.plan.rex import column_meta, concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint
+
+from .evaluator import PlanEvaluator
+from .types import BranchTree, BranchType
 
 logger = logging.getLogger("parseval.speculate")
 
@@ -57,6 +61,14 @@ def _match_column(instance, table: str, col_name: str) -> Optional[str]:
         return None
     lower = col_name.lower()
     return next((s for s in instance.tables[table] if s.lower() == lower), None)
+
+
+def _resolve_table(instance, alias_map, name: str) -> str:
+    """Resolve alias or table name to physical table name."""
+    if not name:
+        return ""
+    real = alias_map.resolve(name)
+    return real if real in instance.tables else name
 
 
 # =============================================================================
@@ -156,6 +168,34 @@ def _rewrite_expr_for_row_scope(
     return rewritten
 
 
+def _strftime_year_column(expr: exp.Expression) -> Optional[exp.Column]:
+    if not isinstance(expr, exp.TimeToStr):
+        return None
+    fmt = concrete(expr.args.get("format"))
+    if fmt != "%Y":
+        return None
+    return expr.find(exp.Column)
+
+
+def _year_literal(expr: exp.Expression) -> Optional[int]:
+    value = concrete(expr)
+    text = str(value) if value is not None else ""
+    if len(text) == 4 and text.isdigit():
+        return int(text)
+    return None
+
+
+def _is_strftime_year_predicate(expr: exp.Expression) -> bool:
+    if isinstance(expr, exp.Between):
+        return _strftime_year_column(expr.this) is not None
+    if isinstance(expr, _COMPARISON_NODES):
+        return (
+            _strftime_year_column(expr.this) is not None
+            or _strftime_year_column(expr.expression) is not None
+        )
+    return False
+
+
 @dataclass
 class TableConstraint:
     """Constraints on what one table needs for a specific branch."""
@@ -165,7 +205,7 @@ class TableConstraint:
     min_rows: int = 1
     duplicate_columns: List[str] = field(default_factory=list)
     group_key_columns: List[str] = field(default_factory=list)
-    # Backward-compat fields (kept so Resolver still works until Task 2)
+    # Legacy row-shaping fields still consumed by Resolver.
     fixed_values: Dict[str, Any] = field(default_factory=dict)
     not_null: Set[str] = field(default_factory=set)
     must_null: Set[str] = field(default_factory=set)
@@ -233,10 +273,6 @@ class BranchSpec:
         self.equivalences.union(col_a, col_b)
 
 
-# Backward-compat alias
-TableRequirement = TableConstraint
-
-
 # =============================================================================
 # Propagator: top-down constraint derivation
 # =============================================================================
@@ -258,16 +294,6 @@ class Propagator:
         self.alias_map = alias_map
         self.dialect = dialect
         self.objective = objective
-
-    def _resolve_table(self, name: str) -> str:
-        """Resolve alias or table name to physical table name."""
-        if not name:
-            return ""
-        real = self.alias_map.resolve(name)
-        return real if real in self.instance.tables else name
-
-    def _match_column(self, table: str, col_name: str) -> Optional[str]:
-        return _match_column(self.instance, table, col_name)
 
     def _is_self_join_table(self, table: str) -> bool:
         """Check if a table is involved in a self-join."""
@@ -393,7 +419,10 @@ class Propagator:
         if isinstance(step, Limit):
             offset = getattr(step, "offset", 0) or 0
             limit_val = step.limit if step.limit != float("inf") else 1
-            needed = offset + int(limit_val)
+            if self.objective == "gold_non_empty":
+                needed = offset + 1 if int(limit_val) > 0 else 0
+            else:
+                needed = offset + int(limit_val)
             for dep in step.chain_dependencies:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
             # Apply min_rows to the driving table only.
@@ -415,13 +444,13 @@ class Propagator:
             # Add IS NOT NULL for projected columns as expression constraints.
             for table, tc in spec.requirements.items():
                 for col in projected:
-                    matched = self._match_column(table, col)
+                    matched = _match_column(self.instance, table, col)
                     if matched:
                         col_node = exp.column(matched, table)
                         is_not_null = exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
                         if not self._has_is_not_null(tc.constraints, matched):
                             tc.constraints.append(is_not_null)
-                dup_cols = [c for c in projected if self._match_column(table, c)]
+                dup_cols = [c for c in projected if _match_column(self.instance, table, c)]
                 if dup_cols:
                     tc.duplicate_columns = dup_cols
                     tc.min_rows = max(tc.min_rows, 2)
@@ -471,8 +500,8 @@ class Propagator:
             if step.group:
                 for group_expr in step.group.values():
                     for col in group_expr.find_all(exp.Column):
-                        table = self._resolve_table(col.table or "")
-                        matched = self._match_column(table, col.name)
+                        table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                        matched = _match_column(self.instance, table, col.name)
                         if matched:
                             req = spec.require(table)
                             spec.equivalences.find(f"{table}.{matched}")
@@ -490,8 +519,8 @@ class Propagator:
                         if count_node.args.get("distinct"):
                             continue
                         for col in count_node.find_all(exp.Column):
-                            table = self._resolve_table(col.table or "")
-                            matched = self._match_column(table, col.name)
+                            table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                            matched = _match_column(self.instance, table, col.name)
                             if matched and table in self.instance.tables:
                                 req = spec.require(table)
                                 if (
@@ -537,14 +566,14 @@ class Propagator:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
             # Link join keys via equivalence (Union-Find) and store as expressions.
             for join_name, join_data in (step.joins or {}).items():
-                join_table = self._resolve_table(join_name)
+                join_table = _resolve_table(self.instance, self.alias_map, join_name)
                 source_keys = join_data.get("source_key", [])
                 join_keys = join_data.get("join_key", [])
                 for sk, jk in zip(source_keys, join_keys):
                     sk_table_name = sk.table if hasattr(sk, "table") and sk.table else (step.source_name or step.name)
-                    sk_table = self._resolve_table(sk_table_name)
-                    sk_col = self._match_column(sk_table, sk.name if hasattr(sk, "name") else str(sk))
-                    jk_col = self._match_column(join_table, jk.name if hasattr(jk, "name") else str(jk))
+                    sk_table = _resolve_table(self.instance, self.alias_map, sk_table_name)
+                    sk_col = _match_column(self.instance, sk_table, sk.name if hasattr(sk, "name") else str(sk))
+                    jk_col = _match_column(self.instance, join_table, jk.name if hasattr(jk, "name") else str(jk))
                     if sk_col and jk_col:
                         sk_alias = normalize_name(sk.table or sk_table_name or "")
                         jk_alias = normalize_name(jk.table or join_name or "")
@@ -588,7 +617,7 @@ class Propagator:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
 
         elif isinstance(step, Scan):
-            table = self._resolve_table(step.name)
+            table = _resolve_table(self.instance, self.alias_map, step.name)
             if table in self.instance.tables:
                 spec.require(table)
             # For FROM-subquery scans, propagate into the SubPlan's inner plan.
@@ -622,7 +651,7 @@ class Propagator:
             if table:
                 tc = spec.require(table)
                 tc.constraints.append(resolved)
-        # Extract temporal/age constraints for backward compat.
+        # Extract temporal/age constraints for Resolver row shaping.
         self._extract_temporal_age_constraints(expr, spec)
 
     def _split_conjuncts(self, expr: exp.Expression) -> List[exp.Expression]:
@@ -643,12 +672,12 @@ class Propagator:
         if isinstance(expr, exp.EQ):
             left = expr.this
             if isinstance(left, exp.Column):
-                table = self._resolve_table(left.table or "")
+                table = _resolve_table(self.instance, self.alias_map, left.table or "")
                 if table and table in self.instance.tables:
                     return table
         # Default: first column's table
         for col in expr.find_all(exp.Column):
-            table = self._resolve_table(col.table or "")
+            table = _resolve_table(self.instance, self.alias_map, col.table or "")
             if table and table in self.instance.tables:
                 return table
         return None
@@ -661,7 +690,7 @@ class Propagator:
         """
         for col in expr.find_all(exp.Column):
             if col.table:
-                resolved = self._resolve_table(col.table)
+                resolved = _resolve_table(self.instance, self.alias_map, col.table)
                 if not resolved or resolved not in self.instance.tables:
                     continue
                 # For self-join tables, use the alias-specific key.
@@ -773,8 +802,8 @@ class Propagator:
                     if isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
                         if isinstance(constraint.this, exp.Column):
                             col = constraint.this
-                            table = self._resolve_table(col.table or table_key)
-                            matched = self._match_column(table, col.name)
+                            table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
+                            matched = _match_column(self.instance, table, col.name)
                             if matched:
                                 targets.setdefault(table, set()).add(matched)
 
@@ -784,8 +813,8 @@ class Propagator:
                 for proj in step.projections:
                     if isinstance(proj, exp.Expression):
                         for col in proj.find_all(exp.Column):
-                            table = self._resolve_table(col.table or "")
-                            matched = self._match_column(table, col.name)
+                            table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                            matched = _match_column(self.instance, table, col.name)
                             if matched and table in self.instance.tables:
                                 targets.setdefault(table, set()).add(matched)
 
@@ -793,8 +822,8 @@ class Propagator:
             if isinstance(step, Aggregate):
                 for agg_expr in step.aggregations:
                     for col in agg_expr.find_all(exp.Column):
-                        table = self._resolve_table(col.table or "")
-                        matched = self._match_column(table, col.name)
+                        table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                        matched = _match_column(self.instance, table, col.name)
                         if matched and table in self.instance.tables:
                             targets.setdefault(table, set()).add(matched)
 
@@ -835,8 +864,8 @@ class Propagator:
                     if isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
                         if isinstance(constraint.this, exp.Column):
                             col = constraint.this
-                            col_table = self._resolve_table(col.table or table_key)
-                            matched = self._match_column(col_table, col.name)
+                            col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
+                            matched = _match_column(self.instance, col_table, col.name)
                             if matched and matched in targets.get(table, set()):
                                 remove = True
                 # Form 2: NOT(col IS NULL)  →  exp.Not(exp.Is(this=col, expression=exp.Null()))
@@ -845,8 +874,8 @@ class Propagator:
                     if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
                         if isinstance(inner.this, exp.Column):
                             col = inner.this
-                            col_table = self._resolve_table(col.table or table_key)
-                            matched = self._match_column(col_table, col.name)
+                            col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
+                            matched = _match_column(self.instance, col_table, col.name)
                             if matched and matched in targets.get(table, set()):
                                 remove = True
                 if not remove:
@@ -876,8 +905,8 @@ class Propagator:
                     if isinstance(right, exp.Not) and isinstance(right.this, exp.Null):
                         if isinstance(constraint.this, exp.Column):
                             col = constraint.this
-                            col_table = self._resolve_table(col.table or table_key)
-                            matched = self._match_column(col_table, col.name)
+                            col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
+                            matched = _match_column(self.instance, col_table, col.name)
                             if matched and matched == target_col:
                                 remove = True
                 if not remove and isinstance(constraint, exp.Not):
@@ -885,8 +914,8 @@ class Propagator:
                     if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
                         if isinstance(inner.this, exp.Column):
                             col = inner.this
-                            col_table = self._resolve_table(col.table or table_key)
-                            matched = self._match_column(col_table, col.name)
+                            col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
+                            matched = _match_column(self.instance, col_table, col.name)
                             if matched and matched == target_col:
                                 remove = True
                 if not remove:
@@ -927,8 +956,8 @@ class Propagator:
             if col_node and lit_node:
                 val = concrete(lit_node)
                 if val is not None:
-                    table = self._resolve_table(col_node.table or "")
-                    matched = self._match_column(table, col_node.name)
+                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
+                    matched = _match_column(self.instance, table, col_node.name)
                     if matched and table in self.instance.tables:
                         tc = spec.require(table)
                         tc.fixed_values[matched] = val
@@ -941,8 +970,8 @@ class Propagator:
                 pattern = str(right.this)
                 prefix = pattern.split('%')[0].split('_')[0]
                 if prefix:
-                    table = self._resolve_table(left.table or "")
-                    matched = self._match_column(table, left.name)
+                    table = _resolve_table(self.instance, self.alias_map, left.table or "")
+                    matched = _match_column(self.instance, table, left.name)
                     if matched and table in self.instance.tables:
                         tc = spec.require(table)
                         tc.fixed_values[matched] = prefix
@@ -958,8 +987,8 @@ class Propagator:
             if col_node and lit_node:
                 threshold = concrete(lit_node)
                 if threshold is not None and not isinstance(threshold, str):
-                    table = self._resolve_table(col_node.table or "")
-                    matched = self._match_column(table, col_node.name)
+                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
+                    matched = _match_column(self.instance, table, col_node.name)
                     if matched and table in self.instance.tables:
                         tc = spec.require(table)
                         op_type = type(conjunct)
@@ -983,8 +1012,8 @@ class Propagator:
                 first_val_node = conjunct.expressions[0]
                 val = concrete(first_val_node)
                 if val is not None:
-                    table = self._resolve_table(col_node.table or "")
-                    matched = self._match_column(table, col_node.name)
+                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
+                    matched = _match_column(self.instance, table, col_node.name)
                     if matched and table in self.instance.tables:
                         tc = spec.require(table)
                         tc.fixed_values[matched] = val
@@ -1028,8 +1057,8 @@ class Propagator:
         if isinstance(threshold, str):
             return
 
-        table = self._resolve_table(col_node.table or "")
-        matched = self._match_column(table, col_node.name)
+        table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
+        matched = _match_column(self.instance, table, col_node.name)
         if not matched or table not in self.instance.tables:
             return
 
@@ -1069,7 +1098,7 @@ class Propagator:
                     if meta and "domain" in meta:
                         col.type = meta["domain"]
                     else:
-                        col_table = self._resolve_table(col.table or table_key)
+                        col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
                         col_type_str = _lookup_col_type(self.instance, col_table, col.name)
                         if col_type_str:
                             try:
@@ -1086,7 +1115,7 @@ class Propagator:
                 if meta and "domain" in meta:
                     col.type = meta["domain"]
                 else:
-                    col_table = self._resolve_table(col.table or "")
+                    col_table = _resolve_table(self.instance, self.alias_map, col.table or "")
                     col_type_str = _lookup_col_type(self.instance, col_table, col.name)
                     if col_type_str:
                         try:
@@ -1109,8 +1138,8 @@ class Propagator:
             if count_node.args.get("distinct"):
                 continue
             for col in count_node.find_all(exp.Column):
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
+                table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                matched = _match_column(self.instance, table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
                     if not self._has_equality_constraint(req.constraints, matched):
@@ -1121,8 +1150,8 @@ class Propagator:
 
         for sum_node in agg_expr.find_all(exp.Sum):
             for col in sum_node.find_all(exp.Column):
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
+                table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                matched = _match_column(self.instance, table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
                     if not self._has_equality_constraint(req.constraints, matched):
@@ -1133,8 +1162,8 @@ class Propagator:
 
         for avg_node in agg_expr.find_all(exp.Avg):
             for col in avg_node.find_all(exp.Column):
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
+                table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                matched = _match_column(self.instance, table, col.name)
                 if matched and table in self.instance.tables:
                     req = spec.require(table)
                     if not self._has_equality_constraint(req.constraints, matched):
@@ -1147,8 +1176,8 @@ class Propagator:
         for agg_type in (exp.Min, exp.Max):
             for agg_node in agg_expr.find_all(agg_type):
                 for col in agg_node.find_all(exp.Column):
-                    table = self._resolve_table(col.table or "")
-                    matched = self._match_column(table, col.name)
+                    table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                    matched = _match_column(self.instance, table, col.name)
                     if matched and table in self.instance.tables:
                         req = spec.require(table)
                         if not self._has_equality_constraint(req.constraints, matched):
@@ -1163,15 +1192,15 @@ class Propagator:
 
     def _propagate_unmatched_left(self, join_step: Join, spec: BranchSpec):
         """Generate a left-table row with no matching right-table row."""
-        source = self._resolve_table(join_step.source_name or join_step.name)
+        source = _resolve_table(self.instance, self.alias_map, join_step.source_name or join_step.name)
         if source in self.instance.tables:
             req = spec.require(source)
             # Add NOT IN constraint on join key to ensure no match.
             for join_name, join_data in (join_step.joins or {}).items():
-                join_table = self._resolve_table(join_name)
+                join_table = _resolve_table(self.instance, self.alias_map, join_name)
                 source_keys = join_data.get("source_key", [])
                 for sk in source_keys:
-                    sk_col = self._match_column(source, sk.name if hasattr(sk, "name") else str(sk))
+                    sk_col = _match_column(self.instance, source, sk.name if hasattr(sk, "name") else str(sk))
                     if sk_col and join_table in self.instance.tables:
                         # Collect existing join key values from the right table.
                         existing_vals = []
@@ -1194,15 +1223,15 @@ class Propagator:
 
     def _propagate_unmatched_right(self, join_step: Join, join_name: str, spec: BranchSpec):
         """Generate a right-table row with no matching left-table row."""
-        join_table = self._resolve_table(join_name)
+        join_table = _resolve_table(self.instance, self.alias_map, join_name)
         if join_table in self.instance.tables:
             req = spec.require(join_table)
             # Add NOT IN constraint on join key to ensure no match.
-            source = self._resolve_table(join_step.source_name or join_step.name)
+            source = _resolve_table(self.instance, self.alias_map, join_step.source_name or join_step.name)
             join_data = (join_step.joins or {}).get(join_name, {})
             join_keys = join_data.get("join_key", [])
             for jk in join_keys:
-                jk_col = self._match_column(join_table, jk.name if hasattr(jk, "name") else str(jk))
+                jk_col = _match_column(self.instance, join_table, jk.name if hasattr(jk, "name") else str(jk))
                 if jk_col and source in self.instance.tables:
                     existing_vals = []
                     for row in self.instance.get_rows(source):
@@ -1235,8 +1264,8 @@ class Propagator:
         )
         if sub.kind.value == "exists" and sub.correlation and not negated_exists:
             for corr_col in sub.correlation:
-                outer_table = self._resolve_table(corr_col.table or "")
-                matched = self._match_column(outer_table, corr_col.name)
+                outer_table = _resolve_table(self.instance, self.alias_map, corr_col.table or "")
+                matched = _match_column(self.instance, outer_table, corr_col.name)
                 if matched:
                     spec.require(outer_table)
                     outer_key = f"{outer_table}.{matched}"
@@ -1288,8 +1317,8 @@ class Propagator:
         outer_col = anchor.this
         if not isinstance(outer_col, exp.Column):
             return
-        outer_table = self._resolve_table(outer_col.table or "")
-        outer_matched = self._match_column(outer_table, outer_col.name)
+        outer_table = _resolve_table(self.instance, self.alias_map, outer_col.table or "")
+        outer_matched = _match_column(self.instance, outer_table, outer_col.name)
         if not outer_matched:
             return
 
@@ -1314,7 +1343,7 @@ class Propagator:
                 continue
             visited.add(id(step))
             if isinstance(step, Scan) and step.source and isinstance(step.source, exp.Table):
-                table = self._resolve_table(step.source.name)
+                table = _resolve_table(self.instance, self.alias_map, step.source.name)
                 if table in self.instance.tables:
                     spec.require(table)
             stack.extend(step.chain_dependencies)
@@ -1322,8 +1351,8 @@ class Propagator:
         # Equate correlated columns between outer and inner.
         if sub.correlation:
             for corr_col in sub.correlation:
-                outer_table = self._resolve_table(corr_col.table or "")
-                outer_matched = self._match_column(outer_table, corr_col.name)
+                outer_table = _resolve_table(self.instance, self.alias_map, corr_col.table or "")
+                outer_matched = _match_column(self.instance, outer_table, corr_col.name)
                 if not outer_matched:
                     continue
                 inner_key = self._find_corr_inner_column(sub, corr_col.name)
@@ -1368,9 +1397,9 @@ class Propagator:
                 continue
             visited.add(id(step))
             if isinstance(step, Scan) and step.source and isinstance(step.source, exp.Table):
-                inner_table = self._resolve_table(step.source.name)
+                inner_table = _resolve_table(self.instance, self.alias_map, step.source.name)
                 if inner_table in self.instance.tables:
-                    matched = self._match_column(inner_table, proj_col_name)
+                    matched = _match_column(self.instance, inner_table, proj_col_name)
                     if matched:
                         spec.require(inner_table)
                         return f"{inner_table}.{matched}"
@@ -1384,9 +1413,9 @@ class Propagator:
             step = stack.pop()
             if isinstance(step, Filter) and step.condition:
                 for col in step.condition.find_all(exp.Column):
-                    inner_table = self._resolve_table(col.table or "")
+                    inner_table = _resolve_table(self.instance, self.alias_map, col.table or "")
                     if inner_table in self.instance.tables:
-                        matched = self._match_column(inner_table, col.name)
+                        matched = _match_column(self.instance, inner_table, col.name)
                         if matched:
                             spec.require(inner_table)
                             return f"{inner_table}.{matched}"
@@ -1405,15 +1434,15 @@ class Propagator:
             if isinstance(step, Filter) and step.condition:
                 for col in step.condition.find_all(exp.Column):
                     if col.name.lower() == col_name.lower():
-                        inner_table = self._resolve_table(col.table or "")
+                        inner_table = _resolve_table(self.instance, self.alias_map, col.table or "")
                         if inner_table in self.instance.tables:
-                            matched = self._match_column(inner_table, col.name)
+                            matched = _match_column(self.instance, inner_table, col.name)
                             if matched:
                                 return f"{inner_table}.{matched}"
             if isinstance(step, Scan) and step.source and isinstance(step.source, exp.Table):
-                table = self._resolve_table(step.source.name)
+                table = _resolve_table(self.instance, self.alias_map, step.source.name)
                 if table in self.instance.tables:
-                    matched = self._match_column(table, col_name)
+                    matched = _match_column(self.instance, table, col_name)
                     if matched:
                         return f"{table}.{matched}"
             stack.extend(step.chain_dependencies)
@@ -1430,10 +1459,10 @@ class Propagator:
                 continue
             left, right = eq_node.this, eq_node.expression
             if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                lt = self._resolve_table(left.table or "")
-                lc = self._match_column(lt, left.name)
-                rt = self._resolve_table(right.table or "")
-                rc = self._match_column(rt, right.name)
+                lt = _resolve_table(self.instance, self.alias_map, left.table or "")
+                lc = _match_column(self.instance, lt, left.name)
+                rt = _resolve_table(self.instance, self.alias_map, right.table or "")
+                rc = _match_column(self.instance, rt, right.name)
                 if lc and rc and lt and rt:
                     spec.require(lt)
                     spec.require(rt)
@@ -1472,7 +1501,7 @@ class Propagator:
                             if count_node.args.get("distinct"):
                                 continue
                             for col in count_node.find_all(exp.Column):
-                                table = self._resolve_table(col.table or "")
+                                table = _resolve_table(self.instance, self.alias_map, col.table or "")
                                 if table and table in self.instance.tables:
                                     return table
         # Fallback: check the HAVING condition directly.
@@ -1484,7 +1513,7 @@ class Propagator:
                 if isinstance(count_node.this, exp.Star):
                     continue
                 for col in count_node.find_all(exp.Column):
-                    table = self._resolve_table(col.table or "")
+                    table = _resolve_table(self.instance, self.alias_map, col.table or "")
                     if table and table in self.instance.tables:
                         return table
         return None
@@ -1656,10 +1685,10 @@ class Propagator:
         # Find column references to self-joined aliases
         for col in conjunct.find_all(exp.Column):
             alias = normalize_name(col.table or "")
-            table = self._resolve_table(alias)
+            table = _resolve_table(self.instance, self.alias_map, alias)
             if table not in self_join_tables:
                 continue
-            col_name = self._match_column(table, col.name)
+            col_name = _match_column(self.instance, table, col.name)
             if not col_name:
                 continue
             req_key = f"{table}__{alias}"
@@ -1672,7 +1701,7 @@ class Propagator:
                 if normalize_name(c.table or "") == alias:
                     c.set("table", exp.to_identifier(table))
             spec.requirements[req_key].constraints.append(resolved)
-            # Also set fixed_values for backward compat if it's a simple EQ with literal
+            # Also set fixed_values for simple EQ with literal.
             if isinstance(conjunct, exp.EQ):
                 left, right = conjunct.this, conjunct.expression
                 lit = right if isinstance(left, exp.Column) and left is col else (left if isinstance(right, exp.Column) else None)
@@ -1680,7 +1709,7 @@ class Propagator:
                     val = concrete(lit)
                     if val is not None:
                         spec.requirements[req_key].fixed_values[col_name] = val
-            # Handle LIKE for backward compat
+            # Handle LIKE as a fixed string prefix.
             elif isinstance(conjunct, exp.Like):
                 pat_node = conjunct.expression
                 if isinstance(pat_node, exp.Literal) and pat_node.is_string:
@@ -1743,8 +1772,8 @@ class Propagator:
                     per_row_value = math.ceil(threshold / max(min_rows, 1))
 
             if target_col and per_row_value is not None:
-                table = self._resolve_table(target_col.table or "")
-                matched = self._match_column(table, target_col.name)
+                table = _resolve_table(self.instance, self.alias_map, target_col.table or "")
+                matched = _match_column(self.instance, table, target_col.name)
                 if matched and table in spec.requirements:
                     spec.require(table).fixed_values[matched] = per_row_value
 
@@ -1755,6 +1784,7 @@ class Propagator:
     def _extract_temporal_age_constraints(self, condition: exp.Expression, spec: BranchSpec):
         """Handle year-difference patterns like STRFTIME('%Y','now') - STRFTIME('%Y', col) > N."""
         from datetime import date as _date
+        self._extract_strftime_year_constraints(condition, spec)
         for node in condition.find_all((exp.GT, exp.GTE)):
             threshold = concrete(node.expression)
             if not isinstance(threshold, (int, float)):
@@ -1771,8 +1801,8 @@ class Propagator:
             if not has_now:
                 continue
             for col in cols:
-                table = self._resolve_table(col.table or "")
-                matched = self._match_column(table, col.name)
+                table = _resolve_table(self.instance, self.alias_map, col.table or "")
+                matched = _match_column(self.instance, table, col.name)
                 if not matched or table not in self.instance.tables:
                     continue
                 col_type = str(self.instance.tables[table].get(matched, "")).upper()
@@ -1781,6 +1811,66 @@ class Propagator:
                     old_date = _date.today().replace(year=_date.today().year - years_ago)
                     spec.require(table).fixed_values[matched] = old_date.isoformat()
                     break
+
+    def _extract_strftime_year_constraints(self, condition: exp.Expression, spec: BranchSpec) -> None:
+        for node in condition.walk():
+            if isinstance(node, exp.Between):
+                col = _strftime_year_column(node.this)
+                low_year = _year_literal(node.args.get("low"))
+                if col is not None and low_year is not None:
+                    self._set_strftime_year_fixed_value(col, low_year, spec)
+                continue
+
+            if not isinstance(node, _COMPARISON_NODES):
+                continue
+
+            col = _strftime_year_column(node.this)
+            year = _year_literal(node.expression)
+            inverted = False
+            if col is None or year is None:
+                col = _strftime_year_column(node.expression)
+                year = _year_literal(node.this)
+                inverted = col is not None and year is not None
+            if col is None or year is None:
+                continue
+
+            op = type(node)
+            if inverted:
+                if op is exp.GT:
+                    op = exp.LT
+                elif op is exp.GTE:
+                    op = exp.LTE
+                elif op is exp.LT:
+                    op = exp.GT
+                elif op is exp.LTE:
+                    op = exp.GTE
+
+            if op is exp.GT:
+                year += 1
+            elif op is exp.LT:
+                year -= 1
+            self._set_strftime_year_fixed_value(col, year, spec)
+
+    def _set_strftime_year_fixed_value(
+        self,
+        col: exp.Column,
+        year: int,
+        spec: BranchSpec,
+    ) -> None:
+        table = _resolve_table(self.instance, self.alias_map, col.table or "")
+        matched = _match_column(self.instance, table, col.name)
+        if not matched:
+            candidates = [
+                (table_name, column_name)
+                for table_name in self.instance.tables
+                for column_name in [_match_column(self.instance, table_name, col.name)]
+                if column_name
+            ]
+            if len(candidates) == 1:
+                table, matched = candidates[0]
+        if not matched or table not in self.instance.tables:
+            return
+        spec.require(table).fixed_values[matched] = f"{year:04d}-06-15"
 
     def _merge_date_values(self, existing: str, new: str) -> str:
         """Merge two date-like strings by combining their year/month/day components."""
@@ -1817,7 +1907,7 @@ class Propagator:
                 continue
             visited.add(id(step))
             if isinstance(step, Scan) and step.source and isinstance(step.source, exp.Table):
-                t = self._resolve_table(step.source.name)
+                t = _resolve_table(self.instance, self.alias_map, step.source.name)
                 if t in self.instance.tables:
                     inner_tables.append(t)
             stack.extend(step.chain_dependencies)
@@ -1831,7 +1921,7 @@ class Propagator:
             cols_to_move = []
             for col, val in list(req.fixed_values.items()):
                 for inner_t in inner_tables:
-                    matched = self._match_column(inner_t, col)
+                    matched = _match_column(self.instance, inner_t, col)
                     if matched:
                         cols_to_move.append((col, val, inner_t, matched))
                         break
@@ -1907,27 +1997,11 @@ class Propagator:
 
     def _resolve_group_aliases(self, expression: exp.Expression) -> exp.Expression:
         """Replace planner group aliases like _g0 with their base expressions."""
-        replacements: Dict[Tuple[str, str], exp.Expression] = {}
-        for step in self.plan.ordered_steps:
-            if not isinstance(step, Aggregate):
-                continue
-            source = normalize_name(step.source or step.name or "")
-            for alias, group_expr in step.group.items():
-                replacements[(source, normalize_name(alias))] = group_expr.copy()
-                replacements[("", normalize_name(alias))] = group_expr.copy()
-
-        if not replacements:
-            return expression
-
-        def replace_group_alias(node):
-            if not isinstance(node, exp.Column):
-                return node
-            table_key = normalize_name(node.table or "")
-            col_key = normalize_name(node.name)
-            replacement = replacements.get((table_key, col_key)) or replacements.get(("", col_key))
-            return replacement.copy() if replacement is not None else node
-
-        return expression.transform(replace_group_alias)
+        replacements = _planner_alias_replacements(
+            self.plan.ordered_steps,
+            include_aggregate_aliases=False,
+        )
+        return _replace_planner_aliases(expression, replacements)
 
 
 # =============================================================================
@@ -1936,7 +2010,7 @@ class Propagator:
 
 
 class Resolver:
-    """Turn TableRequirements into concrete row values.
+    """Turn TableConstraints into concrete row values.
 
     Delegates constraint satisfaction to the Solver (domain + SMT).
     Falls back to heuristic satisfaction when no solver is provided.
@@ -1980,9 +2054,6 @@ class Resolver:
                 if row:
                     result.setdefault(physical, []).append(row)
 
-        if spec.deferred:
-            self._resolve_deferred(spec, result)
-
         return result
 
     def _solve_row(self, table, req, spec, join_equalities, result, row_index=0):
@@ -2008,7 +2079,7 @@ class Resolver:
             if not already_has_eq:
                 all_constraints.append(exp.EQ(
                     this=col_node,
-                    expression=_make_literal(val) if val is not None else exp.Null(),
+                    expression=to_literal(val) if val is not None else exp.Null(),
                 ))
         # Cross-table coordination: add EQ for join-relevant columns only
         pinned_join_eq_cols = set()
@@ -2026,7 +2097,7 @@ class Resolver:
                 self._annotate_col_type(col_node, table, lc)
                 all_constraints.append(exp.EQ(
                     this=col_node,
-                    expression=_make_literal(val) if val is not None else exp.Null(),
+                    expression=to_literal(val) if val is not None else exp.Null(),
                 ))
             elif rt == table and lt in result and result[lt]:
                 joined_row = min(row_index, len(result[lt]) - 1)
@@ -2039,7 +2110,7 @@ class Resolver:
                 self._annotate_col_type(col_node, table, rc)
                 all_constraints.append(exp.EQ(
                     this=col_node,
-                    expression=_make_literal(val) if val is not None else exp.Null(),
+                    expression=to_literal(val) if val is not None else exp.Null(),
                 ))
 
         # For rows after the first, force duplicate_columns and group_key_columns
@@ -2062,7 +2133,7 @@ class Resolver:
                         self._annotate_col_type(col_node, table, fk_col)
                         all_constraints.append(exp.NEQ(
                             this=col_node,
-                            expression=_make_literal(base[fk_col]),
+                            expression=to_literal(base[fk_col]),
                         ))
             base = result[table][0]
             # Force duplicate_columns to match row 0 (skip unique columns).
@@ -2078,7 +2149,7 @@ class Resolver:
                     val = base[col]
                     all_constraints.append(exp.EQ(
                         this=col_node,
-                        expression=_make_literal(val) if val is not None else exp.Null(),
+                        expression=to_literal(val) if val is not None else exp.Null(),
                     ))
             # Exclude all previously generated UNIQUE key values to avoid conflicts.
             # Skip columns pinned by join equalities.
@@ -2098,12 +2169,10 @@ class Resolver:
                             self._annotate_col_type(col_node, table, col_name)
                             all_constraints.append(exp.NEQ(
                                 this=col_node,
-                                expression=_make_literal(val),
+                                expression=to_literal(val),
                             ))
 
-        # Safety net: pre-evaluate any remaining subquery expressions
-        # that weren't caught by the Propagator's deferred extraction.
-        all_constraints = self._pre_lower_subqueries(all_constraints)
+        all_constraints = self._drop_subquery_constraints(all_constraints)
 
         # Filter out cross-table EQ expressions — the solver can't handle
         # them in the constraints list (target_tables only has one table).
@@ -2183,83 +2252,11 @@ class Resolver:
             except Exception:
                 pass
 
-    def _pre_lower_subqueries(self, constraints: List[exp.Expression]) -> List[exp.Expression]:
-        """Evaluate subquery-containing constraints and substitute concrete values.
-
-        Safety net for subqueries that weren't caught by the Propagator's
-        deferred extraction.  Returns a new list with subqueries replaced
-        by their evaluated results.
-        """
-        lowered: List[exp.Expression] = []
-        for expr in constraints:
-            if not expr.find(exp.Subquery):
-                lowered.append(expr)
-                continue
-            # Try to evaluate the subquery and substitute.
-            substituted = self._evaluate_and_substitute(expr)
-            if substituted is not None:
-                lowered.append(substituted)
-            # If we can't evaluate, skip the constraint — don't pass
-            # raw Subquery nodes to the solver.
-        return lowered
-
-    def _evaluate_and_substitute(self, expr: exp.Expression) -> Optional[exp.Expression]:
-        """Evaluate subqueries in an expression and substitute concrete values."""
-        # Handle comparison with subquery: col op (SELECT ...)
-        if isinstance(expr, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)):
-            left, right = expr.this, expr.expression
-            subq_side, outer_side = None, None
-            if right and right.find(exp.Subquery):
-                subq_side, outer_side = right, left
-            elif left and left.find(exp.Subquery):
-                subq_side, outer_side = left, right
-            if subq_side is not None:
-                result = self._evaluate_scalar_subquery(subq_side)
-                if result is not None:
-                    literal = _make_literal(result)
-                    if subq_side is right:
-                        return type(expr)(this=outer_side, expression=literal)
-                    else:
-                        return type(expr)(this=literal, expression=outer_side)
-            return None
-        # Handle IN with subquery: col IN (SELECT ...)
-        if isinstance(expr, exp.In):
-            subq = expr.find(exp.Subquery)
-            if subq:
-                values = self._evaluate_subquery_to_list(subq)
-                if values is not None:
-                    literals = [_make_literal(v) for v in values]
-                    return exp.In(this=expr.this, expressions=literals)
-            return None
-        # For other expressions with subqueries, skip them.
-        return None
-
-    def _evaluate_subquery_to_list(self, subq_node: exp.Expression) -> Optional[list]:
-        """Evaluate a subquery and return its results as a list of values."""
-        subq = subq_node if isinstance(subq_node, exp.Subquery) else subq_node.find(exp.Subquery)
-        if subq is None:
-            return None
-        inner_select = subq.this if isinstance(subq, exp.Subquery) else subq
-        if not isinstance(inner_select, exp.Select):
-            return None
-        try:
-            from parseval.plan.context import build_context_from_instance
-            from parseval.plan.rex import Environment, concrete
-            ctx = build_context_from_instance(self.instance, self.dialect)
-            env = Environment(ctx)
-            result_ctx = env.eval(inner_select)
-            if result_ctx is None or not result_ctx.rows:
-                return []
-            # Return the first column of each row.
-            values = []
-            for row in result_ctx.rows:
-                first_col = next(iter(row.columns.values()), None)
-                if first_col is not None:
-                    val = concrete(first_col)
-                    values.append(val)
-            return values
-        except Exception:
-            return None
+    def _drop_subquery_constraints(
+        self,
+        constraints: List[exp.Expression],
+    ) -> List[exp.Expression]:
+        return [expr for expr in constraints if not expr.find(exp.Subquery)]
 
     def _solve_boundary_row(self, table, req, spec, join_equalities, result, boundary):
         """Build a row with exact boundary values for edge-case testing."""
@@ -2277,7 +2274,7 @@ class Resolver:
             self._annotate_col_type(col_node, table, col_name)
             all_constraints.append(exp.EQ(
                 this=col_node,
-                expression=_make_literal(val) if val is not None else exp.Null(),
+                expression=to_literal(val) if val is not None else exp.Null(),
             ))
 
         # Cross-table coordination: add EQ for join-relevant columns.
@@ -2292,7 +2289,7 @@ class Resolver:
                 self._annotate_col_type(col_node, table, lc)
                 all_constraints.append(exp.EQ(
                     this=col_node,
-                    expression=_make_literal(val) if val is not None else exp.Null(),
+                    expression=to_literal(val) if val is not None else exp.Null(),
                 ))
             elif rt == table and lt in result and result[lt]:
                 joined_row = result[lt][-1]
@@ -2304,7 +2301,7 @@ class Resolver:
                 self._annotate_col_type(col_node, table, rc)
                 all_constraints.append(exp.EQ(
                     this=col_node,
-                    expression=_make_literal(val) if val is not None else exp.Null(),
+                    expression=to_literal(val) if val is not None else exp.Null(),
                 ))
 
         # Exclude existing UNIQUE values.
@@ -2321,10 +2318,10 @@ class Resolver:
                             self._annotate_col_type(col_node, table, col_name)
                             all_constraints.append(exp.NEQ(
                                 this=col_node,
-                                expression=_make_literal(val),
+                                expression=to_literal(val),
                             ))
 
-        all_constraints = self._pre_lower_subqueries(all_constraints)
+        all_constraints = self._drop_subquery_constraints(all_constraints)
 
         # Filter out cross-table EQ expressions — same as _solve_row.
         all_constraints = [
@@ -2424,154 +2421,44 @@ class Resolver:
                 ordered.append(t)
         return ordered
 
-    def _resolve_deferred(self, spec: BranchSpec, result=None):
-        """Evaluate deferred scalar subqueries and adjust outer rows.
-
-        For atoms like `col > (SELECT AVG(val) FROM t)`:
-        1. Evaluate the subquery against the current instance.
-        2. Adjust the outer row's column value to satisfy the comparison.
-        """
-        for atom in spec.deferred:
-            if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
-                continue
-
-            left, right = atom.this, atom.expression
-            subq_side, outer_side = None, None
-            if right and right.find(exp.Subquery):
-                subq_side, outer_side = right, left
-            elif left and left.find(exp.Subquery):
-                subq_side, outer_side = left, right
-            if subq_side is None:
-                continue
-
-            # Evaluate the subquery
-            subq_result = self._evaluate_scalar_subquery(subq_side)
-            if subq_result is None:
-                continue
-
-            # Find the outer column and adjust its value
-            if not isinstance(outer_side, exp.Column):
-                continue
-            table = normalize_name(outer_side.table or "")
-            col_name = outer_side.name
-            if table not in self.instance.tables:
-                continue
-
-            rows = self.instance.get_rows(table)
-            if not rows:
-                continue
-
-            # Compute the target value based on the comparison operator
-            target = self._compute_target_value(atom, subq_result)
-            if target is not None:
-                # Adjust the first row
-                if col_name in rows[0].columns:
-                    rows[0][col_name].set("concrete", target)
-                    rows[0][col_name].set("is_bound", True)
-
-    def _evaluate_scalar_subquery(self, subq_node: exp.Expression) -> Optional[Any]:
-        """Evaluate a scalar subquery against the current instance."""
-        subq = subq_node if isinstance(subq_node, exp.Subquery) else subq_node.find(exp.Subquery)
-        if subq is None:
-            subq = subq_node
-        inner_select = subq.this if isinstance(subq, exp.Subquery) else subq
-        if not isinstance(inner_select, exp.Select):
-            return None
-
-        from_clause = inner_select.args.get("from")
-        if not from_clause:
-            return None
-        from_table = from_clause.this
-        if not isinstance(from_table, exp.Table):
-            return None
-
-        table_name = normalize_name(from_table.alias_or_name)
-        if table_name not in self.instance.tables:
-            return None
-
-        rows = self.instance.get_rows(table_name)
-        if not rows:
-            return None
-
-        projections = inner_select.expressions
-        if not projections:
-            return None
-
-        proj = projections[0]
-        values = []
-        for row in rows:
-            for col in proj.find_all(exp.Column):
-                if col.name in row.columns:
-                    v = row[col.name].concrete
-                    if v is not None:
-                        values.append(v)
-
-        if not values:
-            return None
-
-        if proj.find(exp.Avg):
-            return sum(values) / len(values)
-        elif proj.find(exp.Count):
-            return len(values)
-        elif proj.find(exp.Sum):
-            return sum(values)
-        elif proj.find(exp.Max):
-            return max(values)
-        elif proj.find(exp.Min):
-            return min(values)
-
-        return values[0] if values else None
-
-    def _compute_target_value(self, atom: exp.Expression, subq_result: Any) -> Optional[Any]:
-        """Compute a value that satisfies the comparison atom."""
-        if isinstance(atom, exp.GT):
-            if isinstance(subq_result, (int, float)):
-                return int(subq_result) + 1
-        elif isinstance(atom, exp.GTE):
-            if isinstance(subq_result, (int, float)):
-                return int(subq_result)
-        elif isinstance(atom, exp.LT):
-            if isinstance(subq_result, (int, float)):
-                return int(subq_result) - 1
-        elif isinstance(atom, exp.LTE):
-            if isinstance(subq_result, (int, float)):
-                return int(subq_result)
-        elif isinstance(atom, exp.EQ):
-            return subq_result
-        return None
-
-
 # =============================================================================
 # Top-level API
 # =============================================================================
 
 
-def _make_literal(val: Any) -> exp.Literal:
-    """Create a sqlglot Literal from a Python value."""
-    if isinstance(val, bool):
-        return exp.Literal.number(1 if val else 0)
-    if isinstance(val, int):
-        return exp.Literal.number(val)
-    if isinstance(val, float):
-        return exp.Literal.number(val)
-    return exp.Literal.string(str(val))
-
-
-def _gold_non_empty_validation_sql(plan: Plan, dialect: str) -> str:
-    """Render plan SQL with aggregate group aliases expanded for SQLite."""
+def _planner_alias_replacements(
+    steps,
+    *,
+    include_aggregate_aliases: bool,
+) -> Dict[Tuple[str, str], exp.Expression]:
     replacements: Dict[Tuple[str, str], exp.Expression] = {}
-    for step in plan.ordered_steps:
+    for step in steps:
         if not isinstance(step, Aggregate):
             continue
         source = normalize_name(step.source or step.name or "")
+        if include_aggregate_aliases:
+            for operand in getattr(step, "operands", ()) or ():
+                if isinstance(operand, exp.Alias):
+                    alias = normalize_name(operand.alias_or_name)
+                    replacements[(source, alias)] = operand.this.copy()
+                    replacements[("", alias)] = operand.this.copy()
+            for agg_expr in step.aggregations:
+                if isinstance(agg_expr, exp.Alias):
+                    alias = normalize_name(agg_expr.alias_or_name)
+                    replacements[(source, alias)] = agg_expr.this.copy()
+                    replacements[("", alias)] = agg_expr.this.copy()
         for alias, group_expr in step.group.items():
             replacements[(source, normalize_name(alias))] = group_expr.copy()
             replacements[("", normalize_name(alias))] = group_expr.copy()
+    return replacements
 
+
+def _replace_planner_aliases(
+    expression: exp.Expression,
+    replacements: Dict[Tuple[str, str], exp.Expression],
+) -> exp.Expression:
     if not replacements:
-        return plan.expression.sql(dialect=dialect)
-
-    expression = plan.expression.copy()
+        return expression
 
     def replace_group_alias(node):
         if not isinstance(node, exp.Column):
@@ -2581,69 +2468,445 @@ def _gold_non_empty_validation_sql(plan: Plan, dialect: str) -> str:
         replacement = replacements.get((table_key, col_key)) or replacements.get(("", col_key))
         return replacement.copy() if replacement is not None else node
 
-    return expression.transform(replace_group_alias).sql(dialect=dialect)
+    return expression.transform(replace_group_alias)
 
 
-def validate_gold_non_empty_rows(
+def _iter_steps_with_subplans(step: Step):
+    seen: Set[int] = set()
+
+    def walk(current: Step):
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        yield current
+        if isinstance(current, SubPlan) and current.inner is not None:
+            yield from walk(current.inner)
+        for subplan in current.subplan_dependencies:
+            yield subplan
+            if subplan.inner is not None:
+                yield from walk(subplan.inner)
+        for dep in current.chain_dependencies:
+            yield from walk(dep)
+
+    yield from walk(step)
+
+
+def _iter_all_plan_steps(plan: Plan):
+    for step in plan.ordered_steps:
+        yield from _iter_steps_with_subplans(step)
+
+
+def _subquery_sql_key(node: exp.Expression, dialect: str) -> str:
+    return node.sql(dialect=dialect)
+
+
+def _find_subplan_for_subquery(
+    plan: Plan,
+    subquery: exp.Subquery,
+    dialect: str,
+) -> Optional[SubPlan]:
+    target_sql = _subquery_sql_key(subquery, dialect)
+    for step in _iter_all_plan_steps(plan):
+        if isinstance(step, SubPlan) and step.anchor is not None:
+            if step.anchor is subquery or _subquery_sql_key(step.anchor, dialect) == target_sql:
+                return step
+    return None
+
+
+def _scalar_subquery_operand_expression(subplan: Optional[SubPlan]) -> Optional[exp.Expression]:
+    if subplan is None or subplan.inner is None:
+        return None
+    for step in _iter_steps_with_subplans(subplan.inner):
+        if not isinstance(step, Aggregate):
+            continue
+        for operand in getattr(step, "operands", ()) or ():
+            if isinstance(operand, exp.Alias):
+                return operand.this.copy()
+        for agg_expr in step.aggregations:
+            agg = agg_expr.this if isinstance(agg_expr, exp.Alias) else agg_expr
+            if isinstance(agg, (exp.Avg, exp.Sum, exp.Min, exp.Max)):
+                return agg.this.copy()
+    return None
+
+
+def _scalar_expression_table(
+    instance: Instance,
+    alias_map,
+    expression: exp.Expression,
+) -> Optional[str]:
+    for col in expression.find_all(exp.Column):
+        table = alias_map.resolve(col.table) if col.table else normalize_name(col.table or "")
+        table = normalize_name(table)
+        if table in instance.tables:
+            return table
+    return None
+
+
+def _row_for_scalar_expression(
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    alias_map,
+    expression: exp.Expression,
+    row_index: int,
+) -> Optional[Dict[str, Any]]:
+    table = _scalar_expression_table(instance, alias_map, expression)
+    if table and rows.get(table):
+        return rows[table][min(row_index, len(rows[table]) - 1)]
+    return None
+
+
+def _set_scalar_expression_value(
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    alias_map,
+    expression: exp.Expression,
+    value: Any,
+    row_index: int,
+) -> Optional[str]:
+    row = _row_for_scalar_expression(rows, instance, alias_map, expression, row_index)
+    if row is None:
+        return None
+    if isinstance(expression, exp.Paren):
+        return _set_scalar_expression_value(
+            rows,
+            instance,
+            alias_map,
+            expression.this,
+            value,
+            row_index,
+        )
+    if isinstance(expression, exp.Column):
+        table = normalize_name(alias_map.resolve(expression.table) if expression.table else "")
+        col_name = _match_column(instance, table, expression.name)
+        if col_name:
+            row[col_name] = value
+            return table
+    if isinstance(expression, exp.Sub):
+        left, right = expression.this, expression.expression
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            left_table = normalize_name(alias_map.resolve(left.table) if left.table else "")
+            right_table = normalize_name(alias_map.resolve(right.table) if right.table else "")
+            left_col = _match_column(instance, left_table, left.name)
+            right_col = _match_column(instance, right_table, right.name)
+            if left_col and right_col:
+                row[left_col] = value
+                row[right_col] = 0
+                return left_table
+    return None
+
+
+def _scalar_expression_family(
+    instance: Instance,
+    alias_map,
+    expression: exp.Expression,
+) -> TypeFamily:
+    if isinstance(expression, (exp.Sub, exp.Add, exp.Mul, exp.Div)):
+        return TypeFamily.INTEGER
+    for col in expression.find_all(exp.Column):
+        table = normalize_name(alias_map.resolve(col.table) if col.table else "")
+        matched = _match_column(instance, table, col.name)
+        if not matched:
+            continue
+        col_type = _lookup_col_type(instance, table, matched)
+        if not col_type:
+            continue
+        try:
+            return type_family(DataType.build(col_type))
+        except Exception:
+            return TypeFamily.TEXT
+    return TypeFamily.INTEGER
+
+
+def _invert_scalar_op(op: type[exp.Expression]) -> type[exp.Expression]:
+    if op is exp.GT:
+        return exp.LT
+    if op is exp.GTE:
+        return exp.LTE
+    if op is exp.LT:
+        return exp.GT
+    if op is exp.LTE:
+        return exp.GTE
+    return op
+
+
+def _scalar_witness_pair(
+    op: type[exp.Expression],
+    family: TypeFamily,
+) -> Optional[Tuple[Any, Any]]:
+    if family == TypeFamily.TEXT:
+        if op is exp.GT:
+            return "z_value", "a_value"
+        if op is exp.LT:
+            return "a_value", "z_value"
+        if op in (exp.GTE, exp.LTE, exp.EQ):
+            return "same_value", "same_value"
+        return None
+    if family == TypeFamily.DATE:
+        if op is exp.GT:
+            return date(2024, 1, 10), date(2024, 1, 1)
+        if op is exp.LT:
+            return date(2024, 1, 1), date(2024, 1, 10)
+        if op in (exp.GTE, exp.LTE, exp.EQ):
+            same = date(2024, 1, 5)
+            return same, same
+        return None
+    if family == TypeFamily.DATETIME:
+        if op is exp.GT:
+            return datetime(2024, 1, 10, 0, 0, 0), datetime(2024, 1, 1, 0, 0, 0)
+        if op is exp.LT:
+            return datetime(2024, 1, 1, 0, 0, 0), datetime(2024, 1, 10, 0, 0, 0)
+        if op in (exp.GTE, exp.LTE, exp.EQ):
+            same = datetime(2024, 1, 5, 0, 0, 0)
+            return same, same
+        return None
+    if family == TypeFamily.TIME:
+        if op is exp.GT:
+            return dt_time(12, 0, 0), dt_time(1, 0, 0)
+        if op is exp.LT:
+            return dt_time(1, 0, 0), dt_time(12, 0, 0)
+        if op in (exp.GTE, exp.LTE, exp.EQ):
+            same = dt_time(6, 0, 0)
+            return same, same
+        return None
+    if family == TypeFamily.BOOLEAN:
+        if op is exp.EQ:
+            return True, True
+        return None
+    if op is exp.GT:
+        return 10, 1
+    if op is exp.GTE:
+        return 10, 10
+    if op is exp.LT:
+        return 1, 10
+    if op is exp.LTE:
+        return 10, 10
+    if op is exp.EQ:
+        return 5, 5
+    return None
+
+
+def _scalar_witness_values(
+    atom: exp.Expression,
+    outer_expr: exp.Expression,
+    inner_expr: exp.Expression,
+    instance: Instance,
+    alias_map,
+) -> Optional[Tuple[Any, Any]]:
+    op = type(atom)
+    if atom.this and atom.this.find(exp.Subquery):
+        op = _invert_scalar_op(op)
+    family = _scalar_expression_family(instance, alias_map, outer_expr)
+    if family in (TypeFamily.INTEGER, TypeFamily.DECIMAL):
+        family = _scalar_expression_family(instance, alias_map, inner_expr)
+    return _scalar_witness_pair(op, family)
+
+
+def _align_gold_fk_parent_row(
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    child_table: Optional[str],
+    row_index: int,
+) -> None:
+    if not child_table or child_table not in rows or not rows[child_table]:
+        return
+    child_rows = rows[child_table]
+    child_row = child_rows[min(row_index, len(child_rows) - 1)]
+    for fk in instance.get_foreign_key(child_table):
+        fk_cols = [normalize_name(identifier.name) for identifier in fk.expressions]
+        if not fk_cols:
+            continue
+        fk_col = fk_cols[0]
+        ref = fk.args.get("reference")
+        ref_table_node = ref.find(exp.Table) if ref is not None else None
+        if ref_table_node is None:
+            continue
+        parent_table = normalize_name(ref_table_node.name)
+        if parent_table not in instance.tables:
+            continue
+        ref_col = instance.resolve_fk_ref_column(fk)
+        if not ref_col:
+            continue
+        if fk_col not in child_row:
+            child_row[fk_col] = _gold_default_value(instance, child_table, fk_col, row_index + 1)
+        parent_rows = rows.setdefault(parent_table, [])
+        while len(parent_rows) <= row_index:
+            parent_rows.append({})
+        parent_rows[row_index][ref_col] = child_row[fk_col]
+
+
+def _satisfy_gold_scalar_subqueries(
+    spec: BranchSpec,
+    plan: Plan,
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    alias_map,
+    dialect: str,
+) -> None:
+    seen: Set[str] = set()
+    for atom in spec.deferred:
+        if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+            continue
+        atom_key = atom.sql(dialect=dialect)
+        if atom_key in seen:
+            continue
+        seen.add(atom_key)
+
+        left, right = atom.this, atom.expression
+        if right and right.find(exp.Subquery):
+            outer_expr, subquery_expr = left, right
+        elif left and left.find(exp.Subquery):
+            outer_expr, subquery_expr = right, left
+        else:
+            continue
+        if outer_expr is None or subquery_expr is None:
+            continue
+
+        subquery = subquery_expr if isinstance(subquery_expr, exp.Subquery) else subquery_expr.find(exp.Subquery)
+        if subquery is None:
+            continue
+        subplan = _find_subplan_for_subquery(plan, subquery, dialect)
+        inner_expr = _scalar_subquery_operand_expression(subplan)
+        if inner_expr is None:
+            continue
+        values = _scalar_witness_values(
+            atom,
+            outer_expr,
+            inner_expr,
+            instance,
+            alias_map,
+        )
+        if values is None:
+            continue
+        outer_value, inner_value = values
+
+        outer_table = _set_scalar_expression_value(
+            rows,
+            instance,
+            alias_map,
+            outer_expr,
+            outer_value,
+            row_index=0,
+        )
+        _align_gold_fk_parent_row(
+            rows,
+            instance,
+            outer_table,
+            row_index=0,
+        )
+        inner_row_index = 1
+        if _row_for_scalar_expression(rows, instance, alias_map, inner_expr, inner_row_index) is None:
+            inner_row_index = 0
+        inner_table = _set_scalar_expression_value(
+            rows,
+            instance,
+            alias_map,
+            inner_expr,
+            inner_value,
+            row_index=inner_row_index,
+        )
+        _align_gold_fk_parent_row(
+            rows,
+            instance,
+            inner_table,
+            row_index=inner_row_index,
+        )
+
+
+def _gold_candidate_has_output(
     plan: Plan,
     instance: Instance,
     rows_per_table: Dict[str, List[Dict[str, Any]]],
     dialect: str = "sqlite",
 ) -> bool:
-    """Return True when candidate rows make the plan SQL return rows in SQLite."""
-    if dialect != "sqlite":
-        return True
-
-    sql = plan.expression.sql(dialect=dialect)
-    conn = sqlite3.connect(":memory:")
+    """Return True when candidate rows make evaluator-observable output rows."""
+    checkpoint = instance.checkpoint() if rows_per_table else None
     try:
-        for ddl in instance.ddls.split(";"):
-            ddl = ddl.strip()
-            if ddl:
-                conn.execute(ddl)
+        if rows_per_table:
+            _materialize_rows(instance, rows_per_table)
 
-        for table_name, schema in instance.tables.items():
-            cols = list(schema.keys())
-            existing_rows = instance.get_rows(table_name)
-            candidate_rows = rows_per_table.get(table_name, [])
-            if not existing_rows and not candidate_rows:
-                continue
-
-            placeholders = ",".join(["?"] * len(cols))
-            quoted_cols = ",".join(f'"{col}"' for col in cols)
-            stmt = f'INSERT OR IGNORE INTO "{table_name}" ({quoted_cols}) VALUES ({placeholders})'
-
-            for row in existing_rows:
-                values = []
-                for col in cols:
-                    value = row[col].concrete if col in row.columns else None
-                    if value is not None and not isinstance(value, (int, float, str, bytes)):
-                        value = str(value)
-                    values.append(value)
-                conn.execute(stmt, values)
-
-            for row in candidate_rows:
-                values = []
-                for col in cols:
-                    value = row.get(col)
-                    if value is not None and not isinstance(value, (int, float, str, bytes)):
-                        value = str(value)
-                    values.append(value)
-                conn.execute(stmt, values)
-
-        conn.commit()
-        try:
-            return bool(conn.execute(sql).fetchone())
-        except sqlite3.OperationalError:
-            validation_sql = _gold_non_empty_validation_sql(plan, dialect)
-            if validation_sql == sql:
-                raise
-            return bool(conn.execute(validation_sql).fetchone())
+        tree = BranchTree()
+        ctx = PlanEvaluator(plan, instance, dialect).evaluate_context(tree)
+        if any(table.rows for table in ctx.tables.values()):
+            return True
+        if _gold_has_positive_evaluator_observations(tree):
+            return True
+        return False
     except Exception as exc:
         logger.debug("gold_non_empty validation failed: %s", exc)
         return False
     finally:
-        conn.close()
+        if checkpoint is not None:
+            instance.rollback(checkpoint)
+
+
+def _is_negated_subquery_anchor(anchor: exp.Expression) -> bool:
+    negations = 0
+    node = anchor.parent
+    while node is not None:
+        if isinstance(node, exp.Not):
+            negations += 1
+        node = node.parent
+    return negations % 2 == 1
+
+
+def _gold_subquery_expectations(plan: Plan) -> List[Tuple[str, exp.Expression, BranchType]]:
+    expectations: List[Tuple[str, exp.Expression, BranchType]] = []
+    seen: Set[int] = set()
+    for subplan in _iter_all_plan_steps(plan):
+        if not isinstance(subplan, SubPlan) or id(subplan) in seen:
+            continue
+        seen.add(id(subplan))
+        anchor = subplan.anchor
+        negated = _is_negated_subquery_anchor(anchor)
+        if subplan.kind.value == "exists":
+            outcome = BranchType.EXISTS_FALSE if negated else BranchType.EXISTS_TRUE
+            expectations.append(("exists", anchor, outcome))
+        elif subplan.kind.value == "in":
+            outcome = BranchType.IN_NO_MATCH if negated else BranchType.IN_MATCH
+            expectations.append(("in", anchor, outcome))
+    return expectations
+
+
+def _validate_gold_subquery_observations(
+    plan: Plan,
+    instance: Instance,
+    dialect: str,
+) -> bool:
+    expectations = _gold_subquery_expectations(plan)
+    if not expectations:
+        return False
+
+    tree = PlanEvaluator(plan, instance, dialect).evaluate()
+    for site, anchor, expected in expectations:
+        anchor_sql = anchor.sql(dialect=dialect)
+        matched = False
+        for node in tree.nodes:
+            if node.site != site:
+                continue
+            if node.predicate is not anchor and node.predicate.sql(dialect=dialect) != anchor_sql:
+                continue
+            if expected in node.observed_outcomes(0):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def _gold_has_positive_evaluator_observations(tree: BranchTree) -> bool:
+    """Return True when evaluator observations support a positive witness."""
+    checked = False
+    for node in tree.nodes:
+        if node.site in {"filter", "join_on", "having", "case_arm"}:
+            for atom_id, _atom in enumerate(node.atoms):
+                checked = True
+                if BranchType.ATOM_TRUE not in node.observed_outcomes(atom_id):
+                    return False
+        elif node.site == "group":
+            checked = True
+            if not node.observed_outcomes(0):
+                return False
+    return checked
 
 
 def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
@@ -2782,6 +3045,8 @@ def _build_gold_solver_constraint(
         for constraint in req.constraints:
             if constraint.find(exp.Subquery):
                 continue
+            if _is_strftime_year_predicate(constraint):
+                continue
             if (
                 isinstance(constraint, exp.EQ)
                 and isinstance(constraint.this, exp.Column)
@@ -2849,6 +3114,16 @@ def _complete_gold_rows(
     }
     completed: Dict[str, List[Dict[str, Any]]] = {}
     group_values: Dict[Tuple[str, str], Any] = {}
+    unique_values: Dict[Tuple[str, str], Set[Any]] = {}
+    for table_name, schema in instance.tables.items():
+        for col_name in schema:
+            if not instance.is_unique(table_name, col_name):
+                continue
+            key = (table_name, col_name)
+            values = unique_values.setdefault(key, set())
+            for existing_row in instance.get_rows(table_name):
+                if col_name in existing_row.columns:
+                    values.add(existing_row[col_name].concrete)
 
     ordered_bindings = sorted(
         row_bindings.values(),
@@ -2860,7 +3135,7 @@ def _complete_gold_rows(
         req = _requirement_for_binding(spec, binding)
         if req is not None:
             for col_name, value in req.fixed_values.items():
-                row.setdefault(col_name, value)
+                row[col_name] = value
             for col_name in req.group_key_columns:
                 key = (binding.table, col_name)
                 if col_name in row:
@@ -2874,6 +3149,22 @@ def _complete_gold_rows(
                         1,
                     )
                 row[col_name] = group_values[key]
+            for col_name in instance.tables.get(binding.table, {}):
+                if not instance.is_unique(binding.table, col_name):
+                    continue
+                if col_name in req.fixed_values or col_name in req.group_key_columns:
+                    continue
+                key = (binding.table, col_name)
+                seen_values = unique_values.setdefault(key, set())
+                value = row.get(col_name)
+                if value is None or value in seen_values:
+                    seed = binding.row + 1
+                    value = _gold_default_value(instance, binding.table, col_name, seed)
+                    while value in seen_values:
+                        seed += 1
+                        value = _gold_default_value(instance, binding.table, col_name, seed)
+                    row[col_name] = value
+                seen_values.add(value)
         completed.setdefault(binding.table, []).append(row)
 
     for table, table_rows in pending_rows.items():
@@ -2885,16 +3176,44 @@ def _materialize_rows(
     instance: Instance,
     rows: Dict[str, List[Dict[str, Any]]],
 ) -> None:
-    concretes = {
-        table: {
-            col: [row.get(col) for row in table_rows]
-            for col in instance.tables.get(table, {})
-        }
-        for table, table_rows in rows.items()
-    }
-    for table_name in instance._creation_order(concretes):
+    for table_name in _gold_materialization_order(instance, rows):
         for row in rows.get(table_name, []):
             instance.create_row(table_name, values=row)
+
+
+def _gold_materialization_order(
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> List[str]:
+    requested = [table for table in rows if table in instance.tables]
+    requested_set = set(requested)
+    ordered: List[str] = []
+    visiting: Set[str] = set()
+    visited: Set[str] = set()
+
+    def visit(table_name: str) -> None:
+        if table_name in visited:
+            return
+        if table_name in visiting:
+            return
+        visiting.add(table_name)
+        for fk in instance.get_foreign_key(table_name):
+            ref = fk.args.get("reference")
+            if ref is None:
+                continue
+            ref_table_node = ref.find(exp.Table)
+            if ref_table_node is None:
+                continue
+            ref_table = normalize_name(ref_table_node.name)
+            if ref_table in requested_set:
+                visit(ref_table)
+        visiting.remove(table_name)
+        visited.add(table_name)
+        ordered.append(table_name)
+
+    for table_name in requested:
+        visit(table_name)
+    return ordered
 
 
 def _solve_and_materialize_gold(
@@ -2911,10 +3230,14 @@ def _solve_and_materialize_gold(
         return {}
     rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
     rows = _complete_gold_rows(rows, row_bindings, spec, instance)
+    _satisfy_gold_scalar_subqueries(spec, plan, rows, instance, alias_map, dialect)
     checkpoint = instance.checkpoint()
     try:
         _materialize_rows(instance, rows)
-        if validate_gold_non_empty_rows(plan, instance, {}, dialect=dialect):
+        if _gold_subquery_expectations(plan):
+            if _validate_gold_subquery_observations(plan, instance, dialect):
+                return rows
+        elif _gold_candidate_has_output(plan, instance, {}, dialect=dialect):
             return rows
         instance.rollback(checkpoint)
         return {}
@@ -2969,7 +3292,7 @@ def speculate(
     for spec in branch_specs:
         if spec.requirements:
             rows = resolver.resolve(spec)
-            if objective == "gold_non_empty" and not validate_gold_non_empty_rows(
+            if objective == "gold_non_empty" and not _gold_candidate_has_output(
                 plan,
                 instance,
                 rows,
@@ -2981,46 +3304,10 @@ def speculate(
     return results
 
 
-# Also keep backward-compatible names used by engine.
-def build_spec(plan, instance, *, alias_map, target_outcome="positive", negate_atom=None):
-    """Backward-compatible wrapper."""
-    propagator = Propagator(plan, instance, alias_map, dialect="sqlite")
-    if target_outcome == "positive":
-        specs = propagator.propagate()
-        return specs[0] if specs else BranchSpec(branch="positive")
-    return BranchSpec(branch=target_outcome)
-
-
-def resolve_spec(spec, instance, dialect="sqlite"):
-    """Backward-compatible wrapper."""
-    solver = Solver(dialect=dialect)
-    resolver = Resolver(instance, dialect, solver=solver)
-    rows = resolver.resolve(spec)
-    # Flatten to {table: first_row_values}
-    return {table: row_list[0] if row_list else {} for table, row_list in rows.items()}
-
-
-# Keep SharedKey and UNSET for backward compat with engine imports.
-@dataclass
-class SharedKey:
-    key_id: str
-
-UNSET = object()
-
-SpeculativeSpec = BranchSpec
-
-
 __all__ = [
     "BranchSpec",
     "Propagator",
     "Resolver",
-    "SharedKey",
-    "SpeculativeSpec",
     "TableConstraint",
-    "TableRequirement",
-    "UNSET",
-    "build_spec",
-    "resolve_spec",
     "speculate",
-    "validate_gold_non_empty_rows",
 ]

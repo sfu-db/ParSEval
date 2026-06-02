@@ -3,7 +3,6 @@ from __future__ import annotations
 from sqlglot import exp
 
 from parseval.db_manager import DBManager
-from parseval.helper import normalize_name
 
 from .serialization import InstanceValueSerializer
 from .types import DatabaseTarget, InstanceSnapshot, TableBatch, WriteResult
@@ -56,8 +55,8 @@ class InstanceLoader:
         if not table.rows:
             return 0
         parameter_names = {
-            column: normalize_name(column)
-            for column in table.columns
+            column: f"p{index}"
+            for index, column in enumerate(table.columns)
         }
         statement = exp.Insert(
             this=exp.Schema(
