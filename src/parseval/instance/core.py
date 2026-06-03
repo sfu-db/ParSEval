@@ -594,7 +594,7 @@ class Instance(Catalog):
         }
         row_cells: Dict[str, Variable] = {}
         for column, datatype in self.tables[table_name].items():
-            z_name = normalize_name(f"{table_name}_{column}_{datatype}_{tuple_index}")
+            z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
             concrete = normalized_values.get(column)
             z_value = Variable(
                 this=z_name,

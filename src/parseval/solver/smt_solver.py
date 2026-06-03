@@ -191,6 +191,8 @@ class SMTSolver:
             "DISTINCT": self._translate_distinct,
             "IS": self._translate_is,
             "CAST": self._translate_cast,
+            "TSORDSTOTIMESTAMP": self._translate_ts_or_ds_to_timestamp,
+            "TSORDSTODATE": self._translate_ts_or_ds_to_date,
             "NULLIF": self._translate_nullif,
             "BETWEEN": self._translate_between,
             "IN": self._translate_in,
@@ -701,6 +703,52 @@ class SMTSolver:
             f"Unsupported CAST from {value.typeinfo.logical_name} to {to_type.logical_name}"
         )
 
+    def _translate_ts_or_ds_to_timestamp(self, expression: exp.Expression) -> SMTValue:
+        """Translate ``TsOrDsToTimestamp(expr)`` — sqlglot's auto-inserted cast.
+
+        sqlglot wraps temporal arguments to STRFTIME in this node to coerce
+        them to TIMESTAMP. For DATE inputs, multiplies epoch-days by 86400
+        to produce epoch-seconds. For already-temporal inputs, it is a
+        no-op.
+        """
+        value = self._as_value(self._to_z3_expr(expression.this))
+        target_type = normalize_dtype(DataType.build("TIMESTAMP"), self.z3ctx)
+        if value.is_null_literal:
+            return _null_value(target_type, self.z3ctx)
+        if value.typeinfo.family in {"datetime", "timestamp"}:
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        if value.typeinfo.family == "date":
+            raw = _value_payload(value)
+            return self._wrap_nullable_payload(value, raw * 86400, target_type.dtype)
+        if value.typeinfo.family == "time":
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        raise UnsupportedSMTError(
+            f"Unsupported TsOrDsToTimestamp from {value.typeinfo.logical_name}"
+        )
+
+    def _translate_ts_or_ds_to_date(self, expression: exp.Expression) -> SMTValue:
+        """Translate ``TsOrDsToDate(expr)`` — sqlglot's auto-inserted cast.
+
+        Used by MySQL/PG wrappers around temporal extractors (YEAR/MONTH/
+        DAY) when the underlying column is a TIMESTAMP or DATETIME. For
+        those, we divide epoch-seconds by 86400 to recover epoch-days.
+        For DATE inputs this is a no-op.
+        """
+        value = self._as_value(self._to_z3_expr(expression.this))
+        target_type = normalize_dtype(DataType.build("DATE"), self.z3ctx)
+        if value.is_null_literal:
+            return _null_value(target_type, self.z3ctx)
+        if value.typeinfo.family == "date":
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        if value.typeinfo.family in {"datetime", "timestamp"}:
+            raw = _value_payload(value)
+            return self._wrap_nullable_payload(value, raw / 86400, target_type.dtype)
+        if value.typeinfo.family == "time":
+            return SMTValue(value.expr, target_type, value.is_null_literal)
+        raise UnsupportedSMTError(
+            f"Unsupported TsOrDsToDate from {value.typeinfo.logical_name}"
+        )
+
     def _translate_nullif(self, expression: exp.Expression) -> SMTValue:
         """Translate ``NULLIF(a, b)`` — returns NULL if a equals b, else a."""
         left = self._as_value(self._to_z3_expr(expression.this))
@@ -864,6 +912,12 @@ class SMTSolver:
             return args
         if isinstance(expression, exp.TimeToStr):
             return [expression.args.get("format"), expression.this]
+        if isinstance(expression, exp.Extract):
+            return [expression.expression]
+        if isinstance(expression, (exp.DateAdd, exp.DateSub)):
+            return [expression.this, expression.expression]
+        if isinstance(expression, (exp.DateDiff, exp.TimestampDiff)):
+            return [expression.this, expression.expression]
         return [child for child in expression.iter_expressions() if not isinstance(child, exp.DataType)]
 
     def _resolve_special_function(
