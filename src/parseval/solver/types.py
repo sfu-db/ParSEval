@@ -120,6 +120,20 @@ class ValueSpace:
         if self.like_pattern:
             return self.like_pattern.replace("%", "x").replace("_", "a")
         length = min(self.max_length or 10, 10)
+        # Handle numeric bounds for TEXT columns (e.g., `Academic Year` BETWEEN 2014 AND 2015).
+        # Return a string representation of a number within the range.
+        has_numeric_min = self.min_val is not None and isinstance(self.min_val, (int, float))
+        has_numeric_max = self.max_val is not None and isinstance(self.max_val, (int, float))
+        if has_numeric_min or has_numeric_max:
+            lo = int(self.min_val) if has_numeric_min else int(self.max_val) - 100
+            hi = int(self.max_val) if has_numeric_max else int(self.min_val) + 100
+            # Pick the midpoint, avoiding not_equals.
+            mid = (lo + hi) // 2
+            for offset in range(hi - lo + 1):
+                for try_val in (mid + offset, mid - offset):
+                    if lo <= try_val <= hi and str(try_val) not in self.not_equals:
+                        return str(try_val)
+            return str(lo)
         base = "value"[:length]
         # Respect min_val: append a character to ensure we exceed it.
         if self.min_val is not None and isinstance(self.min_val, str):
@@ -140,6 +154,21 @@ class ValueSpace:
         return base
 
     def _pick_temporal(self) -> Any:
+        # Handle LIKE patterns for DATE/DATETIME columns (e.g., '1996-01%').
+        if self.like_pattern:
+            # Extract the prefix before wildcards and try to parse as date.
+            prefix = self.like_pattern.replace('%', '').replace('_', '')
+            if len(prefix) >= 4:
+                # Try different date formats based on prefix length.
+                try:
+                    if len(prefix) <= 4:
+                        return date(int(prefix), 1, 1)
+                    elif len(prefix) <= 7:
+                        return date.fromisoformat(prefix + '-01')
+                    else:
+                        return date.fromisoformat(prefix[:10])
+                except (ValueError, IndexError):
+                    pass
         if self.min_val is not None:
             if isinstance(self.min_val, datetime):
                 return self.min_val

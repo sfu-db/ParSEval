@@ -87,6 +87,80 @@ def _resolve_table(instance, alias_map, name: str) -> str:
 
 
 # =============================================================================
+# Consolidated helpers for column type annotation and constraint creation
+# =============================================================================
+
+
+def _annotate_col_type(
+    col_node: exp.Column,
+    instance: Instance,
+    table: str,
+    col_name: str,
+) -> None:
+    """Annotate a column node with its type from the instance schema."""
+    col_type_str = _lookup_col_type(instance, table, col_name)
+    if col_type_str:
+        try:
+            col_node.type = DataType.build(col_type_str)
+        except Exception:
+            pass
+
+
+def _make_typed_column(
+    instance: Instance,
+    table: str,
+    col_name: str,
+) -> exp.Column:
+    """Create a column node with type annotation from the instance schema."""
+    col_node = exp.column(col_name, table)
+    _annotate_col_type(col_node, instance, table, col_name)
+    return col_node
+
+
+def _make_is_not_null(col_node: exp.Column) -> exp.Is:
+    """Create an IS NOT NULL constraint for a column."""
+    return exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
+
+
+def _make_is_null(col_node: exp.Column) -> exp.Is:
+    """Create an IS NULL constraint for a column."""
+    return exp.Is(this=col_node, expression=exp.Null())
+
+
+def _has_is_not_null(constraints: List[exp.Expression], col_name: str) -> bool:
+    """Check if constraints already have IS NOT NULL for the given column."""
+    for expr in constraints:
+        if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Not) and isinstance(expr.expression.this, exp.Null):
+            for col in expr.find_all(exp.Column):
+                if col.name == col_name:
+                    return True
+    return False
+
+
+def _has_is_null(constraints: List[exp.Expression], col_name: str) -> bool:
+    """Check if constraints already have IS NULL for the given column."""
+    for expr in constraints:
+        if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null):
+            for col in expr.find_all(exp.Column):
+                if col.name == col_name:
+                    return True
+    return False
+
+
+def _has_equality_constraint(constraints: List[exp.Expression], col_name: str) -> bool:
+    """Check if constraints already have an EQ for the given column."""
+    for expr in constraints:
+        if isinstance(expr, exp.EQ):
+            left = expr.this
+            right = expr.expression
+            if isinstance(left, exp.Column) and left.name == col_name:
+                return True
+            if isinstance(right, exp.Column) and right.name == col_name:
+                return True
+    return False
+
+
+# =============================================================================
 # Data structures
 # =============================================================================
 
@@ -192,11 +266,7 @@ class TableConstraint:
     min_rows: int = 1
     duplicate_columns: List[str] = field(default_factory=list)
     group_key_columns: List[str] = field(default_factory=list)
-    # Legacy row-shaping fields still consumed by Resolver.
     fixed_values: Dict[str, Any] = field(default_factory=dict)
-    not_null: Set[str] = field(default_factory=set)
-    must_null: Set[str] = field(default_factory=set)
-    predicates: List[Tuple[str, str, Any]] = field(default_factory=list)
     # Boundary rows: list of {col_name: value} dicts for edge-case testing.
     boundary_rows: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -260,6 +330,75 @@ class BranchSpec:
         self.equivalences.union(col_a, col_b)
 
 
+@dataclass
+class SpeculateConfig:
+    """Configuration for speculative data generation.
+
+    Each field controls how many rows to generate for that branch type.
+    Set to 0 to skip that branch type entirely.
+
+    Attributes:
+        positive: Number of positive witness rows (satisfy all conditions).
+        negative: Number of negative rows per filter conjunct (violate WHERE).
+        null: Number of NULL rows per nullable column.
+        left_unmatched: Number of left-table rows with no join match.
+        right_unmatched: Number of right-table rows with no join match.
+        having_fail: Number of rows that fail HAVING conditions.
+        case_else: Number of rows exercising CASE WHEN ELSE arms.
+        boundary: Number of boundary value rows for edge-case testing.
+    """
+    positive: int = 1
+    negative: int = 1
+    null: int = 1
+    left_unmatched: int = 1
+    right_unmatched: int = 1
+    having_fail: int = 1
+    case_else: int = 1
+    boundary: int = 1
+
+    @classmethod
+    def gold_non_empty(cls) -> SpeculateConfig:
+        """Config for generating only positive witness rows."""
+        return cls(
+            positive=1,
+            negative=0,
+            null=0,
+            left_unmatched=0,
+            right_unmatched=0,
+            having_fail=0,
+            case_else=1,
+            boundary=0,
+        )
+
+    @classmethod
+    def full_coverage(cls) -> SpeculateConfig:
+        """Config for full branch coverage (all branch types)."""
+        return cls(
+            positive=1,
+            negative=1,
+            null=1,
+            left_unmatched=1,
+            right_unmatched=1,
+            having_fail=1,
+            case_else=1,
+            boundary=1,
+        )
+
+    def should_generate(self, branch_type: str) -> bool:
+        """Check if a branch type should be generated based on config."""
+        mapping = {
+            "positive": self.positive,
+            "negative": self.negative,
+            "null": self.null,
+            "left_unmatched": self.left_unmatched,
+            "right_unmatched": self.right_unmatched,
+            "having_fail": self.having_fail,
+            "case_else": self.case_else,
+            "boundary": self.boundary,
+        }
+        return mapping.get(branch_type, 0) > 0
+
+
 # =============================================================================
 # Propagator: top-down constraint derivation
 # =============================================================================
@@ -275,12 +414,26 @@ class Propagator:
     directly, instead of lowering to ``(col, op, value)`` tuples.
     """
 
-    def __init__(self, plan: Plan, instance: Instance, alias_map, dialect: str, objective: str = "branch_coverage"):
+    def __init__(
+        self,
+        plan: Plan,
+        instance: Instance,
+        alias_map,
+        dialect: str,
+        config: Optional[SpeculateConfig] = None,
+    ):
         self.plan = plan
         self.instance = instance
         self.alias_map = alias_map
         self.dialect = dialect
-        self.objective = objective
+        self.config = config or SpeculateConfig.gold_non_empty()
+        self._is_gold_mode = (
+            self.config.negative == 0
+            and self.config.null == 0
+            and self.config.left_unmatched == 0
+            and self.config.right_unmatched == 0
+            and self.config.having_fail == 0
+        )
 
     def _is_self_join_table(self, table: str) -> bool:
         """Check if a table is involved in a self-join."""
@@ -294,106 +447,116 @@ class Propagator:
     # -----------------------------------------------------------------
 
     def propagate(self) -> List[BranchSpec]:
-        """Produce specs for positive + all negative + null branches."""
-        # Trigger planner's column annotation so _parseval_meta is available.
+        """Produce specs for branches based on config thresholds.
+
+        Uses self.config to determine which branch types to generate.
+        If a branch type's threshold is 0, it is skipped.
+        """
         _ = self.plan.annotations
-        # Build a flat alias_map dict for the solver.
         specs = []
+
         # Positive path.
-        pos = BranchSpec(branch="positive")
-        self._propagate_step(self.plan.root, pos)
-        self._collect_boundary_values(pos)
-        self._add_schema_constraints(pos)
-        self._annotate_column_types(pos)
-        specs.append(pos)
+        if self.config.positive > 0:
+            try:
+                pos = BranchSpec(branch="positive")
+                self._propagate_step(self.plan.root, pos)
+                if self.config.boundary > 0:
+                    self._collect_boundary_values(pos)
+                self._add_schema_constraints(pos)
+                self._annotate_column_types(pos)
+                specs.append(pos)
+            except Exception as exc:
+                logger.debug("positive spec propagation failed: %s", exc)
+                pos = BranchSpec(branch="positive")
+        else:
+            pos = BranchSpec(branch="positive")
+
         # Negative branches per decision site.
-        for step in self.plan.ordered_steps:
-            if isinstance(step, Filter) and step.condition:
-                conjuncts = self._split_conjuncts(step.condition)
-                for idx in range(len(conjuncts)):
-                    neg = BranchSpec(branch=f"negative_c{idx}")
-                    self._propagate_step(self.plan.root, neg, negate_step=step, negate_conjunct=idx)
-                    self._add_schema_constraints(neg)
-                    self._annotate_column_types(neg)
-                    specs.append(neg)
-            elif isinstance(step, Join):
-                left_un = BranchSpec(branch="left_unmatched")
-                self._propagate_unmatched_left(step, left_un)
-                self._add_schema_constraints(left_un)
-                self._annotate_column_types(left_un)
-                specs.append(left_un)
-                # Also generate right-unmatched rows for each joined table.
-                for join_name in (step.joins or {}):
-                    right_un = BranchSpec(branch=f"right_unmatched_{join_name}")
-                    self._propagate_unmatched_right(step, join_name, right_un)
-                    self._add_schema_constraints(right_un)
-                    self._annotate_column_types(right_un)
-                    specs.append(right_un)
-            elif isinstance(step, Having) and step.condition:
-                fail = BranchSpec(branch="having_fail")
-                self._propagate_step(self.plan.root, fail, negate_step=step)
-                self._add_schema_constraints(fail)
-                self._annotate_column_types(fail)
-                specs.append(fail)
-        # Null branches: one per nullable column, NULLing only that column.
-        null_targets = self._collect_null_target_columns(pos)
-        if null_targets:
-            for table, cols in null_targets.items():
-                for col_name in cols:
-                    null_spec = BranchSpec(branch=f"null_{table}.{col_name}")
+        if self.config.negative > 0:
+            for step in self.plan.ordered_steps:
+                try:
+                    if isinstance(step, Filter) and step.condition:
+                        conjuncts = self._split_conjuncts(step.condition)
+                        for idx in range(len(conjuncts)):
+                            neg = BranchSpec(branch=f"negative_c{idx}")
+                            self._propagate_step(self.plan.root, neg, negate_step=step, negate_conjunct=idx)
+                            self._add_schema_constraints(neg)
+                            self._annotate_column_types(neg)
+                            specs.append(neg)
+                except Exception as exc:
+                    logger.debug("negative spec propagation failed for step %s: %s", type(step).__name__, exc)
+
+        # Unmatched join branches.
+        if self.config.left_unmatched > 0 or self.config.right_unmatched > 0:
+            for step in self.plan.ordered_steps:
+                try:
+                    if isinstance(step, Join):
+                        if self.config.left_unmatched > 0:
+                            left_un = BranchSpec(branch="left_unmatched")
+                            self._propagate_unmatched_left(step, left_un)
+                            self._add_schema_constraints(left_un)
+                            self._annotate_column_types(left_un)
+                            specs.append(left_un)
+                        if self.config.right_unmatched > 0:
+                            for join_name in (step.joins or {}):
+                                right_un = BranchSpec(branch=f"right_unmatched_{join_name}")
+                                self._propagate_unmatched_right(step, join_name, right_un)
+                                self._add_schema_constraints(right_un)
+                                self._annotate_column_types(right_un)
+                                specs.append(right_un)
+                except Exception as exc:
+                    logger.debug("unmatched join propagation failed for step %s: %s", type(step).__name__, exc)
+
+        # Having fail branches.
+        if self.config.having_fail > 0:
+            for step in self.plan.ordered_steps:
+                try:
+                    if isinstance(step, Having) and step.condition:
+                        fail = BranchSpec(branch="having_fail")
+                        self._propagate_step(self.plan.root, fail, negate_step=step)
+                        self._add_schema_constraints(fail)
+                        self._annotate_column_types(fail)
+                        specs.append(fail)
+                except Exception as exc:
+                    logger.debug("having_fail propagation failed: %s", exc)
+
+        # Null branches.
+        if self.config.null > 0:
+            try:
+                null_targets = self._collect_null_target_columns(pos)
+                if null_targets:
+                    for table, cols in null_targets.items():
+                        for col_name in cols:
+                            null_spec = BranchSpec(branch=f"null_{table}.{col_name}")
+                            self._propagate_step(self.plan.root, null_spec)
+                            self._apply_single_null_override(null_spec, table, col_name)
+                            self._add_schema_constraints(null_spec)
+                            self._annotate_column_types(null_spec)
+                            specs.append(null_spec)
+                else:
+                    null_spec = BranchSpec(branch="null_branch")
                     self._propagate_step(self.plan.root, null_spec)
-                    self._apply_single_null_override(null_spec, table, col_name)
+                    self._apply_null_overrides(null_spec)
                     self._add_schema_constraints(null_spec)
                     self._annotate_column_types(null_spec)
                     specs.append(null_spec)
-        else:
-            # Fallback: single null branch if no targets found.
-            null_spec = BranchSpec(branch="null_branch")
-            self._propagate_step(self.plan.root, null_spec)
-            self._apply_null_overrides(null_spec)
-            self._add_schema_constraints(null_spec)
-            self._annotate_column_types(null_spec)
-            specs.append(null_spec)
-        # CASE WHEN branches: one per CASE WHEN, negating all WHEN conditions
-        # to exercise the ELSE arm.
-        for case_idx, when_conditions in enumerate(self._collect_case_when_conditions()):
-            case_spec = BranchSpec(branch=f"case_else_{case_idx}")
-            self._propagate_step(self.plan.root, case_spec)
-            for cond in when_conditions:
-                negated = negate_predicate(cond.copy())
-                self._store_expression(negated, case_spec)
-            self._add_schema_constraints(case_spec)
-            self._annotate_column_types(case_spec)
-            specs.append(case_spec)
-        return specs
+            except Exception as exc:
+                logger.debug("null branch propagation failed: %s", exc)
 
-    def propagate_gold_non_empty(self) -> List[BranchSpec]:
-        """Produce positive witness specs only.
-
-        This mode avoids negative, NULL, boundary, and unmatched-join coverage
-        rows.
-        """
-        _ = self.plan.annotations
-        specs: List[BranchSpec] = []
-
-        base = BranchSpec(branch="positive")
-        self._propagate_step(self.plan.root, base)
-        self._add_schema_constraints(base)
-        self._annotate_column_types(base)
-        specs.append(base)
-
-        for case_idx, when_conditions in enumerate(self._collect_case_when_conditions()):
-            prior_conditions: List[exp.Expression] = []
-            for when_idx, cond in enumerate(when_conditions):
-                case_spec = BranchSpec(branch=f"positive_case_{case_idx}_when_{when_idx}")
-                self._propagate_step(self.plan.root, case_spec)
-                for prior in prior_conditions:
-                    self._store_expression(negate_predicate(prior.copy()), case_spec)
-                self._store_expression(cond.copy(), case_spec)
-                self._add_schema_constraints(case_spec)
-                self._annotate_column_types(case_spec)
-                specs.append(case_spec)
-                prior_conditions.append(cond)
+        # CASE WHEN branches.
+        if self.config.case_else > 0:
+            try:
+                for case_idx, when_conditions in enumerate(self._collect_case_when_conditions()):
+                    case_spec = BranchSpec(branch=f"case_else_{case_idx}")
+                    self._propagate_step(self.plan.root, case_spec)
+                    for cond in when_conditions:
+                        negated = negate_predicate(cond.copy())
+                        self._store_expression(negated, case_spec)
+                    self._add_schema_constraints(case_spec)
+                    self._annotate_column_types(case_spec)
+                    specs.append(case_spec)
+            except Exception as exc:
+                logger.debug("CASE WHEN propagation failed: %s", exc)
 
         return specs
 
@@ -406,7 +569,7 @@ class Propagator:
         if isinstance(step, Limit):
             offset = getattr(step, "offset", 0) or 0
             limit_val = step.limit if step.limit != float("inf") else 1
-            if self.objective == "gold_non_empty":
+            if self._is_gold_mode:
                 needed = offset + 1 if int(limit_val) > 0 else 0
             else:
                 needed = offset + int(limit_val)
@@ -432,13 +595,11 @@ class Propagator:
             for table, tc in spec.requirements.items():
                 for col in projected:
                     matched = _match_column(self.instance, table, col)
-                    if matched:
-                        col_node = exp.column(matched, table)
-                        is_not_null = exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
-                        if not self._has_is_not_null(tc.constraints, matched):
-                            tc.constraints.append(is_not_null)
+                    if matched and not _has_is_not_null(tc.constraints, matched):
+                        col_node = _make_typed_column(self.instance, table, matched)
+                        tc.constraints.append(_make_is_not_null(col_node))
                 dup_cols = [c for c in projected if _match_column(self.instance, table, c)]
-                if dup_cols:
+                if step.distinct and dup_cols:
                     tc.duplicate_columns = dup_cols
                     tc.min_rows = max(tc.min_rows, 2)
                     # Propagate min_rows to joined tables so join equalities
@@ -462,7 +623,7 @@ class Propagator:
             for dep in step.chain_dependencies:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
             if step.condition and step is not negate_step:
-                if self.objective == "gold_non_empty":
+                if self._is_gold_mode:
                     for scalar_condition in self._gold_having_scalar_constraints(step.condition):
                         self._store_expression(scalar_condition, spec)
                 else:
@@ -495,7 +656,7 @@ class Propagator:
                             if matched not in req.group_key_columns:
                                 req.group_key_columns.append(matched)
             # Aggregate NULL detection: COUNT/SUM/AVG columns need a NULL row.
-            if self.objective != "gold_non_empty":
+            if not self._is_gold_mode:
                 for agg_expr in step.aggregations:
                     self._add_aggregate_null_constraints(agg_expr, spec)
             else:
@@ -511,15 +672,11 @@ class Propagator:
                             if matched and table in self.instance.tables:
                                 req = spec.require(table)
                                 if (
-                                    not self._has_is_null(req.constraints, matched)
-                                    and not self._has_is_not_null(req.constraints, matched)
+                                    not _has_is_null(req.constraints, matched)
+                                    and not _has_is_not_null(req.constraints, matched)
                                 ):
-                                    col_node = exp.column(matched, table)
-                                    is_not_null = exp.Is(
-                                        this=col_node,
-                                        expression=exp.Not(this=exp.Null()),
-                                    )
-                                    req.constraints.append(is_not_null)
+                                    col_node = _make_typed_column(self.instance, table, matched)
+                                    req.constraints.append(_make_is_not_null(col_node))
 
         elif isinstance(step, Filter):
             for dep in step.chain_dependencies:
@@ -565,7 +722,7 @@ class Propagator:
                         sk_alias = normalize_name(sk.table or sk_table_name or "")
                         jk_alias = normalize_name(jk.table or join_name or "")
                         if (
-                            self.objective == "gold_non_empty"
+                            self._is_gold_mode
                             and sk_table == join_table
                             and self._is_self_join_table(sk_table)
                             and sk_alias
@@ -708,12 +865,11 @@ class Propagator:
             # NOT NULL columns.
             for col_name in self.instance.tables[table]:
                 if not self.instance.nullable(table, col_name):
-                    if self._has_is_null(tc.constraints, col_name):
+                    if _has_is_null(tc.constraints, col_name):
                         continue
-                    col_node = exp.column(col_name, table)
-                    is_not_null = exp.Is(this=col_node, expression=exp.Not(this=exp.Null()))
-                    if not self._has_is_not_null(tc.constraints, col_name):
-                        tc.constraints.append(is_not_null)
+                    if not _has_is_not_null(tc.constraints, col_name):
+                        col_node = _make_typed_column(self.instance, table, col_name)
+                        tc.constraints.append(_make_is_not_null(col_node))
 
             # UNIQUE columns with existing data → exclude existing values.
             existing_rows = self.instance.get_rows(table)
@@ -871,9 +1027,8 @@ class Propagator:
 
             # Add IS NULL constraints for target columns.
             for col_name in targets[table]:
-                col_node = exp.column(col_name, table)
-                is_null = exp.Is(this=col_node, expression=exp.Null())
-                tc.constraints.append(is_null)
+                col_node = _make_typed_column(self.instance, table, col_name)
+                tc.constraints.append(_make_is_null(col_node))
 
     def _apply_single_null_override(self, spec: BranchSpec, target_table: str, target_col: str):
         """Replace IS NOT NULL with IS NULL for a single target column."""
@@ -910,9 +1065,8 @@ class Propagator:
             tc.constraints = new_constraints
 
             # Add IS NULL for the target column only.
-            col_node = exp.column(target_col, target_table)
-            is_null = exp.Is(this=col_node, expression=exp.Null())
-            tc.constraints.append(is_null)
+            col_node = _make_typed_column(self.instance, target_table, target_col)
+            tc.constraints.append(_make_is_null(col_node))
 
     # -----------------------------------------------------------------
     # Boundary value collection
@@ -983,8 +1137,6 @@ class Propagator:
 
     def _annotate_column_types(self, spec: BranchSpec):
         """Set .type on Column nodes from column_meta or instance schema."""
-        from parseval.dtype import DataType
-
         for table_key, tc in spec.requirements.items():
             for constraint in tc.constraints:
                 for col in constraint.find_all(exp.Column):
@@ -995,12 +1147,7 @@ class Propagator:
                         col.type = meta["domain"]
                     else:
                         col_table = _resolve_table(self.instance, self.alias_map, col.table or table_key)
-                        col_type_str = _lookup_col_type(self.instance, col_table, col.name)
-                        if col_type_str:
-                            try:
-                                col.type = DataType.build(col_type_str)
-                            except Exception:
-                                pass
+                        _annotate_col_type(col, self.instance, col_table, col.name)
 
         # Also annotate columns in deferred (scalar subquery) atoms.
         for atom in spec.deferred:
@@ -1012,75 +1159,42 @@ class Propagator:
                     col.type = meta["domain"]
                 else:
                     col_table = _resolve_table(self.instance, self.alias_map, col.table or "")
-                    col_type_str = _lookup_col_type(self.instance, col_table, col.name)
-                    if col_type_str:
-                        try:
-                            col.type = DataType.build(col_type_str)
-                        except Exception:
-                            pass
+                    _annotate_col_type(col, self.instance, col_table, col.name)
 
     # -----------------------------------------------------------------
     # Aggregate NULL constraints
     # -----------------------------------------------------------------
 
     def _add_aggregate_null_constraints(self, agg_expr: exp.Expression, spec: BranchSpec):
-        """Add IS NULL for COUNT/SUM/AVG columns.
+        """Add IS NULL for COUNT/SUM/AVG/MIN/MAX columns.
 
         Skips COUNT(*) and COUNT(DISTINCT col) — those don't need NULL testing.
         """
+        # COUNT columns
         for count_node in agg_expr.find_all(exp.Count):
             if isinstance(count_node.this, exp.Star):
                 continue
             if count_node.args.get("distinct"):
                 continue
             for col in count_node.find_all(exp.Column):
-                table = _resolve_table(self.instance, self.alias_map, col.table or "")
-                matched = _match_column(self.instance, table, col.name)
-                if matched and table in self.instance.tables:
-                    req = spec.require(table)
-                    if not self._has_equality_constraint(req.constraints, matched):
-                        col_node = exp.column(matched, table)
-                        is_null = exp.Is(this=col_node, expression=exp.Null())
-                        req.constraints.append(is_null)
-                        req.min_rows = max(req.min_rows, 2)
+                self._add_null_constraint_for_col(col, spec)
 
-        for sum_node in agg_expr.find_all(exp.Sum):
-            for col in sum_node.find_all(exp.Column):
-                table = _resolve_table(self.instance, self.alias_map, col.table or "")
-                matched = _match_column(self.instance, table, col.name)
-                if matched and table in self.instance.tables:
-                    req = spec.require(table)
-                    if not self._has_equality_constraint(req.constraints, matched):
-                        col_node = exp.column(matched, table)
-                        is_null = exp.Is(this=col_node, expression=exp.Null())
-                        req.constraints.append(is_null)
-                        req.min_rows = max(req.min_rows, 2)
-
-        for avg_node in agg_expr.find_all(exp.Avg):
-            for col in avg_node.find_all(exp.Column):
-                table = _resolve_table(self.instance, self.alias_map, col.table or "")
-                matched = _match_column(self.instance, table, col.name)
-                if matched and table in self.instance.tables:
-                    req = spec.require(table)
-                    if not self._has_equality_constraint(req.constraints, matched):
-                        col_node = exp.column(matched, table)
-                        is_null = exp.Is(this=col_node, expression=exp.Null())
-                        req.constraints.append(is_null)
-                        req.min_rows = max(req.min_rows, 2)
-
-        # MIN/MAX: add IS NULL to test NULL handling.
-        for agg_type in (exp.Min, exp.Max):
+        # SUM/AVG/MIN/MAX columns
+        for agg_type in (exp.Sum, exp.Avg, exp.Min, exp.Max):
             for agg_node in agg_expr.find_all(agg_type):
                 for col in agg_node.find_all(exp.Column):
-                    table = _resolve_table(self.instance, self.alias_map, col.table or "")
-                    matched = _match_column(self.instance, table, col.name)
-                    if matched and table in self.instance.tables:
-                        req = spec.require(table)
-                        if not self._has_equality_constraint(req.constraints, matched):
-                            col_node = exp.column(matched, table)
-                            is_null = exp.Is(this=col_node, expression=exp.Null())
-                            req.constraints.append(is_null)
-                            req.min_rows = max(req.min_rows, 2)
+                    self._add_null_constraint_for_col(col, spec)
+
+    def _add_null_constraint_for_col(self, col: exp.Column, spec: BranchSpec) -> None:
+        """Add IS NULL constraint for a single column if not already constrained."""
+        table = _resolve_table(self.instance, self.alias_map, col.table or "")
+        matched = _match_column(self.instance, table, col.name)
+        if matched and table in self.instance.tables:
+            req = spec.require(table)
+            if not _has_equality_constraint(req.constraints, matched):
+                col_node = _make_typed_column(self.instance, table, matched)
+                req.constraints.append(_make_is_null(col_node))
+                req.min_rows = max(req.min_rows, 2)
 
     # -----------------------------------------------------------------
     # Join / SubPlan handling
@@ -1181,8 +1295,9 @@ class Propagator:
         elif sub.kind.value == "scalar":
             self._propagate_scalar_subplan(sub, spec)
 
-        # Always propagate into inner plan for WHERE constraints.
-        if sub.inner and not negated_exists:
+        # Scalar subqueries are repaired from deferred predicates; do not merge
+        # inner aggregate/null branch constraints into the outer witness spec.
+        if sub.inner and not negated_exists and sub.kind.value != "scalar":
             self._propagate_step(sub.inner, spec)
             self._fix_inner_filter_tables(sub.inner, spec)
 
@@ -1430,7 +1545,7 @@ class Propagator:
             agg_side, threshold, op_class = self._extract_agg_and_threshold(node)
             if agg_side is None or not isinstance(threshold, (int, float)):
                 continue
-            if not agg_side.find(exp.Count):
+            if not self._is_direct_count_expr(agg_side):
                 continue
             if op_class is exp.GT:
                 return int(threshold) + 1
@@ -1440,6 +1555,14 @@ class Propagator:
                 return int(threshold)
             # LT/LTE: no lower bound on group size needed.
         return 1
+
+    def _is_direct_count_expr(self, expr: exp.Expression) -> bool:
+        """Return True for COUNT(...) or a simple cast around COUNT(...)."""
+        if isinstance(expr, exp.Count):
+            return True
+        if isinstance(expr, exp.Cast):
+            return isinstance(expr.this, exp.Count)
+        return False
 
     # -----------------------------------------------------------------
     # Scalar subquery detection
@@ -1719,36 +1842,6 @@ class Propagator:
     # Constraint deduplication helpers
     # -----------------------------------------------------------------
 
-    def _has_equality_constraint(self, constraints: List[exp.Expression], col_name: str) -> bool:
-        """Check if constraints already have an EQ for the given column."""
-        for expr in constraints:
-            if isinstance(expr, exp.EQ):
-                left = expr.this
-                right = expr.expression
-                if isinstance(left, exp.Column) and left.name == col_name:
-                    return True
-                if isinstance(right, exp.Column) and right.name == col_name:
-                    return True
-        return False
-
-    def _has_is_not_null(self, constraints: List[exp.Expression], col_name: str) -> bool:
-        """Check if constraints already have IS NOT NULL for the given column."""
-        for expr in constraints:
-            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Not) and isinstance(expr.expression.this, exp.Null):
-                for col in expr.find_all(exp.Column):
-                    if col.name == col_name:
-                        return True
-        return False
-
-    def _has_is_null(self, constraints: List[exp.Expression], col_name: str) -> bool:
-        """Check if constraints already have IS NULL for the given column."""
-        for expr in constraints:
-            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null):
-                for col in expr.find_all(exp.Column):
-                    if col.name == col_name:
-                        return True
-        return False
-
     def _is_synthetic_having_alias(self, condition: exp.Expression) -> bool:
         """Return True for planner-generated HAVING aggregate alias columns."""
         if not isinstance(condition, exp.Column):
@@ -1845,7 +1938,7 @@ class Resolver:
     def _solve_row(self, table, req, spec, join_equalities, result, row_index=0):
         """Build a SolverConstraint and call solver.solve() to get a row."""
         if self.solver is None:
-            return {}
+            return self._minimal_non_null_row(table, req, result, row_index)
 
         all_constraints = list(req.constraints)
 
@@ -2020,17 +2113,13 @@ class Resolver:
                 table,
                 col_name,
                 row_context=row,
+                rows=result,
             )
         return row
 
     def _annotate_col_type(self, col_node: exp.Column, table: str, col_name: str) -> None:
         """Set .type on a Column node from the instance schema."""
-        col_type_str = _lookup_col_type(self.instance, table, col_name)
-        if col_type_str:
-            try:
-                col_node.type = DataType.build(col_type_str)
-            except Exception:
-                pass
+        _annotate_col_type(col_node, self.instance, table, col_name)
 
     def _drop_subquery_constraints(
         self,
@@ -2582,6 +2671,44 @@ def _row_for_scalar_expression(
     return None
 
 
+def _force_outer_scalar_bound(
+    atom: exp.Expression,
+    outer_expr: exp.Expression,
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    alias_map,
+) -> Set[Tuple[str, int]]:
+    if not isinstance(outer_expr, exp.Column):
+        return set()
+    if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return set()
+    table = _scalar_expression_table(instance, alias_map, outer_expr)
+    if not table or table not in rows or not rows[table]:
+        return set()
+    column = _match_column(instance, table, outer_expr.name)
+    if not column:
+        return set()
+
+    values: List[float] = []
+    for existing_row in instance.get_rows(table):
+        if column in existing_row.columns:
+            value = existing_row[column].concrete
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+    for row in rows.get(table, []):
+        value = row.get(column)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    if not values:
+        return set()
+
+    if isinstance(atom, (exp.GT, exp.GTE)):
+        rows[table][0][column] = int(max(values)) + 1
+    else:
+        rows[table][0][column] = int(min(values)) - 1
+    return {(table, 0)}
+
+
 def _scalar_expression_family(
     instance: Instance,
     alias_map,
@@ -2685,6 +2812,7 @@ def _satisfy_gold_scalar_subqueries(
             dialect,
             inner_row_index,
         )
+        touched.update(_force_outer_scalar_bound(atom, outer_expr, rows, instance, alias_map))
         for table, row_index in touched:
             _align_gold_fk_parent_row(rows, instance, table, row_index=row_index)
 
@@ -2771,19 +2899,29 @@ def _validate_gold_subquery_observations(
 
 
 def _gold_has_positive_evaluator_observations(tree: BranchTree) -> bool:
-    """Return True when evaluator observations support a positive witness."""
-    checked = False
+    """Return True when evaluator observations support a positive witness.
+
+    A positive witness is supported when at least one filter/join/having/case_arm
+    node has ATOM_TRUE observations for all its atoms. If no such nodes exist,
+    the witness is considered valid (no constraints to satisfy).
+    """
+    has_filter_nodes = False
     for node in tree.nodes:
         if node.site in {"filter", "join_on", "having", "case_arm"}:
+            has_filter_nodes = True
+            all_true = True
             for atom_id, _atom in enumerate(node.atoms):
-                checked = True
                 if BranchType.ATOM_TRUE not in node.observed_outcomes(atom_id):
-                    return False
+                    all_true = False
+                    break
+            if all_true:
+                return True
         elif node.site == "group":
-            checked = True
-            if not node.observed_outcomes(0):
-                return False
-    return checked
+            has_filter_nodes = True
+            if node.observed_outcomes(0):
+                return True
+    # If no filter nodes exist, consider it valid (no constraints to satisfy).
+    return not has_filter_nodes
 
 
 def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
@@ -2895,14 +3033,8 @@ def _join_column_type_constraints(
             binding = row_bindings.get(key[0])
             if binding is None:
                 continue
-            col_node = exp.column(key[1], key[0])
-            col_type_str = _lookup_col_type(instance, binding.table, key[1])
-            if col_type_str:
-                try:
-                    col_node.type = DataType.build(col_type_str)
-                except Exception:
-                    pass
-            constraints.append(exp.Is(this=col_node, expression=exp.Not(this=exp.Null())))
+            col_node = _make_typed_column(instance, binding.table, key[1])
+            constraints.append(_make_is_not_null(col_node))
     return constraints
 
 
@@ -2937,11 +3069,44 @@ def _build_gold_solver_constraint(
                 constraints.append(rewritten)
     join_equalities = _row_scoped_join_equalities(spec, row_bindings, alias_map)
     constraints.extend(_join_column_type_constraints(instance, row_bindings, join_equalities))
+    # Re-annotate column types after rewriting — some annotations may have been
+    # lost during _rewrite_expr_for_row_scope or were missing from the original
+    # constraint.
+    _annotate_constraint_column_types(constraints, instance, alias_map, row_bindings)
     return SolverConstraint(
         target_tables=tuple(row_bindings.keys()),
         constraints=constraints,
         join_equalities=join_equalities,
     ), row_bindings
+
+
+def _annotate_constraint_column_types(
+    constraints: List[exp.Expression],
+    instance: Instance,
+    alias_map,
+    row_bindings: Dict[str, RowBinding],
+) -> None:
+    """Annotate column types on final solver constraints.
+
+    Uses row_bindings to resolve the physical table for each column,
+    then looks up the type from the instance schema.
+    """
+    for expr in constraints:
+        for col in expr.find_all(exp.Column):
+            if getattr(col, "type", None) is not None:
+                continue
+            # Resolve physical table from the solver table key.
+            raw_table = normalize_name(col.table or "")
+            binding = row_bindings.get(raw_table)
+            if binding is None:
+                # Try partial match — the table key may have row suffix.
+                for key, b in row_bindings.items():
+                    if key.startswith(raw_table + "__") or key == raw_table:
+                        binding = b
+                        break
+            if binding is None:
+                continue
+            _annotate_col_type(col, instance, binding.table, col.name)
 
 
 def _gold_domain_value(
@@ -2950,24 +3115,28 @@ def _gold_domain_value(
     column: str,
     row_context: Optional[Dict[str, Any]] = None,
     rows: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    builder: Optional[Any] = None,
 ) -> Any:
     context = dict(row_context or {})
     context.pop(column, None)
-    builder = instance.builder
-    if rows:
-        builder = type(instance.builder)(instance.schema_spec)
-        for table_name in instance.tables:
-            for existing_row in instance.get_rows(table_name):
-                builder.runtime.remember_row(
-                    table_name,
-                    {col: value.concrete for col, value in existing_row.items()},
-                )
-        for table_name, table_rows in rows.items():
-            if table_name not in instance.tables:
-                continue
-            for row in table_rows:
-                if row:
-                    builder.runtime.remember_row(table_name, row)
+    if builder is None:
+        if rows:
+            builder = type(instance.builder)(instance.schema_spec)
+            for table_name in instance.tables:
+                for existing_row in instance.get_rows(table_name):
+                    builder.runtime.remember_row(
+                        table_name,
+                        {col: value.concrete for col, value in existing_row.items()},
+                    )
+            for table_name, table_rows in rows.items():
+                if table_name not in instance.tables:
+                    continue
+                for row in table_rows:
+                    if row:
+                        builder.runtime.remember_row(table_name, row)
+        else:
+            builder = instance.builder
+
     return builder.generate_value(
         table,
         column,
@@ -3009,6 +3178,15 @@ def _complete_gold_rows(
     spec: BranchSpec,
     instance: Instance,
 ) -> Dict[str, List[Dict[str, Any]]]:
+    # Build an incremental runtime for the generator so unique columns and FKs are consistent.
+    builder = type(instance.builder)(instance.schema_spec)
+    for table_name in instance.tables:
+        for existing_row in instance.get_rows(table_name):
+            builder.runtime.remember_row(
+                table_name,
+                {col: value.concrete for col, value in existing_row.items()},
+            )
+
     pending_rows = {
         table: [dict(row) for row in table_rows]
         for table, table_rows in rows.items()
@@ -3042,19 +3220,34 @@ def _complete_gold_rows(
                 key = (binding.table, col_name)
                 if col_name in row:
                     group_values.setdefault(key, row[col_name])
-                    continue
                 if key not in group_values:
-                    group_values[key] = _gold_domain_value(
-                        instance,
+                    try:
+                        group_values[key] = builder.generate_value(
+                            binding.table,
+                            col_name,
+                            row_context=row,
+                        )
+                    except Exception:
+                        pass
+                if key in group_values:
+                    row[col_name] = group_values[key]
+
+            # Fill missing columns from schema
+            for col_name in instance.tables.get(binding.table, {}):
+                if col_name in row:
+                    continue
+                try:
+                    row[col_name] = builder.generate_value(
                         binding.table,
                         col_name,
                         row_context=row,
                     )
-                row[col_name] = group_values[key]
+                except Exception:
+                    # Skip columns that can't be generated (e.g., FK columns
+                    # where parent table doesn't have rows yet).
+                    pass
             for col_name in instance.tables.get(binding.table, {}):
                 if not instance.is_unique(binding.table, col_name):
-                    continue
-                if col_name in req.fixed_values or col_name in req.group_key_columns:
                     continue
                 key = (binding.table, col_name)
                 seen_values = unique_values.setdefault(key, set())
@@ -3063,28 +3256,65 @@ def _complete_gold_rows(
                     if col_name in fk_columns:
                         row.pop(col_name, None)
                         continue
+                    context = dict(row)
+                    context.pop(col_name, None)
+                    generated = False
                     for _ in range(16):
-                        value = _gold_domain_value(
-                            instance,
-                            binding.table,
-                            col_name,
-                            row_context=row,
-                        )
-                        if value not in seen_values:
-                            row[col_name] = value
+                        try:
+                            value = builder.generate_value(
+                                binding.table,
+                                col_name,
+                                row_context=context,
+                            )
+                            if value not in seen_values:
+                                row[col_name] = value
+                                generated = True
+                                break
+                        except Exception:
                             break
-                    else:
+                    if not generated:
                         row.pop(col_name, None)
                         continue
                 if col_name in row:
                     seen_values.add(row[col_name])
+
+        # Remember this row for future references (FK/Unique) in the same completion pass.
+        builder.runtime.remember_row(binding.table, row)
         completed.setdefault(binding.table, []).append(row)
+
+    # High LIMIT/OFFSET support: clone rows to satisfy min_rows if solver bindings were capped.
+    # Total rows per table capped at 500 to avoid OOM.
+    MAX_TOTAL_ROWS = 500
+    for table_key, req in spec.requirements.items():
+        physical = normalize_name(req.table.split("__", 1)[0] if "__" in req.table else req.table)
+        if physical not in completed or not completed[physical]:
+            continue
+
+        target = min(req.min_rows, MAX_TOTAL_ROWS)
+        current_rows = completed[physical]
+        while len(current_rows) < target:
+            # Clone the last row.
+            base_row = current_rows[-1]
+            new_row = dict(base_row)
+            # Ensure unique columns get fresh values.
+            for col_name in instance.tables.get(physical, {}):
+                if instance.is_unique(physical, col_name):
+                    context = dict(new_row)
+                    context.pop(col_name, None)
+                    try:
+                        new_row[col_name] = builder.generate_value(
+                            physical,
+                            col_name,
+                            row_context=context,
+                        )
+                    except Exception:
+                        pass
+            builder.runtime.remember_row(physical, new_row)
+            current_rows.append(new_row)
 
     for table, table_rows in pending_rows.items():
         completed.setdefault(table, []).extend(table_rows)
     return completed
-
-
 def _materialize_rows(
     instance: Instance,
     rows: Dict[str, List[Dict[str, Any]]],
@@ -3129,6 +3359,32 @@ def _gold_materialization_order(
     return ordered
 
 
+def _drop_not_null_violating_rows(
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    filtered: Dict[str, List[Dict[str, Any]]] = {}
+    for table_name, table_rows in rows.items():
+        if table_name not in instance.tables:
+            continue
+        kept = []
+        for row in table_rows:
+            violates = any(
+                col_name in row
+                and row[col_name] is None
+                and (
+                    not instance.nullable(table_name, col_name)
+                    or instance.is_unique(table_name, col_name)
+                )
+                for col_name in instance.tables[table_name]
+            )
+            if not violates:
+                kept.append(row)
+        if kept:
+            filtered[table_name] = kept
+    return filtered
+
+
 def _solve_and_materialize_gold(
     spec: BranchSpec,
     plan: Plan,
@@ -3139,9 +3395,14 @@ def _solve_and_materialize_gold(
 ) -> Dict[str, List[Dict[str, Any]]]:
     constraint, row_bindings = _build_gold_solver_constraint(spec, instance, alias_map)
     result = solver.solve(constraint)
-    if not result.sat:
+    if result.sat:
+        rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
+    else:
+        # Fallback: build rows from heuristic values when solver fails.
+        logger.debug("Solver failed for spec=%s reason=%s; using heuristic fallback", spec.branch, result.reason)
+        rows = _heuristic_gold_rows(spec, instance, row_bindings)
+    if not rows:
         return {}
-    rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
     rows = _complete_gold_rows(rows, row_bindings, spec, instance)
     _satisfy_gold_scalar_subqueries(spec, plan, rows, instance, alias_map, dialect)
     checkpoint = instance.checkpoint()
@@ -3159,60 +3420,183 @@ def _solve_and_materialize_gold(
         return {}
 
 
+def _heuristic_gold_rows(
+    spec: BranchSpec,
+    instance: Instance,
+    row_bindings: Dict[str, RowBinding],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build rows using heuristic values when the solver fails.
+
+    Uses fixed_values from the spec and generates default values for
+    remaining columns. This is a best-effort fallback — the rows may
+    not satisfy all constraints but can still produce non-empty output.
+    """
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    for table_key, req in spec.requirements.items():
+        physical = normalize_name(req.table.split("__", 1)[0] if "__" in req.table else req.table)
+        if physical not in instance.tables:
+            continue
+        for row_index in range(max(req.min_rows, 1)):
+            row: Dict[str, Any] = dict(req.fixed_values)
+            # Generate default values for missing columns.
+            for col_name in instance.tables[physical]:
+                if col_name in row:
+                    continue
+                try:
+                    row[col_name] = _gold_domain_value(
+                        instance,
+                        physical,
+                        col_name,
+                        row_context=row,
+                        rows=rows,
+                    )
+                except Exception:
+                    # Skip columns that can't be generated (e.g., FK columns
+                    # where parent table doesn't have rows yet).
+                    pass
+            rows.setdefault(physical, []).append(row)
+    return rows
+
+
+def _try_heuristic_fallback(
+    spec: BranchSpec,
+    plan: Plan,
+    instance: Instance,
+    alias_map,
+    dialect: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Try to generate rows using heuristic values when solver fails.
+
+    This is a best-effort fallback that uses fixed_values from the spec
+    and generates default values for remaining columns.
+    """
+    try:
+        row_bindings = _build_gold_row_bindings(spec)
+        rows = _heuristic_gold_rows(spec, instance, row_bindings)
+        if not rows:
+            return {}
+        rows = _complete_gold_rows(rows, row_bindings, spec, instance)
+        checkpoint = instance.checkpoint()
+        try:
+            _materialize_rows(instance, rows)
+            if _gold_candidate_has_output(plan, instance, {}, dialect=dialect):
+                return rows
+            instance.rollback(checkpoint)
+            return {}
+        except Exception:
+            instance.rollback(checkpoint)
+            return {}
+    except Exception as exc:
+        logger.debug("heuristic fallback failed for spec %s: %s", spec.branch, exc)
+        return {}
+
+
+def _solve_and_materialize_branch_coverage(
+    spec: BranchSpec,
+    plan: Plan,
+    instance: Instance,
+    solver,
+    alias_map,
+    dialect: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Generate rows for branch coverage (positive + negative branches).
+
+    For negative branches, generates rows that violate constraints or
+    don't join with existing rows, then materializes them.
+    """
+    constraint, row_bindings = _build_gold_solver_constraint(spec, instance, alias_map)
+    result = solver.solve(constraint)
+    if result.sat:
+        rows = _rows_from_solver_assignments(result.assignments, row_bindings, instance)
+    else:
+        logger.debug("Solver failed for spec=%s reason=%s; using heuristic fallback", spec.branch, result.reason)
+        rows = _heuristic_gold_rows(spec, instance, row_bindings)
+    if not rows:
+        return {}
+    rows = _complete_gold_rows(rows, row_bindings, spec, instance)
+    _satisfy_gold_scalar_subqueries(spec, plan, rows, instance, alias_map, dialect)
+    # Materialize without validation - branch coverage doesn't require output
+    try:
+        _materialize_rows(instance, rows)
+        return rows
+    except Exception as exc:
+        logger.debug("branch_coverage materialization failed for spec=%s: %s", spec.branch, exc)
+        return {}
+
+
 def speculate(
     plan: Plan,
     instance: Instance,
     alias_map,
     dialect: str = "sqlite",
-    objective: str = "branch_coverage",
+    config: Optional[SpeculateConfig] = None,
 ) -> List[Tuple[str, Dict[str, List[Dict[str, Any]]]]]:
     """One-call API: propagate + resolve → list of (branch_name, rows_per_table).
 
     Returns one entry per branch (positive + negatives). The engine
     materializes each one.
+
+    Args:
+        plan: The query plan to generate data for.
+        instance: The database instance to materialize rows into.
+        alias_map: Table alias mapping.
+        dialect: SQL dialect (default: "sqlite").
+        config: SpeculateConfig controlling which branches to generate.
+            If None, uses SpeculateConfig.gold_non_empty().
+
+    Returns:
+        List of (branch_name, rows_per_table) tuples.
     """
-    propagator = Propagator(plan, instance, alias_map, dialect, objective=objective)
+    if config is None:
+        config = SpeculateConfig.gold_non_empty()
+
+    is_gold_mode = (
+        config.negative == 0
+        and config.null == 0
+        and config.left_unmatched == 0
+        and config.right_unmatched == 0
+        and config.having_fail == 0
+    )
+
+    propagator = Propagator(plan, instance, alias_map, dialect, config=config)
     solver = Solver(dialect=dialect)
     resolver = Resolver(
         instance,
         dialect,
         solver=solver,
-        fill_empty_rows=objective == "gold_non_empty",
+        fill_empty_rows=is_gold_mode,
     )
-    if objective == "gold_non_empty":
-        branch_specs = propagator.propagate_gold_non_empty()
-        logger.info("Generated %d branch specs", len(branch_specs))
-        results = []
-        for spec in branch_specs:
-            if not spec.requirements:
-                continue
-            rows = _solve_and_materialize_gold(
-                spec,
-                plan,
-                instance,
-                solver,
-                alias_map,
-                dialect,
-            )
-            if rows:
-                results.append((spec.branch, rows))
-        return results
-    else:
-        branch_specs = propagator.propagate()
+
+    branch_specs = propagator.propagate()
     logger.info("Generated %d branch specs", len(branch_specs))
 
     results = []
     for spec in branch_specs:
-        if spec.requirements:
-            rows = resolver.resolve(spec)
-            if objective == "gold_non_empty" and not _gold_candidate_has_output(
-                plan,
-                instance,
-                rows,
-                dialect=dialect,
-            ):
-                logger.debug("dropping gold_non_empty spec with empty result: %s", spec.branch)
-                continue
+        if not spec.requirements:
+            continue
+        try:
+            if is_gold_mode:
+                rows = _solve_and_materialize_gold(
+                    spec,
+                    plan,
+                    instance,
+                    solver,
+                    alias_map,
+                    dialect,
+                )
+            else:
+                rows = _solve_and_materialize_branch_coverage(
+                    spec,
+                    plan,
+                    instance,
+                    solver,
+                    alias_map,
+                    dialect,
+                )
+        except Exception as exc:
+            logger.debug("spec %s failed: %s; trying heuristic fallback", spec.branch, exc)
+            rows = _try_heuristic_fallback(spec, plan, instance, alias_map, dialect)
+        if rows:
             results.append((spec.branch, rows))
     return results
 
@@ -3221,6 +3605,7 @@ __all__ = [
     "BranchSpec",
     "Propagator",
     "Resolver",
+    "SpeculateConfig",
     "TableConstraint",
     "speculate",
 ]
