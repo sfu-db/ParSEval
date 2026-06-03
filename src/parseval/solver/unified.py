@@ -286,14 +286,15 @@ class Solver:
 
         # Tier 1: Domain solver
         domain_result = self._try_domain(constraint)
-        if domain_result.status == "unsat":
-            return SolveResult(sat=False, reason=domain_result.reason)
         if domain_result.status == "sat":
             return SolveResult(
                 sat=True,
                 assignments=self._remap_assignments(domain_result.assignments or {}, constraint.alias_map),
             )
-        if domain_result.status != "unknown":
+        # For "unsat" from domain solver, still try SMT as fallback —
+        # the domain solver may incorrectly reject complex expressions
+        # (e.g., OR conditions) that the SMT solver can handle.
+        if domain_result.status not in ("unknown", "unsat"):
             return SolveResult(
                 sat=False,
                 reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",

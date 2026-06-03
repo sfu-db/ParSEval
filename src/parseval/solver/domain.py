@@ -575,7 +575,9 @@ class DomainSolver:
             op, val = pred.op, pred.value
             # Infer real type for string values on TEXT columns.
             # A TEXT column storing '596' should compare numerically.
-            if isinstance(val, str) and space.family == TypeFamily.TEXT:
+            # But for equality comparisons, preserve the original string value
+            # to avoid losing leading zeros or non-numeric strings.
+            if isinstance(val, str) and space.family == TypeFamily.TEXT and op != "=":
                 inferred = infer_type_from_string(val)
                 if not isinstance(inferred, str):
                     val = inferred

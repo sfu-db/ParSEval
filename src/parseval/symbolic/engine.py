@@ -219,41 +219,41 @@ class SymbolicEngine:
 
         iteration = 0
 
-        # for iteration in range(self.max_iterations):
-        #     if tree.fully_covered:
-        #         break
+        for iteration in range(self.max_iterations):
+            if tree.fully_covered:
+                break
 
-        #     targets = tree.uncovered_targets
-        #     if not targets:
-        #         break
+            targets = tree.uncovered_targets
+            if not targets:
+                break
 
-        #     target = self._prioritize(targets)
+            target = self._prioritize(targets)
 
-        #     # Quick infeasibility check.
-        #     reason = is_infeasible(
-        #         target.node, target.atom_id, target.target_outcome, self.instance
-        #     )
-        #     if reason is not None:
-        #         tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
-        #         continue
+            # Quick infeasibility check.
+            reason = is_infeasible(
+                target.node, target.atom_id, target.target_outcome, self.instance
+            )
+            if reason is not None:
+                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+                continue
 
-        #     # Check row budget.
-        #     if self._total_rows() - rows_before >= self.max_rows_per_table * len(self.instance.tables):
-        #         break
+            # Check row budget.
+            if self._total_rows() - rows_before >= self.max_rows_per_table * len(self.instance.tables):
+                break
 
-        #     # Generate constraints.
-        #     constraint = constraint_gen.generate(target)
+            # Generate constraints.
+            constraint = constraint_gen.generate(target)
 
-        #     # Solve and materialize.
-        #     cp = self.instance.checkpoint()
-        #     success = self._solve_and_materialize(constraint)
+            # Solve and materialize.
+            cp = self.instance.checkpoint()
+            success = self._solve_and_materialize(constraint)
 
-        #     if success:
-        #         # Re-evaluate to discover newly covered branches.
-        #         tree = evaluator.evaluate(tree)
-        #     else:
-        #         self.instance.rollback(cp)
-        #         tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+            if success:
+                # Re-evaluate to discover newly covered branches.
+                tree = evaluator.evaluate(tree)
+            else:
+                self.instance.rollback(cp)
+                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
 
         return GenerationResult(
             tree=tree,

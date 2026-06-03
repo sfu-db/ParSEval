@@ -1267,6 +1267,10 @@ _ANONYMOUS_HANDLERS = {
 def _eval_time_to_str(node: exp.TimeToStr, env: Environment) -> Any:
     value = _eval(node.this, env)
     fmt = node.args.get("format")
+    if value is None and isinstance(node.this, (exp.Cast, exp.TsOrDsToTimestamp)):
+        inner = node.this.this
+        if isinstance(inner, exp.Literal) and str(inner.this).lower() == "now":
+            value = datetime.utcnow()
     if value is None or fmt is None:
         return None
     fmt_str = fmt if isinstance(fmt, str) else _eval(fmt, env)
