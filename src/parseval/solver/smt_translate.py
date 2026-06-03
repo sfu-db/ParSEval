@@ -247,8 +247,9 @@ def _translate_instr(
 def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
     """Decompose a Z3 temporal payload into (year, month, day, hour, minute, second).
 
-    Uses epoch-day arithmetic for dates and epoch-second for datetimes.
-    The year is estimated from the Gregorian average year length.
+    Uses Hinnant's algorithm for exact (year, month, day) decomposition
+    from epoch days. Time-of-day components use integer division on
+    epoch seconds.
     """
     raw = _value_payload(value)
     if value.typeinfo.family == "date":
@@ -260,14 +261,24 @@ def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
     second = ts % 60
     minute = (ts / 60) % 60
     hour = (ts / 3600) % 24
+    if value.typeinfo.family == "time":
+        return None, None, None, hour, minute, second
     days_since_epoch = ts / 86400
-    # Use the Gregorian average year length for a closer symbolic year estimate.
-    year_offset = (days_since_epoch * 400) / 146097
-    year = 1970 + year_offset
-    day_of_year = days_since_epoch - ((year_offset * 146097) / 400)
-    month = (day_of_year / 30) + 1
-    day = (day_of_year % 30) + 1
-    return year, month, day, hour, minute, second
+    # Hinnant's algorithm: convert epoch days to (year, month, day) using
+    # integer arithmetic. All divisions are Z3 integer division. The
+    # returned y is the March-based year; add 1 for Jan/Feb to recover
+    # the civil year.
+    z = days_since_epoch + 719468
+    era = z / 146097
+    doe = z - era * 146097
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp = (5 * doy + 2) / 153
+    d = doy - (153 * mp + 2) / 5 + 1
+    m = mp + 3 - 12 * (mp / 10)
+    y = y + z3.If(m <= 2, 1, 0)
+    return y, m, d, hour, minute, second
 
 
 def _translate_strftime(
@@ -320,6 +331,218 @@ def _translate_strftime(
 
 
 # ---------------------------------------------------------------------------
+# Temporal extractors: YEAR / MONTH / DAY (and the portable EXTRACT form)
+# ---------------------------------------------------------------------------
+
+
+_EXTRACT_UNITS = {
+    "YEAR": "year",
+    "MONTH": "month",
+    "DAY": "day",
+    "DAYOFMONTH": "day",
+    "DAY_OF_MONTH": "day",
+    "HOUR": "hour",
+    "MINUTE": "minute",
+    "SECOND": "second",
+}
+
+
+def _wrap_optional(
+    value: z3.ArithRef, guard: z3.BoolRef,
+    typeinfo: SMTTypeInfo, z3ctx,
+) -> "SMTValue":
+    """Wrap a Z3 expression in an Option type, gated on a None-propagation guard.
+
+    The output SMTValue is ``Some(value)`` when ``guard`` holds, else ``NULL``.
+    Used by the temporal extractors (result type is INT) and by the
+    temporal manipulators (result type matches the source column).
+    """
+    option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, z3ctx)
+    return SMTValue(
+        z3.If(guard, option_sort.Some(value), option_sort.NULL),
+        typeinfo,
+    )
+
+
+def _int_typeinfo(z3ctx) -> SMTTypeInfo:
+    """Standard INT typeinfo for temporal extractor results."""
+    return normalize_dtype(DataType.build("INT"), z3ctx)
+
+
+def _translate_temporal_extractor(
+    solver: SMTSolver, expression: exp.Expression, args, *,
+    component: str,
+) -> SMTValue:
+    """Shared translator for ``YEAR/MONTH/DAY/EXTRACT(unit FROM col)``.
+
+    The Hinnant decomposition in :func:`_ymd_hms_from_temporal` already
+    produces ``(year, month, day, hour, minute, second)`` as Z3 int
+    expressions; we just pick the right component.
+    """
+    if len(args) != 1:
+        raise UnsupportedSMTError(
+            f"{type(expression).__name__} expects exactly one argument"
+        )
+    temporal = solver._as_value(args[0])
+    year, month, day, hour, minute, second = _ymd_hms_from_temporal(solver, temporal)
+    components = {
+        "year": year, "month": month, "day": day,
+        "hour": hour, "minute": minute, "second": second,
+    }
+    return _wrap_optional(
+        components[component], _value_some(temporal),
+        _int_typeinfo(solver.z3ctx), solver.z3ctx,
+    )
+
+
+def _temporal_extractor(component: str):
+    """Build a translator that picks a single component from the Hinnant decomp."""
+    def _fn(solver, expression, args):
+        return _translate_temporal_extractor(
+            solver, expression, args, component=component,
+        )
+    _fn.__name__ = f"_translate_temporal_extractor_{component}"
+    return _fn
+
+
+def _translate_extract(solver, expression, args):
+    """Translate ``EXTRACT(unit FROM col)`` (PostgreSQL / MySQL 8+)."""
+    if len(args) != 1:
+        raise UnsupportedSMTError("EXTRACT expects exactly one argument")
+    unit_node = expression.this
+    unit_text = None
+    if isinstance(unit_node, exp.Var):
+        unit_text = unit_node.name.upper()
+    elif isinstance(unit_node, exp.Identifier):
+        unit_text = unit_node.name.upper()
+    elif isinstance(unit_node, exp.Column):
+        unit_text = unit_node.name.upper()
+    elif isinstance(unit_node, exp.Literal):
+        unit_text = str(unit_node.this).upper()
+    if unit_text is None or unit_text not in _EXTRACT_UNITS:
+        raise UnsupportedSMTError(f"Unsupported EXTRACT unit: {unit_text!r}")
+    return _translate_temporal_extractor(
+        solver, expression, args, component=_EXTRACT_UNITS[unit_text],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Temporal manipulators: DATE_ADD / DATE_SUB / DATEDIFF / TIMESTAMPDIFF
+# ---------------------------------------------------------------------------
+
+
+_INTERVAL_UNITS = {
+    "DAY": 86400, "HOUR": 3600, "MINUTE": 60, "SECOND": 1,
+    "WEEK": 7 * 86400,
+}
+
+
+def _interval_to_seconds(value: "SMTValue") -> int:
+    """Resolve a fixed-length interval unit to its seconds count.
+
+    Reads the interval magnitude from the *Z3* payload (an int constant
+    produced by the literal translator), not from the original sqlglot
+    expression.
+    """
+    if not isinstance(value, SMTValue):
+        raise UnsupportedSMTError("Interval length must be a literal integer")
+    raw = _value_payload(value)
+    simplified = z3.simplify(raw)
+    if not z3.is_int_value(simplified):
+        raise UnsupportedSMTError("Interval length must be an integer constant")
+    return simplified.as_long()
+
+
+def _shift_temporal(temporal: SMTValue, seconds: int, z3ctx):
+    """Add ``seconds`` to a temporal payload (None-propagating)."""
+    raw = _value_payload(temporal)
+    if temporal.typeinfo.family == "date":
+        new_raw = raw + seconds // 86400
+    elif temporal.typeinfo.family == "time":
+        new_raw = raw + seconds
+    else:
+        new_raw = raw + seconds
+    return _wrap_optional(new_raw, _value_some(temporal), temporal.typeinfo, z3ctx)
+
+
+def _translate_date_shift(solver, expression, args, sign: int):
+    """Translate ``DATE_ADD``/``DATE_SUB(col, INTERVAL n unit)`` (MySQL).
+
+    ``sign = +1`` for DATE_ADD, ``-1`` for DATE_SUB.  Otherwise identical.
+    """
+    if len(args) != 2:
+        raise UnsupportedSMTError(
+            f"{type(expression).__name__} expects (date, interval)"
+        )
+    col_val = solver._as_value(args[0])
+    interval_val = solver._as_value(args[1])
+    unit = _unit_name(expression).upper()
+    if unit not in _INTERVAL_UNITS:
+        raise UnsupportedSMTError(f"Unsupported unit: {unit!r}")
+    n = _interval_to_seconds(interval_val)
+    return _shift_temporal(col_val, sign * n * _INTERVAL_UNITS[unit], solver.z3ctx)
+
+
+def _translate_date_add(solver, expression, args):
+    return _translate_date_shift(solver, expression, args, sign=+1)
+
+
+def _translate_date_sub(solver, expression, args):
+    return _translate_date_shift(solver, expression, args, sign=-1)
+
+
+def _translate_date_diff(solver, expression, args, *, default_unit: Optional[str] = None):
+    """Translate ``DATEDIFF``/``TIMESTAMPDIFF(unit, d1, d2)`` (MySQL).
+
+    ``DATEDIFF(d1, d2)`` is shorthand for ``TIMESTAMPDIFF(DAY, d1, d2)``;
+    the AST lacks a ``unit`` arg, so we fall back to ``default_unit``.
+    """
+    if len(args) != 2:
+        raise UnsupportedSMTError(
+            f"{type(expression).__name__} expects (d1, d2)"
+        )
+    d1 = solver._as_value(args[0])
+    d2 = solver._as_value(args[1])
+    unit = _unit_name(expression).upper() or (default_unit or "").upper()
+    if unit not in _INTERVAL_UNITS:
+        raise UnsupportedSMTError(f"Unsupported unit: {unit!r}")
+    seconds_per_unit = _INTERVAL_UNITS[unit]
+    p1 = _value_payload(d1)
+    p2 = _value_payload(d2)
+    if d1.typeinfo.family == "date" and d2.typeinfo.family == "date":
+        raw_diff = (p1 - p2) * 86400
+    else:
+        raw_diff = p1 - p2
+    diff = raw_diff / seconds_per_unit
+    guard = z3.And(_value_some(d1), _value_some(d2))
+    return _wrap_optional(
+        diff, guard, _int_typeinfo(solver.z3ctx), solver.z3ctx,
+    )
+
+
+def _translate_datediff(solver, expression, args):
+    return _translate_date_diff(solver, expression, args, default_unit="DAY")
+
+
+def _translate_timestampdiff(solver, expression, args):
+    return _translate_date_diff(solver, expression, args)
+
+
+def _unit_name(expression: exp.Expression) -> str:
+    """Pull the unit name out of a DateAdd/DateSub/TimestampDiff node."""
+    unit = expression.args.get("unit")
+    if unit is None:
+        return ""
+    if isinstance(unit, exp.Var):
+        return unit.name
+    if isinstance(unit, exp.Identifier):
+        return unit.name
+    if isinstance(unit, exp.Literal):
+        return str(unit.this)
+    return str(unit).upper()
+
+
+# ---------------------------------------------------------------------------
 # Register built-in special functions
 # ---------------------------------------------------------------------------
 
@@ -328,3 +551,15 @@ register_special_function("LENGTH", _translate_length, return_type=_return_int)
 register_special_function("SUBSTR", _translate_substr, return_type=_return_text)
 register_special_function("INSTR", _translate_instr, return_type=_return_int)
 register_special_function("STRFTIME", _translate_strftime, return_type=_return_text)
+register_special_function("YEAR", _temporal_extractor("year"), return_type=_return_int)
+register_special_function("MONTH", _temporal_extractor("month"), return_type=_return_int)
+register_special_function("DAY", _temporal_extractor("day"), return_type=_return_int)
+register_special_function("DAYOFMONTH", _temporal_extractor("day"), return_type=_return_int)
+register_special_function("HOUR", _temporal_extractor("hour"), return_type=_return_int)
+register_special_function("MINUTE", _temporal_extractor("minute"), return_type=_return_int)
+register_special_function("SECOND", _temporal_extractor("second"), return_type=_return_int)
+register_special_function("EXTRACT", _translate_extract, return_type=_return_int)
+register_special_function("DATEADD", _translate_date_add, return_type=_return_same_type)
+register_special_function("DATESUB", _translate_date_sub, return_type=_return_same_type)
+register_special_function("DATEDIFF", _translate_datediff, return_type=_return_int)
+register_special_function("TIMESTAMPDIFF", _translate_timestampdiff, return_type=_return_int)

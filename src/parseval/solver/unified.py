@@ -78,6 +78,177 @@ class SolveResult:
 # =============================================================================
 
 
+def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
+    """Return the inner column of a year-extractor call, or None.
+
+    Recognises:
+    * ``STRFTIME('%Y', col)`` (SQLite, with optional ``TsOrDs*`` wrap)
+    * ``YEAR(col)`` (MySQL/PostgreSQL, with optional ``TsOrDs*`` wrap)
+    * ``EXTRACT(YEAR FROM col)`` (standard SQL, PG, MySQL 8+)
+    """
+    if isinstance(expr, exp.TimeToStr):
+        if not isinstance(expr.args.get("format"), exp.Literal):
+            return None
+        if expr.args["format"].this != "%Y":
+            return None
+        inner = expr.this
+        if isinstance(inner, exp.TsOrDsToTimestamp):
+            inner = inner.this
+        return inner if isinstance(inner, exp.Column) else None
+    if isinstance(expr, exp.Year):
+        inner = expr.this
+        if isinstance(inner, exp.TsOrDsToDate):
+            inner = inner.this
+        return inner if isinstance(inner, exp.Column) else None
+    if isinstance(expr, exp.Extract):
+        unit_node = expr.this
+        unit_text = None
+        if isinstance(unit_node, exp.Var):
+            unit_text = unit_node.name.upper()
+        elif isinstance(unit_node, exp.Identifier):
+            unit_text = unit_node.name.upper()
+        elif isinstance(unit_node, exp.Column):
+            unit_text = unit_node.name.upper()
+        if unit_text != "YEAR":
+            return None
+        inner = expr.expression
+        return inner if isinstance(inner, exp.Column) else None
+    return None
+
+
+def _rewrite_year_extractor_predicates(constraint: SolverConstraint) -> None:
+    """Replace ``YEAR(col) op year`` with equivalent column bounds.
+
+    Handles ``STRFTIME('%Y', col)``, ``YEAR(col)``, and
+    ``EXTRACT(YEAR FROM col)``. For DATE / TIMESTAMP columns the year
+    comparison is monotone, so the original predicate is equivalent to
+    ``col >= epoch(date(Y_lo, 1, 1)) AND col <= epoch(date(Y_hi, 12, 31))``.
+    This sidesteps Z3 having to invert the Hinnant year decomposition
+    (a deep non-linear integer formula that is intractable for the
+    default solver strategy within the 5s timeout).
+
+    Mutates ``constraint.constraints`` in place.
+    """
+    from datetime import date as _date, datetime as _dt
+    from .smt_types import date_to_epoch_day, datetime_to_epoch_second
+
+    rewritten: List[exp.Expression] = []
+    for cexpr in constraint.constraints:
+        # Find every (year-extractor → comparison-node → column) pattern.
+        targets: List[Tuple[exp.Expression, exp.Column, int, Optional[int]]] = []
+        for kind in (exp.TimeToStr, exp.Year, exp.Extract):
+            for node in cexpr.find_all(kind):
+                col = _year_extractor_inner_column(node)
+                if col is None:
+                    continue
+                cmp_node = node
+                while cmp_node is not None and not isinstance(
+                    cmp_node, (exp.EQ, exp.GTE, exp.LTE, exp.Between)
+                ):
+                    cmp_node = cmp_node.parent
+                if cmp_node is None:
+                    continue
+                year_lits = [
+                    a for a in cmp_node.args.values()
+                    if isinstance(a, exp.Literal)
+                ]
+                years: List[int] = []
+                for lit in year_lits:
+                    raw = lit.this
+                    if not isinstance(raw, str):
+                        raw = str(raw)
+                    if len(raw) == 4 and raw.isdigit():
+                        years.append(int(raw))
+                if not years:
+                    continue
+                if isinstance(cmp_node, exp.EQ):
+                    lo_year, hi_year = years[0], years[0]
+                elif isinstance(cmp_node, exp.GTE):
+                    lo_year, hi_year = years[0], None
+                elif isinstance(cmp_node, exp.LTE):
+                    lo_year, hi_year = None, years[0]
+                else:
+                    lo_year, hi_year = min(years), max(years)
+                dtype = col_type(col) or DataType.build("TEXT")
+                is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
+                    DataType.Type.DATE32
+                )
+                is_datetime = dtype.is_type(
+                    DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
+                    DataType.Type.TIMESTAMP_MS, DataType.Type.TIMESTAMP_NS,
+                    DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMPLTZ,
+                    DataType.Type.DATETIME, DataType.Type.DATETIME64,
+                )
+                if not (is_date or is_datetime):
+                    continue
+                targets.append((cmp_node, col, lo_year, hi_year))
+
+        if not targets:
+            rewritten.append(cexpr)
+            continue
+
+        new_expr = cexpr.copy()
+        for old_node, col, lo_year, hi_year in targets:
+            dtype = col_type(col) or DataType.build("TEXT")
+            is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
+                DataType.Type.DATE32
+            )
+            new_preds: List[exp.Expression] = []
+            if lo_year is not None:
+                if is_date:
+                    payload = date_to_epoch_day(_date(lo_year, 1, 1))
+                else:
+                    payload = datetime_to_epoch_second(_dt(lo_year, 1, 1))
+                new_preds.append(exp.GTE(
+                    this=col.copy(), expression=exp.Literal.number(payload),
+                ))
+            if hi_year is not None:
+                if is_date:
+                    payload = date_to_epoch_day(_date(hi_year, 12, 31))
+                else:
+                    payload = datetime_to_epoch_second(
+                        _dt(hi_year, 12, 31, 23, 59, 59)
+                    )
+                new_preds.append(exp.LTE(
+                    this=col.copy(), expression=exp.Literal.number(payload),
+                ))
+
+            new_target = _find_replica(new_expr, old_node)
+            if new_target is None:
+                continue
+            parent = new_target.parent
+            if parent is None:
+                new_expr = new_preds[0] if len(new_preds) == 1 else exp.and_(*new_preds)
+                break
+            for k, v in list(parent.args.items()):
+                if v is new_target:
+                    parent.set(k, new_preds[0] if len(new_preds) == 1
+                               else exp.and_(*new_preds))
+                    break
+        rewritten.append(new_expr)
+    constraint.constraints = rewritten
+
+
+def _find_replica(root: exp.Expression, target: exp.Expression) -> Optional[exp.Expression]:
+    """Locate the node in ``root`` that is structurally identical to ``target``.
+
+    Used after ``root = target.copy()`` to find the matching node when we
+    no longer have identity-based references.
+    """
+    for candidate in root.walk():
+        if type(candidate) is type(target) and candidate.sql() == target.sql():
+            return candidate
+    return None
+
+
+def narrow_year_bounds(constraint: SolverConstraint) -> None:
+    """In-place: rewrite year-extractor predicates into date bounds.
+
+    See :func:`_rewrite_year_extractor_predicates` for the rationale.
+    """
+    _rewrite_year_extractor_predicates(constraint)
+
+
 class Solver:
     """Unified constraint solver with tiered resolution.
 
@@ -192,6 +363,12 @@ class Solver:
             from .smt_solver import SMTSolver, UnsupportedSMTError
 
             smt = SMTSolver(timeout_ms=self.timeout_ms)
+
+            # Narrow search space: STRFTIME('%Y', col) year comparisons
+            # imply tight bounds on col (epoch day/second for the year
+            # span). Without this, Z3 must invert the Hinnant year
+            # decomposition and frequently times out.
+            narrow_year_bounds(constraint)
 
             # Declare variables from all columns in constraints.
             for expr in constraint.constraints:

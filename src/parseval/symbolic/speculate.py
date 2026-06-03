@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as dt_time
+from itertools import product
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
@@ -29,7 +29,7 @@ from parseval.plan.helper import to_literal
 from parseval.plan.planner import (
     Aggregate, Filter, Having, Join, Limit, Project, Scan, SetOperation, Sort, SubPlan,
 )
-from parseval.plan.rex import column_meta, concrete, negate_predicate
+from parseval.plan.rex import Environment, column_meta, concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint
 
 from .evaluator import PlanEvaluator
@@ -53,6 +53,21 @@ def _lookup_col_type(instance, table: str, col_name: str) -> Optional[str]:
         if schema_col.lower() == lower:
             return schema_dtype
     return None
+
+
+def _column_type_family(
+    instance,
+    table: str,
+    col_name: str,
+    default: TypeFamily = TypeFamily.TEXT,
+) -> TypeFamily:
+    col_type = _lookup_col_type(instance, table, col_name)
+    if not col_type:
+        return default
+    try:
+        return type_family(DataType.build(col_type))
+    except Exception:
+        return default
 
 
 def _match_column(instance, table: str, col_name: str) -> Optional[str]:
@@ -166,34 +181,6 @@ def _rewrite_expr_for_row_scope(
         if old_type is not None:
             col.type = old_type
     return rewritten
-
-
-def _strftime_year_column(expr: exp.Expression) -> Optional[exp.Column]:
-    if not isinstance(expr, exp.TimeToStr):
-        return None
-    fmt = concrete(expr.args.get("format"))
-    if fmt != "%Y":
-        return None
-    return expr.find(exp.Column)
-
-
-def _year_literal(expr: exp.Expression) -> Optional[int]:
-    value = concrete(expr)
-    text = str(value) if value is not None else ""
-    if len(text) == 4 and text.isdigit():
-        return int(text)
-    return None
-
-
-def _is_strftime_year_predicate(expr: exp.Expression) -> bool:
-    if isinstance(expr, exp.Between):
-        return _strftime_year_column(expr.this) is not None
-    if isinstance(expr, _COMPARISON_NODES):
-        return (
-            _strftime_year_column(expr.this) is not None
-            or _strftime_year_column(expr.expression) is not None
-        )
-    return False
 
 
 @dataclass
@@ -395,7 +382,7 @@ class Propagator:
         self._annotate_column_types(base)
         specs.append(base)
 
-        for case_idx, when_conditions in enumerate(self._collect_case_when_positive_conditions()):
+        for case_idx, when_conditions in enumerate(self._collect_case_when_conditions()):
             prior_conditions: List[exp.Expression] = []
             for when_idx, cond in enumerate(when_conditions):
                 case_spec = BranchSpec(branch=f"positive_case_{case_idx}_when_{when_idx}")
@@ -926,97 +913,6 @@ class Propagator:
             col_node = exp.column(target_col, target_table)
             is_null = exp.Is(this=col_node, expression=exp.Null())
             tc.constraints.append(is_null)
-
-    # -----------------------------------------------------------------
-    # WHERE literal extraction
-    # -----------------------------------------------------------------
-
-    def _extract_where_literals(self, spec: BranchSpec):
-        """Extract literal values from WHERE conditions and inject as fixed_values.
-
-        This ensures the generated data satisfies the WHERE conditions,
-        so queries return non-empty results that can be compared.
-        """
-        for step in self.plan.ordered_steps:
-            if not isinstance(step, Filter) or not step.condition:
-                continue
-            conjuncts = self._split_conjuncts(step.condition)
-            for conjunct in conjuncts:
-                self._extract_literal_from_conjunct(conjunct, spec)
-
-    def _extract_literal_from_conjunct(self, conjunct: exp.Expression, spec: BranchSpec):
-        """Extract literal values from a single WHERE conjunct."""
-        if isinstance(conjunct, exp.EQ):
-            left, right = conjunct.this, conjunct.expression
-            col_node, lit_node = None, None
-            if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
-                col_node, lit_node = left, right
-            elif isinstance(right, exp.Column) and not isinstance(left, exp.Column):
-                col_node, lit_node = right, left
-            if col_node and lit_node:
-                val = concrete(lit_node)
-                if val is not None:
-                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
-                    matched = _match_column(self.instance, table, col_node.name)
-                    if matched and table in self.instance.tables:
-                        tc = spec.require(table)
-                        tc.fixed_values[matched] = val
-
-        elif isinstance(conjunct, exp.Like):
-            # LIKE 'prefix%' → use prefix as fixed value
-            left = conjunct.this
-            right = conjunct.expression
-            if isinstance(left, exp.Column) and isinstance(right, exp.Literal) and right.is_string:
-                pattern = str(right.this)
-                prefix = pattern.split('%')[0].split('_')[0]
-                if prefix:
-                    table = _resolve_table(self.instance, self.alias_map, left.table or "")
-                    matched = _match_column(self.instance, table, left.name)
-                    if matched and table in self.instance.tables:
-                        tc = spec.require(table)
-                        tc.fixed_values[matched] = prefix
-
-        elif isinstance(conjunct, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
-            # Comparison: extract boundary value
-            left, right = conjunct.this, conjunct.expression
-            col_node, lit_node = None, None
-            if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
-                col_node, lit_node = left, right
-            elif isinstance(right, exp.Column) and not isinstance(left, exp.Column):
-                col_node, lit_node = right, left
-            if col_node and lit_node:
-                threshold = concrete(lit_node)
-                if threshold is not None and not isinstance(threshold, str):
-                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
-                    matched = _match_column(self.instance, table, col_node.name)
-                    if matched and table in self.instance.tables:
-                        tc = spec.require(table)
-                        op_type = type(conjunct)
-                        if op_type is exp.GT:
-                            tc.fixed_values[matched] = threshold + 1
-                        elif op_type is exp.GTE:
-                            tc.fixed_values[matched] = threshold
-                        elif op_type is exp.LT:
-                            tc.fixed_values[matched] = threshold - 1
-                        elif op_type is exp.LTE:
-                            tc.fixed_values[matched] = threshold
-
-        elif isinstance(conjunct, exp.Is):
-            # IS NULL / IS NOT NULL — skip
-            pass
-
-        elif isinstance(conjunct, exp.In):
-            # IN (val1, val2, ...) — use first value
-            col_node = conjunct.this
-            if isinstance(col_node, exp.Column) and conjunct.expressions:
-                first_val_node = conjunct.expressions[0]
-                val = concrete(first_val_node)
-                if val is not None:
-                    table = _resolve_table(self.instance, self.alias_map, col_node.table or "")
-                    matched = _match_column(self.instance, table, col_node.name)
-                    if matched and table in self.instance.tables:
-                        tc = spec.require(table)
-                        tc.fixed_values[matched] = val
 
     # -----------------------------------------------------------------
     # Boundary value collection
@@ -1564,41 +1460,6 @@ class Propagator:
                 yield predicate
 
     # -----------------------------------------------------------------
-    # Negation subsets
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def _negation_subsets(n: int) -> List[Tuple[int, ...]]:
-        """Generate all non-empty subsets of range(n) as tuples.
-
-        For n=2: [(0,), (1,), (0,1)]
-        For n=3: [(0,), (1,), (2,), (0,1), (0,2), (1,2), (0,1,2)]
-        """
-        from itertools import combinations
-        result = []
-        for size in range(1, n + 1):
-            for combo in combinations(range(n), size):
-                result.append(combo)
-        return result
-
-    # -----------------------------------------------------------------
-    # DISTINCT detection
-    # -----------------------------------------------------------------
-
-    def _has_distinct_projection(self) -> bool:
-        """Check if any Project step has DISTINCT in its projections."""
-        for step in self.plan.ordered_steps:
-            if isinstance(step, Project):
-                # Check if the step has DISTINCT set
-                if getattr(step, "distinct", False):
-                    return True
-                # Also check projections for DISTINCT flag
-                for proj in (step.projections or []):
-                    if isinstance(proj, exp.Distinct):
-                        return True
-        return False
-
-    # -----------------------------------------------------------------
     # CASE WHEN arm coverage
     # -----------------------------------------------------------------
 
@@ -1638,10 +1499,6 @@ class Propagator:
                     if conditions:
                         result.append(conditions)
         return result
-
-    def _collect_case_when_positive_conditions(self) -> List[List[exp.Expression]]:
-        """Collect CASE WHEN conditions that can produce positive output rows."""
-        return self._collect_case_when_conditions()
 
     # -----------------------------------------------------------------
     # Utilities
@@ -1782,9 +1639,13 @@ class Propagator:
     # -----------------------------------------------------------------
 
     def _extract_temporal_age_constraints(self, condition: exp.Expression, spec: BranchSpec):
-        """Handle year-difference patterns like STRFTIME('%Y','now') - STRFTIME('%Y', col) > N."""
+        """Handle year-difference patterns like STRFTIME('%Y','now') - STRFTIME('%Y', col) > N.
+
+        Simple STRFTIME year equality/comparison is handled by the SMT
+        solver; this only addresses patterns involving CurrentDate / 'now'
+        literals, which the solver cannot fold.
+        """
         from datetime import date as _date
-        self._extract_strftime_year_constraints(condition, spec)
         for node in condition.find_all((exp.GT, exp.GTE)):
             threshold = concrete(node.expression)
             if not isinstance(threshold, (int, float)):
@@ -1805,87 +1666,12 @@ class Propagator:
                 matched = _match_column(self.instance, table, col.name)
                 if not matched or table not in self.instance.tables:
                     continue
-                col_type = str(self.instance.tables[table].get(matched, "")).upper()
-                if "DATE" in col_type or "TIME" in col_type or "birthday" in matched.lower() or "date" in matched.lower():
+                family = _column_type_family(self.instance, table, matched)
+                if family in (TypeFamily.DATE, TypeFamily.DATETIME, TypeFamily.TIME) or "birthday" in matched.lower() or "date" in matched.lower():
                     years_ago = int(threshold) + 1
                     old_date = _date.today().replace(year=_date.today().year - years_ago)
                     spec.require(table).fixed_values[matched] = old_date.isoformat()
                     break
-
-    def _extract_strftime_year_constraints(self, condition: exp.Expression, spec: BranchSpec) -> None:
-        for node in condition.walk():
-            if isinstance(node, exp.Between):
-                col = _strftime_year_column(node.this)
-                low_year = _year_literal(node.args.get("low"))
-                if col is not None and low_year is not None:
-                    self._set_strftime_year_fixed_value(col, low_year, spec)
-                continue
-
-            if not isinstance(node, _COMPARISON_NODES):
-                continue
-
-            col = _strftime_year_column(node.this)
-            year = _year_literal(node.expression)
-            inverted = False
-            if col is None or year is None:
-                col = _strftime_year_column(node.expression)
-                year = _year_literal(node.this)
-                inverted = col is not None and year is not None
-            if col is None or year is None:
-                continue
-
-            op = type(node)
-            if inverted:
-                if op is exp.GT:
-                    op = exp.LT
-                elif op is exp.GTE:
-                    op = exp.LTE
-                elif op is exp.LT:
-                    op = exp.GT
-                elif op is exp.LTE:
-                    op = exp.GTE
-
-            if op is exp.GT:
-                year += 1
-            elif op is exp.LT:
-                year -= 1
-            self._set_strftime_year_fixed_value(col, year, spec)
-
-    def _set_strftime_year_fixed_value(
-        self,
-        col: exp.Column,
-        year: int,
-        spec: BranchSpec,
-    ) -> None:
-        table = _resolve_table(self.instance, self.alias_map, col.table or "")
-        matched = _match_column(self.instance, table, col.name)
-        if not matched:
-            candidates = [
-                (table_name, column_name)
-                for table_name in self.instance.tables
-                for column_name in [_match_column(self.instance, table_name, col.name)]
-                if column_name
-            ]
-            if len(candidates) == 1:
-                table, matched = candidates[0]
-        if not matched or table not in self.instance.tables:
-            return
-        spec.require(table).fixed_values[matched] = f"{year:04d}-06-15"
-
-    def _merge_date_values(self, existing: str, new: str) -> str:
-        """Merge two date-like strings by combining their year/month/day components."""
-        import re
-        date_pat = re.compile(r'^(\d{4})-(\d{2})-(\d{2})')
-        m_existing = date_pat.match(existing)
-        m_new = date_pat.match(new)
-        if not m_existing or not m_new:
-            return new
-        ey, em, ed = m_existing.groups()
-        ny, nm, nd = m_new.groups()
-        year = ey if ey != "2024" else ny
-        month = em if em != "06" else nm
-        day = ed if ed != "15" else nd
-        return f"{year}-{month}-{day}"
 
     # -----------------------------------------------------------------
     # Inner filter table fix
@@ -2229,22 +2015,16 @@ class Resolver:
             ):
                 row[col_name] = base_row[col_name]
                 continue
-            col_type_name = str(col_type).upper()
-            if "INT" in col_type_name:
-                row[col_name] = seed
-            elif any(token in col_type_name for token in ("REAL", "FLOAT", "DOUBLE", "NUM", "DEC")):
-                row[col_name] = float(seed)
-            elif "BLOB" in col_type_name or "BYTE" in col_type_name:
-                row[col_name] = f"val{seed}".encode()
-            elif "DATE" in col_type_name or "TIME" in col_type_name:
-                row[col_name] = "2000-01-01"
-            else:
-                row[col_name] = f"val{seed}"
+            row[col_name] = _gold_domain_value(
+                self.instance,
+                table,
+                col_name,
+                row_context=row,
+            )
         return row
 
     def _annotate_col_type(self, col_node: exp.Column, table: str, col_name: str) -> None:
         """Set .type on a Column node from the instance schema."""
-        from parseval.dtype import DataType
         col_type_str = _lookup_col_type(self.instance, table, col_name)
         if col_type_str:
             try:
@@ -2529,6 +2309,253 @@ def _scalar_subquery_operand_expression(subplan: Optional[SubPlan]) -> Optional[
     return None
 
 
+def _annotate_expression_column_types(
+    expression: exp.Expression,
+    instance: Instance,
+    alias_map,
+) -> None:
+    for col in expression.find_all(exp.Column):
+        if getattr(col, "type", None) is not None:
+            continue
+        table = normalize_name(alias_map.resolve(col.table) if col.table else "")
+        matched = _match_column(instance, table, col.name)
+        if not matched:
+            candidates = [
+                (table_name, column_name)
+                for table_name in instance.tables
+                for column_name in [_match_column(instance, table_name, col.name)]
+                if column_name
+            ]
+            if len(candidates) == 1:
+                table, matched = candidates[0]
+        if not matched:
+            continue
+        col_type = _lookup_col_type(instance, table, matched)
+        if not col_type:
+            continue
+        try:
+            col.type = DataType.build(col_type)
+        except Exception:
+            pass
+
+
+def _bindings_for_scalar_expression(
+    expression: exp.Expression,
+    instance: Instance,
+    alias_map,
+    row_index: int,
+) -> Dict[str, RowBinding]:
+    bindings: Dict[str, RowBinding] = {}
+    for col in expression.find_all(exp.Column):
+        raw_alias = normalize_name(col.table or "")
+        physical = normalize_name(alias_map.resolve(raw_alias) if raw_alias else "")
+        matched = _match_column(instance, physical, col.name)
+        if not matched:
+            candidates = [
+                (table_name, column_name)
+                for table_name in instance.tables
+                for column_name in [_match_column(instance, table_name, col.name)]
+                if column_name
+            ]
+            if len(candidates) == 1:
+                physical, matched = candidates[0]
+                if not raw_alias:
+                    raw_alias = physical
+        if not matched or physical not in instance.tables:
+            continue
+        binding = RowBinding(
+            table=physical,
+            alias=raw_alias or physical,
+            row=row_index,
+        )
+        bindings[_solver_table_key(binding)] = binding
+    return bindings
+
+
+def _merge_scalar_solver_assignments(
+    rows: Dict[str, List[Dict[str, Any]]],
+    assignments: Dict[str, Any],
+    row_bindings: Dict[str, RowBinding],
+) -> Set[Tuple[str, int]]:
+    touched: Set[Tuple[str, int]] = set()
+    for variable_name, value in assignments.items():
+        table_key, column = _split_solver_variable(variable_name)
+        binding = row_bindings.get(table_key)
+        if binding is None:
+            continue
+        table_rows = rows.setdefault(binding.table, [])
+        while len(table_rows) <= binding.row:
+            table_rows.append({})
+        table_rows[binding.row][column] = value
+        touched.add((binding.table, binding.row))
+    return touched
+
+
+def _solver_assignments_satisfy(
+    expression: exp.Expression,
+    assignments: Dict[str, Any],
+) -> bool:
+    try:
+        return concrete(expression, Environment(assignments)) is True
+    except Exception:
+        return False
+
+
+def _solve_scalar_witness_values(
+    atom: exp.Expression,
+    outer_expr: exp.Expression,
+    inner_expr: exp.Expression,
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    alias_map,
+    dialect: str,
+    inner_row_index: int,
+) -> Set[Tuple[str, int]]:
+    outer_scoped = outer_expr.copy()
+    inner_scoped = inner_expr.copy()
+    _annotate_expression_column_types(outer_scoped, instance, alias_map)
+    _annotate_expression_column_types(inner_scoped, instance, alias_map)
+
+    row_bindings = {
+        **_bindings_for_scalar_expression(outer_scoped, instance, alias_map, row_index=0),
+        **_bindings_for_scalar_expression(inner_scoped, instance, alias_map, row_index=inner_row_index),
+    }
+    if not row_bindings:
+        return set()
+
+    scoped_outer = _rewrite_expr_for_row_scope(
+        outer_scoped,
+        row_bindings,
+        alias_map,
+        default_row=0,
+    )
+    scoped_inner = _rewrite_expr_for_row_scope(
+        inner_scoped,
+        row_bindings,
+        alias_map,
+        default_row=inner_row_index,
+    )
+    if atom.this and atom.this.find(exp.Subquery):
+        constraint_expr = type(atom)(this=scoped_inner, expression=scoped_outer)
+    else:
+        constraint_expr = type(atom)(this=scoped_outer, expression=scoped_inner)
+
+    result = Solver(dialect=dialect).solve(
+        SolverConstraint(
+            target_tables=tuple(row_bindings.keys()),
+            constraints=[constraint_expr],
+        )
+    )
+    if not result.sat or not _solver_assignments_satisfy(constraint_expr, result.assignments):
+        return _solve_scalar_witness_with_domain_values(
+            constraint_expr,
+            row_bindings,
+            rows,
+            instance,
+        )
+    return _merge_scalar_solver_assignments(rows, result.assignments, row_bindings)
+
+
+def _solve_scalar_witness_with_domain_values(
+    constraint_expr: exp.Expression,
+    row_bindings: Dict[str, RowBinding],
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+) -> Set[Tuple[str, int]]:
+    assignments = _domain_scalar_witness_assignments(
+        constraint_expr,
+        row_bindings,
+        rows,
+        instance,
+    )
+    if not assignments:
+        return set()
+    return _merge_scalar_solver_assignments(rows, assignments, row_bindings)
+
+
+def _domain_scalar_witness_assignments(
+    constraint_expr: exp.Expression,
+    row_bindings: Dict[str, RowBinding],
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+) -> Dict[str, Any]:
+    pools: List[Tuple[str, List[Any]]] = []
+    seen: Set[str] = set()
+    for col in constraint_expr.find_all(exp.Column):
+        variable_name = f"{col.table}.{col.name}"
+        if variable_name in seen:
+            continue
+        seen.add(variable_name)
+        binding = row_bindings.get(normalize_name(col.table or ""))
+        if binding is None:
+            return {}
+        matched = _match_column(instance, binding.table, col.name)
+        if not matched:
+            return {}
+        values = _domain_scalar_column_values(
+            rows,
+            instance,
+            binding,
+            matched,
+        )
+        if not values:
+            return {}
+        pools.append((variable_name, values))
+
+    if not pools or len(pools) > 4:
+        return {}
+
+    variable_names = [name for name, _values in pools]
+    value_pools = [values for _name, values in pools]
+    for values in product(*value_pools):
+        assignments = dict(zip(variable_names, values))
+        if _solver_assignments_satisfy(constraint_expr, assignments):
+            return assignments
+    return {}
+
+
+def _domain_scalar_column_values(
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    binding: RowBinding,
+    column: str,
+    limit: int = 16,
+) -> List[Any]:
+    values: List[Any] = []
+    seen: Set[Any] = set()
+
+    def add(value: Any) -> None:
+        try:
+            key = value
+            if key in seen:
+                return
+            seen.add(key)
+        except TypeError:
+            pass
+        values.append(value)
+
+    table_rows = rows.get(binding.table, [])
+    if binding.row < len(table_rows) and column in table_rows[binding.row]:
+        add(table_rows[binding.row][column])
+
+    row_context = dict(table_rows[binding.row]) if binding.row < len(table_rows) else {}
+    row_context.pop(column, None)
+    for _ in range(limit):
+        try:
+            add(
+                instance.builder.generate_value(
+                    binding.table,
+                    column,
+                    row_context=row_context,
+                )
+            )
+        except Exception:
+            break
+        if len(values) >= limit:
+            break
+    return values
+
+
 def _scalar_expression_table(
     instance: Instance,
     alias_map,
@@ -2555,46 +2582,6 @@ def _row_for_scalar_expression(
     return None
 
 
-def _set_scalar_expression_value(
-    rows: Dict[str, List[Dict[str, Any]]],
-    instance: Instance,
-    alias_map,
-    expression: exp.Expression,
-    value: Any,
-    row_index: int,
-) -> Optional[str]:
-    row = _row_for_scalar_expression(rows, instance, alias_map, expression, row_index)
-    if row is None:
-        return None
-    if isinstance(expression, exp.Paren):
-        return _set_scalar_expression_value(
-            rows,
-            instance,
-            alias_map,
-            expression.this,
-            value,
-            row_index,
-        )
-    if isinstance(expression, exp.Column):
-        table = normalize_name(alias_map.resolve(expression.table) if expression.table else "")
-        col_name = _match_column(instance, table, expression.name)
-        if col_name:
-            row[col_name] = value
-            return table
-    if isinstance(expression, exp.Sub):
-        left, right = expression.this, expression.expression
-        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-            left_table = normalize_name(alias_map.resolve(left.table) if left.table else "")
-            right_table = normalize_name(alias_map.resolve(right.table) if right.table else "")
-            left_col = _match_column(instance, left_table, left.name)
-            right_col = _match_column(instance, right_table, right.name)
-            if left_col and right_col:
-                row[left_col] = value
-                row[right_col] = 0
-                return left_table
-    return None
-
-
 def _scalar_expression_family(
     instance: Instance,
     alias_map,
@@ -2607,98 +2594,8 @@ def _scalar_expression_family(
         matched = _match_column(instance, table, col.name)
         if not matched:
             continue
-        col_type = _lookup_col_type(instance, table, matched)
-        if not col_type:
-            continue
-        try:
-            return type_family(DataType.build(col_type))
-        except Exception:
-            return TypeFamily.TEXT
+        return _column_type_family(instance, table, matched)
     return TypeFamily.INTEGER
-
-
-def _invert_scalar_op(op: type[exp.Expression]) -> type[exp.Expression]:
-    if op is exp.GT:
-        return exp.LT
-    if op is exp.GTE:
-        return exp.LTE
-    if op is exp.LT:
-        return exp.GT
-    if op is exp.LTE:
-        return exp.GTE
-    return op
-
-
-def _scalar_witness_pair(
-    op: type[exp.Expression],
-    family: TypeFamily,
-) -> Optional[Tuple[Any, Any]]:
-    if family == TypeFamily.TEXT:
-        if op is exp.GT:
-            return "z_value", "a_value"
-        if op is exp.LT:
-            return "a_value", "z_value"
-        if op in (exp.GTE, exp.LTE, exp.EQ):
-            return "same_value", "same_value"
-        return None
-    if family == TypeFamily.DATE:
-        if op is exp.GT:
-            return date(2024, 1, 10), date(2024, 1, 1)
-        if op is exp.LT:
-            return date(2024, 1, 1), date(2024, 1, 10)
-        if op in (exp.GTE, exp.LTE, exp.EQ):
-            same = date(2024, 1, 5)
-            return same, same
-        return None
-    if family == TypeFamily.DATETIME:
-        if op is exp.GT:
-            return datetime(2024, 1, 10, 0, 0, 0), datetime(2024, 1, 1, 0, 0, 0)
-        if op is exp.LT:
-            return datetime(2024, 1, 1, 0, 0, 0), datetime(2024, 1, 10, 0, 0, 0)
-        if op in (exp.GTE, exp.LTE, exp.EQ):
-            same = datetime(2024, 1, 5, 0, 0, 0)
-            return same, same
-        return None
-    if family == TypeFamily.TIME:
-        if op is exp.GT:
-            return dt_time(12, 0, 0), dt_time(1, 0, 0)
-        if op is exp.LT:
-            return dt_time(1, 0, 0), dt_time(12, 0, 0)
-        if op in (exp.GTE, exp.LTE, exp.EQ):
-            same = dt_time(6, 0, 0)
-            return same, same
-        return None
-    if family == TypeFamily.BOOLEAN:
-        if op is exp.EQ:
-            return True, True
-        return None
-    if op is exp.GT:
-        return 10, 1
-    if op is exp.GTE:
-        return 10, 10
-    if op is exp.LT:
-        return 1, 10
-    if op is exp.LTE:
-        return 10, 10
-    if op is exp.EQ:
-        return 5, 5
-    return None
-
-
-def _scalar_witness_values(
-    atom: exp.Expression,
-    outer_expr: exp.Expression,
-    inner_expr: exp.Expression,
-    instance: Instance,
-    alias_map,
-) -> Optional[Tuple[Any, Any]]:
-    op = type(atom)
-    if atom.this and atom.this.find(exp.Subquery):
-        op = _invert_scalar_op(op)
-    family = _scalar_expression_family(instance, alias_map, outer_expr)
-    if family in (TypeFamily.INTEGER, TypeFamily.DECIMAL):
-        family = _scalar_expression_family(instance, alias_map, inner_expr)
-    return _scalar_witness_pair(op, family)
 
 
 def _align_gold_fk_parent_row(
@@ -2727,7 +2624,13 @@ def _align_gold_fk_parent_row(
         if not ref_col:
             continue
         if fk_col not in child_row:
-            child_row[fk_col] = _gold_default_value(instance, child_table, fk_col, row_index + 1)
+            child_row[fk_col] = _gold_domain_value(
+                instance,
+                parent_table,
+                ref_col,
+                row_context={},
+                rows=rows,
+            )
         parent_rows = rows.setdefault(parent_table, [])
         while len(parent_rows) <= row_index:
             parent_rows.append({})
@@ -2768,48 +2671,22 @@ def _satisfy_gold_scalar_subqueries(
         inner_expr = _scalar_subquery_operand_expression(subplan)
         if inner_expr is None:
             continue
-        values = _scalar_witness_values(
-            atom,
-            outer_expr,
-            inner_expr,
-            instance,
-            alias_map,
-        )
-        if values is None:
-            continue
-        outer_value, inner_value = values
-
-        outer_table = _set_scalar_expression_value(
-            rows,
-            instance,
-            alias_map,
-            outer_expr,
-            outer_value,
-            row_index=0,
-        )
-        _align_gold_fk_parent_row(
-            rows,
-            instance,
-            outer_table,
-            row_index=0,
-        )
         inner_row_index = 1
         if _row_for_scalar_expression(rows, instance, alias_map, inner_expr, inner_row_index) is None:
             inner_row_index = 0
-        inner_table = _set_scalar_expression_value(
+
+        touched = _solve_scalar_witness_values(
+            atom,
+            outer_expr,
+            inner_expr,
             rows,
             instance,
             alias_map,
-            inner_expr,
-            inner_value,
-            row_index=inner_row_index,
+            dialect,
+            inner_row_index,
         )
-        _align_gold_fk_parent_row(
-            rows,
-            instance,
-            inner_table,
-            row_index=inner_row_index,
-        )
+        for table, row_index in touched:
+            _align_gold_fk_parent_row(rows, instance, table, row_index=row_index)
 
 
 def _gold_candidate_has_output(
@@ -3007,8 +2884,6 @@ def _join_column_type_constraints(
     row_bindings: Dict[str, RowBinding],
     join_equalities: List[Tuple[str, str, str, str]],
 ) -> List[exp.Expression]:
-    from parseval.dtype import DataType
-
     constraints: List[exp.Expression] = []
     seen: Set[Tuple[str, str]] = set()
     for left_table, left_col, right_table, right_col in join_equalities:
@@ -3045,8 +2920,6 @@ def _build_gold_solver_constraint(
         for constraint in req.constraints:
             if constraint.find(exp.Subquery):
                 continue
-            if _is_strftime_year_predicate(constraint):
-                continue
             if (
                 isinstance(constraint, exp.EQ)
                 and isinstance(constraint.this, exp.Column)
@@ -3071,17 +2944,45 @@ def _build_gold_solver_constraint(
     ), row_bindings
 
 
-def _gold_default_value(instance: Instance, table: str, column: str, seed: int) -> Any:
-    col_type = str(instance.tables.get(table, {}).get(column, "")).upper()
-    if "INT" in col_type:
-        return seed
-    if any(token in col_type for token in ("REAL", "FLOAT", "DOUBLE", "NUM", "DEC")):
-        return float(seed)
-    if "BLOB" in col_type or "BYTE" in col_type:
-        return f"val{seed}".encode()
-    if "DATE" in col_type or "TIME" in col_type:
-        return "2000-01-01"
-    return f"val{seed}"
+def _gold_domain_value(
+    instance: Instance,
+    table: str,
+    column: str,
+    row_context: Optional[Dict[str, Any]] = None,
+    rows: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Any:
+    context = dict(row_context or {})
+    context.pop(column, None)
+    builder = instance.builder
+    if rows:
+        builder = type(instance.builder)(instance.schema_spec)
+        for table_name in instance.tables:
+            for existing_row in instance.get_rows(table_name):
+                builder.runtime.remember_row(
+                    table_name,
+                    {col: value.concrete for col, value in existing_row.items()},
+                )
+        for table_name, table_rows in rows.items():
+            if table_name not in instance.tables:
+                continue
+            for row in table_rows:
+                if row:
+                    builder.runtime.remember_row(table_name, row)
+    return builder.generate_value(
+        table,
+        column,
+        row_context=context,
+    )
+
+
+def _gold_fk_columns(instance: Instance, table: str) -> Set[str]:
+    columns: Set[str] = set()
+    for fk in instance.get_foreign_key(table):
+        for identifier in fk.expressions:
+            matched = _match_column(instance, table, identifier.name)
+            if matched:
+                columns.add(matched)
+    return columns
 
 
 def _requirement_for_binding(
@@ -3134,6 +3035,7 @@ def _complete_gold_rows(
         row = table_rows.pop(0) if table_rows else {}
         req = _requirement_for_binding(spec, binding)
         if req is not None:
+            fk_columns = _gold_fk_columns(instance, binding.table)
             for col_name, value in req.fixed_values.items():
                 row[col_name] = value
             for col_name in req.group_key_columns:
@@ -3142,11 +3044,11 @@ def _complete_gold_rows(
                     group_values.setdefault(key, row[col_name])
                     continue
                 if key not in group_values:
-                    group_values[key] = _gold_default_value(
+                    group_values[key] = _gold_domain_value(
                         instance,
                         binding.table,
                         col_name,
-                        1,
+                        row_context=row,
                     )
                 row[col_name] = group_values[key]
             for col_name in instance.tables.get(binding.table, {}):
@@ -3158,13 +3060,24 @@ def _complete_gold_rows(
                 seen_values = unique_values.setdefault(key, set())
                 value = row.get(col_name)
                 if value is None or value in seen_values:
-                    seed = binding.row + 1
-                    value = _gold_default_value(instance, binding.table, col_name, seed)
-                    while value in seen_values:
-                        seed += 1
-                        value = _gold_default_value(instance, binding.table, col_name, seed)
-                    row[col_name] = value
-                seen_values.add(value)
+                    if col_name in fk_columns:
+                        row.pop(col_name, None)
+                        continue
+                    for _ in range(16):
+                        value = _gold_domain_value(
+                            instance,
+                            binding.table,
+                            col_name,
+                            row_context=row,
+                        )
+                        if value not in seen_values:
+                            row[col_name] = value
+                            break
+                    else:
+                        row.pop(col_name, None)
+                        continue
+                if col_name in row:
+                    seen_values.add(row[col_name])
         completed.setdefault(binding.table, []).append(row)
 
     for table, table_rows in pending_rows.items():
