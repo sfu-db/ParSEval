@@ -133,6 +133,7 @@ class InstantiateResult:
     """Result of database instantiation."""
     success: bool
     generation: GenerationResult
+    q_result: Optional[ExecutionResult] = None
     connection_string: str = ""
     db_id: str = ""
     error_msg: str = ""
