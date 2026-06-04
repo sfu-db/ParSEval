@@ -384,6 +384,73 @@ class SpeculateConfig:
             boundary=1,
         )
 
+    @classmethod
+    def from_thresholds(cls, thresholds) -> SpeculateConfig:
+        """Derive a SpeculateConfig from CoverageThresholds.
+
+        Maps coverage requirements to generation strategy:
+        - atom_true, filter_true, join_match → positive
+        - atom_false, filter_false → negative
+        - atom_null → null
+        - join_no_match → left_unmatched + right_unmatched
+        - having_fail → having_fail
+        - case_arm_skipped → case_else
+        """
+        from .types import CoverageThresholds
+
+        if not isinstance(thresholds, CoverageThresholds):
+            return cls.full_coverage()
+
+        # Positive: need if any "pass" outcome is required
+        positive = 1 if any([
+            thresholds.atom_true > 0,
+            thresholds.filter_true > 0,
+            thresholds.join_match > 0,
+            thresholds.having_pass > 0,
+            thresholds.case_arm_taken > 0,
+            thresholds.exists_true > 0,
+            thresholds.exists_false > 0,
+            thresholds.in_match > 0,
+            thresholds.in_no_match > 0,
+            thresholds.group_single > 0,
+            thresholds.group_multi > 0,
+            thresholds.distinct_unique > 0,
+            thresholds.distinct_duplicate > 0,
+        ]) else 0
+
+        # Negative: need if any "fail" outcome is required
+        negative = 1 if any([
+            thresholds.atom_false > 0,
+            thresholds.filter_false > 0,
+        ]) else 0
+
+        # Null: need if atom_null is required
+        null = 1 if thresholds.atom_null > 0 else 0
+
+        # Unmatched joins: need if join_no_match is required
+        left_unmatched = 1 if thresholds.join_no_match > 0 else 0
+        right_unmatched = 1 if thresholds.join_no_match > 0 else 0
+
+        # Having fail: need if having_fail is required
+        having_fail = 1 if thresholds.having_fail > 0 else 0
+
+        # Case else: need if case_arm_skipped is required
+        case_else = 1 if thresholds.case_arm_skipped > 0 else 0
+
+        # Boundary: always generate for edge-case testing
+        boundary = 1 if positive > 0 else 0
+
+        return cls(
+            positive=positive,
+            negative=negative,
+            null=null,
+            left_unmatched=left_unmatched,
+            right_unmatched=right_unmatched,
+            having_fail=having_fail,
+            case_else=case_else,
+            boundary=boundary,
+        )
+
     def should_generate(self, branch_type: str) -> bool:
         """Check if a branch type should be generated based on config."""
         mapping = {

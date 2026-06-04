@@ -23,11 +23,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlglot import exp
 
 from parseval.plan import Plan, Step
-from parseval.plan.planner import Filter, Having, Join, Aggregate, Project, Scan, SubPlan
+from parseval.plan.planner import Filter, Join, Aggregate, Project, Scan, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
 from parseval.helper import normalize_name
 from parseval.instance import Instance
-from parseval.solver.unified import SolverConstraint
+from parseval.solver import SolverConstraint
 
 from .types import BranchType, CoverageTarget
 
@@ -170,10 +170,31 @@ class ConstraintGenerator:
                         avoid_values[f"{real_table}.{col_name}"] = existing
 
         # FK and CHECK constraints are table-level — still require per-table iteration.
+        # Also add NOT NULL and UNIQUE constraints for ALL columns in target tables.
         for table_name in tables:
             real_table = self._resolve_table_name(table_name)
             if real_table not in self.instance.tables:
                 continue
+
+            # Add NOT NULL and UNIQUE for ALL columns in the table.
+            schema = self.instance.tables[real_table]
+            for col_name in schema:
+                key = (real_table, col_name)
+                if key in seen_cols:
+                    continue
+                seen_cols.add(key)
+
+                if not self.instance.nullable(real_table, col_name):
+                    not_null_columns.append(key)
+
+                if self.instance.is_unique(real_table, col_name):
+                    existing = {
+                        sym.concrete
+                        for sym in self.instance.get_column_data(real_table, col_name)
+                        if sym.concrete is not None
+                    }
+                    if existing:
+                        avoid_values[f"{real_table}.{col_name}"] = existing
 
             for fk in self.instance.get_foreign_key(real_table):
                 local_col = normalize_name(fk.expressions[0].name)

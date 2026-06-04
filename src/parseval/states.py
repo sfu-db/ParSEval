@@ -110,27 +110,11 @@ class DisproveResult:
     q2_result: ExecutionResult
     generation: GenerationResult
     connection_string: str = ""
-    db_id: str = ""
     error_msg: str = ""
 
     @property
     def is_equivalent(self) -> bool:
         return self.verdict == Verdict.EQ
-
-    def to_dict(self) -> dict:
-        return {
-            "verdict": self.verdict.value,
-            "semantics": self.semantics.value,
-            "q1_rows": len(self.q1_result.rows),
-            "q2_rows": len(self.q2_result.rows),
-            "q1_error": self.q1_result.error_msg,
-            "q2_error": self.q2_result.error_msg,
-            "generation_success": self.generation.success,
-            "rows_generated": self.generation.rows_generated,
-            "coverage": self.generation.coverage,
-            "elapsed_time": self.generation.elapsed_time,
-            "error_msg": self.error_msg,
-        }
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-serializable dict."""
@@ -141,7 +125,6 @@ class DisproveResult:
             "q2_result": self.q2_result.to_dict(),
             "generation": self.generation.to_dict(),
             "connection_string": self.connection_string,
-            "db_id": self.db_id,
             "error_msg": self.error_msg,
         }
 
