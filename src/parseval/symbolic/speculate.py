@@ -3579,6 +3579,10 @@ def _solve_and_materialize_branch_coverage(
         logger.debug("Solver failed for spec=%s reason=%s; using heuristic fallback", spec.branch, result.reason)
         rows = _heuristic_gold_rows(spec, instance, row_bindings)
     if not rows:
+        # Solver returned sat but no assignments (empty constraints);
+        # fall back to heuristic row generation.
+        rows = _heuristic_gold_rows(spec, instance, row_bindings)
+    if not rows:
         return {}
     rows = _complete_gold_rows(rows, row_bindings, spec, instance)
     _satisfy_gold_scalar_subqueries(spec, plan, rows, instance, alias_map, dialect)
