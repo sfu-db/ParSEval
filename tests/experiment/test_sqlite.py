@@ -12,7 +12,7 @@ import argparse
 import datetime
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
+import sys
 try:
     from tqdm import tqdm
 except Exception:
@@ -118,7 +118,7 @@ def run_disprove_experiment(
     if workers <= 1:
         records = [
             _process_disprove_task(task)
-            for task in tqdm(tasks, desc="Disproving BIRD pairs")
+            for task in tqdm(tasks, desc="Disproving BIRD pairs", disable = not sys.stdout.isatty())
         ]
     else:
         records_by_index = {}
@@ -128,6 +128,7 @@ def run_disprove_experiment(
                 as_completed(futures),
                 total=len(futures),
                 desc="Disproving BIRD pairs",
+                disable = not sys.stdout.isatty()
             ):
                 record = future.result()
                 records_by_index[record["index"]] = record
