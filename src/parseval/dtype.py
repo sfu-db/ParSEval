@@ -156,7 +156,9 @@ def parse_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
-        for candidate in (value.replace(" ", "T"), value):
+        # Strip trailing .0 that some databases emit (e.g., '2014-04-23T20:29:39.0')
+        cleaned = value.rstrip('0').rstrip('.') if '.' in value else value
+        for candidate in (cleaned.replace(" ", "T"), cleaned):
             try:
                 return datetime.fromisoformat(candidate).replace(microsecond=0)
             except ValueError:

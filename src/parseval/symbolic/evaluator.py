@@ -1249,13 +1249,23 @@ class PlanEvaluator:
         if not non_null_values:
             return None
         if isinstance(aggregate_expr, exp.Avg):
-            return sum(non_null_values) / len(non_null_values)
+            # Filter to numeric values only (handle TEXT columns with numeric content)
+            numeric = [v for v in non_null_values if isinstance(v, (int, float))]
+            return sum(numeric) / len(numeric) if numeric else None
         if isinstance(aggregate_expr, exp.Sum):
-            return sum(non_null_values)
+            numeric = [v for v in non_null_values if isinstance(v, (int, float))]
+            return sum(numeric) if numeric else None
         if isinstance(aggregate_expr, exp.Min):
-            return min(non_null_values)
+            # Try numeric comparison first, then string comparison
+            try:
+                return min(non_null_values)
+            except TypeError:
+                return min(str(v) for v in non_null_values)
         if isinstance(aggregate_expr, exp.Max):
-            return max(non_null_values)
+            try:
+                return max(non_null_values)
+            except TypeError:
+                return max(str(v) for v in non_null_values)
         return None
 
     def _inner_plan_has_rows(

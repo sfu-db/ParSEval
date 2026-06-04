@@ -169,6 +169,15 @@ class ValueSpace:
                         return date.fromisoformat(prefix[:10])
                 except (ValueError, IndexError):
                     pass
+        # Handle integer bounds (epoch days from narrow_year_bounds).
+        if self.min_val is not None and isinstance(self.min_val, (int, float)):
+            lo = int(self.min_val)
+            hi = int(self.max_val) if self.max_val is not None and isinstance(self.max_val, (int, float)) else lo + 365
+            mid = (lo + hi) // 2
+            try:
+                return date(1970, 1, 1) + __import__('datetime').timedelta(days=mid)
+            except (ValueError, OverflowError):
+                pass
         if self.min_val is not None:
             if isinstance(self.min_val, datetime):
                 return self.min_val
