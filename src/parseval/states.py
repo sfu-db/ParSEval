@@ -73,7 +73,7 @@ class ExecutionResult:
         if not self.error_msg:
             return False
         lower = self.error_msg.lower()
-        return any(k in lower for k in ("syntax", "parse", "near", "no such column", "no such table"))
+        return any(k in lower for k in ("syntax", "parse", "near", "no such "))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -150,12 +150,8 @@ def compare_results(
 ) -> Verdict:
     """Compare two execution results and return a verdict."""
     # Syntax errors
-    if r1.is_syntax_error or r2.is_syntax_error:
-        return Verdict.SYNTAX_ERROR
-
-    # Runtime errors
     if r1.is_error or r2.is_error:
-        return Verdict.RUNTIME_ERROR
+        return Verdict.SYNTAX_ERROR
 
     # Compare based on semantics
     if semantics == Semantics.SET:

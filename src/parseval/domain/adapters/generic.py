@@ -81,13 +81,15 @@ class GenericTypeAdapter(TypeAdapter):
                 return value.date()
             if isinstance(value, date):
                 return value
-            return datetime.fromisoformat(str(value).replace(" ", "T")).date()
+            cleaned = str(value).rstrip('0').rstrip('.') if '.' in str(value) else str(value)
+            return datetime.fromisoformat(cleaned.replace(" ", "T")).date()
         if profile.family == TypeFamily.DATETIME:
             if isinstance(value, datetime):
                 return value
             if isinstance(value, date):
                 return datetime(value.year, value.month, value.day)
-            return datetime.fromisoformat(str(value).replace(" ", "T"))
+            cleaned = str(value).rstrip('0').rstrip('.') if '.' in str(value) else str(value)
+            return datetime.fromisoformat(cleaned.replace(" ", "T"))
         if profile.family == TypeFamily.TIME:
             if isinstance(value, datetime):
                 return value.time().replace(microsecond=0)
