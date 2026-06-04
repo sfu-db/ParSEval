@@ -1,13 +1,11 @@
-"""SQLite experiment runner — disprove equivalence on Bird dataset pairs."""
+"""SQLite experiment runner — generate test databases for BIRD dataset queries."""
 
 import json
 import os
 import argparse
-import sqlite3
 import datetime
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from decimal import Decimal
 
 try:
     from tqdm import tqdm
@@ -25,28 +23,6 @@ def load_gold(gold_fp: str):
     with open(gold_fp) as f:
         return json.load(f)
 
-def _execute_generated_instance(instance, tpath, sql: str):
-    """Execute SQL against the rows already materialized in an Instance."""
-    db_path = os.path.abspath(tpath)
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    for suffix in ("", "-wal", "-shm"):
-        path = f"{db_path}{suffix}"
-        if os.path.exists(path):
-            os.remove(path)
-
-    connection_string = f"sqlite:///{db_path}"
-    try:
-        from parseval.instance.io import to_db
-
-        to_db(instance, connection_string=connection_string, dialect="sqlite")
-        conn = sqlite3.connect(db_path)
-        try:
-            return conn.execute(sql).fetchall(), ""
-        finally:
-            conn.close()
-    except Exception as exc:
-        return [], str(exc)[:300]
-
 
 def _process_bird_datagen_case(index, row, schemas, *, execute_sqlite=True):
     t0 = time.time()
@@ -59,49 +35,48 @@ def _process_bird_datagen_case(index, row, schemas, *, execute_sqlite=True):
         "difficulty": row.get("difficulty"),
         "sql": sql,
         "status": "unknown",
-        "branches": 0,
         "rows_generated": 0,
+        "coverage": 0.0,
         "non_empty": False,
-        "insert_errors": 0,
         "error_msg": "",
         "elapsed_time": 0.0,
     }
     try:
-        from parseval.instance import Instance
-        from parseval.plan import Plan
-        from parseval.query import preprocess_sql
-        from parseval.symbolic.speculate import speculate, SpeculateConfig
+        from parseval.main import instantiate_db
 
-        instance = Instance(ddls=ddls, name=f"{db_id}_{index}", dialect="sqlite")
-        expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr, instance)
-        results = speculate(
-            plan,
-            instance,
-            plan.alias_map,
-            dialect="sqlite",
-            config=SpeculateConfig.gold_non_empty(),
+        db_path = os.path.abspath(f"tmp/worker_{db_id}_{index}.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            path = f"{db_path}{suffix}"
+            if os.path.exists(path):
+                os.remove(path)
+        connection_string = f"sqlite:///{db_path}"
+
+        result = instantiate_db(
+            sql, ddls, connection_string, "sqlite",
+            db_id=f"{db_id}_{index}",
+            max_iterations=10,
+            atom_null=0,
+            atom_dup=1,
         )
-        record["branches"] = len(results)
-        record["rows_generated"] = sum(
-            len(instance.get_rows(table_name))
-            for table_name in instance.tables
-        )
-        if not results or record["rows_generated"] == 0:
+
+        record["rows_generated"] = result.generation.rows_generated
+        record["coverage"] = result.generation.coverage
+        if result.q_result is not None:
+            record["non_empty"] = bool(result.q_result.rows)
+            if result.q_result.error_msg:
+                record["error_msg"] = result.q_result.error_msg
+        if not result.success:
+            record["status"] = "generation_error"
+            record["error_msg"] = result.error_msg or record["error_msg"]
+        elif record["non_empty"]:
+            record["status"] = "non_empty"
+        elif result.q_result and result.q_result.error_msg:
+            record["status"] = "execution_error"
+        elif record["rows_generated"] == 0:
             record["status"] = "empty_generation"
-        elif execute_sqlite:
-            tpath = f"tmp/worker_{db_id}_{index}.db"
-            rows, error_msg = _execute_generated_instance(instance, tpath, sql)
-            record["non_empty"] = bool(rows)
-            if error_msg:
-                record["status"] = "execution_error"
-                record["error_msg"] = error_msg
-            elif rows:
-                record["status"] = "non_empty"
-            else:
-                record["status"] = "empty_result"
         else:
-            record["status"] = "generated"
+            record["status"] = "empty_result"
     except Exception as exc:
         record["status"] = "generation_error"
         record["error_msg"] = str(exc)[:300]
@@ -124,24 +99,27 @@ def summarize_datagen_results(records):
     total = len(records)
     status_counts = {}
     total_rows = 0
-    total_branches = 0
+    coverages = []
     for record in records:
         status = record.get("status", "unknown")
         status_counts[status] = status_counts.get(status, 0) + 1
         total_rows += int(record.get("rows_generated") or 0)
-        total_branches += int(record.get("branches") or 0)
+        cov = record.get("coverage")
+        if cov is not None:
+            coverages.append(cov)
     non_empty = status_counts.get("non_empty", 0)
     empty_generation = status_counts.get("empty_generation", 0)
     generation_errors = status_counts.get("generation_error", 0)
     witness_queries = total - empty_generation - generation_errors
-    generated = total - status_counts.get("generation_error", 0)
+    generated = total - generation_errors
+    avg_coverage = round(sum(coverages) / len(coverages), 4) if coverages else 0.0
     return {
         "total_queries": total,
         "generated_queries": generated,
         "witness_queries": witness_queries,
         "non_empty_queries": non_empty,
         "generated_rows": total_rows,
-        "generated_branches": total_branches,
+        "average_coverage": avg_coverage,
         "status_counts": status_counts,
         "status_ratio": {
             key: round(value / total, 4) if total else 0
@@ -152,7 +130,7 @@ def summarize_datagen_results(records):
     }
 
 
-def run_bird_speculate_datagen(
+def run_bird_datagen(
     schema_fp: str,
     gold_fp: str,
     *,
@@ -174,7 +152,7 @@ def run_bird_speculate_datagen(
     if workers <= 1:
         records = [
             _process_bird_datagen_task(task)
-            for task in tqdm(tasks, desc="Generating BIRD gold witnesses")
+            for task in tqdm(tasks, desc="Generating BIRD test databases")
         ]
     else:
         records_by_index = {}
@@ -183,7 +161,7 @@ def run_bird_speculate_datagen(
             for future in tqdm(
                 as_completed(futures),
                 total=len(futures),
-                desc="Generating BIRD gold witnesses",
+                desc="Generating BIRD test databases",
             ):
                 record = future.result()
                 records_by_index[record["index"]] = record
@@ -193,9 +171,9 @@ def run_bird_speculate_datagen(
     return metrics
 
 
-def run_bird_speculate_datagen_experiment(args):
+def run_bird_datagen_experiment(args):
     os.makedirs(args.output_dir, exist_ok=True)
-    metrics = run_bird_speculate_datagen(
+    metrics = run_bird_datagen(
         schema_fp=args.schema_fp,
         gold_fp=args.gold_fp,
         limit=args.limit,
@@ -215,7 +193,7 @@ def run_bird_speculate_datagen_experiment(args):
     return metrics
 
 
-def test_bird_speculate_datagen_smoke():
+def test_bird_datagen_smoke():
     try:
         import pytest
     except Exception:
@@ -227,7 +205,7 @@ def test_bird_speculate_datagen_smoke():
 
     limit = int(os.environ.get("BIRD_DATAGEN_LIMIT", "25"))
     min_non_empty_ratio = float(os.environ.get("BIRD_DATAGEN_MIN_NON_EMPTY_RATIO", "0.8"))
-    metrics = run_bird_speculate_datagen(
+    metrics = run_bird_datagen(
         schema_fp="data/sqlite/schema.json",
         gold_fp="data/sqlite/dev.json",
         limit=limit,
@@ -241,7 +219,7 @@ def test_bird_speculate_datagen_smoke():
         assert metrics["non_empty_ratio"] >= min_non_empty_ratio
 
 
-def test_bird_speculate_datagen_parallel_smoke():
+def test_bird_datagen_parallel_smoke():
     try:
         import pytest
     except Exception:
@@ -251,7 +229,7 @@ def test_bird_speculate_datagen_parallel_smoke():
             return
         pytest.skip("BIRD SQLite fixtures are not available")
 
-    metrics = run_bird_speculate_datagen(
+    metrics = run_bird_datagen(
         schema_fp="data/sqlite/schema.json",
         gold_fp="data/sqlite/dev.json",
         limit=3,
@@ -274,5 +252,4 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--no_execute_sqlite", action="store_true")
     args = parser.parse_args()
-    run_bird_speculate_datagen_experiment(args)
-    
+    run_bird_datagen_experiment(args)
