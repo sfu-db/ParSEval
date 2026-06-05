@@ -38,8 +38,8 @@ class SymbolIndex:
 
     def __init__(self) -> None:
         self._by_name: Dict[str, Variable] = {}
-        self._by_column: Dict[Tuple[str, str], List[Variable]] = defaultdict(list)
-        self._by_row: Dict[Tuple[str, Any], List[Variable]] = defaultdict(list)
+        self._by_column: Dict[Any, List[Variable]] = defaultdict(list)
+        self._by_row: Dict[Tuple[Any, Any], List[Variable]] = defaultdict(list)
 
     # ------------------------------------------------------------------
     # mutation
@@ -61,13 +61,13 @@ class SymbolIndex:
             self._remove_from_reverse_indices(existing)
         self._by_name[name] = variable
 
-        table = variable.args.get("table")
-        column = variable.args.get("column")
+        relation_id = variable.args.get("relation_id") or variable.args.get("table")
+        column_id = variable.args.get("column_id") or variable.args.get("column")
         rowid = variable.args.get("rowid")
-        if table and column:
-            self._by_column[(table, column)].append(variable)
-        if table and rowid is not None:
-            self._by_row[(table, rowid)].append(variable)
+        if column_id:
+            self._by_column[column_id].append(variable)
+        if relation_id and rowid is not None:
+            self._by_row[(relation_id, rowid)].append(variable)
 
     def register_many(self, variables: Iterable[Variable]) -> None:
         for variable in variables:
@@ -81,27 +81,27 @@ class SymbolIndex:
         return removed
 
     def _remove_from_reverse_indices(self, variable: Variable) -> None:
-        table = variable.args.get("table")
-        column = variable.args.get("column")
+        relation_id = variable.args.get("relation_id") or variable.args.get("table")
+        column_id = variable.args.get("column_id") or variable.args.get("column")
         rowid = variable.args.get("rowid")
-        if table and column:
-            bucket = self._by_column.get((table, column))
+        if column_id:
+            bucket = self._by_column.get(column_id)
             if bucket is not None:
                 try:
                     bucket.remove(variable)
                 except ValueError:
                     pass
                 if not bucket:
-                    self._by_column.pop((table, column), None)
-        if table and rowid is not None:
-            bucket = self._by_row.get((table, rowid))
+                    self._by_column.pop(column_id, None)
+        if relation_id and rowid is not None:
+            bucket = self._by_row.get((relation_id, rowid))
             if bucket is not None:
                 try:
                     bucket.remove(variable)
                 except ValueError:
                     pass
                 if not bucket:
-                    self._by_row.pop((table, rowid), None)
+                    self._by_row.pop((relation_id, rowid), None)
 
     def clear(self) -> None:
         self._by_name.clear()
@@ -116,13 +116,13 @@ class SymbolIndex:
         """Return the :class:`Variable` registered under ``name``, or ``None``."""
         return self._by_name.get(name)
 
-    def by_column(self, table: str, column: str) -> List[Variable]:
-        """Return every cell registered for ``table.column``, in insertion order."""
-        return list(self._by_column.get((table, column), ()))
+    def by_column(self, column_id) -> List[Variable]:
+        """Return every cell registered for ``column_id``, in insertion order."""
+        return list(self._by_column.get(column_id, ()))
 
-    def by_row(self, table: str, rowid: Any) -> List[Variable]:
-        """Return every cell registered for ``table`` at ``rowid``, in order."""
-        return list(self._by_row.get((table, rowid), ()))
+    def by_row(self, relation_id, rowid: Any) -> List[Variable]:
+        """Return every cell registered for ``relation_id`` at ``rowid``, in order."""
+        return list(self._by_row.get((relation_id, rowid), ()))
 
     # ------------------------------------------------------------------
     # dict-style ergonomics (for legacy call sites)

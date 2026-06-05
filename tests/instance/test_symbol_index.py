@@ -31,7 +31,7 @@ class TestRegister(unittest.TestCase):
         v = _var("x1", table="t", column="x", rowid=0)
         index.register(v)
         index.register(v)
-        self.assertEqual(len(index.by_column("t", "x")), 1)
+        self.assertEqual(len(index.by_column("x")), 1)
         self.assertEqual(len(index.by_row("t", 0)), 1)
 
     def test_register_replaces_existing_name(self):
@@ -50,7 +50,7 @@ class TestRegister(unittest.TestCase):
         index = SymbolIndex()
         v = _var("x1")  # no table/column/rowid
         index.register(v)
-        self.assertEqual(index.by_column("t", "x"), [])
+        self.assertEqual(index.by_column("x"), [])
         self.assertEqual(index.by_row("t", 0), [])
         self.assertIs(index.by_name("x1"), v)
 
@@ -63,9 +63,9 @@ class TestLookup(unittest.TestCase):
         b_r0 = _var("t_y_0", table="t", column="y", rowid=0)
         for v in (a_r0, a_r1, b_r0):
             index.register(v)
-        self.assertEqual(index.by_column("t", "x"), [a_r0, a_r1])
-        self.assertEqual(index.by_column("t", "y"), [b_r0])
-        self.assertEqual(index.by_column("t", "z"), [])
+        self.assertEqual(index.by_column("x"), [a_r0, a_r1])
+        self.assertEqual(index.by_column("y"), [b_r0])
+        self.assertEqual(index.by_column("z"), [])
 
     def test_by_row_returns_all_columns_for_a_row(self):
         index = SymbolIndex()
@@ -121,7 +121,7 @@ class TestUnregisterClear(unittest.TestCase):
         removed = index.unregister("t_x_0")
         self.assertIs(removed, v)
         self.assertIsNone(index.by_name("t_x_0"))
-        self.assertEqual(index.by_column("t", "x"), [])
+        self.assertEqual(index.by_column("x"), [])
         self.assertEqual(index.by_row("t", 0), [])
 
     def test_unregister_missing_returns_none(self):
@@ -155,8 +155,8 @@ class TestInstanceIntegration(unittest.TestCase):
             self.assertIsNotNone(v.args.get("rowid"))
 
         # Reverse indices should resolve.
-        id_cells = inst.symbols.by_column("users", "id")
-        name_cells = inst.symbols.by_column("users", "name")
+        id_cells = inst.symbols.by_column(inst.column_id("users", "id"))
+        name_cells = inst.symbols.by_column(inst.column_id("users", "name"))
         self.assertEqual(len(id_cells), 1)
         self.assertEqual(len(name_cells), 1)
 

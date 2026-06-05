@@ -230,6 +230,8 @@ class Variable(Symbol):
         # --- Instance back-pointers ---
         "table": False,
         "column": False,
+        "relation_id": False,
+        "column_id": False,
         "rowid": False,
         # --- solver hints ---
         "nullable": False,

@@ -23,6 +23,7 @@ from sqlglot import exp
 
 from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.helper import normalize_name
+from parseval.identity import ColumnId
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
 from parseval.plan.helper import to_literal
@@ -36,6 +37,14 @@ from .evaluator import PlanEvaluator
 from .types import BranchTree, BranchType
 
 logger = logging.getLogger("parseval.speculate")
+
+
+def _row_value_dict(row) -> Dict[str, Any]:
+    values: Dict[str, Any] = {}
+    for column, value in row.items():
+        key = column.name.normalized if isinstance(column, ColumnId) else str(column)
+        values[key] = value.concrete
+    return values
 
 
 def _lookup_col_type(instance, table: str, col_name: str) -> Optional[str]:
@@ -3193,7 +3202,7 @@ def _gold_domain_value(
                 for existing_row in instance.get_rows(table_name):
                     builder.runtime.remember_row(
                         table_name,
-                        {col: value.concrete for col, value in existing_row.items()},
+                        _row_value_dict(existing_row),
                     )
             for table_name, table_rows in rows.items():
                 if table_name not in instance.tables:
@@ -3251,7 +3260,7 @@ def _complete_gold_rows(
         for existing_row in instance.get_rows(table_name):
             builder.runtime.remember_row(
                 table_name,
-                {col: value.concrete for col, value in existing_row.items()},
+                _row_value_dict(existing_row),
             )
 
     pending_rows = {

@@ -20,6 +20,7 @@ from parseval.domain import DatabaseBuilder
 from parseval.domain.exceptions import ForeignKeyResolutionError, UniqueConflictError
 from parseval.identity import (
     CatalogColumn,
+    ColumnId,
     ColumnKind,
     RelationKind,
     column_id,
@@ -818,8 +819,35 @@ class Instance(Catalog):
         return self.get_rows(table_name)[index]
 
     def get_column_data(self, table_name, column_name) -> List[Symbol]:
-        column_name = self._normalize_name(column_name, dialect=self.dialect)
-        return [row[column_name] for row in self.get_rows(table_name)]
+        table_name = self._normalize_table(table_name, dialect=self.dialect)
+        col_id = self._stored_column_id(table_name, column_name)
+        return [row[col_id] for row in self.get_rows(table_name)]
+
+    @staticmethod
+    def _row_value_dict(row: Row) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for column, symbol in row.items():
+            key = column.name.normalized if isinstance(column, ColumnId) else str(column)
+            values[key] = symbol.concrete
+        return values
+
+    def _table_key_for_storage(self, table_name: str) -> str:
+        return self._resolve_declared_table_key(table_name)
+
+    def _table_columns_for_storage(self, table_name: str):
+        table_key = self._table_key_for_storage(table_name)
+        return (self._ddl_columns or self.tables).get(table_key, self.tables[table_name])
+
+    def _column_source_for_storage(self, table_name: str, column_name: str):
+        table_key = self._table_key_for_storage(table_name)
+        column_key = self._resolve_declared_column_key(table_key, column_name)
+        return self._column_sources.get((table_key, column_key), column_key)
+
+    def _stored_column_id(self, table_name: str, column_name: str):
+        table_key = self._table_key_for_storage(table_name)
+        table_source = self._table_sources.get(table_key, table_key)
+        column_source = self._column_source_for_storage(table_name, column_name)
+        return self.column_id(table_source, column_source)
 
     def create_rows(
         self, concretes: Dict[str, Dict[str, List[Any]]], sync_db: bool = False
@@ -904,20 +932,29 @@ class Instance(Catalog):
         normalized_values = {
             self._normalize_name(k, dialect=self.dialect): v for k, v in values.items()
         }
-        row_cells: Dict[str, Variable] = {}
-        for column, datatype in self.tables[table_name].items():
+        table_columns = self._table_columns_for_storage(table_name)
+        row_cells: Dict[Any, Variable] = {}
+        table_key = self._table_key_for_storage(table_name)
+        table_source = self._table_sources.get(table_key, table_key)
+        relation_id = self.table_id(table_source)
+        for column, datatype in table_columns.items():
+            col_id = self._stored_column_id(table_name, column)
             z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
-            concrete = normalized_values.get(column)
+            concrete = normalized_values.get(
+                self._normalize_name(column, dialect=self.dialect)
+            )
             z_value = Variable(
                 this=z_name,
                 _type=datatype,
                 concrete=concrete,
                 table=table_name,
                 column=column,
+                relation_id=relation_id,
+                column_id=col_id,
                 rowid=rowid,
             )
             z_value.type = datatype
-            row_cells[column] = z_value
+            row_cells[col_id] = z_value
             self.symbols.register(z_value)
         row = Row(this=rowid, columns=row_cells)
         self.add_row(table_name, row)
@@ -1025,26 +1062,39 @@ class Instance(Catalog):
                 raise
             new_values = {}
             rowid = f"{table_name}_rowid_{tuple_index}"
-            for column, datatype in self.tables[table_name].items():
+            table_key = self._table_key_for_storage(table_name)
+            table_source = self._table_sources.get(table_key, table_key)
+            relation_id = self.table_id(table_source)
+            table_columns = self._table_columns_for_storage(table_name)
+            for column, datatype in table_columns.items():
+                col_id = self._stored_column_id(table_name, column)
                 z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
-                concrete = completed.get(column)
+                concrete = completed.get(
+                    column,
+                    completed.get(self._normalize_name(column, dialect=self.dialect)),
+                )
                 z_value = Variable(
                     this=z_name,
                     _type=datatype,
                     concrete=concrete,
                     table=table_name,
                     column=column,
+                    relation_id=relation_id,
+                    column_id=col_id,
                     rowid=rowid,
                 )
                 z_value.type = datatype
-                new_values[column] = z_value
+                new_values[col_id] = z_value
                 self.symbols.register(z_value)
             if self._row_violates_unique_constraints(table_name, new_values):
                 continue
             self.add_row(table_name, Row(this=rowid, columns=new_values))
             self.builder.runtime.remember_row(
                 table_name,
-                {column: value.concrete for column, value in new_values.items()},
+                {
+                    column.name.normalized: value.concrete
+                    for column, value in new_values.items()
+                },
             )
             return tuple_index
         raise_exception(f"Failed to create row for table {table_name} after 10 attempts")
@@ -1089,7 +1139,7 @@ class Instance(Catalog):
         row = self.place_row(table_name, row_values)
         self.builder.runtime.remember_row(
             table_name,
-            {col: val.concrete for col, val in row.items()},
+            self._row_value_dict(row),
         )
         return tuple_index
 
@@ -1268,7 +1318,10 @@ class Instance(Catalog):
         self, table_name: str, row_values: Dict[str, Variable]
     ) -> bool:
         for columns in self._constraint_groups(table_name):
-            concretes = tuple(row_values[column].concrete for column in columns)
+            concretes = tuple(
+                row_values[self._stored_column_id(table_name, column)].concrete
+                for column in columns
+            )
             if any(value is None for value in concretes):
                 continue
             for existing_row in self.get_rows(table_name):
@@ -1281,7 +1334,7 @@ class Instance(Catalog):
             if self.is_unique(table_name, column_name)
         ]
         for column in unique_columns:
-            concrete = row_values[column].concrete
+            concrete = row_values[self._stored_column_id(table_name, column)].concrete
             if concrete is None:
                 continue
             for existing in self.get_column_data(table_name, column):
@@ -1426,7 +1479,7 @@ class Instance(Catalog):
             for row in self.get_rows(table_name):
                 self.builder.runtime.remember_row(
                     table_name,
-                    {col: val.concrete for col, val in row.items()},
+                    self._row_value_dict(row),
                 )
 
     def snapshot(self) -> InstanceSnapshot:
@@ -1452,9 +1505,7 @@ class Instance(Catalog):
     def _row_dicts(self, table_name: str) -> list[dict[str, Any]]:
         rows = []
         for row in self.get_rows(table_name):
-            rows.append(
-                {column_name: symbol.concrete for column_name, symbol in row.items()}
-            )
+            rows.append(self._row_value_dict(row))
         return rows
 
     def to_db(
