@@ -38,6 +38,16 @@ def test_column_ast_is_stamped_with_resolved_identity():
     assert col.meta[PARSEVAL_COLUMN_ID].relation.alias.normalized == "u"
 
 
+def test_plan_exposes_aliases_through_relation_identity_not_alias_map():
+    ddl = "CREATE TABLE users (id INT PRIMARY KEY);"
+    plan = _plan("SELECT u.id FROM users AS u", ddl)
+    ann = plan.annotation_for(plan.root)
+
+    assert not hasattr(plan, "alias_map")
+    assert ann.source_relations[0].name.normalized == "users"
+    assert ann.source_relations[0].alias.normalized == "u"
+
+
 def test_bare_ambiguous_column_fails_during_annotation():
     ddl = "CREATE TABLE users (id INT); CREATE TABLE orders (id INT, user_id INT);"
     plan = _plan(

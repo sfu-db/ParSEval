@@ -142,13 +142,6 @@ class Catalog(MappingSchema):
             return self._identity_key(exp.to_table(value), is_table=True)
         return self._identifier_key(value)
 
-    def _resolve_table_key(self, key: str) -> str:
-        return key
-
-    def _resolve_column_key(self, table_key: str, column_key: str) -> str:
-        del table_key
-        return column_key
-
     def _resolve_declared_key(self, key: str, candidates) -> str:
         if key in candidates or not self.normalize:
             return key
@@ -263,7 +256,7 @@ class Catalog(MappingSchema):
                 )
 
     def table_id(self, table: exp.Table | str):
-        key = self._resolve_table_key(self._identity_key(table, is_table=True))
+        key = self._identity_key(table, is_table=True)
         return self._relation_ids[key]
 
     def column_id(
@@ -271,8 +264,8 @@ class Catalog(MappingSchema):
         table: exp.Table | str,
         column: exp.Column | exp.Identifier | str,
     ):
-        table_key = self._resolve_table_key(self._identity_key(table, is_table=True))
-        column_key = self._resolve_column_key(table_key, self._identity_key(column))
+        table_key = self._identity_key(table, is_table=True)
+        column_key = self._identity_key(column)
         return self._column_ids[(table_key, column_key)]
 
     def catalog_column(
@@ -296,7 +289,7 @@ class Catalog(MappingSchema):
                 seen.add(key)
 
     def get_primary_key(self, table: exp.Table | str):
-        table = self._resolve_table_key(self._identity_key(table, is_table=True))
+        table = self._identity_key(table, is_table=True)
         return tuple(self.primary_keys.get(table, ()))
 
     def _primary_key_names(self, table: exp.Table | str) -> Tuple[str, ...]:
@@ -358,7 +351,7 @@ class Catalog(MappingSchema):
         fk_list.extend(fks)
 
     def get_foreign_key(self, table: exp.Table | str):
-        table = self._resolve_table_key(self._identity_key(table, is_table=True))
+        table = self._identity_key(table, is_table=True)
         return self.foreign_keys.get(table, [])
 
     def add_unique_constraint(
@@ -378,7 +371,7 @@ class Catalog(MappingSchema):
             unique_constraints.append(normalized_columns)
 
     def get_unique_constraints(self, table: exp.Table | str):
-        table = self._resolve_table_key(self._identity_key(table, is_table=True))
+        table = self._identity_key(table, is_table=True)
         return tuple(self.unique_constraints.get(table, ()))
 
     def add_constraint(
@@ -399,14 +392,14 @@ class Catalog(MappingSchema):
         table: exp.Table | str,
         column: exp.Column | exp.Identifier | str,
     ):
-        table = self._resolve_table_key(self._identity_key(table, is_table=True))
-        column = self._resolve_column_key(table, self._identity_key(column))
+        table = self._identity_key(table, is_table=True)
+        column = self._identity_key(column)
         table_constraints = self.constraints.get(table, {})
         return table_constraints.get(column, set())
 
     def get_check_constraints(self, table: exp.Table | str) -> List[exp.Expression]:
         """Return parsed CHECK constraint expressions for a table."""
-        table = self._resolve_table_key(self._identity_key(table, is_table=True))
+        table = self._identity_key(table, is_table=True)
         results = []
         for col_constraints in self.constraints.get(table, {}).values():
             for c in col_constraints:
@@ -968,7 +961,6 @@ class Instance(Catalog):
         self,
         table_name: str,
         values: Dict[str, Any] | None = None,
-        alias: Optional[str] = None,
         sync_db: bool = False,
     ) -> RowCreationResult:
         del sync_db
@@ -998,7 +990,7 @@ class Instance(Catalog):
                 ),
             )
             try:
-                main_pos = self._create_row(table_name, values, alias=alias)
+                main_pos = self._create_row(table_name, values)
             except UniqueConflictError:
                 created = self._bootstrap_reference_rows(
                     table_name,
@@ -1017,7 +1009,7 @@ class Instance(Catalog):
                         locked_columns=provided_columns,
                     ),
                 )
-                main_pos = self._create_row(table_name, values, alias=alias)
+                main_pos = self._create_row(table_name, values)
         finally:
             self._bootstrapping.discard(table_name)
         new_tuples[table_name].append(self.get_row(table_name, main_pos))
@@ -1031,9 +1023,7 @@ class Instance(Catalog):
         self,
         table_name: str,
         concretes: Dict[str, Any],
-        alias: Optional[str] = None,
     ):
-        del alias
         table_name = self._normalize_name(table_name, dialect=self.dialect, is_table=True)
         if table_name not in self.tables:
             return None
@@ -1205,7 +1195,7 @@ class Instance(Catalog):
                     and self.is_unique(table_name, local_col)
                     and explicit_value in used_child_values
                 ):
-                    created = self.create_row(ref_table, {}, alias=None)
+                    created = self.create_row(ref_table, {})
                     self._merge_created_rows(created_rows, created.created)
                     ref_position = next(iter(created.positions.values()))
                     ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
@@ -1215,7 +1205,6 @@ class Instance(Catalog):
                     created = self.create_row(
                         ref_table,
                         {ref_col: explicit_value},
-                        alias=None,
                     )
                     self._merge_created_rows(created_rows, created.created)
                 continue
@@ -1237,7 +1226,7 @@ class Instance(Catalog):
                     values[local_col] = random.choice(available_values)
                     continue
 
-            created = self.create_row(ref_table, {}, alias=None)
+            created = self.create_row(ref_table, {})
             self._merge_created_rows(created_rows, created.created)
             ref_position = next(iter(created.positions.values()))
             ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
@@ -1390,7 +1379,7 @@ class Instance(Catalog):
                 # Skip if ref_table is already being bootstrapped (circular FK).
                 if ref_table in self._bootstrapping:
                     continue
-                created = self.create_row(ref_table, {}, alias=None)
+                created = self.create_row(ref_table, {})
                 self._merge_created_rows(created_rows, created.created)
                 ref_position = next(iter(created.positions.values()))
                 ref_value = self.get_column_data(ref_table, ref_col)[ref_position].concrete
@@ -1517,8 +1506,7 @@ class Instance(Catalog):
     ):
         """Write this instance to a live database.
 
-        Thin delegation to :func:`parseval.instance.io.to_db`; kept as a
-        method for backward compatibility with existing call sites.
+        Thin delegation to :func:`parseval.instance.io.to_db`.
         """
         from .io import to_db as _to_db
 
