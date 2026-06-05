@@ -57,6 +57,16 @@ from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from parseval.helper import normalize_name
+from parseval.identity import (
+    PARSEVAL_COLUMN_ID,
+    ColumnId,
+    ColumnKind,
+    RelationId,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
+)
 if t.TYPE_CHECKING:
     from parseval.instance import Instance
 
@@ -156,34 +166,79 @@ class Plan:
             exprs = _step_expressions(step)
             source_tables = _source_tables(step)
             if self._instance is not None:
-                for expr in exprs:
-                    for col in expr.find_all(exp.Column):
-                        # Skip columns inside subquery boundaries — they belong
-                        # to an inner scope and are enriched via SubPlan.inner.
-                        if col.find_ancestor(exp.Subquery) is not None or col.find_ancestor(exp.Exists) is not None:
-                            continue
-                        _enrich_one_column(col, source_tables, self._instance, set_column_meta, DataType, alias_map=alias_map)
+                _prepare_step_identity(step, self._instance)
                 # SubPlan inner plans live in a separate scope — recurse
                 # through all inner steps (not just the root, since the
                 # correlated condition is typically on a Filter dependency).
                 if isinstance(step, SubPlan):
+                    resolve_exprs = tuple(
+                        col for col in (getattr(step, "correlation", None) or ())
+                        if isinstance(col, exp.Expression)
+                    )
                     inner = step.inner
                     if inner is not None:
-                        inner_steps = _collect_inner_steps(inner)
+                        inner_steps = _identity_order(inner)
                         for inner_step in inner_steps:
-                            inner_tables = _source_tables(inner_step)
+                            _prepare_step_identity(inner_step, self._instance)
                             for inner_expr in _step_expressions(inner_step):
-                                for col in inner_expr.find_all(exp.Column):
-                                    _enrich_one_column(col, inner_tables, self._instance, set_column_meta, DataType, alias_map=alias_map)
+                                for col in _iter_scope_columns(inner_expr):
+                                    resolved_id = _resolve_column_id(
+                                        col,
+                                        inner_step,
+                                        self._instance,
+                                        allow_unresolved=True,
+                                    )
+                                    if resolved_id is None:
+                                        continue
+                                    col.meta[PARSEVAL_COLUMN_ID] = resolved_id
+                                    _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
+                            if isinstance(inner_step, Project):
+                                inner_step.output_column_ids = _build_project_output_columns(
+                                    inner_step,
+                                    self._instance,
+                                )
+                        step.output_column_ids = tuple(
+                            getattr(inner, "output_column_ids", ())
+                        )
+                else:
+                    resolve_exprs = exprs
+                for expr in resolve_exprs:
+                    for col in _iter_scope_columns(expr):
+                        resolved_id = _resolve_column_id(
+                            col,
+                            step,
+                            self._instance,
+                            allow_unresolved=isinstance(step, SubPlan),
+                        )
+                        if resolved_id is None:
+                            continue
+                        col.meta[PARSEVAL_COLUMN_ID] = resolved_id
+                        _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
+                if isinstance(step, Project):
+                    step.output_column_ids = _build_project_output_columns(
+                        step,
+                        self._instance,
+                    )
 
             annotations[id(step)] = StepAnnotations(
                 step_id=f"step_{index}",
                 step_type=type(step).__name__,
                 step_name=getattr(step, "name", "") or "",
                 condition=getattr(step, "condition", None),
-                projected_columns=_projected_columns(step),
+                projected_columns=(
+                    _projected_column_ids(step)
+                    if self._instance is not None
+                    else _projected_columns(step)
+                ),
                 source_tables=source_tables,
-                referenced_columns=_unique_columns(exprs),
+                referenced_columns=(
+                    _unique_column_ids(exprs)
+                    if self._instance is not None
+                    else _unique_columns(exprs)
+                ),
+                source_relations=(
+                    _source_relations(step) if self._instance is not None else ()
+                ),
             )
         self._annotations = annotations
 
@@ -1155,11 +1210,337 @@ class StepAnnotations:
     step_type: str
     step_name: str
     condition: t.Optional[exp.Expression] = None
-    referenced_columns: t.Tuple[exp.Column, ...] = ()
-    projected_columns: t.Tuple[str, ...] = ()
+    referenced_columns: t.Tuple[t.Any, ...] = ()
+    projected_columns: t.Tuple[t.Any, ...] = ()
     source_tables: t.Tuple[str, ...] = ()
+    source_relations: t.Tuple[RelationId, ...] = ()
     flags: t.FrozenSet[str] = frozenset()
     metadata: t.Dict[str, t.Any] = field(default_factory=dict)
+
+
+def _scope_id_for(step: "Step") -> str:
+    return f"s{id(step)}"
+
+
+def _identity_order(root: "Step") -> t.List["Step"]:
+    ordered: t.List[Step] = []
+    visited: t.Set[int] = set()
+
+    def visit(step: "Step") -> None:
+        if id(step) in visited:
+            return
+        visited.add(id(step))
+        for dep in sorted(step.dependencies, key=lambda item: item.name or ""):
+            visit(dep)
+        ordered.append(step)
+
+    visit(root)
+    return ordered
+
+
+def _iter_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
+    stack: t.List[exp.Expression] = [expression]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Column):
+            yield node
+            continue
+        if isinstance(node, (exp.Subquery, exp.Exists)):
+            continue
+        if isinstance(node, exp.In) and isinstance(
+            node.args.get("query"),
+            exp.Expression,
+        ):
+            continue
+        for child in node.args.values():
+            if isinstance(child, exp.Expression):
+                stack.append(child)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, exp.Expression):
+                        stack.append(item)
+
+
+def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
+    if getattr(step, "output_column_ids", None) is not None:
+        return
+
+    if isinstance(step, SubPlan):
+        for inner_step in _identity_order(step.inner):
+            _prepare_step_identity(inner_step, instance)
+        output_columns = getattr(step.inner, "output_column_ids", ())
+        step.output_column_ids = tuple(output_columns)
+        step.relation_id = relation_id(
+            RelationKind.CTE if step.kind is SubPlanKind.CTE else RelationKind.SUBQUERY,
+            identifier_name(step.alias or step.name or step.kind.value, dialect=getattr(instance, "dialect", None)),
+            alias=(
+                identifier_name(step.alias, dialect=getattr(instance, "dialect", None))
+                if step.alias
+                else None
+            ),
+            scope_id=_scope_id_for(step),
+        )
+        return
+
+    if isinstance(step, Scan):
+        _prepare_scan_identity(step, instance)
+        return
+
+    for dep in step.chain_dependencies:
+        _prepare_step_identity(dep, instance)
+
+    if isinstance(step, Project):
+        step.output_column_ids = _build_project_output_columns(step, instance)
+    else:
+        output_columns: t.List[ColumnId] = []
+        for dep in step.chain_dependencies:
+            output_columns.extend(getattr(dep, "output_column_ids", ()))
+        step.output_column_ids = tuple(output_columns)
+
+
+def _prepare_scan_identity(scan: "Scan", instance: t.Any) -> None:
+    source = scan.source
+    dialect = getattr(instance, "dialect", None)
+    scope_id = _scope_id_for(scan)
+    subplans = scan.subplan_dependencies
+
+    if subplans:
+        subplan = subplans[0]
+        _prepare_step_identity(subplan, instance)
+        kind = RelationKind.CTE if subplan.kind is SubPlanKind.CTE else RelationKind.SUBQUERY
+        alias_name = scan.name or subplan.alias or subplan.name or kind.value
+        rel_id = relation_id(
+            kind,
+            identifier_name(subplan.alias or subplan.name or alias_name, dialect=dialect),
+            alias=identifier_name(alias_name, dialect=dialect),
+            scope_id=scope_id,
+        )
+        scan.relation_id = rel_id
+        scan.output_column_ids = tuple(
+            column_id(
+                ColumnKind.PROJECTED,
+                source_col.name,
+                rel_id,
+                scope_id=scope_id,
+                ordinal=index,
+                source_column_id=source_col.source_column_id or source_col,
+            )
+            for index, source_col in enumerate(getattr(subplan, "output_column_ids", ()))
+        )
+        return
+
+    if isinstance(source, exp.Table):
+        physical = instance.table_id(source)
+        alias_name = source.alias_or_name
+        alias_ident = (
+            identifier_name(alias_name, dialect=dialect)
+            if alias_name and alias_name != source.name
+            else None
+        )
+        rel_id = relation_id(
+            RelationKind.TABLE,
+            physical.name,
+            catalog=physical.catalog,
+            db=physical.db,
+            alias=alias_ident,
+            scope_id=scope_id,
+        )
+        scan.relation_id = rel_id
+        table_key = instance._identity_key(source, is_table=True)
+        table_columns = (getattr(instance, "_ddl_columns", {}) or instance.tables).get(table_key, {})
+        scan.output_column_ids = tuple(
+            _query_column_for_physical(
+                instance,
+                source,
+                rel_id,
+                column_key,
+                index,
+                scope_id,
+            )
+            for index, column_key in enumerate(table_columns)
+        )
+        return
+
+    rel_id = relation_id(RelationKind.SYNTHETIC, None, scope_id=scope_id)
+    scan.relation_id = rel_id
+    scan.output_column_ids = ()
+
+
+def _query_column_for_physical(
+    instance: t.Any,
+    table: exp.Table,
+    relation: RelationId,
+    column_key: str,
+    ordinal: int,
+    scope_id: str,
+) -> ColumnId:
+    column_source = getattr(instance, "_column_sources", {}).get(
+        (instance._identity_key(table, is_table=True), column_key),
+        column_key,
+    )
+    physical_column = instance.column_id(table, column_source)
+    return column_id(
+        ColumnKind.PHYSICAL,
+        physical_column.name,
+        relation,
+        scope_id=scope_id,
+        ordinal=ordinal,
+        source_column_id=physical_column,
+    )
+
+
+def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[ColumnId, ...]:
+    result: t.List[ColumnId] = []
+    dialect = getattr(instance, "dialect", None)
+    for ordinal, projection in enumerate(step.projections):
+        alias_name = projection.alias_or_name
+        if not alias_name:
+            continue
+        source = None
+        if isinstance(projection, exp.Column):
+            source = projection.meta.get(PARSEVAL_COLUMN_ID)
+        else:
+            projection_columns = list(_iter_scope_columns(projection))
+            if len(projection_columns) == 1:
+                source = projection_columns[0].meta.get(PARSEVAL_COLUMN_ID)
+        if isinstance(source, ColumnId) and alias_name == source.name.raw:
+            result.append(source)
+            continue
+        relation = source.relation if isinstance(source, ColumnId) else None
+        result.append(
+            column_id(
+                ColumnKind.PROJECTED,
+                identifier_name(alias_name, dialect=dialect),
+                relation,
+                scope_id=_scope_id_for(step),
+                ordinal=ordinal,
+                source_column_id=(
+                    source.source_column_id or source
+                    if isinstance(source, ColumnId)
+                    else None
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def _visible_columns(step: "Step") -> t.Tuple[ColumnId, ...]:
+    if isinstance(step, Scan):
+        return tuple(getattr(step, "output_column_ids", ()))
+    columns: t.List[ColumnId] = []
+    for dep in step.chain_dependencies:
+        columns.extend(getattr(dep, "output_column_ids", ()))
+    return tuple(columns)
+
+
+def _relation_matches(relation: RelationId | None, qualifier: str, dialect: str | None) -> bool:
+    if relation is None:
+        return False
+    key = identifier_name(qualifier, dialect=dialect).normalized
+    return (
+        relation.alias is not None and relation.alias.normalized == key
+    ) or (
+        relation.name is not None and relation.name.normalized == key
+    )
+
+
+def _column_matches_qualifier(candidate: ColumnId, qualifier: str, dialect: str | None) -> bool:
+    if _relation_matches(candidate.relation, qualifier, dialect):
+        return True
+    source = candidate.source_column_id
+    return source is not None and _relation_matches(source.relation, qualifier, dialect)
+
+
+def _resolve_column_id(
+    col: exp.Column,
+    step: "Step",
+    instance: t.Any,
+    *,
+    allow_unresolved: bool = False,
+) -> ColumnId | None:
+    dialect = getattr(instance, "dialect", None)
+    name = identifier_name(col.this, dialect=dialect)
+    candidates = [
+        candidate
+        for candidate in _visible_columns(step)
+        if candidate.name.normalized == name.normalized
+    ]
+    if col.table:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if _column_matches_qualifier(candidate, col.table, dialect)
+        ]
+        if not candidates:
+            if allow_unresolved:
+                return None
+            raise ValueError(f"Unresolved column qualifier: {col.sql()}")
+        return candidates[0]
+    relations = {
+        candidate.relation
+        for candidate in candidates
+        if candidate.relation is not None
+    }
+    if len(relations) > 1:
+        raise ValueError(f"Ambiguous column: {col.sql()}")
+    if not candidates:
+        if allow_unresolved:
+            return None
+        raise ValueError(f"Unresolved column: {col.sql()}")
+    return candidates[0]
+
+
+def _enrich_identity_column(
+    col: exp.Column,
+    resolved_id: ColumnId,
+    instance: t.Any,
+    set_column_meta: t.Callable,
+    DataType: t.Any,
+) -> None:
+    source = resolved_id.source_column_id
+    if source is None or source.relation is None or source.relation.name is None:
+        return
+    try:
+        catalog_column = instance.catalog_column(source.relation.name.normalized, source.name.normalized)
+    except Exception:
+        return
+    meta = {
+        "table": source.relation.name.normalized,
+        "nullable": catalog_column.nullable,
+        "unique": catalog_column.unique,
+        "domain": DataType.build(catalog_column.datatype),
+    }
+    set_column_meta(col, meta)
+
+
+def _unique_column_ids(
+    expressions: t.Iterable[exp.Expression],
+) -> t.Tuple[ColumnId, ...]:
+    seen: t.Set[ColumnId] = set()
+    columns: t.List[ColumnId] = []
+    for expression in expressions:
+        if expression is None:
+            continue
+        for column in _iter_scope_columns(expression):
+            cid = column.meta.get(PARSEVAL_COLUMN_ID)
+            if isinstance(cid, ColumnId) and cid not in seen:
+                seen.add(cid)
+                columns.append(cid)
+    return tuple(columns)
+
+
+def _projected_column_ids(step: "Step") -> t.Tuple[ColumnId, ...]:
+    return tuple(getattr(step, "output_column_ids", ()))
+
+
+def _source_relations(step: "Step") -> t.Tuple[RelationId, ...]:
+    seen: t.Set[RelationId] = set()
+    relations: t.List[RelationId] = []
+    for column in _visible_columns(step):
+        if column.relation is not None and column.relation not in seen:
+            seen.add(column.relation)
+            relations.append(column.relation)
+    return tuple(relations)
 
 
 def _unique_columns(
