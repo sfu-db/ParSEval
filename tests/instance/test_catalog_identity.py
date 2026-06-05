@@ -34,6 +34,31 @@ def test_schema_spec_carries_identity_fields():
     assert column.table_id == table.id
 
 
+def test_inline_primary_key_populates_table_primary_key_ids():
+    inst = Instance("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);", name="db", dialect="sqlite")
+    table = inst.schema_spec.get_table("users")
+    assert table.primary_key == ("id",)
+    assert table.primary_key_ids == (inst.column_id("users", "id"),)
+
+
+def test_catalog_column_preserves_table_level_single_column_unique():
+    inst = Instance("CREATE TABLE users (id INT, email TEXT, UNIQUE(email));", name="db", dialect="sqlite")
+    assert inst.catalog_column("users", "email").unique is True
+    assert inst.schema_spec.get_table("users").get_column("email").unique is True
+
+
+def test_table_level_multi_column_unique_populates_identity_fields():
+    inst = Instance(
+        "CREATE TABLE users (id INT, email TEXT, org TEXT, UNIQUE(email, org));",
+        name="db",
+        dialect="sqlite",
+    )
+    table = inst.schema_spec.get_table("users")
+    assert table.unique_constraint_ids == (
+        (inst.column_id("users", "email"), inst.column_id("users", "org")),
+    )
+
+
 def test_foreign_key_spec_carries_column_ids():
     ddl = '''
     CREATE TABLE users (id INT PRIMARY KEY);
