@@ -41,6 +41,20 @@ def test_inline_primary_key_populates_table_primary_key_ids():
     assert table.primary_key_ids == (inst.column_id("users", "id"),)
 
 
+def test_mixed_case_table_level_primary_key_populates_catalog_metadata():
+    inst = Instance(
+        "CREATE TABLE Users (ID INT, Name TEXT, PRIMARY KEY(ID));",
+        name="db",
+        dialect="sqlite",
+    )
+    info = inst.catalog_column("users", "id")
+    assert info.primary_key is True
+    assert info.unique is True
+    assert info.nullable is False
+    assert inst.nullable("users", "id") is False
+    assert inst.is_unique("users", "id") is True
+
+
 def test_catalog_column_preserves_table_level_single_column_unique():
     inst = Instance("CREATE TABLE users (id INT, email TEXT, UNIQUE(email));", name="db", dialect="sqlite")
     assert inst.catalog_column("users", "email").unique is True

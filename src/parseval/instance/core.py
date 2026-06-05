@@ -140,8 +140,8 @@ class Catalog(MappingSchema):
             isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint)
             for constraint in raw_constraints
         )
-        primary_key = inline_primary_key or any(
-            pk.name == column_key for pk in self.get_primary_key(table_key)
+        primary_key = inline_primary_key or column_key in self._primary_key_names(
+            table_key
         )
         self._catalog_columns[col_id] = CatalogColumn(
             id=col_id,
@@ -194,6 +194,12 @@ class Catalog(MappingSchema):
             self.normalize,
         )
         return self.primary_keys.get(table, set())
+
+    def _primary_key_names(self, table: exp.Table | str) -> Set[str]:
+        return {
+            self._normalize_name(identifier.name, self.dialect, self.normalize)
+            for identifier in self.get_primary_key(table)
+        }
 
     def resolve_fk_ref_column(self, fk: exp.ForeignKey) -> Optional[str]:
         """Resolve the referenced column name from a ForeignKey node.
@@ -329,9 +335,13 @@ class Catalog(MappingSchema):
         for constraint in self.get_column_constraints(table, column):
             if isinstance(constraint.kind, exp.NotNullColumnConstraint):
                 return constraint.kind.args.get("allow_null", False)
-        for pk in self.get_primary_key(table):
-            if pk.name == (column if isinstance(column, str) else column.this):
-                return False
+        column_name = self._normalize_name(
+            column if isinstance(column, str) else column.name,
+            self.dialect,
+            self.normalize,
+        )
+        if column_name in self._primary_key_names(table):
+            return False
         return True
 
     def is_unique(
@@ -341,7 +351,7 @@ class Catalog(MappingSchema):
         normalize: Optional[bool] = None,
     ):
         del normalize
-        pk_columns = self.get_primary_key(table)
+        pk_columns = self._primary_key_names(table)
         for constraint in self.get_column_constraints(table, column):
             if isinstance(
                 constraint.kind,
@@ -358,10 +368,7 @@ class Catalog(MappingSchema):
                 return True
         if len(pk_columns) != 1:
             return False
-        for pk in pk_columns:
-            if pk.name == (column if isinstance(column, str) else column.this):
-                return True
-        return False
+        return column_name in pk_columns
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -491,10 +498,7 @@ class Catalog(MappingSchema):
 
         for table_name in self.tables.keys():
             column_types = self.tables[table_name]
-            pk_columns = {
-                identifier.name.lower()
-                for identifier in self.get_primary_key(table_name)
-            }
+            pk_columns = set(self._primary_key_names(table_name))
             for column_name in column_types:
                 raw_constraints = self.get_column_constraints(table_name, column_name)
                 if any(
