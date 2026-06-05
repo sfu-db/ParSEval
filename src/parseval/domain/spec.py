@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 from parseval.dtype import DataType
+from parseval.identity import ColumnId, RelationId
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,10 @@ class ForeignKeySpec:
     source_columns: Tuple[str, ...]
     target_table: str
     target_columns: Tuple[str, ...]
+    source_table_id: Optional[RelationId] = None
+    source_column_ids: Tuple[ColumnId, ...] = ()
+    target_table_id: Optional[RelationId] = None
+    target_column_ids: Tuple[ColumnId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,8 @@ class ColumnSpec:
     scale: Optional[int] = None
     semantic_tags: Tuple[str, ...] = ()
     checks: Tuple[Any, ...] = ()
+    id: Optional[ColumnId] = None
+    table_id: Optional[RelationId] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "datatype", DataType.build(self.datatype))
@@ -90,6 +97,9 @@ class TableSpec:
     primary_key: Tuple[str, ...] = ()
     unique_constraints: Tuple[Tuple[str, ...], ...] = ()
     foreign_keys: Tuple[ForeignKeySpec, ...] = ()
+    id: Optional[RelationId] = None
+    primary_key_ids: Tuple[ColumnId, ...] = ()
+    unique_constraint_ids: Tuple[Tuple[ColumnId, ...], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", self.name.lower())
@@ -105,6 +115,12 @@ class TableSpec:
             ),
         )
         object.__setattr__(self, "foreign_keys", tuple(self.foreign_keys))
+        object.__setattr__(self, "primary_key_ids", tuple(self.primary_key_ids))
+        object.__setattr__(
+            self,
+            "unique_constraint_ids",
+            tuple(tuple(columns) for columns in self.unique_constraint_ids),
+        )
 
     def get_column(self, column_name: str) -> ColumnSpec:
         normalized = column_name.lower()
