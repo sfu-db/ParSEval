@@ -383,30 +383,37 @@ class Catalog(MappingSchema):
             uniques: Dict[str, list],
             tbl_constraints: Dict[str, Dict[str, set]],
         ) -> None:
-            table_name = ddl.this.this.name
+            table_name = self._identity_key(ddl.this.this, is_table=True)
             if table_name not in deps:
                 deps[table_name] = 0
             table_mapping = maps.setdefault(table_name, {})
             constraints = tbl_constraints.setdefault(table_name, {})
             for node in ddl.dfs():
                 if isinstance(node, exp.ColumnDef):
-                    table_mapping[node.name] = node.kind.sql(dialect=dialect)
-                    constraints.setdefault(node.name, set()).update(node.constraints)
+                    column_name = self._identity_key(node.this)
+                    table_mapping[column_name] = node.kind.sql(dialect=dialect)
+                    constraints.setdefault(column_name, set()).update(node.constraints)
                     # Capture inline FK references (REFERENCES table(col)).
                     for constraint in node.constraints:
                         if isinstance(constraint.kind, exp.Reference):
-                            ref_table = constraint.kind.find(exp.Table).name
+                            ref_table = self._identity_key(
+                                constraint.kind.find(exp.Table),
+                                is_table=True,
+                            )
                             deps[ref_table] = deps.get(ref_table, 0) + 1
                             # Build a synthetic ForeignKey node for uniform handling.
                             synthetic_fk = exp.ForeignKey(
-                                expressions=[exp.Identifier(this=node.name)],
+                                expressions=[exp.Identifier(this=column_name)],
                                 reference=constraint.kind,
                             )
                             fks.setdefault(table_name, []).append(synthetic_fk)
                 elif isinstance(node, exp.PrimaryKey):
                     pks.setdefault(table_name, []).extend(node.expressions)
                 elif isinstance(node, exp.ForeignKey):
-                    ref_table = node.args.get("reference").find(exp.Table).name
+                    ref_table = self._identity_key(
+                        node.args.get("reference").find(exp.Table),
+                        is_table=True,
+                    )
                     deps[ref_table] = deps.get(ref_table, 0) + 1
                     fks.setdefault(table_name, []).append(node)
                 elif isinstance(node, exp.UniqueColumnConstraint) and node.this is not None:
