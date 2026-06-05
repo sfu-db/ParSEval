@@ -28,11 +28,14 @@ class TestPlaceRow(unittest.TestCase):
     def test_place_row_registers_symbols_with_backpointers(self):
         inst = Instance(ddls=SCHEMA, name="place", dialect="sqlite")
         inst.place_row("t", {"id": 1, "name": "bob", "score": 8.0})
-        id_cells = inst.symbols.by_column("t", "id")
+        id_col = inst.column_id("t", "id")
+        id_cells = inst.symbols.by_column(id_col)
         self.assertEqual(len(id_cells), 1)
         self.assertEqual(id_cells[0].concrete, 1)
         self.assertEqual(id_cells[0].args.get("table"), "t")
         self.assertEqual(id_cells[0].args.get("column"), "id")
+        self.assertEqual(id_cells[0].args.get("relation_id"), inst.table_id("t"))
+        self.assertEqual(id_cells[0].args.get("column_id"), id_col)
 
     def test_place_row_allows_duplicate_pk_without_error(self):
         """place_row is unchecked — no unique validation."""

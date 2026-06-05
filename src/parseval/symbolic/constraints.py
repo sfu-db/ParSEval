@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
+from parseval.identity import ColumnId
 from parseval.plan import Plan, Step
 from parseval.plan.planner import Filter, Join, Aggregate, Project, Scan, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
@@ -30,6 +31,14 @@ from parseval.instance import Instance
 from parseval.solver import SolverConstraint
 
 from .types import BranchType, CoverageTarget
+
+
+def _row_env_bindings(row) -> Dict[str, Any]:
+    bindings: Dict[str, Any] = {}
+    for column, symbol in row.items():
+        key = column.name.normalized if isinstance(column, ColumnId) else str(column)
+        bindings[key] = symbol.concrete
+    return bindings
 
 
 def _collect_path_predicates_and_joins(
@@ -606,7 +615,7 @@ class ConstraintGenerator:
                 continue
             passing = []
             for row in rows:
-                env = Environment({c: s.concrete for c, s in row.items()})
+                env = Environment(_row_env_bindings(row))
                 if concrete(filt.condition, env) is True:
                     passing.append(row)
             rows = passing
@@ -620,7 +629,7 @@ class ConstraintGenerator:
 
         values = set()
         for row in rows:
-            env = Environment({c: s.concrete for c, s in row.items()})
+            env = Environment(_row_env_bindings(row))
             val = concrete(projection, env)
             values.add(val)
         return values

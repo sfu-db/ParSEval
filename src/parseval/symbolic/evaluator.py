@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlglot import exp
 
 from parseval.helper import normalize_name
+from parseval.identity import ColumnId
 from parseval.plan import Plan, Step
 from parseval.plan.planner import (
     Aggregate,
@@ -160,6 +161,17 @@ def _symbol_value(sym: Any) -> Any:
     return sym
 
 
+def _row_column_name(column: Any) -> str:
+    if isinstance(column, ColumnId):
+        return column.name.normalized
+    return str(column)
+
+
+def _row_items_by_name(row: Row):
+    for column, symbol in row.items():
+        yield _row_column_name(column), symbol
+
+
 def _derived_variable(name: str, value: Any, row_ids: Tuple[Any, ...]) -> Variable:
     normalized = normalize_name(name)
     row_suffix = "_".join(str(row_id) for row_id in row_ids) or "scalar"
@@ -176,7 +188,7 @@ def _derived_variable(name: str, value: Any, row_ids: Tuple[Any, ...]) -> Variab
 
 def _retained_columns(row: Row, table_name: str) -> Dict[str, Any]:
     columns: Dict[str, Any] = {}
-    for col_name, symbol in row.items():
+    for col_name, symbol in _row_items_by_name(row):
         columns[col_name] = symbol
         if "." not in col_name:
             columns[f"{table_name}.{col_name}"] = symbol
@@ -192,7 +204,7 @@ def _case_arm_condition(case_expr: exp.Case, arm_pred: exp.Expression) -> exp.Ex
 def _qualified_bindings_from_row(row: Row, table_name: str) -> Dict[str, Any]:
     """Build qualified-only bindings for a row."""
     bindings: Dict[str, Any] = {}
-    for col_name, symbol in row.items():
+    for col_name, symbol in _row_items_by_name(row):
         value = _symbol_value(symbol)
         if "." in col_name:
             bindings[col_name] = value
@@ -210,7 +222,7 @@ def _env_from_row(
     bindings: Dict[str, Any] = {}
     if outer_bindings:
         bindings.update(outer_bindings)
-    for col_name, symbol in row.items():
+    for col_name, symbol in _row_items_by_name(row):
         value = _symbol_value(symbol)
         bindings[col_name] = value
         if "." not in col_name:
@@ -227,12 +239,12 @@ def _env_from_join(
 ) -> Environment:
     """Build an Environment from two joined rows with both table qualifiers."""
     bindings: Dict[str, Any] = dict(outer_bindings) if outer_bindings else {}
-    for col_name, symbol in source_row.items():
+    for col_name, symbol in _row_items_by_name(source_row):
         value = _symbol_value(symbol)
         bindings[col_name] = value
         if "." not in col_name:
             bindings[f"{source_name}.{col_name}"] = value
-    for col_name, symbol in join_row.items():
+    for col_name, symbol in _row_items_by_name(join_row):
         value = _symbol_value(symbol)
         bindings[col_name] = value
         if "." not in col_name:
@@ -242,7 +254,7 @@ def _env_from_join(
 
 def _qualified_columns(row: Row, table_name: str) -> Dict[str, Any]:
     columns: Dict[str, Any] = {}
-    for col_name, symbol in row.items():
+    for col_name, symbol in _row_items_by_name(row):
         if "." in col_name:
             columns[col_name] = symbol
         else:
@@ -931,7 +943,7 @@ class PlanEvaluator:
         env = _env_from_row(row, table_name)
         for projection in step.projections:
             if self._is_star_projection(projection):
-                values.update(dict(row.items()))
+                values.update(dict(_row_items_by_name(row)))
                 continue
             name = self._projection_name(projection)
             expr = projection.this if isinstance(projection, exp.Alias) else projection
@@ -1298,7 +1310,7 @@ class PlanEvaluator:
                 except KeyError:
                     projection_expr = projection.this if isinstance(projection, exp.Alias) else projection
             elif len(row.columns) == 1:
-                values.add(_symbol_value(next(iter(dict(row.items()).values()))))
+                values.add(_symbol_value(next(iter(dict(_row_items_by_name(row)).values()))))
                 continue
             else:
                 continue
