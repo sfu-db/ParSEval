@@ -141,16 +141,16 @@ class InstanceLoaderTests(unittest.TestCase):
         original_create_row = instance._create_row
         state = {"raised": False}
 
-        def flaky_create_row(table_name, concretes, alias=None):
+        def flaky_create_row(table_name, concretes):
             if table_name == "children" and not state["raised"]:
                 state["raised"] = True
                 raise UniqueConflictError("retry after parent bootstrap")
-            return original_create_row(table_name, concretes, alias=alias)
+            return original_create_row(table_name, concretes)
 
         def bootstrap_reference_rows(table_name, values, prefer_new_for_unique=False, locked_columns=None):
             if table_name != "children" or not prefer_new_for_unique:
                 return {}
-            parent_position = original_create_row("parents", {}, alias=None)
+            parent_position = original_create_row("parents", {})
             parent_id = instance.get_column_data("parents", "id")[parent_position].concrete
             values["parent_id"] = parent_id
             return {"parents": [instance.get_row("parents", parent_position)]}
