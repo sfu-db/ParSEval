@@ -1,3 +1,5 @@
+from sqlglot import exp
+
 from parseval.identity import ColumnId, ColumnKind, RelationId, RelationKind
 from parseval.instance import Instance
 
@@ -150,6 +152,116 @@ def test_default_normalization_resolves_mixed_case_composite_foreign_key_referen
         inst.column_id("parent", "a"),
         inst.column_id("parent", "b"),
     )
+
+
+def test_quoted_mixed_case_catalog_identities_preserve_identifier_metadata():
+    inst = Instance(
+        'CREATE TABLE "Users" ("ID" INT PRIMARY KEY, "Email" TEXT UNIQUE);',
+        name="db",
+        dialect="sqlite",
+    )
+    table = exp.to_table('"Users"')
+    id_name = exp.Identifier(this="ID", quoted=True)
+    email_name = exp.Identifier(this="Email", quoted=True)
+
+    users_id = inst.table_id(table)
+    id_col = inst.column_id(table, id_name)
+    email_col = inst.column_id(table, email_name)
+
+    assert users_id.name.raw == "Users"
+    assert users_id.name.normalized == "Users"
+    assert users_id.name.quoted is True
+    assert id_col.name.raw == "ID"
+    assert id_col.name.normalized == "ID"
+    assert id_col.name.quoted is True
+    assert email_col.name.raw == "Email"
+    assert email_col.name.normalized == "Email"
+    assert email_col.name.quoted is True
+    assert inst.catalog_column(table, id_name).primary_key is True
+    assert inst.catalog_column(table, email_name).unique is True
+
+
+def test_unquoted_lookup_does_not_resolve_quoted_identifier():
+    inst = Instance(
+        'CREATE TABLE "Users" ("ID" INT PRIMARY KEY);',
+        name="db",
+        dialect="sqlite",
+    )
+
+    try:
+        inst.table_id("users")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("unquoted users resolved quoted table \"Users\"")
+
+    try:
+        inst.column_id(exp.to_table('"Users"'), "id")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("unquoted id resolved quoted column \"ID\"")
+
+
+def test_unquoted_foreign_key_reference_links_to_quoted_declared_table():
+    ddl = """
+    CREATE TABLE "Team" ("id" INT PRIMARY KEY);
+    CREATE TABLE "Match" (
+        "team_id" INT,
+        FOREIGN KEY ("team_id") REFERENCES Team(id)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+    team = exp.to_table('"Team"')
+    match = exp.to_table('"Match"')
+    team_id = exp.Identifier(this="id", quoted=True)
+    match_team_id = exp.Identifier(this="team_id", quoted=True)
+    fk = inst.schema_spec.get_table("Match").foreign_keys[0]
+
+    assert fk.source_table_id == inst.table_id(match)
+    assert fk.target_table_id == inst.table_id(team)
+    assert fk.source_column_ids == (inst.column_id(match, match_team_id),)
+    assert fk.target_column_ids == (inst.column_id(team, team_id),)
+
+    try:
+        inst.table_id("team")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("public unquoted lookup resolved quoted table \"Team\"")
+
+
+def test_qualified_tables_with_same_leaf_name_have_distinct_relation_ids():
+    inst = Instance(
+        "CREATE TABLE main.users (id INT); CREATE TABLE aux.users (id INT);",
+        name="db",
+        dialect="sqlite",
+    )
+    main_users = exp.to_table("main.users")
+    aux_users = exp.to_table("aux.users")
+
+    main_id = inst.table_id(main_users)
+    aux_id = inst.table_id(aux_users)
+
+    assert main_id != aux_id
+    assert main_id.name.raw == "users"
+    assert main_id.db.raw == "main"
+    assert aux_id.name.raw == "users"
+    assert aux_id.db.raw == "aux"
+    assert inst.column_id(main_users, "id").relation == main_id
+    assert inst.column_id(aux_users, "id").relation == aux_id
+
+
+def test_inline_primary_key_and_unique_constraints_populate_catalog_indexes():
+    inst = Instance(
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);",
+        name="db",
+        dialect="sqlite",
+    )
+    assert tuple(pk.name for pk in inst.get_primary_key("users")) == ("id",)
+    table = inst.schema_spec.get_table("users")
+    assert table.primary_key_ids == (inst.column_id("users", "id"),)
+    assert table.unique_constraint_ids == ((inst.column_id("users", "email"),),)
 
 
 def test_catalog_column_preserves_table_level_single_column_unique():
