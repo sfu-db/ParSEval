@@ -118,6 +118,40 @@ def test_normalize_false_mixed_case_foreign_key_identity_metadata():
     assert orders.get_column("UserID").foreign_key == fk
 
 
+def test_default_normalization_resolves_mixed_case_inline_foreign_key_reference():
+    ddl = """
+    CREATE TABLE Users (ID INT PRIMARY KEY);
+    CREATE TABLE Orders (UserID INT REFERENCES users(id));
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+    orders = inst.schema_spec.get_table("orders")
+    fk = orders.foreign_keys[0]
+    assert fk.source_table_id == inst.table_id("orders")
+    assert fk.target_table_id == inst.table_id("users")
+    assert fk.source_column_ids == (inst.column_id("orders", "userid"),)
+    assert fk.target_column_ids == (inst.column_id("users", "id"),)
+
+
+def test_default_normalization_resolves_mixed_case_composite_foreign_key_reference():
+    ddl = """
+    CREATE TABLE Parent (A INT, B INT, PRIMARY KEY(A, B));
+    CREATE TABLE Child (A INT, B INT, FOREIGN KEY (A, B) REFERENCES parent);
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+    child = inst.schema_spec.get_table("child")
+    fk = child.foreign_keys[0]
+    assert fk.source_table_id == inst.table_id("child")
+    assert fk.target_table_id == inst.table_id("parent")
+    assert fk.source_column_ids == (
+        inst.column_id("child", "a"),
+        inst.column_id("child", "b"),
+    )
+    assert fk.target_column_ids == (
+        inst.column_id("parent", "a"),
+        inst.column_id("parent", "b"),
+    )
+
+
 def test_catalog_column_preserves_table_level_single_column_unique():
     inst = Instance("CREATE TABLE users (id INT, email TEXT, UNIQUE(email));", name="db", dialect="sqlite")
     assert inst.catalog_column("users", "email").unique is True
