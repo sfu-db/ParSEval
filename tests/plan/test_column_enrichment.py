@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -150,17 +151,14 @@ class TestBasicEnrichment(unittest.TestCase):
         self.assertEqual(len(cols), 0)
 
     def test_column_not_in_instance_not_enriched(self):
-        """A column that exists in the SQL but not in the instance schema."""
+        """A column absent from the instance schema fails closed."""
         # Use raw sqlglot parse (no preprocess_sql validation) with a
         # manually built plan referencing a column absent from the schema.
         inst = _make_instance("CREATE TABLE t (x INTEGER);")
         expr = sqlglot.parse_one("SELECT * FROM t WHERE t.z > 0", read="sqlite")
         plan = Plan(expr, inst)
-        plan.annotation_for(plan.root)
-        step = _first_step_of_type(plan, Filter)
-        cols = _condition_columns(step)
-        # z is not in the schema, so it should not be enriched.
-        self.assertEqual(len(cols), 0)
+        with pytest.raises(ValueError, match="Unresolved column qualifier"):
+            plan.annotation_for(plan.root)
 
     def test_nullable_and_unique_metadata(self):
         inst = _make_instance(
