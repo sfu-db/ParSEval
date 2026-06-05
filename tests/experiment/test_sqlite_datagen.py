@@ -28,7 +28,8 @@ def _process_bird_datagen_case(index, row, schemas, *, execute_sqlite=True):
     t0 = time.time()
     db_id = row.get("db_id")
     sql = row.get("SQL") or ""
-    ddls = ";".join(schemas.get(db_id, []))
+    raw_ddls = schemas.get(db_id, [])
+    ddls = raw_ddls if isinstance(raw_ddls, str) else ";".join(raw_ddls)
     record = {
         "index": index,
         "db_id": db_id,

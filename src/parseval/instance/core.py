@@ -471,6 +471,7 @@ class Instance(Catalog):
         self.data: Dict[str, List[Row]] = defaultdict(list)
         self.symbols: SymbolIndex = SymbolIndex()
         self.name_seq = name_sequence(self.name)
+        self._bootstrapping: set[str] = set()
 
         # Parse the DDL exactly once, into the sqlglot-native catalog state
         # this Instance inherits. ``schema_spec`` is a lazy domain-module
@@ -630,34 +631,16 @@ class Instance(Catalog):
         }
         new_tuples = defaultdict(list)
         positions: Dict[str, int] = {}
-        self._merge_created_rows(
-            new_tuples,
-            self._bootstrap_reference_rows(
-                table_name,
-                values,
-                locked_columns=provided_columns,
-            ),
-        )
-        self._merge_created_rows(
-            new_tuples,
-            self._resolve_composite_reference_conflicts(
-                table_name,
-                values,
-                locked_columns=provided_columns,
-            ),
-        )
+        self._bootstrapping.add(table_name)
         try:
-            main_pos = self._create_row(table_name, values, alias=alias)
-        except UniqueConflictError:
-            created = self._bootstrap_reference_rows(
-                table_name,
-                values,
-                prefer_new_for_unique=True,
-                locked_columns=provided_columns,
+            self._merge_created_rows(
+                new_tuples,
+                self._bootstrap_reference_rows(
+                    table_name,
+                    values,
+                    locked_columns=provided_columns,
+                ),
             )
-            if not created:
-                raise
-            self._merge_created_rows(new_tuples, created)
             self._merge_created_rows(
                 new_tuples,
                 self._resolve_composite_reference_conflicts(
@@ -666,7 +649,29 @@ class Instance(Catalog):
                     locked_columns=provided_columns,
                 ),
             )
-            main_pos = self._create_row(table_name, values, alias=alias)
+            try:
+                main_pos = self._create_row(table_name, values, alias=alias)
+            except UniqueConflictError:
+                created = self._bootstrap_reference_rows(
+                    table_name,
+                    values,
+                    prefer_new_for_unique=True,
+                    locked_columns=provided_columns,
+                )
+                if not created:
+                    raise
+                self._merge_created_rows(new_tuples, created)
+                self._merge_created_rows(
+                    new_tuples,
+                    self._resolve_composite_reference_conflicts(
+                        table_name,
+                        values,
+                        locked_columns=provided_columns,
+                    ),
+                )
+                main_pos = self._create_row(table_name, values, alias=alias)
+        finally:
+            self._bootstrapping.discard(table_name)
         new_tuples[table_name].append(self.get_row(table_name, main_pos))
         positions[table_name] = main_pos
         return RowCreationResult(
@@ -701,7 +706,11 @@ class Instance(Catalog):
                     preset_values=concretes,
                     persist=False,
                 )
-            except (UniqueConflictError, ForeignKeyResolutionError):
+            except UniqueConflictError:
+                raise
+            except Exception:
+                if table_name in self._bootstrapping:
+                    return self._create_row_circular_fk(table_name, concretes, tuple_index)
                 raise
             new_values = {}
             rowid = f"{table_name}_rowid_{tuple_index}"
@@ -729,6 +738,62 @@ class Instance(Catalog):
             return tuple_index
         raise_exception(f"Failed to create row for table {table_name} after 10 attempts")
 
+    def _create_row_circular_fk(
+        self,
+        table_name: str,
+        concretes: Dict[str, Any],
+        tuple_index: int,
+    ) -> int:
+        """Create a row bypassing FK validation for circular dependencies.
+
+        Uses place_row with preset values and defaults for FK columns that
+        reference tables currently being bootstrapped.
+        """
+        row_values: Dict[str, Any] = {}
+        fk_cols: list[str] = []
+        for column, datatype in self.tables[table_name].items():
+            if column in concretes:
+                row_values[column] = concretes[column]
+            else:
+                row_values[column] = self._default_for_type(datatype)
+
+        for fk in self.get_foreign_key(table_name):
+            local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
+            ref = fk.args.get("reference")
+            if ref is None:
+                continue
+            ref_table_node = ref.find(exp.Table)
+            if ref_table_node is None:
+                continue
+            ref_table_str = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
+            if ref_table_str in self._bootstrapping:
+                if self.nullable(table_name, local_col):
+                    row_values[local_col] = None
+                else:
+                    row_values[local_col] = self._default_for_type(
+                        self.tables[table_name].get(local_col, "TEXT")
+                    )
+                fk_cols.append(local_col)
+
+        row = self.place_row(table_name, row_values)
+        self.builder.runtime.remember_row(
+            table_name,
+            {col: val.concrete for col, val in row.items()},
+        )
+        return tuple_index
+
+    @staticmethod
+    def _default_for_type(datatype: str) -> Any:
+        """Return a sensible default value for a SQL type string."""
+        upper = datatype.upper()
+        if any(t in upper for t in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT")):
+            return 1
+        if any(t in upper for t in ("REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL")):
+            return 1.0
+        if "BOOL" in upper:
+            return 0
+        return "value"
+
     def _bootstrap_reference_rows(
         self,
         table_name: str,
@@ -754,8 +819,14 @@ class Instance(Catalog):
             if ref_table_node is None:
                 continue
             ref_table = self._normalize_table(ref_table_node.name, dialect=self.dialect)
+            ref_table_str = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
             ref_col = self.resolve_fk_ref_column(fk)
             if ref_col is None:
+                continue
+
+            # Circular FK: ref_table is already being bootstrapped.
+            # Skip entirely — _create_row_circular_fk will handle the value.
+            if ref_table_str in self._bootstrapping:
                 continue
 
             explicit_value = values.get(local_col)
@@ -952,6 +1023,9 @@ class Instance(Catalog):
                 if fk_target is None:
                     continue
                 ref_table, ref_col = fk_target
+                # Skip if ref_table is already being bootstrapped (circular FK).
+                if ref_table in self._bootstrapping:
+                    continue
                 created = self.create_row(ref_table, {}, alias=None)
                 self._merge_created_rows(created_rows, created.created)
                 ref_position = next(iter(created.positions.values()))
@@ -974,7 +1048,7 @@ class Instance(Catalog):
             ref_table_node = ref.find(exp.Table)
             if ref_table_node is None:
                 continue
-            ref_table = self._normalize_table(ref_table_node.name, dialect=self.dialect)
+            ref_table = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
             ref_col = self.resolve_fk_ref_column(fk)
             if ref_col is None:
                 continue
