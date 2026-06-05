@@ -21,7 +21,6 @@ from parseval.domain.exceptions import ForeignKeyResolutionError, UniqueConflict
 from parseval.identity import (
     CatalogColumn,
     ColumnKind,
-    IdentifierName,
     RelationKind,
     column_id,
     identifier_name,
@@ -111,12 +110,30 @@ class Catalog(MappingSchema):
     def tables(self):
         return self.mapping
 
-    def _identity_key(self, value: exp.Identifier | str) -> str:
-        node = value if isinstance(value, exp.Identifier) else exp.Identifier(this=str(value))
-        return identifier_name(node, dialect=self.dialect).normalized
+    def _identity_key(
+        self,
+        value: exp.Column | exp.Identifier | exp.Table | str,
+        *,
+        is_table: bool = False,
+    ) -> str:
+        if isinstance(value, exp.Table):
+            raw = value.name
+            is_table = True
+        elif isinstance(value, exp.Column):
+            raw = value.name
+        elif isinstance(value, exp.Identifier):
+            raw = value.name
+        else:
+            raw = str(value)
+        return self._normalize_name(
+            raw,
+            dialect=self.dialect,
+            normalize=self.normalize,
+            is_table=is_table,
+        )
 
     def _remember_table_identity(self, table_name: str) -> None:
-        key = self._normalize_name(table_name, self.dialect, self.normalize)
+        key = self._identity_key(table_name, is_table=True)
         if key not in self._relation_ids:
             self._relation_ids[key] = relation_id(
                 RelationKind.TABLE,
@@ -124,8 +141,8 @@ class Catalog(MappingSchema):
             )
 
     def _remember_column_identity(self, table_name: str, column_name: str, datatype_sql: str) -> None:
-        table_key = self._normalize_name(table_name, self.dialect, self.normalize)
-        column_key = self._normalize_name(column_name, self.dialect, self.normalize)
+        table_key = self._identity_key(table_name, is_table=True)
+        column_key = self._identity_key(column_name)
         self._remember_table_identity(table_name)
         rel_id = self._relation_ids[table_key]
         col_id = column_id(
@@ -161,15 +178,12 @@ class Catalog(MappingSchema):
                 self._remember_column_identity(table_name, column_name, datatype_sql)
 
     def table_id(self, table: exp.Table | str):
-        table_name = table.name if isinstance(table, exp.Table) else table
-        key = self._normalize_name(table_name, self.dialect, self.normalize)
+        key = self._identity_key(table, is_table=True)
         return self._relation_ids[key]
 
     def column_id(self, table: exp.Table | str, column: exp.Column | str):
-        table_name = table.name if isinstance(table, exp.Table) else table
-        column_name = column.name if isinstance(column, exp.Column) else column
-        table_key = self._normalize_name(table_name, self.dialect, self.normalize)
-        column_key = self._normalize_name(column_name, self.dialect, self.normalize)
+        table_key = self._identity_key(table, is_table=True)
+        column_key = self._identity_key(column)
         return self._column_ids[(table_key, column_key)]
 
     def catalog_column(self, table: exp.Table | str, column: exp.Column | str) -> CatalogColumn:
@@ -178,78 +192,70 @@ class Catalog(MappingSchema):
     def add_primary_key(
         self, table: exp.Table | str, columns: List[exp.Identifier] | exp.Identifier
     ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        pk_set = self.primary_keys.setdefault(table, set())
+        table = self._identity_key(table, is_table=True)
+        pk_columns = self.primary_keys.setdefault(table, [])
         columns = [columns] if isinstance(columns, exp.Identifier) else columns
-        pk_set.update(columns)
+        seen = {self._identity_key(column) for column in pk_columns}
+        for column in columns:
+            key = self._identity_key(column)
+            if key not in seen:
+                pk_columns.append(column)
+                seen.add(key)
 
     def get_primary_key(self, table: exp.Table | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        return self.primary_keys.get(table, set())
+        table = self._identity_key(table, is_table=True)
+        return tuple(self.primary_keys.get(table, ()))
 
-    def _primary_key_names(self, table: exp.Table | str) -> Set[str]:
-        return {
-            self._normalize_name(identifier.name, self.dialect, self.normalize)
+    def _primary_key_names(self, table: exp.Table | str) -> Tuple[str, ...]:
+        return tuple(
+            self._identity_key(identifier)
             for identifier in self.get_primary_key(table)
-        }
+        )
 
-    def resolve_fk_ref_column(self, fk: exp.ForeignKey) -> Optional[str]:
-        """Resolve the referenced column name from a ForeignKey node.
+    def resolve_fk_ref_columns(self, fk: exp.ForeignKey) -> Tuple[str, ...]:
+        """Resolve referenced column names from a ForeignKey node.
 
         When the FK is defined as ``REFERENCES parent_table`` without
         specifying the column (implying the parent's PK), this method
-        infers the referenced column from the parent table's primary key
-        or column-level PK constraints.  Returns None if unresolvable.
+        infers referenced columns from the parent table's primary key or
+        column-level PK constraints. Returns an empty tuple if unresolvable.
         """
         ref = fk.args.get("reference")
         if ref is None:
-            return None
+            return ()
         # Explicit referenced column.
         if ref.this.expressions:
-            return self._normalize_name(ref.this.expressions[0].name, normalize=self.normalize)
+            return tuple(self._identity_key(identifier) for identifier in ref.this.expressions)
         # Implicit: resolve from parent table's PK.
         ref_table_node = ref.find(exp.Table)
         if ref_table_node is None:
-            return None
-        ref_table = self._normalize_name(ref_table_node.name, self.dialect, self.normalize)
+            return ()
+        ref_table = self._identity_key(ref_table_node, is_table=True)
         # Check table-level PK first.
-        pk_set = self.primary_keys.get(ref_table, set())
-        if pk_set:
-            # Use first PK column (single-column FK implies single-column PK).
-            return self._normalize_name(next(iter(pk_set)).name, normalize=self.normalize)
+        pk_columns = self._primary_key_names(ref_table)
+        if pk_columns:
+            return pk_columns
         # Check column-level PK constraints.
         for col_name in (self.mapping.get(ref_table) or {}):
             for constraint in self.get_column_constraints(ref_table, col_name):
                 if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
-                    return self._normalize_name(col_name, normalize=self.normalize)
-        return None
+                    return (self._identity_key(col_name),)
+        return ()
+
+    def resolve_fk_ref_column(self, fk: exp.ForeignKey) -> Optional[str]:
+        columns = self.resolve_fk_ref_columns(fk)
+        return columns[0] if len(columns) == 1 else None
 
     def add_foreign_key(
         self, table: exp.Table | str, foreign_key: List[exp.ForeignKey] | exp.ForeignKey
     ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
+        table = self._identity_key(table, is_table=True)
         fk_list = self.foreign_keys.setdefault(table, [])
         fks = [foreign_key] if isinstance(foreign_key, exp.ForeignKey) else foreign_key
         fk_list.extend(fks)
 
     def get_foreign_key(self, table: exp.Table | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
+        table = self._identity_key(table, is_table=True)
         return self.foreign_keys.get(table, [])
 
     def add_unique_constraint(
@@ -257,13 +263,9 @@ class Catalog(MappingSchema):
         table: exp.Table | str,
         columns: List[exp.Identifier],
     ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
+        table = self._identity_key(table, is_table=True)
         normalized_columns = tuple(
-            self._normalize_name(column.name, self.dialect, self.normalize)
+            self._identity_key(column)
             for column in columns
         )
         if not normalized_columns:
@@ -273,11 +275,7 @@ class Catalog(MappingSchema):
             unique_constraints.append(normalized_columns)
 
     def get_unique_constraints(self, table: exp.Table | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
+        table = self._identity_key(table, is_table=True)
         return tuple(self.unique_constraints.get(table, ()))
 
     def add_constraint(
@@ -286,38 +284,22 @@ class Catalog(MappingSchema):
         column: exp.Column | str,
         constraint,
     ):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        column = self._normalize_name(
-            column if isinstance(column, str) else column.this, normalize=self.normalize
-        )
+        table = self._identity_key(table, is_table=True)
+        column = self._identity_key(column)
         table_constraints = self.constraints.setdefault(table, {})
         column_constraints = table_constraints.setdefault(column, set())
         constraints = [constraint] if not isinstance(constraint, (list, set, tuple)) else constraint
         column_constraints.update(constraints)
 
     def get_column_constraints(self, table: exp.Table | str, column: exp.Column | str):
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
-        column = self._normalize_name(
-            column if isinstance(column, str) else column.this, normalize=self.normalize
-        )
+        table = self._identity_key(table, is_table=True)
+        column = self._identity_key(column)
         table_constraints = self.constraints.get(table, {})
         return table_constraints.get(column, set())
 
     def get_check_constraints(self, table: exp.Table | str) -> List[exp.Expression]:
         """Return parsed CHECK constraint expressions for a table."""
-        table = self._normalize_name(
-            table if isinstance(table, str) else table.this,
-            self.dialect,
-            self.normalize,
-        )
+        table = self._identity_key(table, is_table=True)
         results = []
         for col_constraints in self.constraints.get(table, {}).values():
             for c in col_constraints:
@@ -335,11 +317,7 @@ class Catalog(MappingSchema):
         for constraint in self.get_column_constraints(table, column):
             if isinstance(constraint.kind, exp.NotNullColumnConstraint):
                 return constraint.kind.args.get("allow_null", False)
-        column_name = self._normalize_name(
-            column if isinstance(column, str) else column.name,
-            self.dialect,
-            self.normalize,
-        )
+        column_name = self._identity_key(column)
         if column_name in self._primary_key_names(table):
             return False
         return True
@@ -358,11 +336,7 @@ class Catalog(MappingSchema):
                 (exp.UniqueColumnConstraint, exp.PrimaryKeyColumnConstraint),
             ):
                 return True
-        column_name = self._normalize_name(
-            column if isinstance(column, str) else column.this,
-            self.dialect,
-            self.normalize,
-        )
+        column_name = self._identity_key(column)
         for unique_columns in self.get_unique_constraints(table):
             if len(unique_columns) == 1 and unique_columns[0] == column_name:
                 return True
@@ -404,7 +378,7 @@ class Catalog(MappingSchema):
             ddl: exp.Create,
             maps: Dict[str, Dict[str, str]],
             deps: Dict[str, int],
-            pks: Dict[str, set],
+            pks: Dict[str, list],
             fks: Dict[str, list],
             uniques: Dict[str, list],
             tbl_constraints: Dict[str, Dict[str, set]],
@@ -430,7 +404,7 @@ class Catalog(MappingSchema):
                             )
                             fks.setdefault(table_name, []).append(synthetic_fk)
                 elif isinstance(node, exp.PrimaryKey):
-                    pks.setdefault(table_name, set()).update(node.expressions)
+                    pks.setdefault(table_name, []).extend(node.expressions)
                 elif isinstance(node, exp.ForeignKey):
                     ref_table = node.args.get("reference").find(exp.Table).name
                     deps[ref_table] = deps.get(ref_table, 0) + 1
@@ -440,7 +414,7 @@ class Catalog(MappingSchema):
 
         parsed_ddls = parse(ddls, dialect=dialect)
         mappings: Dict[str, Dict[str, str]] = {}
-        primary_keys: Dict[str, set] = {}
+        primary_keys: Dict[str, list] = {}
         foreign_keys: Dict[str, list] = {}
         unique_constraints: Dict[str, list] = {}
         for stmt_expr in parsed_ddls:
@@ -498,14 +472,14 @@ class Catalog(MappingSchema):
 
         for table_name in self.tables.keys():
             column_types = self.tables[table_name]
-            pk_columns = set(self._primary_key_names(table_name))
+            pk_columns = list(self._primary_key_names(table_name))
             for column_name in column_types:
                 raw_constraints = self.get_column_constraints(table_name, column_name)
                 if any(
                     isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint)
                     for constraint in raw_constraints
-                ):
-                    pk_columns.add(column_name.lower())
+                ) and column_name not in pk_columns:
+                    pk_columns.append(column_name)
             unique_constraints = tuple(self.get_unique_constraints(table_name))
             fk_nodes = self.get_foreign_key(table_name)
             fk_specs: List[ForeignKeySpec] = []
@@ -518,28 +492,34 @@ class Catalog(MappingSchema):
                 if target_table is None:
                     continue
                 source_columns = tuple(
-                    identifier.name.lower()
+                    self._identity_key(identifier)
                     for identifier in fk_node.expressions
                 )
                 target_columns = tuple(
-                    identifier.name.lower()
+                    self._identity_key(identifier)
                     for identifier in reference.this.expressions
                 )
                 # If target columns not specified, infer from parent PK.
                 if not target_columns:
-                    ref_col = self.resolve_fk_ref_column(fk_node)
-                    target_columns = (ref_col,) if ref_col else source_columns
+                    target_columns = self.resolve_fk_ref_columns(fk_node)
+                if len(source_columns) != len(target_columns):
+                    raise ValueError(
+                        "Foreign key column count does not match referenced columns: "
+                        f"{table_name}({', '.join(source_columns)}) -> "
+                        f"{target_table.name}({', '.join(target_columns)})"
+                    )
                 source_column_ids = tuple(
                     self.column_id(table_name, col) for col in source_columns
                 )
-                target_table_id = self.table_id(target_table.name)
+                target_table_name = self._identity_key(target_table, is_table=True)
+                target_table_id = self.table_id(target_table)
                 target_column_ids = tuple(
-                    self.column_id(target_table.name, col) for col in target_columns
+                    self.column_id(target_table, col) for col in target_columns
                 )
                 fk_spec = ForeignKeySpec(
                     source_table=table_name,
                     source_columns=source_columns,
-                    target_table=target_table.name,
+                    target_table=target_table_name,
                     target_columns=target_columns,
                     source_table_id=self.table_id(table_name),
                     source_column_ids=source_column_ids,
@@ -562,14 +542,14 @@ class Catalog(MappingSchema):
                     for constraint in raw_constraints
                 )
                 single_column_unique = any(
-                    len(columns) == 1 and columns[0] == column_name.lower()
+                    len(columns) == 1 and columns[0] == column_name
                     for columns in unique_constraints
                 )
                 nullable = not any(
                     isinstance(constraint.kind, exp.NotNullColumnConstraint)
                     for constraint in raw_constraints
                 )
-                is_pk = column_pk or column_name.lower() in pk_columns
+                is_pk = column_pk or column_name in pk_columns
                 datatype_node = self._datatype_node_for(column_name, type_sql)
                 column_specs.append(
                     ColumnSpec(
@@ -579,7 +559,7 @@ class Catalog(MappingSchema):
                         nullable=nullable and not is_pk,
                         unique=column_unique or single_column_unique,
                         primary_key=is_pk,
-                        foreign_key=single_column_fk_map.get(column_name.lower()),
+                        foreign_key=single_column_fk_map.get(column_name),
                         default=None,
                         native_type=type_sql,
                         dialect=self.dialect,
@@ -595,13 +575,13 @@ class Catalog(MappingSchema):
                 TableSpec(
                     name=table_name,
                     columns=tuple(column_specs),
-                    primary_key=tuple(sorted(pk_columns)),
+                    primary_key=tuple(pk_columns),
                     unique_constraints=tuple(unique_constraints),
                     foreign_keys=tuple(fk_specs),
                     id=self.table_id(table_name),
                     primary_key_ids=tuple(
                         self.column_id(table_name, column)
-                        for column in sorted(pk_columns)
+                        for column in pk_columns
                     ),
                     unique_constraint_ids=tuple(
                         tuple(self.column_id(table_name, column) for column in columns)
