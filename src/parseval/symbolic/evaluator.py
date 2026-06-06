@@ -172,6 +172,17 @@ def _row_items_by_name(row: Row):
         yield _row_column_name(column), symbol
 
 
+def _annotation_table_names(annotation) -> Tuple[str, ...]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for relation in getattr(annotation, "source_relations", ()):
+        name = relation.name.normalized if relation.name is not None else relation.display
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return tuple(names)
+
+
 def _derived_variable(name: str, value: Any, row_ids: Tuple[Any, ...]) -> Variable:
     normalized = normalize_name(name)
     row_suffix = "_".join(str(row_id) for row_id in row_ids) or "scalar"
@@ -302,6 +313,9 @@ class PlanEvaluator:
         self.plan = plan
         self.instance = instance
         self.dialect = dialect
+        if getattr(self.plan, "_instance", None) is not instance:
+            self.plan._instance = instance
+            self.plan._annotations = None
 
     def evaluate(self, tree: Optional[BranchTree] = None) -> BranchTree:
         if tree is None:
@@ -422,7 +436,7 @@ class PlanEvaluator:
                 site="filter",
                 predicate=predicate,
                 atoms=atoms,
-                tables=annotation.source_tables,
+                tables=_annotation_table_names(annotation),
             )
 
         passing_rows: List[Row] = []
@@ -507,7 +521,7 @@ class PlanEvaluator:
                     site="join_on",
                     predicate=condition,
                     atoms=atoms,
-                    tables=annotation.source_tables,
+                    tables=_annotation_table_names(annotation),
                 )
 
             source_name = step.source_name or step.name
@@ -670,7 +684,7 @@ class PlanEvaluator:
                 site="group",
                 predicate=group_pred,
                 atoms=(group_pred,),
-                tables=annotation.source_tables,
+                tables=_annotation_table_names(annotation),
             )
 
         for table_name, table in ctx.tables.items():
@@ -738,7 +752,7 @@ class PlanEvaluator:
                 site="having",
                 predicate=predicate,
                 atoms=atoms,
-                tables=annotation.source_tables,
+                tables=_annotation_table_names(annotation),
             )
 
         passing_rows: List[Row] = []
@@ -807,7 +821,7 @@ class PlanEvaluator:
                             site="case_arm",
                             predicate=arm_pred,
                             atoms=atoms,
-                            tables=annotation.source_tables,
+                            tables=_annotation_table_names(annotation),
                         )
 
                         for table_name, table in ctx.tables.items():
@@ -850,7 +864,7 @@ class PlanEvaluator:
                     site="distinct",
                     predicate=exp.Literal.string("DISTINCT"),
                     atoms=(exp.Literal.string("DISTINCT"),),
-                    tables=annotation.source_tables,
+                    tables=_annotation_table_names(annotation),
                 )
 
                 seen = set()
