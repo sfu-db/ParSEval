@@ -48,6 +48,7 @@ from __future__ import annotations
 import enum
 import heapq
 import math
+import re
 import typing as t
 from dataclasses import dataclass, field
 
@@ -57,8 +58,10 @@ from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from parseval.helper import normalize_name
+from parseval.dtype import DataType, parse_datetime
 from parseval.identity import (
     PARSEVAL_COLUMN_ID,
+    PARSEVAL_SEMANTIC_DATATYPE,
     ColumnId,
     ColumnKind,
     RelationId,
@@ -132,8 +135,8 @@ class Plan:
 
         Annotations are computed lazily on first access. They carry
         ``step_id`` (stable index), ``step_type``, ``step_name``,
-        ``condition``, ``projected_columns``, ``source_tables`` (recursive
-        base-table resolution), and ``referenced_columns``.
+        ``condition``, ``projected_columns``, ``source_relations``, and
+        ``referenced_columns``.
         """
         if self._annotations is None:
             self._annotate()
@@ -150,12 +153,10 @@ class Plan:
 
     def _annotate(self) -> None:
         from parseval.plan.rex import set_column_meta
-        from parseval.dtype import DataType
 
         annotations: t.Dict[int, "StepAnnotations"] = {}
         for index, step in enumerate(self.ordered_steps):
             exprs = _step_expressions(step)
-            source_tables = _source_tables(step)
             if self._instance is not None:
                 _prepare_step_identity(step, self._instance)
                 # SubPlan inner plans live in a separate scope — recurse
@@ -195,11 +196,15 @@ class Plan:
                     resolve_exprs = exprs
                 for expr in resolve_exprs:
                     for col in _iter_scope_columns(expr):
+                        allow_unresolved = isinstance(step, SubPlan) or (
+                            isinstance(step, Aggregate)
+                            and _is_planner_synthetic_operand(col)
+                        )
                         resolved_id = _resolve_column_id(
                             col,
                             step,
                             self._instance,
-                            allow_unresolved=isinstance(step, SubPlan),
+                            allow_unresolved=allow_unresolved,
                         )
                         if resolved_id is None:
                             continue
@@ -210,26 +215,23 @@ class Plan:
                         step,
                         self._instance,
                     )
+                semantic_datatypes = _infer_semantic_datatypes(exprs)
+                metadata = _generation_metadata(step, self._instance)
+            else:
+                semantic_datatypes = {}
+                metadata = {}
+            if semantic_datatypes:
+                metadata["semantic_datatypes"] = semantic_datatypes
 
             annotations[id(step)] = StepAnnotations(
                 step_id=f"step_{index}",
                 step_type=type(step).__name__,
                 step_name=getattr(step, "name", "") or "",
                 condition=getattr(step, "condition", None),
-                projected_columns=(
-                    _projected_column_ids(step)
-                    if self._instance is not None
-                    else _projected_columns(step)
-                ),
-                source_tables=source_tables,
-                referenced_columns=(
-                    _unique_column_ids(exprs)
-                    if self._instance is not None
-                    else _unique_columns(exprs)
-                ),
-                source_relations=(
-                    _source_relations(step) if self._instance is not None else ()
-                ),
+                projected_columns=_projected_column_ids(step),
+                referenced_columns=_unique_column_ids(exprs),
+                source_relations=_source_relations(step),
+                metadata=metadata,
             )
         self._annotations = annotations
 
@@ -613,6 +615,7 @@ class Scan(Step):
             step = Scan()
             step.name = alias_
             step.source = expression
+            subplan.consumer = step
             step.add_dependency(subplan)
             return step
 
@@ -876,6 +879,7 @@ class SubPlan(Step):
         self.correlation: t.Tuple[exp.Column, ...] = tuple(correlation)
         self.output_columns: t.Tuple[str, ...] = tuple(output_columns)
         self.alias = alias
+        self.consumer: Step | None = None
 
     @property
     def correlated(self) -> bool:
@@ -1061,6 +1065,7 @@ def _attach_subplans(
             ),
         )
         subplan.name = subplan.alias or f"{kind.value}_{id(anchor)}"
+        subplan.consumer = consumer
         consumer.add_dependency(subplan)
 
 
@@ -1201,9 +1206,8 @@ class StepAnnotations:
     step_type: str
     step_name: str
     condition: t.Optional[exp.Expression] = None
-    referenced_columns: t.Tuple[t.Any, ...] = ()
-    projected_columns: t.Tuple[t.Any, ...] = ()
-    source_tables: t.Tuple[str, ...] = ()
+    referenced_columns: t.Tuple[ColumnId, ...] = ()
+    projected_columns: t.Tuple[ColumnId, ...] = ()
     source_relations: t.Tuple[RelationId, ...] = ()
     flags: t.FrozenSet[str] = frozenset()
     metadata: t.Dict[str, t.Any] = field(default_factory=dict)
@@ -1279,7 +1283,9 @@ def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
     for dep in step.chain_dependencies:
         _prepare_step_identity(dep, instance)
 
-    if isinstance(step, Project):
+    if isinstance(step, Aggregate):
+        step.output_column_ids = _build_aggregate_output_columns(step, instance)
+    elif isinstance(step, Project):
         step.output_column_ids = _build_project_output_columns(step, instance)
     else:
         output_columns: t.List[ColumnId] = []
@@ -1414,6 +1420,85 @@ def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[C
     return tuple(result)
 
 
+def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tuple[ColumnId, ...]:
+    result: t.List[ColumnId] = []
+    dialect = getattr(instance, "dialect", None)
+    aggregate_relation = _aggregate_output_relation(step, instance)
+
+    for ordinal, (name, expression) in enumerate(step.group.items()):
+        source = None
+        if isinstance(expression, exp.Column):
+            source = _resolve_column_id(
+                expression,
+                step,
+                instance,
+                allow_unresolved=True,
+            )
+        result.append(
+            column_id(
+                ColumnKind.PROJECTED,
+                identifier_name(name, dialect=dialect),
+                source.relation if isinstance(source, ColumnId) else aggregate_relation,
+                scope_id=_scope_id_for(step),
+                ordinal=ordinal,
+                source_column_id=source if isinstance(source, ColumnId) else None,
+            )
+        )
+
+    seen = {column.name.normalized for column in result}
+    for aggregation in step.aggregations:
+        alias_name = aggregation.alias_or_name
+        if not alias_name:
+            continue
+        name = identifier_name(alias_name, dialect=dialect)
+        if name.normalized in seen:
+            continue
+        seen.add(name.normalized)
+        source = _first_resolved_column_id(aggregation, step, instance)
+        result.append(
+            column_id(
+                ColumnKind.AGGREGATE,
+                name,
+                aggregate_relation or (source.relation if source is not None else None),
+                scope_id=_scope_id_for(step),
+                ordinal=len(result),
+                source_column_id=source,
+            )
+        )
+
+    return tuple(result)
+
+
+def _aggregate_output_relation(step: "Aggregate", instance: t.Any) -> RelationId | None:
+    dialect = getattr(instance, "dialect", None)
+    visible = _visible_columns(step)
+    if step.name:
+        for column in visible:
+            if _relation_matches(column.relation, step.name, dialect):
+                return column.relation
+    for column in visible:
+        if column.relation is not None:
+            return column.relation
+    return None
+
+
+def _first_resolved_column_id(
+    expression: exp.Expression,
+    step: "Step",
+    instance: t.Any,
+) -> ColumnId | None:
+    for column in _iter_scope_columns(expression):
+        resolved = _resolve_column_id(
+            column,
+            step,
+            instance,
+            allow_unresolved=True,
+        )
+        if resolved is not None:
+            return resolved.source_column_id or resolved
+    return None
+
+
 def _visible_columns(step: "Step") -> t.Tuple[ColumnId, ...]:
     if isinstance(step, Scan):
         return tuple(getattr(step, "output_column_ids", ()))
@@ -1441,6 +1526,18 @@ def _column_matches_qualifier(candidate: ColumnId, qualifier: str, dialect: str 
     return source is not None and _relation_matches(source.relation, qualifier, dialect)
 
 
+def _column_matches_name(candidate: ColumnId, name: IdentifierName) -> bool:
+    if candidate.name.normalized == name.normalized:
+        return True
+    source = candidate.source_column_id
+    return (
+        candidate.kind is ColumnKind.PROJECTED
+        and candidate.name.normalized.startswith("_g")
+        and source is not None
+        and source.name.normalized == name.normalized
+    )
+
+
 def _resolve_column_id(
     col: exp.Column,
     step: "Step",
@@ -1453,7 +1550,7 @@ def _resolve_column_id(
     candidates = [
         candidate
         for candidate in _visible_columns(step)
-        if candidate.name.normalized == name.normalized
+        if _column_matches_name(candidate, name)
     ]
     if col.table:
         candidates = [
@@ -1503,6 +1600,509 @@ def _enrich_identity_column(
     set_column_meta(col, meta)
 
 
+def _generation_metadata(step: "Step", instance: t.Any) -> t.Dict[str, t.Any]:
+    metadata: t.Dict[str, t.Any] = {}
+    if isinstance(step, Aggregate):
+        aggregation = _aggregation_metadata(step)
+        if aggregation["group_keys"] or aggregation["aggregate_outputs"]:
+            metadata["aggregation"] = aggregation
+    if isinstance(step, Having):
+        constraints = _having_constraints(step)
+        if constraints:
+            metadata["having_constraints"] = constraints
+    if isinstance(step, SubPlan):
+        metadata["subquery"] = _subquery_metadata(step, instance)
+    return metadata
+
+
+def _aggregation_metadata(step: "Aggregate") -> t.Dict[str, t.Any]:
+    group_keys = tuple(
+        column
+        for column in getattr(step, "output_column_ids", ())
+        if column.name.normalized in set(step.group.keys())
+    )
+    outputs: t.Dict[ColumnId, t.Dict[str, t.Any]] = {}
+    for aggregation in step.aggregations:
+        alias_name = aggregation.alias_or_name
+        if not alias_name:
+            continue
+        output_column = _output_column_by_name(step, alias_name)
+        aggregate_function = _direct_aggregate_function(aggregation)
+        if output_column is None or aggregate_function is None:
+            continue
+        argument = _aggregate_argument_id(aggregate_function)
+        outputs[output_column] = {
+            "alias": alias_name,
+            "function": _aggregate_function_name(aggregate_function),
+            "argument": argument,
+            "semantic_datatype": _aggregate_semantic_datatype(
+                aggregate_function,
+            ),
+        }
+    return {
+        "group_keys": group_keys,
+        "aggregate_outputs": outputs,
+    }
+
+
+def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
+    aggregate = next(
+        (dep for dep in step.chain_dependencies if isinstance(dep, Aggregate)),
+        None,
+    )
+    if aggregate is None or step.condition is None:
+        return ()
+    aliases = _condition_column_names(step.condition)
+    constraints: t.List[t.Dict[str, t.Any]] = []
+    for aggregation in aggregate.aggregations:
+        alias_name = aggregation.alias_or_name
+        if alias_name not in aliases or not isinstance(aggregation, exp.Alias):
+            continue
+        constraint = _aggregate_comparison_constraint(aggregation.this)
+        if constraint is not None:
+            constraints.append(constraint)
+    return tuple(constraints)
+
+
+def _condition_column_names(expression: exp.Expression) -> t.Set[str]:
+    return {column.name for column in _iter_scope_columns(expression)}
+
+
+def _aggregate_comparison_constraint(expression: exp.Expression) -> t.Dict[str, t.Any] | None:
+    if not isinstance(expression, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return None
+    left_agg = _direct_aggregate_function(expression.left)
+    right_agg = _direct_aggregate_function(expression.right)
+    if left_agg is not None and right_agg is None:
+        literal = _literal_value(expression.right)
+        aggregate_function = left_agg
+    elif right_agg is not None and left_agg is None:
+        literal = _literal_value(expression.left)
+        aggregate_function = right_agg
+    else:
+        return None
+    if literal is None:
+        return None
+    function = _aggregate_function_name(aggregate_function)
+    constraint = {
+        "function": function,
+        "argument": _aggregate_argument_id(aggregate_function),
+        "operator": expression.key,
+        "value": literal,
+        "semantic_datatype": _aggregate_semantic_datatype(
+            aggregate_function,
+        ),
+    }
+    required_rows = _required_rows_for_count(function, expression.key, literal)
+    if required_rows is not None:
+        constraint["required_rows"] = required_rows
+    return constraint
+
+
+def _required_rows_for_count(function: str, operator: str, value: t.Any) -> int | None:
+    if function != "count" or not isinstance(value, int):
+        return None
+    if operator == "gt":
+        return value + 1
+    if operator in {"gte", "eq"}:
+        return max(value, 0)
+    return None
+
+
+def _literal_value(expression: t.Any) -> t.Any:
+    if not isinstance(expression, exp.Literal):
+        return None
+    if expression.is_string:
+        return str(expression.this)
+    text = expression.this
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return text
+
+
+def _direct_aggregate_function(expression: exp.Expression) -> exp.AggFunc | None:
+    inner = expression.this if isinstance(expression, exp.Alias) else expression
+    return inner if isinstance(inner, exp.AggFunc) else None
+
+
+def _aggregate_function_name(expression: exp.AggFunc) -> str:
+    return expression.key.lower()
+
+
+def _aggregate_argument_id(expression: exp.AggFunc) -> ColumnId | None:
+    for column in _iter_scope_columns(expression):
+        if _is_planner_synthetic_operand(column):
+            continue
+        cid = column.meta.get(PARSEVAL_COLUMN_ID)
+        if isinstance(cid, ColumnId):
+            return cid
+    return None
+
+
+def _aggregate_semantic_datatype(expression: exp.AggFunc) -> DataType:
+    if isinstance(expression, exp.Count):
+        return DataType.build("INT")
+    if isinstance(expression, exp.Avg):
+        return DataType.build("REAL")
+    argument_type = _aggregate_argument_datatype(expression)
+    if argument_type is not None:
+        return argument_type
+    if isinstance(expression, exp.Sum):
+        return DataType.build("REAL")
+    return DataType.build("UNKNOWN")
+
+
+def _aggregate_argument_datatype(expression: exp.AggFunc) -> DataType | None:
+    for column in _iter_scope_columns(expression):
+        if _is_planner_synthetic_operand(column):
+            continue
+        meta = column.args.get("_parseval_meta")
+        if meta is None:
+            continue
+        domain = dict(meta).get("domain")
+        if domain is not None:
+            return DataType.build(domain)
+    return None
+
+
+def _output_column_by_name(step: "Step", name: str) -> ColumnId | None:
+    normalized = identifier_name(name).normalized
+    for column in getattr(step, "output_column_ids", ()):
+        if column.name.normalized == normalized:
+            return column
+    return None
+
+
+def _subquery_metadata(step: "SubPlan", instance: t.Any) -> t.Dict[str, t.Any]:
+    polarity = _subquery_polarity(step.anchor)
+    metadata: t.Dict[str, t.Any] = {
+        "kind": step.kind.value,
+        "polarity": polarity,
+        "cardinality": _subquery_cardinality(step.kind, polarity),
+        "output_columns": tuple(getattr(step, "output_column_ids", ())),
+        "correlations": _subquery_correlation_links(step, instance),
+    }
+    if step.kind is SubPlanKind.IN:
+        predicate_column = _subquery_predicate_column(step, instance)
+        if predicate_column is not None:
+            metadata["predicate_column"] = predicate_column
+    return metadata
+
+
+def _subquery_polarity(anchor: exp.Expression) -> str:
+    negated = False
+    current = getattr(anchor, "parent", None)
+    while isinstance(current, exp.Expression):
+        if isinstance(current, exp.Not):
+            negated = not negated
+        current = getattr(current, "parent", None)
+    return "negative" if negated else "positive"
+
+
+def _subquery_cardinality(kind: SubPlanKind, polarity: str) -> str:
+    if kind is SubPlanKind.EXISTS:
+        return "zero" if polarity == "negative" else "one_or_more"
+    if kind is SubPlanKind.IN:
+        return "zero_matching" if polarity == "negative" else "one_or_more"
+    if kind is SubPlanKind.SCALAR:
+        return "one"
+    return "many"
+
+
+def _subquery_predicate_column(step: "SubPlan", instance: t.Any) -> ColumnId | None:
+    if not isinstance(step.anchor, exp.In):
+        return None
+    column = _single_scope_column(step.anchor.this)
+    if column is None:
+        return None
+    return _resolve_outer_column_id(step, column, instance)
+
+
+def _subquery_correlation_links(
+    step: "SubPlan",
+    instance: t.Any,
+) -> t.Tuple[t.Dict[str, t.Any], ...]:
+    links: t.List[t.Dict[str, t.Any]] = []
+    seen: t.Set[t.Tuple[ColumnId, ColumnId, str]] = set()
+    for inner_step in _identity_order(step.inner):
+        _prepare_step_identity(inner_step, instance)
+        for expression in _step_expressions(inner_step):
+            for node in _iter_scope_nodes(expression):
+                if not isinstance(node, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                    continue
+                left = _single_scope_column(node.left)
+                right = _single_scope_column(node.right)
+                if left is None or right is None:
+                    continue
+                link = _correlation_link_for_columns(step, inner_step, left, right, node.key, instance)
+                if link is None:
+                    link = _correlation_link_for_columns(step, inner_step, right, left, node.key, instance)
+                if link is None:
+                    continue
+                key = (link["inner"], link["outer"], link["operator"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                links.append(link)
+    return tuple(links)
+
+
+def _correlation_link_for_columns(
+    subplan: "SubPlan",
+    inner_step: "Step",
+    inner_col: exp.Column,
+    outer_col: exp.Column,
+    operator: str,
+    instance: t.Any,
+) -> t.Dict[str, t.Any] | None:
+    inner_id = _resolve_column_id(inner_col, inner_step, instance, allow_unresolved=True)
+    outer_id = _resolve_outer_column_id(subplan, outer_col, instance)
+    if inner_id is None or outer_id is None:
+        return None
+    return {
+        "inner": inner_id,
+        "outer": outer_id,
+        "operator": operator,
+    }
+
+
+def _resolve_outer_column_id(
+    subplan: "SubPlan",
+    column: exp.Column,
+    instance: t.Any,
+) -> ColumnId | None:
+    consumer = getattr(subplan, "consumer", None)
+    if consumer is None:
+        return None
+    _prepare_step_identity(consumer, instance)
+    return _resolve_column_id(column, consumer, instance, allow_unresolved=True)
+
+
+def _is_planner_synthetic_operand(column: exp.Column) -> bool:
+    return column.name.startswith("_a_")
+
+
+_NUMERIC_LITERAL_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _infer_semantic_datatypes(
+    expressions: t.Iterable[exp.Expression],
+) -> t.Dict[ColumnId, DataType]:
+    expression_tuple = tuple(expr for expr in expressions if expr is not None)
+    candidates: t.Dict[ColumnId, t.List[t.Tuple[int, DataType]]] = {}
+
+    def add(column: exp.Column, datatype: DataType, priority: int) -> None:
+        if not _column_accepts_semantic_datatype(column):
+            return
+        cid = column.meta.get(PARSEVAL_COLUMN_ID)
+        if isinstance(cid, ColumnId):
+            candidates.setdefault(cid, []).append((priority, DataType.build(datatype)))
+
+    for expression in expression_tuple:
+        for node in _iter_scope_nodes(expression):
+            if isinstance(node, exp.Cast):
+                target = node.args.get("to")
+                if isinstance(target, exp.DataType):
+                    for column in _iter_scope_columns(node.this):
+                        add(column, DataType.build(target), priority=3)
+                continue
+
+            temporal_function_type = _temporal_function_semantic_datatype(node)
+            if temporal_function_type is not None:
+                for column in _iter_scope_columns(node):
+                    add(column, temporal_function_type, priority=2)
+                continue
+
+            if isinstance(node, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                _collect_range_comparison_semantics(node, add)
+                continue
+
+            if isinstance(node, exp.Between):
+                _collect_between_semantics(node, add)
+
+    semantic_datatypes: t.Dict[ColumnId, DataType] = {}
+    for cid, column_candidates in candidates.items():
+        datatype = _resolve_semantic_datatype(column_candidates)
+        if datatype is not None:
+            semantic_datatypes[cid] = datatype
+
+    if semantic_datatypes:
+        for expression in expression_tuple:
+            for column in _iter_scope_columns(expression):
+                cid = column.meta.get(PARSEVAL_COLUMN_ID)
+                if isinstance(cid, ColumnId) and cid in semantic_datatypes:
+                    column.meta[PARSEVAL_SEMANTIC_DATATYPE] = semantic_datatypes[cid]
+
+    return semantic_datatypes
+
+
+def _iter_scope_nodes(expression: exp.Expression) -> t.Iterator[exp.Expression]:
+    stack: t.List[exp.Expression] = [expression]
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (exp.Subquery, exp.Exists)):
+            continue
+        if isinstance(node, exp.In) and isinstance(node.args.get("query"), exp.Expression):
+            continue
+        for child in node.args.values():
+            if isinstance(child, exp.Expression):
+                stack.append(child)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, exp.Expression):
+                        stack.append(item)
+
+
+def _column_accepts_semantic_datatype(column: exp.Column) -> bool:
+    meta = column.args.get("_parseval_meta")
+    if meta is None:
+        return False
+    domain = dict(meta).get("domain")
+    if domain is None:
+        return False
+    datatype = DataType.build(domain)
+    return datatype.is_type(*DataType.TEXT_TYPES)
+
+
+def _collect_range_comparison_semantics(
+    node: exp.Expression,
+    add: t.Callable[[exp.Column, DataType, int], None],
+) -> None:
+    left_column = _single_scope_column(node.left)
+    right_column = _single_scope_column(node.right)
+    if left_column is not None and right_column is None:
+        datatype = _literal_semantic_datatype(node.right)
+        if datatype is not None:
+            add(left_column, datatype, 1)
+    elif right_column is not None and left_column is None:
+        datatype = _literal_semantic_datatype(node.left)
+        if datatype is not None:
+            add(right_column, datatype, 1)
+
+
+def _collect_between_semantics(
+    node: exp.Between,
+    add: t.Callable[[exp.Column, DataType, int], None],
+) -> None:
+    column = _single_scope_column(node.this)
+    if column is None:
+        return
+    low_type = _literal_semantic_datatype(node.args.get("low"))
+    high_type = _literal_semantic_datatype(node.args.get("high"))
+    datatype = _merge_semantic_datatypes(
+        tuple(dtype for dtype in (low_type, high_type) if dtype is not None)
+    )
+    if datatype is not None:
+        add(column, datatype, 1)
+
+
+def _single_scope_column(expression: t.Any) -> exp.Column | None:
+    if not isinstance(expression, exp.Expression):
+        return None
+    columns = list(_iter_scope_columns(expression))
+    return columns[0] if len(columns) == 1 and isinstance(expression, exp.Column) else None
+
+
+def _literal_semantic_datatype(expression: t.Any) -> DataType | None:
+    if not isinstance(expression, exp.Literal) or not expression.is_string:
+        return None
+    value = str(expression.this).strip()
+    if not value:
+        return None
+    if _NUMERIC_LITERAL_RE.match(value):
+        return DataType.build("REAL") if _numeric_literal_is_decimal(value) else DataType.build("INT")
+    temporal = _temporal_literal_semantic_datatype(value)
+    if temporal is not None:
+        return temporal
+    return None
+
+
+def _numeric_literal_is_decimal(value: str) -> bool:
+    return "." in value or "e" in value.lower()
+
+
+def _temporal_literal_semantic_datatype(value: str) -> DataType | None:
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    return (
+        DataType.build("DATETIME")
+        if _literal_has_time_component(value)
+        else DataType.build("DATE")
+    )
+
+
+def _literal_has_time_component(value: str) -> bool:
+    return bool(re.search(r"(?:\d{1,2}:\d{2}|[Tt]\d{1,2})", value))
+
+
+def _temporal_function_semantic_datatype(node: exp.Expression) -> DataType | None:
+    if isinstance(node, exp.Date):
+        return DataType.build("DATE")
+    if isinstance(node, exp.TimeToStr):
+        return DataType.build("DATETIME")
+    if isinstance(node, exp.Anonymous) and str(node.name).upper() in {
+        "DATETIME",
+        "TIMESTAMP",
+    }:
+        return DataType.build("DATETIME")
+    return None
+
+
+def _resolve_semantic_datatype(
+    candidates: t.Sequence[t.Tuple[int, DataType]],
+) -> DataType | None:
+    if not candidates:
+        return None
+    highest_priority = max(priority for priority, _ in candidates)
+    selected = tuple(
+        datatype for priority, datatype in candidates if priority == highest_priority
+    )
+    return _merge_semantic_datatypes(selected)
+
+
+def _merge_semantic_datatypes(datatypes: t.Sequence[DataType]) -> DataType | None:
+    if not datatypes:
+        return None
+    families = {_semantic_datatype_family(datatype) for datatype in datatypes}
+    if families <= {"integer"}:
+        return DataType.build("INT")
+    if families <= {"integer", "decimal"}:
+        return DataType.build("REAL")
+    if families <= {"date"}:
+        return DataType.build("DATE")
+    if families <= {"date", "datetime"}:
+        return DataType.build("DATETIME")
+    return None
+
+
+def _semantic_datatype_family(datatype: DataType) -> str:
+    datatype = DataType.build(datatype)
+    if datatype.is_type(*DataType.INTEGER_TYPES):
+        return "integer"
+    if datatype.is_type(*DataType.REAL_TYPES):
+        return "decimal"
+    if datatype.is_type(DataType.Type.DATE, DataType.Type.DATE32):
+        return "date"
+    if datatype.is_type(
+        DataType.Type.DATETIME,
+        DataType.Type.DATETIME64,
+        DataType.Type.TIMESTAMP,
+        DataType.Type.TIMESTAMPLTZ,
+        DataType.Type.TIMESTAMPTZ,
+        DataType.Type.TIMESTAMP_MS,
+        DataType.Type.TIMESTAMP_NS,
+        DataType.Type.TIMESTAMP_S,
+    ):
+        return "datetime"
+    return datatype.sql().lower()
+
+
 def _unique_column_ids(
     expressions: t.Iterable[exp.Expression],
 ) -> t.Tuple[ColumnId, ...]:
@@ -1531,81 +2131,6 @@ def _source_relations(step: "Step") -> t.Tuple[RelationId, ...]:
             seen.add(column.relation)
             relations.append(column.relation)
     return tuple(relations)
-
-
-def _unique_columns(
-    expressions: t.Iterable[exp.Expression],
-) -> t.Tuple[exp.Column, ...]:
-    seen: t.Set[str] = set()
-    columns: t.List[exp.Column] = []
-    for expression in expressions:
-        if expression is None:
-            continue
-        for column in expression.find_all(exp.Column):
-            sql = column.sql()
-            if sql in seen:
-                continue
-            seen.add(sql)
-            columns.append(column)
-    return tuple(columns)
-
-
-def _projected_columns(step: "Step") -> t.Tuple[str, ...]:
-    projections = getattr(step, "projections", None) or []
-    names: t.List[str] = []
-    for projection in projections:
-        alias_name = projection.alias_or_name
-        if alias_name:
-            names.append(alias_name)
-    return tuple(names)
-
-
-def _source_tables(step: "Step") -> t.Tuple[str, ...]:
-    """Base tables this step ultimately reads from.
-
-    ``Scan`` yields its underlying table; ``Join`` yields the source plus
-    every joined alias; ``Filter`` / ``Having`` / ``Project`` / ``Limit`` /
-    ``Sort`` / ``Aggregate`` recurse through chain dependencies to the
-    leaves. ``Scan`` with an ``exp.Subquery`` source resolves through its
-    ``SubPlan(TABLE)`` inner tree. ``SubPlan`` branches of other kinds are
-    intentionally not followed — they represent subqueries whose rows
-    belong to a different scope.
-    """
-    names: t.List[str] = []
-    seen: t.Set[str] = set()
-
-    def add(name: str) -> None:
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
-
-    def collect(current: "Step") -> None:
-        source = getattr(current, "source", None)
-        if isinstance(source, exp.Table):
-            add(source.name)
-        if isinstance(current, Scan):
-            for dependency in current.chain_dependencies:
-                collect(dependency)
-            for sub in current.subplan_dependencies:
-                if sub.kind is SubPlanKind.TABLE:
-                    collect(sub.inner)
-            return
-        if isinstance(current, Join):
-            for dependency in sorted(
-                current.chain_dependencies,
-                key=lambda dep: dep.name or "",
-            ):
-                collect(dependency)
-            for join_name in sorted((getattr(current, "joins", None) or {}).keys()):
-                add(join_name)
-            return
-        if isinstance(current, SubPlan):
-            return
-        for dependency in current.chain_dependencies:
-            collect(dependency)
-
-    collect(step)
-    return tuple(names)
 
 
 def _step_expressions(step: "Step") -> t.Tuple[exp.Expression, ...]:

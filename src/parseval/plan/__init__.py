@@ -9,7 +9,7 @@ The public surface of the plan module is:
   :class:`Project`, :class:`Limit`, :class:`SetOperation`,
   :class:`SubPlan` (+ :class:`SubPlanKind`).
 * :class:`StepAnnotations` — derived, cached facts about a step (step_id,
-  step_type, source_tables, referenced_columns, projected_columns, etc.)
+  step_type, source_relations, referenced_columns, projected_columns, etc.)
   accessed via :meth:`Plan.annotation_for`.
 * :func:`correlation_columns` and :func:`scope_columns` — sqlglot-level
   helpers used by the planner at build time and by the encoder for

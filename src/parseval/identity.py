@@ -8,6 +8,7 @@ from sqlglot import exp
 
 
 PARSEVAL_COLUMN_ID = "parseval_column_id"
+PARSEVAL_SEMANTIC_DATATYPE = "parseval_semantic_datatype"
 
 
 @dataclass(frozen=True)
