@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import random
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
+from parseval.identity import ColumnId, RelationId
 from .spec import ColumnSpec, ForeignKeySpec, SchemaSpec, TableSpec
 
 
@@ -42,9 +43,9 @@ class TableState:
     """
 
     spec: TableSpec
-    rows: List[Dict[str, Any]] = field(default_factory=list)
+    rows: List[Dict[ColumnId, Any]] = field(default_factory=list)
 
-    def add_row(self, row: Dict[str, Any]) -> None:
+    def add_row(self, row: Dict[ColumnId, Any]) -> None:
         """Append a generated row to this table's state."""
         self.rows.append(row)
 
@@ -64,25 +65,26 @@ class RowContext:
     """
 
     table: TableSpec
-    values: Dict[str, Any] = field(default_factory=dict)
-    provided_columns: Set[str] = field(default_factory=set)
-    generated_columns: Set[str] = field(default_factory=set)
+    values: Dict[ColumnId, Any] = field(default_factory=dict)
+    provided_columns: Set[ColumnId] = field(default_factory=set)
+    generated_columns: Set[ColumnId] = field(default_factory=set)
 
-    def set_provided(self, column: str, value: Any) -> None:
+    def set_provided(self, column: ColumnSpec | ColumnId, value: Any) -> None:
         """Mark a column as explicitly provided with the given value."""
-        normalized = column.lower()
-        self.values[normalized] = value
-        self.provided_columns.add(normalized)
+        column_id = column.id if isinstance(column, ColumnSpec) else column
+        self.values[column_id] = value
+        self.provided_columns.add(column_id)
 
-    def set_generated(self, column: str, value: Any) -> None:
+    def set_generated(self, column: ColumnSpec | ColumnId, value: Any) -> None:
         """Mark a column as auto-generated with the given value."""
-        normalized = column.lower()
-        self.values[normalized] = value
-        self.generated_columns.add(normalized)
+        column_id = column.id if isinstance(column, ColumnSpec) else column
+        self.values[column_id] = value
+        self.generated_columns.add(column_id)
 
-    def get(self, column: str, default: Any = None) -> Any:
-        """Retrieve a column value (case-insensitive lookup)."""
-        return self.values.get(column.lower(), default)
+    def get(self, column: ColumnSpec | ColumnId, default: Any = None) -> Any:
+        """Retrieve a column value by identity."""
+        column_id = column.id if isinstance(column, ColumnSpec) else column
+        return self.values.get(column_id, default)
 
 
 @dataclass
@@ -96,32 +98,45 @@ class SchemaRuntime:
         schema: The schema being generated.
         seed: Random seed for deterministic generation.
         rng: Random number generator instance.
-        tables: Map of table name (lowered) to its TableState.
-        columns: Map of qualified column name (table.column) to its ColumnState.
+        tables: Map of RelationId to its TableState.
+        columns: Map of ColumnId to its ColumnState.
     """
 
     schema: SchemaSpec
     seed: int = 142
     rng: random.Random = field(init=False)
-    tables: Dict[str, TableState] = field(init=False)
-    columns: Dict[str, ColumnState] = field(init=False)
+    tables: Dict[RelationId, TableState] = field(init=False)
+    columns: Dict[ColumnId, ColumnState] = field(init=False)
 
     def __post_init__(self) -> None:
         """Initialize the random number generator and build column state entries."""
         self.rng = random.Random(self.seed)
-        self.tables = {table.name: TableState(table) for table in self.schema.tables}
+        self.tables = {table.id: TableState(table) for table in self.schema.tables}
         self.columns = {}
         for table in self.schema.tables:
             for column in table.columns:
-                self.columns[column.qualified_name] = ColumnState(column)
+                self.columns[column.id] = ColumnState(column)
 
-    def table_state(self, table_name: str) -> TableState:
-        """Look up the mutable state for a table by name (case-insensitive)."""
-        return self.tables[table_name.lower()]
+    def table_state(self, table: str | RelationId | TableSpec) -> TableState:
+        """Look up the mutable state for a table by identity."""
+        table_spec = self.schema.get_table(table)
+        return self.tables[table_spec.id]
 
-    def column_state(self, table_name: str, column_name: str) -> ColumnState:
-        """Look up the mutable state for a column by table and column name (case-insensitive)."""
-        return self.columns[f"{table_name.lower()}.{column_name.lower()}"]
+    def column_state(
+        self,
+        table: str | RelationId | TableSpec | ColumnId | ColumnSpec,
+        column: str | ColumnId | ColumnSpec | None = None,
+    ) -> ColumnState:
+        """Look up the mutable state for a column by identity."""
+        if isinstance(table, ColumnSpec):
+            return self.columns[table.id]
+        if isinstance(table, ColumnId) and column is None:
+            return self.columns[table]
+        if column is None:
+            raise KeyError("Column is required for table/column lookup")
+        table_spec = self.schema.get_table(table)
+        column_spec = table_spec.get_column(column)
+        return self.columns[column_spec.id]
 
     def referenced_values(self, column: ColumnSpec) -> Optional[List[Any]]:
         """Return all used values from the FK target column for single-column foreign keys.
@@ -130,33 +145,43 @@ class SchemaRuntime:
         since those must be resolved via ``referenced_key_tuples``.
         """
         foreign_key = column.foreign_key
-        if foreign_key is None or len(foreign_key.target_columns) != 1:
+        if foreign_key is None or len(foreign_key.target_column_ids) != 1:
             return None
-        target_column = foreign_key.target_columns[0]
-        target_state = self.column_state(foreign_key.target_table, target_column)
+        target_column = foreign_key.target_column_ids[0]
+        target_state = self.column_state(target_column)
         return list(target_state.used_values)
 
     def referenced_key_tuples(
         self, foreign_key: ForeignKeySpec
     ) -> List[Tuple[Any, ...]]:
         """Return all tuples from the target table for composite FK resolution."""
-        table_state = self.table_state(foreign_key.target_table)
+        table_state = self.table_state(foreign_key.target_table_id)
         tuples: List[Tuple[Any, ...]] = []
         for row in table_state.rows:
             tuples.append(
-                tuple(row.get(column.lower()) for column in foreign_key.target_columns)
+                tuple(row.get(column) for column in foreign_key.target_column_ids)
             )
         return tuples
 
-    def remember_row(self, table_name: str, row: Dict[str, Any]) -> None:
+    def remember_row(
+        self,
+        table: str | RelationId | TableSpec,
+        row: Mapping[str | ColumnId | ColumnSpec, Any],
+    ) -> None:
         """Persist a generated row into the runtime state for uniqueness/FK tracking."""
-        table = self.schema.get_table(table_name)
-        normalized_row = {key.lower(): value for key, value in row.items()}
-        self.table_state(table.name).add_row(normalized_row)
-        for column in table.columns:
-            self.column_state(table.name, column.column).remember(
-                normalized_row.get(column.column)
-            )
+        table_spec = self.schema.get_table(table)
+        identity_row: Dict[ColumnId, Any] = {}
+        for key, value in row.items():
+            column = key if isinstance(key, ColumnId) else table_spec.get_column(key)
+            column_id = column.id if isinstance(column, ColumnSpec) else column
+            identity_row[column_id] = value
+        stored_row = {
+            column.id: identity_row.get(column.id)
+            for column in table_spec.columns
+        }
+        self.table_state(table_spec.id).add_row(stored_row)
+        for column in table_spec.columns:
+            self.column_state(column.id).remember(stored_row.get(column.id))
 
 
 __all__ = ["ColumnState", "TableState", "SchemaRuntime", "RowContext"]

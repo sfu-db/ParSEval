@@ -4,7 +4,7 @@ from typing import Any, Optional
 import uuid
 
 from ..compiler import ColumnDomainPlan
-from ..types import TypeFamily, TypeProfile
+from parseval.dtype import TypeFamily, TypeProfile
 from .base import ValueProvider
 
 
@@ -23,7 +23,7 @@ class UUIDProvider(ValueProvider):
         type_profile: Optional[TypeProfile] = None,
         null_rate: float = 0.0,
     ) -> Any:
-        state = runtime.column_state(spec.table, spec.column)
+        state = runtime.column_state(spec.id)
         fk_value = self._resolve_foreign_key(spec, runtime)
         if fk_value is not None:
             return fk_value

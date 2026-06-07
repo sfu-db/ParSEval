@@ -5,10 +5,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 import uuid
 
-from parseval.dtype import DataType
+from parseval.dtype import DataType, TypeFamily, TypeProfile
 
 from .base import TypeAdapter
-from ..types import TypeFamily, TypeProfile
 
 
 class GenericTypeAdapter(TypeAdapter):

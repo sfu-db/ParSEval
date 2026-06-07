@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from parseval.identity import RelationId
 from parseval.plan.rex import Row
 
 
@@ -35,5 +36,5 @@ class WriteResult:
 
 @dataclass(frozen=True)
 class RowCreationResult:
-    created: dict[str, tuple[Row, ...]]
-    positions: dict[str, int]
+    created: dict[RelationId, tuple[Row, ...]]
+    positions: dict[RelationId, int]

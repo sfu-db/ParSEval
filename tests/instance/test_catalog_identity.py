@@ -1,4 +1,6 @@
 from sqlglot import exp
+import json
+from pathlib import Path
 
 from parseval.identity import ColumnId, ColumnKind, RelationId, RelationKind
 from parseval.instance import Instance
@@ -55,6 +57,30 @@ def test_mixed_case_table_level_primary_key_populates_catalog_metadata():
     assert info.nullable is False
     assert inst.nullable("users", "id") is False
     assert inst.is_unique("users", "id") is True
+
+
+def test_default_normalization_resolves_unquoted_mixed_case_table_lookup():
+    inst = Instance(
+        "CREATE TABLE Team (ID INT PRIMARY KEY, Name TEXT);",
+        name="db",
+        dialect="sqlite",
+    )
+
+    team_id = inst.table_id("team")
+    assert team_id == inst.table_id("Team")
+    assert inst.column_id("team", "id").relation == team_id
+
+
+def test_default_normalization_resolves_bird_mixed_case_table_lookup():
+    schemas = json.loads(Path("data/sqlite/schema.json").read_text())
+    inst = Instance(
+        ";".join(schemas["european_football_2"]),
+        name="db",
+        dialect="sqlite",
+    )
+
+    assert inst.table_id("team") == inst.table_id("Team")
+    assert inst.column_id("team", "id").relation == inst.table_id("team")
 
 
 def test_normalize_false_mixed_case_inline_primary_key_identity_metadata():
@@ -188,12 +214,7 @@ def test_unquoted_lookup_does_not_resolve_quoted_identifier():
         dialect="sqlite",
     )
 
-    try:
-        inst.table_id("users")
-    except KeyError:
-        pass
-    else:
-        raise AssertionError("unquoted users resolved quoted table \"Users\"")
+    assert inst.table_id("users") == inst.table_id(exp.to_table('"Users"'))
 
     try:
         inst.column_id(exp.to_table('"Users"'), "id")
@@ -223,12 +244,7 @@ def test_unquoted_foreign_key_reference_links_to_quoted_declared_table():
     assert fk.source_column_ids == (inst.column_id(match, match_team_id),)
     assert fk.target_column_ids == (inst.column_id(team, team_id),)
 
-    try:
-        inst.table_id("team")
-    except KeyError:
-        pass
-    else:
-        raise AssertionError("public unquoted lookup resolved quoted table \"Team\"")
+    assert inst.table_id("team") == inst.table_id(team)
 
 
 def test_qualified_tables_with_same_leaf_name_have_distinct_relation_ids():
@@ -314,4 +330,91 @@ def test_implicit_composite_foreign_key_uses_parent_primary_key_order():
     assert fk.target_column_ids == (
         inst.column_id("parent", "a"),
         inst.column_id("parent", "b"),
+    )
+
+
+def test_constraints_are_resolved_by_column_and_relation_ids():
+    ddl = """
+    CREATE TABLE main.users (
+        id INT PRIMARY KEY,
+        email TEXT UNIQUE,
+        score INT NOT NULL CHECK (score > 0)
+    );
+    CREATE TABLE aux.users (
+        id INT PRIMARY KEY,
+        email TEXT UNIQUE,
+        score INT CHECK (score > 10)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+    main_users = exp.to_table("main.users")
+    aux_users = exp.to_table("aux.users")
+    main_score_id = inst.column_id(main_users, "score")
+    aux_score_id = inst.column_id(aux_users, "score")
+
+    assert inst.get_primary_key_ids(main_users) == (inst.column_id(main_users, "id"),)
+    assert inst.get_primary_key_ids(aux_users) == (inst.column_id(aux_users, "id"),)
+    assert inst.get_unique_constraint_ids(main_users) == (
+        (inst.column_id(main_users, "email"),),
+    )
+    assert inst.get_unique_constraint_ids(aux_users) == (
+        (inst.column_id(aux_users, "email"),),
+    )
+
+    main_constraints = inst.get_column_constraints_by_id(main_score_id)
+    aux_constraints = inst.get_column_constraints_by_id(aux_score_id)
+    assert any(
+        isinstance(constraint.kind, exp.NotNullColumnConstraint)
+        for constraint in main_constraints
+    )
+    assert not any(
+        isinstance(constraint.kind, exp.NotNullColumnConstraint)
+        for constraint in aux_constraints
+    )
+    main_checks = [
+        constraint.kind.this.sql()
+        for constraint in main_constraints
+        if isinstance(constraint.kind, exp.CheckColumnConstraint)
+    ]
+    aux_checks = [
+        constraint.kind.this.sql()
+        for constraint in aux_constraints
+        if isinstance(constraint.kind, exp.CheckColumnConstraint)
+    ]
+    assert main_checks == ["score > 0"]
+    assert aux_checks == ["score > 10"]
+
+
+def test_foreign_keys_are_resolved_by_relation_ids():
+    ddl = """
+    CREATE TABLE main.users (id INT PRIMARY KEY);
+    CREATE TABLE main.orders (
+        id INT PRIMARY KEY,
+        user_id INT,
+        FOREIGN KEY (user_id) REFERENCES main.users(id)
+    );
+    CREATE TABLE aux.users (id INT PRIMARY KEY);
+    CREATE TABLE aux.orders (
+        id INT PRIMARY KEY,
+        user_id INT,
+        FOREIGN KEY (user_id) REFERENCES aux.users(id)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+    main_orders = exp.to_table("main.orders")
+    aux_orders = exp.to_table("aux.orders")
+    main_fk = inst.get_foreign_keys_by_relation_id(inst.table_id(main_orders))[0]
+    aux_fk = inst.get_foreign_keys_by_relation_id(inst.table_id(aux_orders))[0]
+
+    assert main_fk.source_table_id == inst.table_id(main_orders)
+    assert main_fk.target_table_id == inst.table_id(exp.to_table("main.users"))
+    assert main_fk.source_column_ids == (inst.column_id(main_orders, "user_id"),)
+    assert main_fk.target_column_ids == (
+        inst.column_id(exp.to_table("main.users"), "id"),
+    )
+    assert aux_fk.source_table_id == inst.table_id(aux_orders)
+    assert aux_fk.target_table_id == inst.table_id(exp.to_table("aux.users"))
+    assert aux_fk.source_column_ids == (inst.column_id(aux_orders, "user_id"),)
+    assert aux_fk.target_column_ids == (
+        inst.column_id(exp.to_table("aux.users"), "id"),
     )

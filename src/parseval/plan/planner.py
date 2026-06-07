@@ -85,7 +85,7 @@ class Plan:
         into the corresponding :class:`SubPlan`, so downstream consumers
         never need to consult a separate scope graph.
         """
-        self.expression = expression.copy()
+        self.expression = _normalize_planner_expression(expression.copy())
         self._correlations = _build_correlation_map(self.expression)
         self.root = Step.from_expression(
             self.expression, correlations=self._correlations
@@ -237,6 +237,28 @@ class Plan:
 
     def __repr__(self) -> str:
         return f"Plan\n----\n{repr(self.root)}"
+
+
+def _normalize_planner_expression(expression: exp.Expression) -> exp.Expression:
+    """Normalize parser dialect variants into the planner's preferred AST."""
+
+    def transform(node: exp.Expression) -> exp.Expression:
+        normalized = _normalize_strftime(node)
+        return normalized if normalized is not None else node
+
+    return expression.transform(transform)
+
+
+def _normalize_strftime(node: exp.Expression) -> exp.Expression | None:
+    if not isinstance(node, exp.Anonymous) or str(node.name).upper() != "STRFTIME":
+        return None
+    args = list(node.expressions)
+    if len(args) != 2:
+        return None
+    fmt, value = args
+    if not isinstance(fmt, exp.Expression) or not isinstance(value, exp.Expression):
+        return None
+    return exp.TimeToStr(this=value.copy(), format=fmt.copy())
 
 
 class Step:
@@ -1936,6 +1958,7 @@ def _infer_semantic_datatypes(
                 cid = column.meta.get(PARSEVAL_COLUMN_ID)
                 if isinstance(cid, ColumnId) and cid in semantic_datatypes:
                     column.meta[PARSEVAL_SEMANTIC_DATATYPE] = semantic_datatypes[cid]
+        _wrap_semantic_literal_casts(expression_tuple, semantic_datatypes)
 
     return semantic_datatypes
 
@@ -2006,6 +2029,122 @@ def _single_scope_column(expression: t.Any) -> exp.Column | None:
         return None
     columns = list(_iter_scope_columns(expression))
     return columns[0] if len(columns) == 1 and isinstance(expression, exp.Column) else None
+
+
+def _wrap_semantic_literal_casts(
+    expressions: t.Iterable[exp.Expression],
+    semantic_datatypes: t.Mapping[ColumnId, DataType],
+) -> None:
+    for expression in expressions:
+        for node in _iter_scope_nodes(expression):
+            if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                _wrap_binary_semantic_literal(node, semantic_datatypes)
+            elif isinstance(node, exp.Between):
+                _wrap_between_semantic_literals(node, semantic_datatypes)
+
+
+def _wrap_binary_semantic_literal(
+    node: exp.Binary,
+    semantic_datatypes: t.Mapping[ColumnId, DataType],
+) -> None:
+    left_datatype = _literal_cast_datatype_for_expression(
+        node.left,
+        semantic_datatypes,
+    )
+    right_datatype = _literal_cast_datatype_for_expression(
+        node.right,
+        semantic_datatypes,
+    )
+    if left_datatype is not None and right_datatype is None:
+        wrapped = _semantic_literal_cast(node.right, left_datatype)
+        if wrapped is not node.right:
+            node.set("expression", wrapped)
+    elif right_datatype is not None and left_datatype is None:
+        wrapped = _semantic_literal_cast(node.left, right_datatype)
+        if wrapped is not node.left:
+            node.set("this", wrapped)
+
+
+def _wrap_between_semantic_literals(
+    node: exp.Between,
+    semantic_datatypes: t.Mapping[ColumnId, DataType],
+) -> None:
+    column = _single_scope_column(node.this)
+    if column is None:
+        return
+    datatype = _literal_cast_datatype_for_column(column, semantic_datatypes)
+    if datatype is None:
+        return
+    for key in ("low", "high"):
+        value = node.args.get(key)
+        wrapped = _semantic_literal_cast(value, datatype)
+        if wrapped is not value:
+            node.set(key, wrapped)
+
+
+def _literal_cast_datatype_for_expression(
+    expression: t.Any,
+    semantic_datatypes: t.Mapping[ColumnId, DataType],
+) -> DataType | None:
+    column = _single_semantic_column(expression)
+    if column is None:
+        return None
+    if isinstance(expression, exp.Column):
+        return _literal_cast_datatype_for_column(column, semantic_datatypes)
+    if isinstance(expression, exp.Cast):
+        target = expression.args.get("to")
+        return (
+            _semantic_cast_datatype(DataType.build(target))
+            if isinstance(target, exp.DataType)
+            else None
+        )
+    if isinstance(expression, exp.Date):
+        return DataType.build("DATE")
+    if isinstance(expression, exp.Anonymous) and str(expression.name).upper() in {
+        "DATETIME",
+        "TIMESTAMP",
+    }:
+        return DataType.build("DATETIME")
+    return None
+
+
+def _literal_cast_datatype_for_column(
+    column: exp.Column,
+    semantic_datatypes: t.Mapping[ColumnId, DataType],
+) -> DataType | None:
+    cid = column.meta.get(PARSEVAL_COLUMN_ID)
+    if not isinstance(cid, ColumnId):
+        return None
+    datatype = semantic_datatypes.get(cid)
+    if datatype is None:
+        return None
+    return _semantic_cast_datatype(datatype)
+
+
+def _single_semantic_column(expression: t.Any) -> exp.Column | None:
+    if not isinstance(expression, exp.Expression):
+        return None
+    columns = list(_iter_scope_columns(expression))
+    return columns[0] if len(columns) == 1 else None
+
+
+def _semantic_literal_cast(expression: t.Any, datatype: DataType) -> t.Any:
+    if not isinstance(expression, exp.Literal) or not expression.is_string:
+        return expression
+    return exp.Cast(this=expression.copy(), to=datatype.copy())
+
+
+def _semantic_cast_datatype(datatype: DataType) -> DataType | None:
+    family = _semantic_datatype_family(datatype)
+    if family == "integer":
+        return DataType.build("INT")
+    if family == "decimal":
+        return DataType.build("REAL")
+    if family == "date":
+        return DataType.build("DATE")
+    if family == "datetime":
+        return DataType.build("DATETIME")
+    return None
 
 
 def _literal_semantic_datatype(expression: t.Any) -> DataType | None:

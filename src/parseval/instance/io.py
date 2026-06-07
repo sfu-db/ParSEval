@@ -27,10 +27,8 @@ def to_db(
 ) -> Union[str, None]:
     """Write ``instance``'s current rows to a live database.
 
-    This is the functional equivalent of the old ``Instance.to_db``
-    method, extracted so the Instance class doesn't carry persistence
-    concerns. The Instance method still exists as a thin delegation for
-    backward compatibility.
+    This keeps live database writes separate from the in-memory
+    row-management code in :class:`Instance`.
 
     Parameters
     ----------

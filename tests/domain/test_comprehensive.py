@@ -80,11 +80,18 @@ class ComprehensiveDomainTests(unittest.TestCase):
         # Generate parent first (essential due to current implementation's "topological blindness")
         builder.build(BuildPolicy(row_counts={"parent": 5, "child": 10}, default_row_count=0))
         
-        parent_ids = {row["id"] for row in builder.runtime.table_state("parent").rows}
+        parent_table = schema.get_table("parent")
+        child_table = schema.get_table("child")
+        parent_id_col = parent_table.get_column("id").id
+        child_parent_id_col = child_table.get_column("parent_id").id
+        parent_ids = {
+            row[parent_id_col]
+            for row in builder.runtime.table_state(parent_table.id).rows
+        }
         child_rows = builder.runtime.table_state("child").rows
         
         for row in child_rows:
-            self.assertIn(row["parent_id"], parent_ids, "Child must reference an existing parent ID")
+            self.assertIn(row[child_parent_id_col], parent_ids, "Child must reference an existing parent ID")
 
     def test_multiple_tables_generation(self):
         table1 = TableSpec(name="t1", columns=(ColumnSpec(table="t1", column="c1", datatype=DataType.build("INT")),))

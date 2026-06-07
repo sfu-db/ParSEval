@@ -528,7 +528,8 @@ class DomainModuleTests(unittest.TestCase):
 
         self.assertEqual(row["id"], 7)
         self.assertIn("email", row)
-        self.assertEqual(builder.runtime.table_state("users").rows[0]["id"], 7)
+        id_column = schema.get_table("users").get_column("id").id
+        self.assertEqual(builder.runtime.table_state("users").rows[0][id_column], 7)
 
     def test_complete_row_rejects_duplicate_unique_preset(self):
         identifier = ColumnSpec(

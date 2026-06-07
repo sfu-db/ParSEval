@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Any, Dict, Tuple, Optional, List, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Tuple, Optional, List, TYPE_CHECKING
 from itertools import product
 
 from sqlglot import exp
@@ -13,12 +14,34 @@ if TYPE_CHECKING:
     from .rex import Symbol
 
 
+@dataclass(frozen=True)
+class AggregateGroup:
+    """Execution metadata for one SQL aggregate output row."""
+
+    output_row_id: Tuple[Any, ...]
+    group_key: Tuple[Any, ...]
+    source_row_ids: Tuple[Tuple[Any, ...], ...]
+    aggregate_values: Mapping[Any, Any]
+
+
+@dataclass(frozen=True)
+class WindowFrame:
+    """Execution metadata for one window-derived value on one output row."""
+
+    column_id: ColumnId
+    source_row_id: Tuple[Any, ...]
+    partition_key: Tuple[Any, ...]
+    order_key: Tuple[Any, ...]
+    frame_row_ids: Tuple[Tuple[Any, ...], ...]
+    value: Any
+
+
 class Row(exp.Expression):
     """One logical row produced by a plan step.
 
     A ``Row`` pairs a stable row identity (``this`` — a tuple of ids) with
-    a mapping ``columns: Dict[str, Symbol]`` from column name to the cell
-    value. Rows are the unit of currency for :class:`DerivedSchema` and
+    a mapping from column identity/name to the cell value. Rows are the
+    unit of currency for :class:`DerivedSchema` and
     flow through :class:`parseval.symbolic.encoder.SymbolicScopeEncoder`
     between plan steps.
 
@@ -31,8 +54,12 @@ class Row(exp.Expression):
     arg_types = {"this": True, "columns": True}
 
     @property
-    def columns(self) -> Tuple[str, ...]:
-        return tuple(self.args.get("columns", {}).keys())
+    def column_values(self) -> Mapping[Any, "Symbol"]:
+        return self.args.get("columns", {})
+
+    @property
+    def columns(self) -> Tuple[Any, ...]:
+        return tuple(self.column_values.keys())
 
     @property
     def rowid(self) -> Tuple[Any, ...]:
@@ -48,13 +75,23 @@ class Row(exp.Expression):
         return str(key)
 
     def items(self):
-        return self.args.get("columns", {}).items()
+        return self.column_values.items()
+
+    def values(self):
+        return self.column_values.values()
 
     def __iter__(self):
-        return iter(self.args.get("columns"))
+        return iter(self.column_values)
+
+    def __contains__(self, key):
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
 
     def __getitem__(self, key):
-        columns = self.args.get("columns", {})
+        columns = self.column_values
         if key in columns:
             return columns[key]
         if isinstance(key, ColumnId):
@@ -81,45 +118,13 @@ class Row(exp.Expression):
         return self[column]
 
     def __len__(self):
-        return len(self.args.get("columns", {}))
+        return len(self.column_values)
 
     def __add__(self, other):
         assert isinstance(other, Row), f"Cannot add Row with {type(other)}"
-        new_columns = {**self.args.get("columns"), **other.args.get("columns", {})}
+        new_columns = {**self.column_values, **other.column_values}
         rid = self.rowid + other.rowid
         return Row(this=rid, columns=new_columns)
-
-    def sql(self, dialect=None, **opts):
-        return f"{self.key}({self.this})"
-
-
-class AggGroup(exp.Expression):
-    """A group of rows aggregated under a single GROUP BY key.
-
-    ``this`` carries the concatenated row identities forming the group,
-    ``group_key`` is the tuple of key values, and ``group_values`` is the
-    list of contributing :class:`Row` objects. Produced by the
-    :class:`parseval.plan.Aggregate` step and consumed by HAVING and any
-    downstream consumer that needs per-group provenance.
-    """
-
-    arg_types = {"this": True, "group_key": True, "group_values": True}
-
-    @property
-    def group_key(self):
-        return self.args.get("group_key", ())
-
-    @property
-    def group_values(self):
-        return self.args.get("group_values", [])
-
-    @property
-    def name(self) -> Any:
-        return self.text("this")
-
-    @property
-    def rowids(self) -> Tuple[Any, ...]:
-        return self.this
 
     def sql(self, dialect=None, **opts):
         return f"{self.key}({self.this})"
@@ -131,9 +136,11 @@ class DerivedSchema:
         columns,
         rows=None,
         column_range=None,
-        datatypes: Optional[Dict[str, DATATYPE]] = None,
-        nullables: Optional[Dict[str, bool]] = None,
-        uniqueness: Optional[Dict[str, bool]] = None,
+        datatypes: Optional[Dict[Any, DATATYPE]] = None,
+        nullables: Optional[Dict[Any, bool]] = None,
+        uniqueness: Optional[Dict[Any, bool]] = None,
+        aggregate_groups: Optional[Dict[Tuple[Any, ...], AggregateGroup]] = None,
+        window_frames: Optional[Dict[Tuple[Any, ...], Tuple[WindowFrame, ...]]] = None,
     ):
         self.columns = tuple(columns)
         self.column_range = column_range
@@ -142,7 +149,9 @@ class DerivedSchema:
         self.mask = [True] * len(self.rows)
         self.datatypes = datatypes or {}
         self.nullables = nullables or {}
-        self.uniqueness: Dict[str, bool] = uniqueness or {}
+        self.uniqueness: Dict[Any, bool] = uniqueness or {}
+        self.aggregate_groups = aggregate_groups or {}
+        self.window_frames = window_frames or {}
 
         if rows:
             assert len(rows[0]) == len(
@@ -159,7 +168,7 @@ class DerivedSchema:
     def get_column_type(self, column):
         return self.datatypes.get(column, None)
 
-    def add_columns(self, *columns: str) -> None:
+    def add_columns(self, *columns: Any) -> None:
         self.columns += columns
         if self.column_range:
             self.column_range = range(
@@ -175,7 +184,36 @@ class DerivedSchema:
         self.mask.append(True)
 
     def pop(self):
-        self.rows.pop()
+        row = self.rows.pop()
+        self.aggregate_groups.pop(row.rowid, None)
+        self.window_frames.pop(row.rowid, None)
+
+    def with_rows(
+        self,
+        rows: List[Row],
+        *,
+        columns: Optional[Tuple[Any, ...]] = None,
+        column_range=None,
+    ) -> "DerivedSchema":
+        row_ids = {row.rowid for row in rows}
+        return DerivedSchema(
+            columns=self.columns if columns is None else columns,
+            rows=rows,
+            column_range=self.column_range if column_range is None else column_range,
+            datatypes=self.datatypes,
+            nullables=self.nullables,
+            uniqueness=self.uniqueness,
+            aggregate_groups={
+                row_id: group
+                for row_id, group in self.aggregate_groups.items()
+                if row_id in row_ids
+            },
+            window_frames={
+                row_id: frames
+                for row_id, frames in self.window_frames.items()
+                if row_id in row_ids
+            },
+        )
 
     @property
     def width(self):
@@ -197,8 +235,7 @@ class DerivedSchema:
             for i, column in enumerate(self.columns)
             if not self.column_range or i in self.column_range
         )
-        widths = {column: len(column) for column in columns}
-        lines = [" ".join(column for column in columns)]
+        lines = [" ".join(str(column) for column in columns)]
 
         for i, row in enumerate(self):
             if i > 10:

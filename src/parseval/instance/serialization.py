@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from parseval.domain.types import TypeService
+from parseval.dtype import TypeService
 
 
 class InstanceValueSerializer:

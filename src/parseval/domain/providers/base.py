@@ -7,8 +7,8 @@ from typing import Any, Optional
 from ..coercion import coerce_reference_value
 from ..spec import ColumnSpec
 from ..state import RowContext, SchemaRuntime
-from ..types import TypeProfile
 from ..compiler import ColumnDomainPlan
+from parseval.dtype import TypeProfile
 
 class ValueProvider(ABC):
     priority = 0

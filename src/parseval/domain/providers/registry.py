@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from parseval.dtype import TypeService
+from parseval.identity import ColumnId
 from ..spec import ColumnSpec
-from ..types import TypeService
 from .base import ValueProvider
 from .boolean_like import BooleanLikeTinyIntProvider
 from .boolean import BooleanProvider
@@ -27,7 +28,7 @@ class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: List[ValueProvider] = []
         self._semantic_providers: Dict[str, ValueProvider] = {}
-        self._column_providers: Dict[str, ValueProvider] = {}
+        self._column_providers: Dict[ColumnId, ValueProvider] = {}
         self.type_service = TypeService()
 
     @classmethod
@@ -51,12 +52,17 @@ class ProviderRegistry:
     def register_semantic(self, tag: str, provider: ValueProvider) -> None:
         self._semantic_providers[tag.lower()] = provider
 
-    def register_column(self, qualified_name: str, provider: ValueProvider) -> None:
-        self._column_providers[qualified_name.lower()] = provider
+    def register_column(
+        self,
+        column: ColumnId | ColumnSpec,
+        provider: ValueProvider,
+    ) -> None:
+        column_id = column.id if isinstance(column, ColumnSpec) else column
+        self._column_providers[column_id] = provider
 
     def resolve(self, spec: ColumnSpec) -> ValueProvider:
         type_profile = self.type_service.profile(spec)
-        column_provider = self._column_providers.get(spec.qualified_name)
+        column_provider = self._column_providers.get(spec.id)
         if column_provider is not None:
             return column_provider
 

@@ -3,6 +3,8 @@ from datetime import date, datetime, time
 from parseval.dtype import (
     DataType,
     TypeFamily,
+    TypeProfile,
+    TypeService,
     infer_type_from_value,
     parse_date,
     parse_datetime,
@@ -19,6 +21,13 @@ def test_type_family_maps_core_datatypes():
     assert type_family(DataType.build("DATE")) == TypeFamily.DATE
     assert type_family(DataType.build("TIME")) == TypeFamily.TIME
     assert type_family(DataType.build("TIMESTAMP")) == TypeFamily.DATETIME
+
+
+def test_type_service_profiles_live_in_dtype_module():
+    profile = TypeService().profile_datatype(DataType.build("INT"))
+
+    assert isinstance(profile, TypeProfile)
+    assert profile.family == TypeFamily.INTEGER
 
 
 def test_parse_temporal_values():
