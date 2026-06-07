@@ -8,12 +8,20 @@ translated.
 
 Public API::
 
-    from parseval.solver import Solver, SolveResult, SolverConstraint
+    from parseval.solver import Solver, SolveResult, SolverConstraint, SolverVar
 
     solver = Solver(dialect="sqlite")
     result = solver.solve(constraint)
 """
 
+from .types import SolverVar, set_solver_var, solver_var
 from .unified import Solver, SolveResult, SolverConstraint
 
-__all__ = ["Solver", "SolveResult", "SolverConstraint"]
+__all__ = [
+    "Solver",
+    "SolveResult",
+    "SolverConstraint",
+    "SolverVar",
+    "set_solver_var",
+    "solver_var",
+]

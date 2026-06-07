@@ -34,6 +34,10 @@ from .types import (
     epoch_day_to_date,
     seconds_to_time,
     epoch_second_to_datetime,
+    parse_date,
+    parse_time,
+    parse_datetime,
+    solver_var,
 )
 from .smt_translate import (
     _coerce_numeric_sort,
@@ -48,28 +52,17 @@ from .smt_translate import (
 
 logger = logging.getLogger("parseval.smt")
 
-_TEMPORAL_FMTS = {
-    "date": ["%Y-%m-%d"],
-    "datetime": ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"],
-    "timestamp": ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"],
-    "time": ["%H:%M:%S", "%H:%M"],
-}
-
-
 def _string_to_temporal_epoch(s: str, family: str) -> Optional[int]:
     """Convert a string to its temporal epoch value (days, seconds, etc.)."""
-    from datetime import time as dt_time
-    for fmt in _TEMPORAL_FMTS.get(family, []):
-        try:
-            if family == "date":
-                return date_to_epoch_day(datetime.strptime(s, fmt).date())
-            elif family in ("datetime", "timestamp"):
-                return datetime_to_epoch_second(datetime.strptime(s, fmt))
-            elif family == "time":
-                t = dt_time.fromisoformat(s) if hasattr(dt_time, "fromisoformat") else datetime.strptime(s, fmt).time()
-                return time_to_seconds(t)
-        except (ValueError, AttributeError):
-            continue
+    if family == "date":
+        parsed = parse_date(s)
+        return date_to_epoch_day(parsed) if parsed is not None else None
+    if family in ("datetime", "timestamp"):
+        parsed = parse_datetime(s)
+        return datetime_to_epoch_second(parsed) if parsed is not None else None
+    if family == "time":
+        parsed = parse_time(s)
+        return time_to_seconds(parsed) if parsed is not None else None
     return None
 
 
@@ -351,7 +344,7 @@ class SMTSolver:
         """Look up or create a Z3 variable for a column reference.
 
         Maintains a bidirectional mapping between column names
-        (``"table.column"``) and Z3 expressions in ``self.context``.
+        and Z3 expressions in ``self.context``.
 
         Args:
             condition: A sqlglot Column expression.
@@ -359,13 +352,20 @@ class SMTSolver:
         Returns:
             An SMTValue wrapping the Z3 variable with its type info.
         """
-        col_key = f"{condition.table}.{condition.name}"
+        col_key = self._column_key(condition)
         if col_key not in self.context.get("variable_to_z3", {}):
-            value = declare_column(condition, z3ctx=self.z3ctx)
-            self.context.setdefault("variable_to_z3", {})[col_key] = value.expr
-            self.context.setdefault("z3_to_variable", {})[str(value.expr)] = condition
+            self.declare_variable(col_key, condition.type)
         expr = self.context["variable_to_z3"][col_key]
         return SMTValue(expr, normalize_dtype(condition.type, self.z3ctx))
+
+    def _column_key(self, condition: exp.Column) -> str:
+        variable = solver_var(condition)
+        if variable is not None:
+            encoded = self.context.get("solver_var_to_name", {}).get(variable)
+            if encoded is not None:
+                return encoded
+            return variable.display
+        return f"{condition.table}.{condition.name}"
 
     def _as_value(self, item) -> SMTValue:
         """Assert that an item is an SMTValue and return it."""
@@ -1061,21 +1061,16 @@ class SMTSolver:
         self.add(z3.Implies(opt.is_Some(expr), value < upper), track_vars=False)
 
     def z3_to_python(self, model: z3.ModelRef):
-        """Extract concrete Python values from a Z3 model for tracked variables.
-
-        Only returns values for variables that were actively constrained
-        (i.e., appear in ``self.constrained_var_names``).
+        """Extract concrete Python values from a Z3 model for declared variables.
 
         Args:
             model: A satisfiable Z3 model.
 
         Returns:
-            Dict mapping variable name (``"table.column"``) to Python value.
+            Dict mapping internal SMT variable names to Python values.
         """
         result = {}
         for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-            if var_name not in self.constrained_var_names:
-                continue
             concrete = self._z3_to_python(model.evaluate(z3var, model_completion=True), var_name)
             variable = self.context["z3_to_variable"][var_name]
             if concrete == "":

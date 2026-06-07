@@ -14,9 +14,10 @@ sqlglot AST nodes. Internally it uses a two-tier resolution strategy:
 
 The solver is a pure function of its inputs — it does not depend on
 ``Instance`` or any database state.  The caller is responsible for
-annotating ``exp.Column.type`` on every column node in the constraint
-expressions so the solver can resolve datatypes for Z3 encoding and
-CSP value generation.
+annotating every ``exp.Column`` node in the constraint expressions with a
+datatype and a :class:`parseval.solver.types.SolverVar`. The solver uses
+that identity metadata for CSP variables, join equalities, and public
+assignments.
 """
 
 from __future__ import annotations
@@ -28,9 +29,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlglot import exp
 
 from parseval.dtype import DataType
-from parseval.helper import normalize_name
+from parseval.identity import RelationId
 
-from .types import col_type
+from .types import SolverVar, col_type, solver_var
 
 
 # =============================================================================
@@ -42,34 +43,33 @@ from .types import col_type
 class SolverConstraint:
     """Constraints for the solver to satisfy.
 
-    Every ``exp.Column`` node inside *constraints* must have its ``.type``
-    attribute set to a valid ``exp.DataType`` (e.g.
-    ``exp.DataType.build("INT")``).  The solver reads types from these
-    annotations — it does not consult any external schema.
+    Every ``exp.Column`` node inside *constraints* must have a datatype
+    annotation and ``SolverVar`` metadata. The solver reads types and
+    identities from those annotations — it does not consult any external
+    schema.
 
     Attributes:
-        target_tables: Tables the solver should generate values for.
+        target_relations: Relations the solver should generate values for.
         constraints: All constraint expressions (comparisons, IS NULL, etc.).
-        join_equalities: Cross-table equalities ``(left_table, left_col,
-            right_table, right_col)`` that the solver enforces.
-        alias_map: Table alias → real name mapping for column resolution.
+        join_equalities: Cross-variable equalities that the solver enforces.
+        variables: Optional explicit datatype map for solver variables.
     """
 
-    target_tables: Tuple[str, ...]
+    target_relations: Tuple[RelationId, ...]
     constraints: List[exp.Expression] = field(default_factory=list)
-    join_equalities: List[Tuple[str, str, str, str]] = field(default_factory=list)
-    alias_map: Dict[str, str] = field(default_factory=dict)
+    join_equalities: List[Tuple[SolverVar, SolverVar]] = field(default_factory=list)
+    variables: Dict[SolverVar, DataType] = field(default_factory=dict)
 
 
 @dataclass
 class SolveResult:
     """Outcome of a solver invocation.
 
-    Assignments use ``"table.column"`` keys mapping to concrete Python values.
+    Assignments use :class:`SolverVar` keys mapping to concrete Python values.
     """
 
     sat: bool
-    assignments: Dict[str, Any] = field(default_factory=dict)
+    assignments: Dict[SolverVar, Any] = field(default_factory=dict)
     reason: str = ""
 
 
@@ -284,37 +284,40 @@ class Solver:
         if not ok:
             return SolveResult(sat=False, reason=reason)
 
-        # Tier 1: Domain solver
-        domain_result = self._try_domain(constraint)
-        if domain_result.status == "sat":
-            return SolveResult(
-                sat=True,
-                assignments=self._remap_assignments(domain_result.assignments or {}, constraint.alias_map),
-            )
-        # For "unsat" from domain solver, still try SMT as fallback —
-        # the domain solver may incorrectly reject complex expressions
-        # (e.g., OR conditions) that the SMT solver can handle.
-        if domain_result.status not in ("unknown", "unsat"):
-            return SolveResult(
-                sat=False,
-                reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",
-            )
+        assignments: Dict[SolverVar, Any] = {}
+        for component in self._components(constraint):
+            domain_result = self._try_domain(component)
+            if domain_result.status == "sat":
+                assignments.update(domain_result.assignments or {})
+                continue
+            if domain_result.status == "unsat":
+                return SolveResult(
+                    sat=False,
+                    reason=domain_result.reason or "unsat",
+                )
+            if domain_result.status != "unknown":
+                return SolveResult(
+                    sat=False,
+                    reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",
+                )
 
-        # Tier 2: SMT solver
-        smt_result, smt_reason = self._try_smt(constraint)
-        if smt_result is not None:
-            return SolveResult(sat=True, assignments=smt_result)
+            smt_result, smt_reason = self._try_smt(component)
+            if smt_result is None:
+                return SolveResult(sat=False, reason=smt_reason)
+            assignments.update(smt_result)
 
-        return SolveResult(sat=False, reason=smt_reason)
+        return SolveResult(sat=True, assignments=assignments)
 
     # ── Validation ──────────────────────────────────────────────
 
     def _validate_types(self, constraint: SolverConstraint) -> Tuple[bool, str]:
-        """Check that all Column nodes have type annotations."""
+        """Check that all Column nodes have type and solver-var annotations."""
         for expr in constraint.constraints:
             for col in expr.find_all(exp.Column):
                 if col_type(col) is None:
                     return False, f"Column {col.table or '?'}.{col.name} has no type annotation"
+                if solver_var(col) is None:
+                    return False, f"Column {col.table or '?'}.{col.name} has no solver variable metadata"
         return True, ""
 
     # ── Domain solver ───────────────────────────────────────────
@@ -328,40 +331,14 @@ class Solver:
         ds = DomainSolver()
         return ds.solve(constraint)
 
-    def _remap_assignments(
-        self,
-        assignments: Dict[str, Any],
-        alias_map: Dict[str, str],
-    ) -> Dict[str, Any]:
-        """Remap ``"table.col"`` keys: resolve aliases to physical names.
-
-        For self-joins where multiple aliases map to the same physical table,
-        keeps the alias key to avoid collisions.
-        """
-        # Count how many aliases map to each physical table.
-        table_counts: Dict[str, int] = {}
-        for key in assignments:
-            table = key.split(".", 1)[0]
-            physical = alias_map.get(table, table)
-            table_counts[physical] = table_counts.get(physical, 0) + 1
-
-        remapped: Dict[str, Any] = {}
-        for key, value in assignments.items():
-            table, col = key.split(".", 1)
-            physical = alias_map.get(table, table)
-            # Use physical name if unique, alias if self-join.
-            result_table = physical if table_counts[physical] == 1 else table
-            remapped[f"{result_table}.{col}"] = value
-        return remapped
-
     # ── SMT solver ──────────────────────────────────────────────
 
     def _try_smt(
         self, constraint: SolverConstraint,
-    ) -> Tuple[Optional[Dict[str, Dict[str, Any]]], str]:
+    ) -> Tuple[Optional[Dict[SolverVar, Any]], str]:
         """Solve all constraint expressions with Z3."""
         try:
-            from .smt_solver import SMTSolver, UnsupportedSMTError
+            from .smt_solver import SMTSolver
 
             smt = SMTSolver(timeout_ms=self.timeout_ms)
 
@@ -371,136 +348,142 @@ class Solver:
             # decomposition and frequently times out.
             narrow_year_bounds(constraint)
 
-            # Declare variables from all columns in constraints.
-            for expr in constraint.constraints:
-                for col in expr.find_all(exp.Column):
-                    col_key = f"{normalize_name(col.table or '')}.{normalize_name(col.name)}"
-                    dtype = col_type(col) or DataType.build("TEXT")
-                    smt.declare_variable(col_key, dtype)
+            variables = self._collect_variables(constraint)
+            encoded_names = {
+                variable: self._smt_name(index, variable)
+                for index, variable in enumerate(variables)
+            }
+            smt.context["solver_var_to_name"] = encoded_names
+            reverse_names = {name: variable for variable, name in encoded_names.items()}
 
-            # Declare variables from join equalities.
-            declared_keys = set(smt.context.get("variable_to_z3", {}))
-            for lt, lc, rt, rc in constraint.join_equalities:
-                for table, col_name in [(lt, lc), (rt, rc)]:
-                    resolved_table = self._resolve_smt_table(constraint, declared_keys, table, col_name)
-                    if resolved_table is None:
-                        return None, "all tiers exhausted"
-                    key = f"{normalize_name(resolved_table)}.{normalize_name(col_name)}"
-                    if key not in smt.context.get("variable_to_z3", {}):
-                        dtype = self._find_col_type(constraint, resolved_table, col_name)
-                        smt.declare_variable(key, dtype)
-                    declared_keys.add(key)
+            for variable, dtype in variables.items():
+                smt.declare_variable(encoded_names[variable], dtype)
 
-            # Translate and add all constraint expressions.
-            # Skip constraints that fail translation instead of aborting —
-            # the remaining constraints may still produce a valid assignment.
-            skipped = 0
             for expr in constraint.constraints:
-                try:
-                    z3_expr = smt.translate(expr)
-                except (UnsupportedSMTError, Exception):
-                    skipped += 1
-                    continue
+                z3_expr = smt.translate(expr)
                 if z3_expr is None:
-                    skipped += 1
-                    continue
+                    return None, "unsupported_smt_expression"
                 smt.add(z3_expr)
 
-            # Add join equalities as Z3 equalities.
-            for lt, lc, rt, rc in constraint.join_equalities:
-                try:
-                    left_table = self._resolve_smt_table(constraint, declared_keys, lt, lc)
-                    right_table = self._resolve_smt_table(constraint, declared_keys, rt, rc)
-                    if left_table is None or right_table is None:
-                        return None, "all tiers exhausted"
-                    left_key = f"{normalize_name(left_table)}.{normalize_name(lc)}"
-                    right_key = f"{normalize_name(right_table)}.{normalize_name(rc)}"
-                    left_z3 = smt.context.get("variable_to_z3", {}).get(left_key)
-                    right_z3 = smt.context.get("variable_to_z3", {}).get(right_key)
-                    if left_z3 is None or right_z3 is None:
-                        return None, "all tiers exhausted"
-                    smt.add_raw(left_z3 == right_z3)
-                except Exception:
+            for left_var, right_var in constraint.join_equalities:
+                left_z3 = smt.context.get("variable_to_z3", {}).get(encoded_names[left_var])
+                right_z3 = smt.context.get("variable_to_z3", {}).get(encoded_names[right_var])
+                if left_z3 is None or right_z3 is None:
                     return None, "all tiers exhausted"
+                smt.add_raw(left_z3 == right_z3)
 
             status, solutions = smt.solve()
-            if status != "sat" or not solutions:
+            if status == "unsat":
+                return None, "unsat"
+            if status != "sat":
+                return None, "all tiers exhausted"
+            if not solutions and variables:
                 return None, "all tiers exhausted"
 
-            # Return flat "table.col" → value dict.
-            alias_map = constraint.alias_map or {}
-            assignments: Dict[str, Any] = {}
+            assignments: Dict[SolverVar, Any] = {}
             for var_name, value in solutions.items():
-                assignments[var_name] = value
-            if not assignments:
+                variable = reverse_names.get(var_name)
+                if variable is not None:
+                    assignments[variable] = value
+            if not assignments and variables:
                 return None, "all tiers exhausted"
-            return self._remap_assignments(assignments, alias_map), ""
+            return assignments, ""
         except Exception:
             return None, "all tiers exhausted"
 
-    def _resolve_smt_table(
-        self,
-        constraint: SolverConstraint,
-        declared_keys: set[str],
-        table: str,
-        col_name: str,
-    ) -> Optional[str]:
-        """Resolve a join-side table name into the SMT variable namespace."""
-        table_norm = normalize_name(table)
-        col_norm = normalize_name(col_name)
-        exact_key = f"{table_norm}.{col_norm}"
-        if exact_key in declared_keys:
-            return table_norm
-
-        alias_map = constraint.alias_map or {}
-        candidates: List[str] = []
-        for key in declared_keys:
-            if "." not in key:
-                continue
-            key_table, key_col = key.split(".", 1)
-            if key_col != col_norm:
-                continue
-            if key_table == table_norm:
-                return key_table
-            physical = normalize_name(alias_map.get(key_table, key_table))
-            if physical == table_norm:
-                candidates.append(key_table)
-
-        if len(candidates) == 1:
-            return candidates[0]
-        if candidates:
-            return None
-
-        target_candidates: List[str] = []
-        for target in constraint.target_tables:
-            target_norm = normalize_name(target)
-            if target_norm == table_norm:
-                return target_norm
-            if normalize_name(alias_map.get(target_norm, target_norm)) == table_norm:
-                target_candidates.append(target_norm)
-
-        if len(target_candidates) == 1:
-            return target_candidates[0]
-        if target_candidates:
-            return None
-
-        return table_norm
-
-    def _find_col_type(
-        self, constraint: SolverConstraint, table: str, col_name: str
-    ) -> DataType:
-        """Find the DataType for a column from the constraint expressions."""
-        table_norm = normalize_name(table)
-        col_norm = normalize_name(col_name)
+    def _collect_variables(self, constraint: SolverConstraint) -> Dict[SolverVar, DataType]:
+        variables: Dict[SolverVar, DataType] = dict(constraint.variables)
         for expr in constraint.constraints:
             for col in expr.find_all(exp.Column):
-                if (
-                    normalize_name(col.table or "") == table_norm
-                    and normalize_name(col.name) == col_norm
-                ):
-                    dtype = col_type(col)
-                    if dtype is not None:
-                        return dtype
-        return DataType.build("TEXT")
+                variable = solver_var(col)
+                dtype = col_type(col)
+                if variable is not None and dtype is not None:
+                    variables.setdefault(variable, dtype)
+        for left_var, right_var in constraint.join_equalities:
+            if left_var not in variables and right_var in variables:
+                variables[left_var] = variables[right_var]
+            elif right_var not in variables and left_var in variables:
+                variables[right_var] = variables[left_var]
+            else:
+                variables.setdefault(left_var, DataType.build("TEXT"))
+                variables.setdefault(right_var, DataType.build("TEXT"))
+        return variables
+
+    def _components(self, constraint: SolverConstraint) -> List[SolverConstraint]:
+        expr_vars = [self._expression_variables(expr) for expr in constraint.constraints]
+        parent: Dict[SolverVar, SolverVar] = {}
+
+        def add(variable: SolverVar) -> None:
+            parent.setdefault(variable, variable)
+
+        def find(variable: SolverVar) -> SolverVar:
+            add(variable)
+            while parent[variable] != variable:
+                parent[variable] = parent[parent[variable]]
+                variable = parent[variable]
+            return variable
+
+        def union(left: SolverVar, right: SolverVar) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[left_root] = right_root
+
+        for variables in expr_vars:
+            for variable in variables:
+                add(variable)
+            if len(variables) > 1:
+                first = next(iter(variables))
+                for variable in variables:
+                    union(first, variable)
+        for left_var, right_var in constraint.join_equalities:
+            union(left_var, right_var)
+
+        grouped_exprs: Dict[object, List[exp.Expression]] = {}
+        grouped_joins: Dict[object, List[Tuple[SolverVar, SolverVar]]] = {}
+        grouped_vars: Dict[object, set[SolverVar]] = {}
+
+        for index, expr in enumerate(constraint.constraints):
+            variables = expr_vars[index]
+            key: object = find(next(iter(variables))) if variables else ("expr", index)
+            grouped_exprs.setdefault(key, []).append(expr)
+            grouped_vars.setdefault(key, set()).update(variables)
+
+        for left_var, right_var in constraint.join_equalities:
+            key = find(left_var)
+            grouped_joins.setdefault(key, []).append((left_var, right_var))
+            grouped_vars.setdefault(key, set()).update((left_var, right_var))
+
+        keys = set(grouped_exprs) | set(grouped_joins)
+        components: List[SolverConstraint] = []
+        for key in keys:
+            component_vars = grouped_vars.get(key, set())
+            component_types = {
+                variable: dtype
+                for variable, dtype in constraint.variables.items()
+                if variable in component_vars
+            }
+            components.append(SolverConstraint(
+                target_relations=constraint.target_relations,
+                constraints=grouped_exprs.get(key, []),
+                join_equalities=grouped_joins.get(key, []),
+                variables=component_types,
+            ))
+        return components
+
+    def _expression_variables(self, expr: exp.Expression) -> set[SolverVar]:
+        variables: set[SolverVar] = set()
+        for col in expr.find_all(exp.Column):
+            variable = solver_var(col)
+            if variable is not None:
+                variables.add(variable)
+        return variables
+
+    def _smt_name(self, index: int, variable: SolverVar) -> str:
+        return (
+            f"sv_{index}_"
+            f"{variable.relation_id.display}_"
+            f"{variable.column_id.name.normalized}"
+        ).replace(".", "_").replace("#", "_")
 
 __all__ = ["Solver", "SolveResult", "SolverConstraint"]
