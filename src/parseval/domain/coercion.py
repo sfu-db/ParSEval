@@ -3,8 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Any
 
-from parseval.dtype import DataType
-from .types import TypeService
+from parseval.dtype import DataType, TypeService
 
 _TYPE_SERVICE = TypeService()
 

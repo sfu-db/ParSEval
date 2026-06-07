@@ -73,37 +73,14 @@ import functools
 
 from parseval.dtype import DataType
 from parseval.helper import like_to_pattern, normalize_name
+from parseval.identity import ColumnId, RelationId
 
-# Re-export AST-extension predicates and runtime containers from their homes
-# so callers can still import them as ``parseval.plan.rex.Is_Null`` / etc.
-
-from .context import AggGroup, Row  # noqa: F401
+from .context import Row  # noqa: F401
 
 
 # =============================================================================
 # Symbol hierarchy
 # =============================================================================
-
-
-
-class Is_Null(exp.Unary, exp.Predicate):
-    """``<expr> IS NULL`` predicate.
-
-    sqlglot parses ``IS NULL`` as ``exp.Is(this=<expr>, expression=exp.Null())``.
-    ParSEval uses a dedicated class so the evaluator / extractor can
-    dispatch on a single concept (rather than pattern-matching the
-    generic ``exp.Is`` node) for the two common NULL predicates.
-    """
-
-    def sql(self, dialect=None, **opts):
-        return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
-
-
-class Is_Not_Null(exp.Unary, exp.Predicate):
-    """``<expr> IS NOT NULL`` predicate; see :class:`Is_Null`."""
-
-    def sql(self, dialect=None, **opts):
-        return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
 
 
 class Symbol(exp.Expression):
@@ -217,8 +194,9 @@ class Variable(Symbol):
     A ``Variable`` is the bridge between the ``Instance`` (which stores
     it in rows), the AST (in which it appears as a leaf of expressions),
     and the solver (which chooses its value). It carries the usual
-    tri-state slots plus optional back-pointers (``table`` / ``column`` /
-    ``rowid``) and solver hints (``nullable`` / ``unique`` / ``domain``).
+    tri-state slots plus identity back-pointers (``relation_id`` /
+    ``column_id`` / ``rowid``) and solver hints (``nullable`` / ``unique`` /
+    ``domain``).
     """
 
     arg_types = {
@@ -227,9 +205,7 @@ class Variable(Symbol):
         "concrete": False,
         "is_bound": False,
         "is_null": False,
-        # --- Instance back-pointers ---
-        "table": False,
-        "column": False,
+        # --- Instance identity back-pointers ---
         "relation_id": False,
         "column_id": False,
         "rowid": False,
@@ -243,11 +219,47 @@ class Variable(Symbol):
     def __init__(self, *args, **kwargs):
         if "_type" in kwargs:
             kwargs["type"] = kwargs.pop("_type")
+        if "table" in kwargs or "column" in kwargs:
+            raise ValueError(
+                "Variable identity must use column_id/relation_id, "
+                "not table/column strings"
+            )
+        col_id = kwargs.get("column_id")
+        if not isinstance(col_id, ColumnId):
+            raise ValueError("Variable requires column_id")
+        if kwargs.get("rowid") is None:
+            raise ValueError("Variable requires rowid")
+        kwargs.setdefault("relation_id", col_id.relation)
         super().__init__(*args, **kwargs)
 
     @property
     def name(self) -> str:
         return self.text("this")
+
+    @property
+    def column_id(self) -> ColumnId:
+        return self.args["column_id"]
+
+    @property
+    def relation_id(self) -> RelationId | None:
+        return self.args.get("relation_id") or self.column_id.relation
+
+    @property
+    def rowid(self) -> Any:
+        return self.args["rowid"]
+
+    @property
+    def table_name(self) -> Optional[str]:
+        relation = self.relation_id
+        return (
+            relation.name.normalized
+            if relation is not None and relation.name
+            else None
+        )
+
+    @property
+    def column_name(self) -> str:
+        return self.column_id.name.normalized
 
     @property
     def concrete(self) -> Any:
@@ -307,7 +319,7 @@ class ITE(Symbol):
 
 # Register generator transforms so ``Symbol`` et al. pretty-print when a
 # sqlglot ``Generator`` runs over an AST containing them.
-for _klass in [Symbol, Const, Variable, ITE, Row, AggGroup]:
+for _klass in [Symbol, Const, Variable, ITE, Row]:
     generator.Generator.TRANSFORMS[_klass] = (
         lambda self, expression: expression.sql(dialect=self.dialect)
     )
@@ -468,6 +480,62 @@ def _eval_via_sqlglot_env(node: exp.Expression, env: Environment) -> Any:
         return op(*operand_values)
     except Exception:  # pragma: no cover - defensive
         return None
+
+
+# =============================================================================
+# NULL predicate helpers
+# =============================================================================
+
+
+def make_is_null(expr: exp.Expression) -> exp.Is:
+    """Build the sqlglot-native ``expr IS NULL`` predicate."""
+    return exp.Is(this=expr, expression=exp.Null())
+
+
+def make_is_not_null(expr: exp.Expression) -> exp.Is:
+    """Build the sqlglot-native ``expr IS NOT NULL`` predicate."""
+    return exp.Is(this=expr, expression=exp.Not(this=exp.Null()))
+
+
+def _unparen(expr: exp.Expression) -> exp.Expression:
+    while isinstance(expr, exp.Paren):
+        expr = expr.this
+    return expr
+
+
+def is_null_predicate(expr: exp.Expression) -> bool:
+    """Return True for sqlglot's ``expr IS NULL`` shape."""
+    expr = _unparen(expr)
+    return isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null)
+
+
+def is_not_null_predicate(expr: exp.Expression) -> bool:
+    """Return True for sqlglot's parsed or constructed ``expr IS NOT NULL``."""
+    expr = _unparen(expr)
+    if isinstance(expr, exp.Is):
+        right = _unparen(expr.expression)
+        return isinstance(right, exp.Not) and isinstance(_unparen(right.this), exp.Null)
+    if isinstance(expr, exp.Not):
+        return is_null_predicate(expr.this)
+    return False
+
+
+def null_predicate_parts(expr: exp.Expression) -> Optional[Tuple[exp.Expression, bool]]:
+    """Return ``(operand, is_null)`` for native NULL predicates, else ``None``.
+
+    ``is_null`` is True for ``IS NULL`` and False for ``IS NOT NULL``.
+    """
+    expr = _unparen(expr)
+    if is_null_predicate(expr):
+        assert isinstance(expr, exp.Is)
+        return expr.this, True
+    if isinstance(expr, exp.Is) and is_not_null_predicate(expr):
+        return expr.this, False
+    if isinstance(expr, exp.Not) and is_null_predicate(expr.this):
+        inner = _unparen(expr.this)
+        assert isinstance(inner, exp.Is)
+        return inner.this, False
+    return None
 
 
 # =============================================================================
@@ -912,22 +980,17 @@ def _eval_is(node: exp.Is, env: Environment) -> Optional[bool]:
     right_node = node.expression
     if isinstance(right_node, exp.Null):
         return left is None
+    if isinstance(right_node, exp.Not) and isinstance(
+        _unparen(right_node.this),
+        exp.Null,
+    ):
+        return left is not None
     if isinstance(right_node, exp.Boolean):
         if left is None:
             return False  # IS TRUE / IS FALSE treats NULL as not-matching
         return bool(left) is bool(right_node.this)
     right = _eval(right_node, env)
     return left is right
-
-
-@handler(Is_Null)
-def _eval_is_null_class(node: Is_Null, env: Environment) -> bool:
-    return _eval(node.this, env) is None
-
-
-@handler(Is_Not_Null)
-def _eval_is_not_null_class(node: Is_Not_Null, env: Environment) -> bool:
-    return _eval(node.this, env) is not None
 
 
 # ----- conditional -----
@@ -1318,15 +1381,16 @@ def _eval_ite(node: ITE, env: Environment) -> Any:
 def negate_predicate(expr: exp.Expression) -> exp.Expression:
     """Return the logical negation of ``expr``.
 
-    ``IS NULL`` ↔ ``IS NOT NULL`` are flipped directly via the dedicated
-    :class:`Is_Null` / :class:`Is_Not_Null` classes; any other predicate
-    is wrapped in ``NOT`` and handed to sqlglot's ``simplify`` so double
-    negations collapse naturally.
+    ``IS NULL`` and ``IS NOT NULL`` are flipped directly using sqlglot's
+    native ``exp.Is`` forms. Other predicates are wrapped in ``NOT`` and
+    handed to sqlglot's ``simplify`` so double negations collapse naturally.
     """
-    if expr.key == "is_null":
-        return Is_Not_Null(this=expr.this)
-    if expr.key == "is_not_null":
-        return Is_Null(this=expr.this)
+    null_parts = null_predicate_parts(expr)
+    if null_parts is not None:
+        operand, is_null = null_parts
+        if is_null:
+            return make_is_not_null(operand.copy())
+        return make_is_null(operand.copy())
     return simplify(expr.not_())
 
 
@@ -1411,11 +1475,13 @@ __all__ = [
     "tvl_not",
     # Re-exports
     "Row",
-    "AggGroup",
-    "Is_Null",
-    "Is_Not_Null",
     "DataType",
     # Utilities
+    "make_is_null",
+    "make_is_not_null",
+    "is_null_predicate",
+    "is_not_null_predicate",
+    "null_predicate_parts",
     "negate_predicate",
     "column_meta",
     "set_column_meta",

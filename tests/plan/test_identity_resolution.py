@@ -44,6 +44,7 @@ def test_plan_exposes_aliases_through_relation_identity_not_alias_map():
     ann = plan.annotation_for(plan.root)
 
     assert not hasattr(plan, "alias_map")
+    assert not hasattr(ann, "source_tables")
     assert ann.source_relations[0].name.normalized == "users"
     assert ann.source_relations[0].alias.normalized == "u"
 
@@ -77,3 +78,11 @@ def test_subquery_output_resolves_to_subquery_column():
 
     assert ann.projected_columns[0].relation.kind.value == "subquery"
     assert ann.projected_columns[0].relation.alias.normalized == "dt"
+
+
+def test_projected_alias_does_not_expose_source_name():
+    ddl = "CREATE TABLE users (id INT PRIMARY KEY);"
+    plan = _plan("SELECT dt.id FROM (SELECT id AS x FROM users) AS dt", ddl)
+
+    with pytest.raises(ValueError, match="Unresolved column"):
+        plan.annotation_for(plan.root)

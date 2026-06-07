@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from ..compiler import ColumnDomainPlan
-from ..types import TypeProfile
+from parseval.dtype import TypeProfile
 from .base import ValueProvider
 
 

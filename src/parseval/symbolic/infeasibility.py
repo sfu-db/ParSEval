@@ -12,7 +12,6 @@ from typing import Optional
 
 from sqlglot import exp
 
-from parseval.plan.ast_ext import Is_Not_Null, Is_Null
 from parseval.instance import Instance
 
 from .types import BranchNode, BranchType

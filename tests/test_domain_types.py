@@ -5,8 +5,7 @@ import uuid
 
 from parseval.domain.coercion import coerce_reference_value, coerce_value, values_equivalent
 from parseval.domain.spec import ColumnSpec
-from parseval.domain.types import TypeFamily, TypeProfile, TypeService
-from parseval.dtype import DataType
+from parseval.dtype import DataType, TypeFamily, TypeProfile, TypeService
 
 
 class DomainTypeTests(unittest.TestCase):

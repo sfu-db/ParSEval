@@ -15,10 +15,16 @@ The public surface of the plan module is:
   helpers used by the planner at build time and by the encoder for
   column resolution.
 * :mod:`parseval.plan.context` — ``Context`` / ``DerivedSchema`` /
-  ``build_context_from_instance``.
+  ``AggregateGroup`` / ``WindowFrame`` / ``build_context_from_instance``.
 """
 
-from .context import Context, DerivedSchema, build_context_from_instance
+from .context import (
+    AggregateGroup,
+    Context,
+    DerivedSchema,
+    WindowFrame,
+    build_context_from_instance,
+)
 from .planner import (
     Aggregate,
     Filter,
@@ -61,6 +67,7 @@ def __getattr__(name):
 
 __all__ = [
     "Aggregate",
+    "AggregateGroup",
     "Context",
     "DerivedSchema",
     "Filter",
@@ -76,6 +83,7 @@ __all__ = [
     "StepAnnotations",
     "SubPlan",
     "SubPlanKind",
+    "WindowFrame",
     "build_context_from_instance",
     "correlation_columns",
     "scope_columns",

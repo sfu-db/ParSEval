@@ -1,6 +1,13 @@
 import datetime as dt
 import unittest
 
+from parseval.identity import (
+    ColumnKind,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
+)
 from parseval.instance import Instance
 from parseval.plan.rex import Row, Variable
 
@@ -13,12 +20,24 @@ CREATE TABLE users (
 );
 """
 
+REL_USERS = relation_id(RelationKind.TABLE, identifier_name("users"))
+
 
 def _row(rowid: str, **values):
     return Row(
         this=rowid,
         columns={
-            key: Variable(this=f"{rowid}_{key}", _type="TEXT", concrete=value)
+            key: Variable(
+                this=f"{rowid}_{key}",
+                _type="TEXT",
+                concrete=value,
+                column_id=column_id(
+                    ColumnKind.PHYSICAL,
+                    identifier_name(key),
+                    REL_USERS,
+                ),
+                rowid=rowid,
+            )
             for key, value in values.items()
         },
     )

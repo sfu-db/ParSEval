@@ -7,12 +7,12 @@ operations walk every cell in a ``(table, rowid)`` tuple. Pre-refactor
 the Instance kept five loose dicts for this — two used, three dead. This
 module consolidates the live bookkeeping into one :class:`SymbolIndex`.
 
-``SymbolIndex`` leans on the back-pointers every :class:`Variable`
-carries (``table`` / ``column`` / ``rowid``) so reverse indices are
-populated automatically at :meth:`register` time. Callers that used to
-treat the Instance's ``symbols`` attribute as a dict keep working via
-``__getitem__`` / ``__contains__`` / iteration; the richer lookups are
-available as explicit methods.
+``SymbolIndex`` leans on the identity back-pointers every
+:class:`Variable` carries (``relation_id`` / ``column_id`` / ``rowid``) so
+reverse indices are populated automatically at :meth:`register` time.
+Callers that used to treat the Instance's ``symbols`` attribute as a dict
+keep working via ``__getitem__`` / ``__contains__`` / iteration; the
+richer lookups are available as explicit methods.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ class SymbolIndex:
     * each Variable is registered exactly once per unique name; registering
       the same name twice updates the entry rather than duplicating it;
     * reverse indices (by column / by row) derive from the Variable's own
-      ``table`` / ``column`` / ``rowid`` back-pointers — they're always
-      consistent with the primary name index.
+      ``relation_id`` / ``column_id`` / ``rowid`` back-pointers — they're
+      always consistent with the primary name index.
     """
 
     __slots__ = ("_by_name", "_by_column", "_by_row")
@@ -48,10 +48,8 @@ class SymbolIndex:
     def register(self, variable: Variable) -> None:
         """Register ``variable`` under its stable name and reverse indices.
 
-        Reverse indices are populated only when the Variable carries the
-        corresponding back-pointer. This keeps index size proportional to
-        the information actually available rather than padding missing
-        fields with ``None``-keyed buckets.
+        Reverse indices are populated from ``ColumnId`` / ``RelationId``
+        identity objects, never from string table or column names.
         """
         name = variable.name
         existing = self._by_name.get(name)
@@ -61,12 +59,11 @@ class SymbolIndex:
             self._remove_from_reverse_indices(existing)
         self._by_name[name] = variable
 
-        relation_id = variable.args.get("relation_id") or variable.args.get("table")
-        column_id = variable.args.get("column_id") or variable.args.get("column")
-        rowid = variable.args.get("rowid")
-        if column_id:
-            self._by_column[column_id].append(variable)
-        if relation_id and rowid is not None:
+        column_id = variable.column_id
+        relation_id = variable.relation_id
+        rowid = variable.rowid
+        self._by_column[column_id].append(variable)
+        if relation_id is not None:
             self._by_row[(relation_id, rowid)].append(variable)
 
     def register_many(self, variables: Iterable[Variable]) -> None:
@@ -81,19 +78,18 @@ class SymbolIndex:
         return removed
 
     def _remove_from_reverse_indices(self, variable: Variable) -> None:
-        relation_id = variable.args.get("relation_id") or variable.args.get("table")
-        column_id = variable.args.get("column_id") or variable.args.get("column")
-        rowid = variable.args.get("rowid")
-        if column_id:
-            bucket = self._by_column.get(column_id)
-            if bucket is not None:
-                try:
-                    bucket.remove(variable)
-                except ValueError:
-                    pass
-                if not bucket:
-                    self._by_column.pop(column_id, None)
-        if relation_id and rowid is not None:
+        column_id = variable.column_id
+        relation_id = variable.relation_id
+        rowid = variable.rowid
+        bucket = self._by_column.get(column_id)
+        if bucket is not None:
+            try:
+                bucket.remove(variable)
+            except ValueError:
+                pass
+            if not bucket:
+                self._by_column.pop(column_id, None)
+        if relation_id is not None:
             bucket = self._by_row.get((relation_id, rowid))
             if bucket is not None:
                 try:
@@ -125,7 +121,7 @@ class SymbolIndex:
         return list(self._by_row.get((relation_id, rowid), ()))
 
     # ------------------------------------------------------------------
-    # dict-style ergonomics (for legacy call sites)
+    # dict-style lookup
     # ------------------------------------------------------------------
 
     def __getitem__(self, name: str) -> Variable:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from parseval.dtype import TypeProfile
+from parseval.identity import ColumnId
 from ..compiler import ColumnDomainPlan
-from ..types import TypeProfile
+from ..spec import ColumnSpec
 from .base import ValueProvider
 
 
@@ -31,13 +33,18 @@ class SemanticProvider(ValueProvider):
 
 
 class ColumnOverrideProvider(ValueProvider):
-    def __init__(self, qualified_name: str, generator: Callable[..., Any], priority: int = 100) -> None:
-        self.qualified_name = qualified_name.lower()
+    def __init__(
+        self,
+        column: ColumnId | ColumnSpec,
+        generator: Callable[..., Any],
+        priority: int = 100,
+    ) -> None:
+        self.column_id = column.id if isinstance(column, ColumnSpec) else column
         self.generator = generator
         self.priority = priority
 
     def supports(self, spec, type_profile: TypeProfile) -> int:
-        return 100 if spec.qualified_name == self.qualified_name else 0
+        return 100 if spec.id == self.column_id else 0
 
     def generate(
         self,

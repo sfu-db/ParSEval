@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Tuple
 
 from parseval.dtype import DataType
-from parseval.identity import ColumnId, RelationId
+from parseval.identity import (
+    ColumnId,
+    ColumnKind,
+    RelationId,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,21 @@ class ColumnSpec:
         object.__setattr__(self, "column", self.column.lower())
         object.__setattr__(self, "semantic_tags", tuple(self.semantic_tags))
         object.__setattr__(self, "checks", tuple(self.checks))
+        table_id = self.table_id or relation_id(
+            RelationKind.TABLE,
+            identifier_name(self.table, dialect=self.dialect),
+        )
+        object.__setattr__(self, "table_id", table_id)
+        if self.id is None:
+            object.__setattr__(
+                self,
+                "id",
+                column_id(
+                    ColumnKind.PHYSICAL,
+                    identifier_name(self.column, dialect=self.dialect),
+                    table_id,
+                ),
+            )
 
     @property
     def qualified_name(self) -> str:
@@ -123,7 +146,14 @@ class TableSpec:
         )
 
     def get_column(self, column_name: str) -> ColumnSpec:
-        normalized = column_name.lower()
+        if isinstance(column_name, ColumnSpec):
+            column_name = column_name.id
+        if isinstance(column_name, ColumnId):
+            for column in self.columns:
+                if column.id == column_name:
+                    return column
+            raise KeyError(f"Unknown column {column_name.display}")
+        normalized = str(column_name).lower()
         for column in self.columns:
             if column.column == normalized:
                 return column
@@ -144,8 +174,139 @@ class SchemaSpec:
     dialect: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def get_table(self, table_name: str) -> TableSpec:
-        normalized = table_name.lower()
+    def __post_init__(self) -> None:
+        table_ids: dict[str, RelationId] = {}
+        column_ids: dict[str, dict[str, ColumnId]] = {}
+
+        for table in self.tables:
+            table_key = table.name.lower()
+            table_id = table.id or relation_id(
+                RelationKind.TABLE,
+                identifier_name(table.name, dialect=self.dialect),
+            )
+            table_ids[table_key] = table_id
+            column_ids[table_key] = {}
+            for column in table.columns:
+                column_key = column.column.lower()
+                existing_id = column.id if column.table_id == table_id else None
+                column_ids[table_key][column_key] = existing_id or column_id(
+                    ColumnKind.PHYSICAL,
+                    identifier_name(column.column, dialect=self.dialect),
+                    table_id,
+                )
+
+        normalized_tables = []
+        for table in self.tables:
+            table_key = table.name.lower()
+            table_id = table_ids[table_key]
+            foreign_keys = self._normalize_foreign_keys(
+                table,
+                table_ids,
+                column_ids,
+            )
+            foreign_key_by_source = {
+                tuple(fk.source_column_ids): fk
+                for fk in foreign_keys
+            }
+            columns = []
+            for column in table.columns:
+                column_key = column.column.lower()
+                normalized_fk = None
+                if column.foreign_key is not None:
+                    fk = self._normalize_foreign_key(
+                        column.foreign_key,
+                        table_ids,
+                        column_ids,
+                    )
+                    normalized_fk = foreign_key_by_source.get(
+                        tuple(fk.source_column_ids),
+                        fk,
+                    )
+                columns.append(
+                    replace(
+                        column,
+                        table=table.name,
+                        id=column_ids[table_key][column_key],
+                        table_id=table_id,
+                        foreign_key=normalized_fk,
+                    )
+                )
+            primary_key_ids = table.primary_key_ids or tuple(
+                column_ids[table_key][column.lower()]
+                for column in table.primary_key
+            )
+            unique_constraint_ids = table.unique_constraint_ids or tuple(
+                tuple(column_ids[table_key][column.lower()] for column in columns)
+                for columns in table.unique_constraints
+            )
+            normalized_tables.append(
+                replace(
+                    table,
+                    id=table_id,
+                    columns=tuple(columns),
+                    foreign_keys=foreign_keys,
+                    primary_key_ids=primary_key_ids,
+                    unique_constraint_ids=unique_constraint_ids,
+                )
+            )
+        object.__setattr__(self, "tables", tuple(normalized_tables))
+
+    def _normalize_foreign_keys(
+        self,
+        table: TableSpec,
+        table_ids: dict[str, RelationId],
+        column_ids: dict[str, dict[str, ColumnId]],
+    ) -> Tuple[ForeignKeySpec, ...]:
+        seen = set()
+        foreign_keys = []
+        for fk in tuple(table.foreign_keys) + tuple(
+            column.foreign_key
+            for column in table.columns
+            if column.foreign_key is not None
+        ):
+            normalized = self._normalize_foreign_key(fk, table_ids, column_ids)
+            key = (
+                normalized.source_table_id,
+                normalized.source_column_ids,
+                normalized.target_table_id,
+                normalized.target_column_ids,
+            )
+            if key not in seen:
+                seen.add(key)
+                foreign_keys.append(normalized)
+        return tuple(foreign_keys)
+
+    def _normalize_foreign_key(
+        self,
+        fk: ForeignKeySpec,
+        table_ids: dict[str, RelationId],
+        column_ids: dict[str, dict[str, ColumnId]],
+    ) -> ForeignKeySpec:
+        source_key = fk.source_table.lower()
+        target_key = fk.target_table.lower()
+        return replace(
+            fk,
+            source_table_id=fk.source_table_id or table_ids[source_key],
+            source_column_ids=fk.source_column_ids or tuple(
+                column_ids[source_key][column.lower()]
+                for column in fk.source_columns
+            ),
+            target_table_id=fk.target_table_id or table_ids[target_key],
+            target_column_ids=fk.target_column_ids or tuple(
+                column_ids[target_key][column.lower()]
+                for column in fk.target_columns
+            ),
+        )
+
+    def get_table(self, table_name: str | RelationId | TableSpec) -> TableSpec:
+        if isinstance(table_name, TableSpec):
+            table_name = table_name.id
+        if isinstance(table_name, RelationId):
+            for table in self.tables:
+                if table.id == table_name:
+                    return table
+            raise KeyError(f"Unknown table {table_name.display}")
+        normalized = str(table_name).lower()
         for table in self.tables:
             if table.name == normalized:
                 return table

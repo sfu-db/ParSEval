@@ -139,21 +139,25 @@ class InstanceLoaderTests(unittest.TestCase):
         """
         instance = Instance(ddls=schema, name="retry_case", dialect="sqlite")
         original_create_row = instance._create_row
+        parents_id = instance.table_id("parents")
+        children_id = instance.table_id("children")
+        parent_pk = instance.column_id("parents", "id")
+        child_parent_id = instance.column_id("children", "parent_id")
         state = {"raised": False}
 
-        def flaky_create_row(table_name, concretes):
-            if table_name == "children" and not state["raised"]:
+        def flaky_create_row(relation, concretes):
+            if relation == children_id and not state["raised"]:
                 state["raised"] = True
                 raise UniqueConflictError("retry after parent bootstrap")
-            return original_create_row(table_name, concretes)
+            return original_create_row(relation, concretes)
 
-        def bootstrap_reference_rows(table_name, values, prefer_new_for_unique=False, locked_columns=None):
-            if table_name != "children" or not prefer_new_for_unique:
+        def bootstrap_reference_rows(relation, values, prefer_new_for_unique=False, locked_columns=None):
+            if relation != children_id or not prefer_new_for_unique:
                 return {}
-            parent_position = original_create_row("parents", {})
-            parent_id = instance.get_column_data("parents", "id")[parent_position].concrete
-            values["parent_id"] = parent_id
-            return {"parents": [instance.get_row("parents", parent_position)]}
+            parent_position = original_create_row(parents_id, {})
+            parent_value = instance.get_column_data(parents_id, parent_pk)[parent_position].concrete
+            values[child_parent_id] = parent_value
+            return {parents_id: [instance.get_row(parents_id, parent_position)]}
 
         with patch.object(instance, "_create_row", side_effect=flaky_create_row):
             with patch.object(
@@ -163,11 +167,11 @@ class InstanceLoaderTests(unittest.TestCase):
             ):
                 result = instance.create_row("children", {"id": 2})
 
-        self.assertIn("parents", result.created)
-        self.assertIn("children", result.created)
-        parent_id = result.created["parents"][0]["id"].concrete
-        child_parent_id = result.created["children"][0]["parent_id"].concrete
-        self.assertEqual(parent_id, child_parent_id)
+        self.assertIn(parents_id, result.created)
+        self.assertIn(children_id, result.created)
+        parent_value = result.created[parents_id][0][parent_pk].concrete
+        child_parent_value = result.created[children_id][0][child_parent_id].concrete
+        self.assertEqual(parent_value, child_parent_value)
 
     def test_composite_primary_key_columns_are_not_treated_as_individually_unique(self):
         schema = """

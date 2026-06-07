@@ -1,10 +1,9 @@
 import unittest
 import uuid
 
-from parseval.domain.providers.registry import ProviderRegistry
 from parseval.domain.spec import ColumnSpec
-from parseval.domain.types import TypeService
-from parseval.dtype import DataType
+from parseval.domain.providers.registry import ProviderRegistry
+from parseval.dtype import DataType, TypeService
 
 
 class ProviderResolutionTests(unittest.TestCase):

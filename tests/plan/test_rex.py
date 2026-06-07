@@ -24,12 +24,16 @@ import sqlglot
 from sqlglot import exp, parse_one
 
 from parseval.dtype import DataType
+from parseval.identity import (
+    ColumnKind,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
+)
 from parseval.plan.rex import (
-    AggGroup,
     Const,
     Environment,
-    Is_Not_Null,
-    Is_Null,
     ITE,
     Row,
     Symbol,
@@ -47,6 +51,12 @@ REAL = DataType.build("REAL")
 TEXT = DataType.build("TEXT")
 BOOL = DataType.build("BOOLEAN")
 DATE_T = DataType.build("DATE")
+REL_T = relation_id(RelationKind.TABLE, identifier_name("T"))
+COL_X = column_id(ColumnKind.PHYSICAL, identifier_name("x"), REL_T)
+
+
+def _variable(name: str = "x", type=INT) -> Variable:
+    return Variable(this=name, type=type, column_id=COL_X, rowid="row_0")
 
 
 def _predicate(sql: str) -> exp.Expression:
@@ -87,54 +97,59 @@ class TestSymbolTriState(unittest.TestCase):
         self.assertTrue(c.is_bound)
 
     def test_variable_starts_unbound(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         self.assertFalse(v.is_bound)
         self.assertFalse(v.is_null)
         self.assertIsNone(v.concrete)
         self.assertEqual(v.name, "x")
 
     def test_variable_bind_value(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         v.bind(42)
         self.assertTrue(v.is_bound)
         self.assertFalse(v.is_null)
         self.assertEqual(v.concrete, 42)
 
     def test_variable_bind_null(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         v.bind_null()
         self.assertTrue(v.is_bound)
         self.assertTrue(v.is_null)
         self.assertIsNone(v.concrete)
 
     def test_variable_unbind_round_trips(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         v.bind(7)
         v.unbind()
         self.assertFalse(v.is_bound)
         self.assertIsNone(v.concrete)
 
-    def test_variable_back_pointers(self):
+    def test_variable_identity_back_pointers(self):
         v = Variable(
             this="T_0_x",
             type=INT,
-            table="T",
-            column="x",
-            rowid=0,
+            column_id=COL_X,
+            rowid="row_0",
             nullable=False,
             unique=True,
         )
-        self.assertEqual(v.args.get("table"), "T")
-        self.assertEqual(v.args.get("column"), "x")
-        self.assertEqual(v.args.get("rowid"), 0)
+        self.assertEqual(v.column_id, COL_X)
+        self.assertEqual(v.relation_id, REL_T)
+        self.assertEqual(v.table_name, "t")
+        self.assertEqual(v.column_name, "x")
+        self.assertEqual(v.args.get("rowid"), "row_0")
         self.assertFalse(v.args.get("nullable"))
         self.assertTrue(v.args.get("unique"))
+
+    def test_variable_rejects_string_identity_back_pointers(self):
+        with self.assertRaises(ValueError):
+            Variable(this="T_0_x", type=INT, table="T", column="x", rowid="row_0")
 
     def test_legacy_underscore_type_kwarg(self):
         """``Const(this=5, _type=...)`` and ``Variable(this=..., _type=...)`` both work."""
         c = Const(this=5, _type=INT)
         self.assertEqual(c.type, INT)
-        v = Variable(this="x", _type=INT)
+        v = Variable(this="x", _type=INT, column_id=COL_X, rowid="row_0")
         self.assertEqual(v.type, INT)
 
 
@@ -396,11 +411,17 @@ class TestNullChecks(unittest.TestCase):
         env = Environment({"x": None})
         self.assertFalse(concrete(_predicate("x IS NOT NULL"), env))
 
-    def test_dedicated_classes_evaluate(self):
+    def test_constructed_is_not_null_true_when_bound(self):
         col = _value("x")
+        pred = exp.Is(this=col, expression=exp.Not(this=exp.Null()))
+        env = Environment({"x": 5})
+        self.assertTrue(concrete(pred, env))
+
+    def test_constructed_is_not_null_false_when_null(self):
+        col = _value("x")
+        pred = exp.Is(this=col, expression=exp.Not(this=exp.Null()))
         env = Environment({"x": None})
-        self.assertTrue(concrete(Is_Null(this=col), env))
-        self.assertFalse(concrete(Is_Not_Null(this=col), env))
+        self.assertFalse(concrete(pred, env))
 
 
 # ---------------------------------------------------------------------------
@@ -530,13 +551,22 @@ class TestCast(unittest.TestCase):
 class TestNegatePredicate(unittest.TestCase):
     def test_negates_is_null_to_is_not_null(self):
         col = _value("x")
-        negated = negate_predicate(Is_Null(this=col))
-        self.assertIsInstance(negated, Is_Not_Null)
+        negated = negate_predicate(exp.Is(this=col, expression=exp.Null()))
+        self.assertTrue(concrete(negated, Environment({"x": 5})))
+        self.assertFalse(concrete(negated, Environment({"x": None})))
 
     def test_negates_is_not_null_to_is_null(self):
         col = _value("x")
-        negated = negate_predicate(Is_Not_Null(this=col))
-        self.assertIsInstance(negated, Is_Null)
+        negated = negate_predicate(
+            exp.Is(this=col, expression=exp.Not(this=exp.Null()))
+        )
+        self.assertTrue(concrete(negated, Environment({"x": None})))
+        self.assertFalse(concrete(negated, Environment({"x": 5})))
+
+    def test_negates_parsed_is_not_null_to_is_null(self):
+        negated = negate_predicate(_predicate("x IS NOT NULL"))
+        self.assertTrue(concrete(negated, Environment({"x": None})))
+        self.assertFalse(concrete(negated, Environment({"x": 5})))
 
     def test_negates_general_predicate(self):
         pred = _predicate("x > 5")
@@ -595,13 +625,13 @@ class TestRealisticExpressions(unittest.TestCase):
         self.assertEqual(concrete(_value("COALESCE(a, b, c, 99)"), env), 42)
 
     def test_variable_embedded_in_expression(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         v.bind(10)
         expr = exp.GT(this=v, expression=exp.Literal.number(5))
         self.assertTrue(concrete(expr))
 
     def test_unbound_variable_propagates_as_null(self):
-        v = Variable(this="x", type=INT)
+        v = _variable()
         expr = exp.GT(this=v, expression=exp.Literal.number(5))
         self.assertIsNone(concrete(expr))
 

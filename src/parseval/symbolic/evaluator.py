@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlglot import exp
 
 from parseval.helper import normalize_name
-from parseval.identity import ColumnId
+from parseval.identity import ColumnId, ColumnKind, column_id, identifier_name
 from parseval.plan import Plan, Step
 from parseval.plan.planner import (
     Aggregate,
@@ -31,7 +31,13 @@ from parseval.plan.planner import (
     SubPlan,
     SubPlanKind,
 )
-from parseval.plan.context import Context, DerivedSchema, Row, build_context_from_instance
+from parseval.plan.context import (
+    AggregateGroup,
+    Context,
+    DerivedSchema,
+    Row,
+    build_context_from_instance,
+)
 from parseval.plan.rex import Const, Environment, Variable, concrete, column_meta
 from parseval.instance import Instance
 
@@ -191,7 +197,7 @@ def _derived_variable(name: str, value: Any, row_ids: Tuple[Any, ...]) -> Variab
         concrete=value,
         is_bound=True,
         is_null=value is None,
-        column=normalized,
+        column_id=column_id(ColumnKind.DERIVED, identifier_name(normalized), None),
         rowid=row_ids,
         source="evaluator",
     )
@@ -490,9 +496,12 @@ class PlanEvaluator:
 
         return Context(
             tables={
-                name: DerivedSchema(columns=table.columns, rows=passing_rows, column_range=table.column_range)
+                name: table.with_rows(passing_rows, column_range=table.column_range)
                 if passing_rows and len(passing_rows[0]) == len(table.columns)
-                else DerivedSchema(columns=tuple(passing_rows[0].columns) if passing_rows else table.columns, rows=passing_rows)
+                else table.with_rows(
+                    passing_rows,
+                    columns=tuple(passing_rows[0].columns) if passing_rows else table.columns,
+                )
                 for name, table in ctx.tables.items()
             }
         )
@@ -694,24 +703,39 @@ class PlanEvaluator:
                     env = _env_from_row(row, table_name)
                     key = tuple(concrete(g, env) for g in step.group.values())
                     groups[key] = groups.get(key, 0) + 1
-                output_rows = self._grouped_aggregate_rows(step, list(table.rows), table_name)
+                output_rows, aggregate_groups = self._grouped_aggregate_rows(
+                    step,
+                    list(table.rows),
+                    table_name,
+                )
             else:
-                row_ids = tuple(row_id for row in table.rows for row_id in _row_ids(row))
-                columns = {
-                    alias: _derived_variable(
-                        alias,
-                        self._aggregate_expression_value(
-                            aggregate,
-                            list(table.rows),
-                            table_name,
-                            operands=getattr(step, "operands", ()) or (),
-                        ),
-                        row_ids,
+                source_row_ids = tuple(row.rowid for row in table.rows)
+                output_row_id = ("agg", step.name, "global")
+                aggregate_values: Dict[Any, Any] = {}
+                columns = {}
+                for aggregate in step.aggregations:
+                    alias = normalize_name(aggregate.alias_or_name)
+                    value = self._aggregate_expression_value(
+                        aggregate,
+                        list(table.rows),
+                        table_name,
+                        operands=getattr(step, "operands", ()) or (),
                     )
-                    for aggregate in step.aggregations
-                    for alias in (normalize_name(aggregate.alias_or_name),)
+                    aggregate_values[alias] = value
+                    columns[alias] = _derived_variable(
+                        alias,
+                        value,
+                        output_row_id,
+                    )
+                output_rows = [Row(this=output_row_id, columns=columns)]
+                aggregate_groups = {
+                    output_row_id: AggregateGroup(
+                        output_row_id=output_row_id,
+                        group_key=(),
+                        source_row_ids=source_row_ids,
+                        aggregate_values=aggregate_values,
+                    )
                 }
-                output_rows = [Row(this=row_ids, columns=columns)]
                 groups[((),)] = len(table.rows)
 
             if node is not None:
@@ -724,6 +748,7 @@ class PlanEvaluator:
                     step.name: DerivedSchema(
                         columns=tuple(output_rows[0].columns) if output_rows else self._aggregate_columns(step),
                         rows=output_rows,
+                        aggregate_groups=aggregate_groups,
                     )
                 }
             )
@@ -790,6 +815,8 @@ class PlanEvaluator:
                 if predicate_value is True:
                     passing_rows.append(row)
 
+        for table in ctx.tables.values():
+            return Context(tables={step.name: table.with_rows(passing_rows, columns=columns)})
         return Context(tables={step.name: DerivedSchema(columns=columns, rows=passing_rows)})
 
     def _eval_project(
@@ -900,7 +927,7 @@ class PlanEvaluator:
                     key=lambda row: self._sort_key_value(expr, row, table_name),
                     reverse=descending,
                 )
-            output[step.name] = DerivedSchema(columns=table.columns, rows=rows)
+            output[step.name] = table.with_rows(rows)
             break
         return Context(tables=output)
 
@@ -914,7 +941,7 @@ class PlanEvaluator:
             else:
                 limit_value = max(int(step.limit), 0)
                 rows = list(table.rows)[offset : offset + limit_value]
-            output[step.name] = DerivedSchema(columns=table.columns, rows=rows)
+            output[step.name] = table.with_rows(rows)
             break
         return Context(tables=output)
 
@@ -939,7 +966,23 @@ class PlanEvaluator:
                 rows = distinct_rows
 
             columns = tuple(rows[0].columns) if rows else visible_columns
-            output[step.name] = DerivedSchema(columns=columns, rows=rows)
+            output[step.name] = DerivedSchema(
+                columns=columns,
+                rows=rows,
+                datatypes=table.datatypes,
+                nullables=table.nullables,
+                uniqueness=table.uniqueness,
+                aggregate_groups={
+                    row.rowid: table.aggregate_groups[row.rowid]
+                    for row in rows
+                    if row.rowid in table.aggregate_groups
+                },
+                window_frames={
+                    row.rowid: table.window_frames[row.rowid]
+                    for row in rows
+                    if row.rowid in table.window_frames
+                },
+            )
             break
         return Context(tables=output)
 
@@ -1142,7 +1185,7 @@ class PlanEvaluator:
         rows: List[Row],
         table_name: str,
         outer_bindings: Optional[Dict[str, Any]] = None,
-    ) -> List[Row]:
+    ) -> Tuple[List[Row], Dict[Tuple[Any, ...], AggregateGroup]]:
         grouped: Dict[Tuple[Any, ...], List[Row]] = {}
         group_aliases = list(step.group)
         for row in rows:
@@ -1151,26 +1194,33 @@ class PlanEvaluator:
             grouped.setdefault(key, []).append(row)
 
         output_rows: List[Row] = []
-        for key, group_rows in grouped.items():
-            row_ids = tuple(row_id for row in group_rows for row_id in _row_ids(row))
+        aggregate_groups: Dict[Tuple[Any, ...], AggregateGroup] = {}
+        for group_index, (key, group_rows) in enumerate(grouped.items()):
+            output_row_id = ("agg", step.name, group_index)
+            source_row_ids = tuple(row.rowid for row in group_rows)
             columns: Dict[str, Any] = _retained_columns(group_rows[0], table_name)
             for alias, value in zip(group_aliases, key):
-                columns[alias] = _derived_variable(alias, value, row_ids)
+                columns[alias] = _derived_variable(alias, value, output_row_id)
+            aggregate_values: Dict[Any, Any] = {}
             for aggregate in step.aggregations:
                 alias = normalize_name(aggregate.alias_or_name)
-                columns[alias] = _derived_variable(
-                    alias,
-                    self._aggregate_expression_value(
-                        aggregate,
-                        group_rows,
-                        table_name,
-                        outer_bindings,
-                        getattr(step, "operands", ()) or (),
-                    ),
-                    row_ids,
+                value = self._aggregate_expression_value(
+                    aggregate,
+                    group_rows,
+                    table_name,
+                    outer_bindings,
+                    getattr(step, "operands", ()) or (),
                 )
-            output_rows.append(Row(this=row_ids, columns=columns))
-        return output_rows
+                aggregate_values[alias] = value
+                columns[alias] = _derived_variable(alias, value, output_row_id)
+            output_rows.append(Row(this=output_row_id, columns=columns))
+            aggregate_groups[output_row_id] = AggregateGroup(
+                output_row_id=output_row_id,
+                group_key=key,
+                source_row_ids=source_row_ids,
+                aggregate_values=aggregate_values,
+            )
+        return output_rows, aggregate_groups
 
     def _aggregate_columns(self, step: Aggregate) -> Tuple[str, ...]:
         return tuple(list(step.group) + [normalize_name(aggregate.alias_or_name) for aggregate in step.aggregations])

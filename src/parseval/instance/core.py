@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from functools import cached_property
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 import random
 
 from sqlglot import exp, parse
@@ -22,6 +22,7 @@ from parseval.identity import (
     CatalogColumn,
     ColumnId,
     ColumnKind,
+    RelationId,
     RelationKind,
     column_id,
     identifier_name,
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
     from parseval.domain import SchemaSpec
 
 
+_BOOTSTRAP_MISSING = object()
+
+
 class Catalog(MappingSchema):
     def __init__(
         self,
@@ -61,9 +65,18 @@ class Catalog(MappingSchema):
         self.primary_keys = {}
         self.foreign_keys = {}
         self.unique_constraints = {}
-        self._relation_ids: Dict[str, Any] = {}
-        self._column_ids: Dict[Tuple[str, str], Any] = {}
-        self._catalog_columns: Dict[Any, CatalogColumn] = {}
+        self._relation_ids: Dict[str, RelationId] = {}
+        self._column_ids: Dict[Tuple[str, str], ColumnId] = {}
+        self._relation_keys_by_id: Dict[RelationId, str] = {}
+        self._column_keys_by_id: Dict[ColumnId, Tuple[str, str]] = {}
+        self._catalog_columns: Dict[ColumnId, CatalogColumn] = {}
+        self._constraints_by_column_id: Dict[ColumnId, set] = {}
+        self._primary_key_ids_by_relation_id: Dict[RelationId, Tuple[ColumnId, ...]] = {}
+        self._unique_constraint_ids_by_relation_id: Dict[
+            RelationId,
+            Tuple[Tuple[ColumnId, ...], ...],
+        ] = {}
+        self._foreign_keys_by_relation_id: Dict[RelationId, Tuple[Any, ...]] = {}
         self._table_sources: Dict[str, exp.Table | str] = {}
         self._column_sources: Dict[Tuple[str, str], exp.Identifier | str] = {}
         self._ddl_columns: Dict[str, Dict[str, str]] = {}
@@ -200,20 +213,29 @@ class Catalog(MappingSchema):
             identifier_name(table, dialect=self.dialect),
         )
 
-    def _remember_table_identity(self, table: exp.Table | str) -> None:
-        key = self._identity_key(table, is_table=True)
+    def _remember_table_identity(
+        self,
+        table: exp.Table | str,
+        *,
+        table_key: str | None = None,
+    ) -> None:
+        key = table_key or self._identity_key(table, is_table=True)
         if key not in self._relation_ids:
             self._relation_ids[key] = self._relation_identity_from_source(table)
+        self._relation_keys_by_id[self._relation_ids[key]] = key
 
     def _remember_column_identity(
         self,
         table: exp.Table | str,
         column: exp.Identifier | str,
         datatype_sql: str,
+        *,
+        table_key: str | None = None,
+        column_key: str | None = None,
     ) -> None:
-        table_key = self._identity_key(table, is_table=True)
-        column_key = self._identity_key(column)
-        self._remember_table_identity(table)
+        table_key = table_key or self._identity_key(table, is_table=True)
+        column_key = column_key or self._identity_key(column)
+        self._remember_table_identity(table, table_key=table_key)
         rel_id = self._relation_ids[table_key]
         col_id = column_id(
             ColumnKind.PHYSICAL,
@@ -221,6 +243,7 @@ class Catalog(MappingSchema):
             rel_id,
         )
         self._column_ids[(table_key, column_key)] = col_id
+        self._column_keys_by_id[col_id] = (table_key, column_key)
         datatype = self._datatype_node_for(column_key, datatype_sql)
         raw_constraints = self.constraints.get(table_key, {}).get(column_key, set())
         inline_primary_key = any(
@@ -239,11 +262,17 @@ class Catalog(MappingSchema):
     def _rebuild_identity_indexes(self) -> None:
         self._relation_ids.clear()
         self._column_ids.clear()
+        self._relation_keys_by_id.clear()
+        self._column_keys_by_id.clear()
         self._catalog_columns.clear()
+        self._constraints_by_column_id.clear()
+        self._primary_key_ids_by_relation_id.clear()
+        self._unique_constraint_ids_by_relation_id.clear()
+        self._foreign_keys_by_relation_id.clear()
         table_columns = self._ddl_columns or self.tables
         for table_key, columns in table_columns.items():
             table_source = self._table_sources.get(table_key, table_key)
-            self._remember_table_identity(table_source)
+            self._remember_table_identity(table_source, table_key=table_key)
             for column_key, datatype_sql in columns.items():
                 column_source = self._column_sources.get(
                     (table_key, column_key),
@@ -253,20 +282,186 @@ class Catalog(MappingSchema):
                     table_source,
                     column_source,
                     datatype_sql,
+                    table_key=table_key,
+                    column_key=column_key,
+                )
+        self._rebuild_constraint_identity_indexes()
+        self._refresh_catalog_column_metadata()
+
+    def _rebuild_constraint_identity_indexes(self) -> None:
+        table_columns = self._ddl_columns or self.tables
+        for table_key, columns in table_columns.items():
+            table_source = self._table_sources.get(table_key, table_key)
+            rel_id = self.table_id(table_source)
+
+            pk_ids = tuple(
+                self._column_id_for_declared_key(table_key, table_source, column)
+                for column in self.primary_keys.get(table_key, ())
+            )
+            self._primary_key_ids_by_relation_id[rel_id] = pk_ids
+
+            unique_ids = []
+            for unique_columns in self.unique_constraints.get(table_key, ()):
+                unique_ids.append(
+                    tuple(
+                        self._column_id_for_declared_key(
+                            table_key,
+                            table_source,
+                            column,
+                        )
+                        for column in unique_columns
+                    )
+                )
+            self._unique_constraint_ids_by_relation_id[rel_id] = tuple(unique_ids)
+
+            for column_key, constraints in self.constraints.get(table_key, {}).items():
+                col_id = self.column_id(
+                    table_source,
+                    self._column_sources.get((table_key, column_key), column_key),
+                )
+                self._constraints_by_column_id.setdefault(col_id, set()).update(
+                    constraints
                 )
 
-    def table_id(self, table: exp.Table | str):
+        for table_key in table_columns:
+            table_source = self._table_sources.get(table_key, table_key)
+            rel_id = self.table_id(table_source)
+            fk_specs = []
+            for fk in self.foreign_keys.get(table_key, ()):
+                fk_spec = self._foreign_key_spec_for_node(table_key, table_source, fk)
+                if fk_spec is not None:
+                    fk_specs.append(fk_spec)
+            self._foreign_keys_by_relation_id[rel_id] = tuple(fk_specs)
+
+    def _refresh_catalog_column_metadata(self) -> None:
+        table_columns = self._ddl_columns or self.tables
+        for table_key, columns in table_columns.items():
+            table_source = self._table_sources.get(table_key, table_key)
+            rel_id = self.table_id(table_source)
+            pk_ids = set(self.get_primary_key_ids(rel_id))
+            for column_key, datatype_sql in columns.items():
+                column_source = self._column_sources.get(
+                    (table_key, column_key),
+                    column_key,
+                )
+                col_id = self.column_id(table_source, column_source)
+                datatype = self._datatype_node_for(column_key, datatype_sql)
+                self._catalog_columns[col_id] = CatalogColumn(
+                    id=col_id,
+                    datatype=datatype,
+                    nullable=self.nullable(rel_id, col_id) and col_id not in pk_ids,
+                    unique=self.is_unique(rel_id, col_id),
+                    primary_key=col_id in pk_ids,
+                )
+
+    def _foreign_key_spec_for_node(
+        self,
+        table_key: str,
+        table_source: exp.Table | str,
+        fk_node: exp.ForeignKey,
+    ):
+        from parseval.domain import ForeignKeySpec
+
+        reference = fk_node.args.get("reference")
+        if reference is None:
+            return None
+        target_table = reference.find(exp.Table)
+        if target_table is None:
+            return None
+        source_columns = tuple(
+            self._resolve_declared_column_key(table_key, identifier)
+            for identifier in fk_node.expressions
+        )
+        target_table_key = self._resolve_declared_table_key(target_table)
+        target_columns = tuple(
+            self._resolve_declared_column_key(target_table_key, identifier)
+            for identifier in reference.this.expressions
+        )
+        if not target_columns:
+            target_columns = self.resolve_fk_ref_columns(fk_node)
+        if len(source_columns) != len(target_columns):
+            raise ValueError(
+                "Foreign key column count does not match referenced columns: "
+                f"{table_key}({', '.join(source_columns)}) -> "
+                f"{target_table.name}({', '.join(target_columns)})"
+            )
+        target_table_source = self._table_sources.get(target_table_key, target_table)
+        return ForeignKeySpec(
+            source_table=table_key,
+            source_columns=source_columns,
+            target_table=target_table_key,
+            target_columns=target_columns,
+            source_table_id=self.table_id(table_source),
+            source_column_ids=tuple(
+                self.column_id(
+                    table_source,
+                    self._column_sources.get((table_key, column), column),
+                )
+                for column in source_columns
+            ),
+            target_table_id=self.table_id(target_table_source),
+            target_column_ids=tuple(
+                self.column_id(
+                    target_table_source,
+                    self._column_sources.get((target_table_key, column), column),
+                )
+                for column in target_columns
+            ),
+        )
+
+    def _resolve_relation_id(self, table: RelationId | exp.Table | str) -> RelationId:
+        return table if isinstance(table, RelationId) else self.table_id(table)
+
+    def _column_id_for_declared_key(
+        self,
+        table_key: str,
+        table_source: exp.Table | str,
+        column: exp.Identifier | str,
+    ) -> ColumnId:
+        column_key = self._resolve_declared_column_key(table_key, column)
+        return self.column_id(
+            table_source,
+            self._column_sources.get((table_key, column_key), column_key),
+        )
+
+    def table_id(self, table: RelationId | exp.Table | str):
+        if isinstance(table, RelationId):
+            return table
         key = self._identity_key(table, is_table=True)
+        if key not in self._relation_ids:
+            key = self._resolve_declared_table_key(table)
         return self._relation_ids[key]
 
     def column_id(
         self,
-        table: exp.Table | str,
+        table: RelationId | exp.Table | str,
         column: exp.Column | exp.Identifier | str,
     ):
-        table_key = self._identity_key(table, is_table=True)
+        table_key = (
+            self._relation_keys_by_id[table]
+            if isinstance(table, RelationId)
+            else self._resolve_declared_table_key(table)
+        )
         column_key = self._identity_key(column)
         return self._column_ids[(table_key, column_key)]
+
+    def _column_id_for_metadata_lookup(
+        self,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
+    ) -> ColumnId:
+        if isinstance(column, ColumnId):
+            return column
+        try:
+            return self.column_id(table, column)
+        except KeyError:
+            table_key = (
+                self._relation_keys_by_id[table]
+                if isinstance(table, RelationId)
+                else self._identity_key(table, is_table=True)
+            )
+            column_key = self._resolve_declared_column_key(table_key, column)
+            return self._column_ids[(table_key, column_key)]
 
     def catalog_column(
         self,
@@ -291,6 +486,15 @@ class Catalog(MappingSchema):
     def get_primary_key(self, table: exp.Table | str):
         table = self._identity_key(table, is_table=True)
         return tuple(self.primary_keys.get(table, ()))
+
+    def get_primary_key_ids(
+        self,
+        table: RelationId | exp.Table | str,
+    ) -> Tuple[ColumnId, ...]:
+        return self._primary_key_ids_by_relation_id.get(
+            self._resolve_relation_id(table),
+            (),
+        )
 
     def _primary_key_names(self, table: exp.Table | str) -> Tuple[str, ...]:
         return tuple(
@@ -354,6 +558,9 @@ class Catalog(MappingSchema):
         table = self._identity_key(table, is_table=True)
         return self.foreign_keys.get(table, [])
 
+    def get_foreign_keys_by_relation_id(self, relation: RelationId):
+        return self._foreign_keys_by_relation_id.get(relation, ())
+
     def add_unique_constraint(
         self,
         table: exp.Table | str,
@@ -374,6 +581,15 @@ class Catalog(MappingSchema):
         table = self._identity_key(table, is_table=True)
         return tuple(self.unique_constraints.get(table, ()))
 
+    def get_unique_constraint_ids(
+        self,
+        table: RelationId | exp.Table | str,
+    ) -> Tuple[Tuple[ColumnId, ...], ...]:
+        return self._unique_constraint_ids_by_relation_id.get(
+            self._resolve_relation_id(table),
+            (),
+        )
+
     def add_constraint(
         self,
         table: exp.Table | str,
@@ -389,19 +605,34 @@ class Catalog(MappingSchema):
 
     def get_column_constraints(
         self,
-        table: exp.Table | str,
-        column: exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
     ):
+        if isinstance(column, ColumnId):
+            return self.get_column_constraints_by_id(column)
+        if self._constraints_by_column_id:
+            return self.get_column_constraints_by_id(
+                self._column_id_for_metadata_lookup(table, column)
+            )
         table = self._identity_key(table, is_table=True)
         column = self._identity_key(column)
         table_constraints = self.constraints.get(table, {})
         return table_constraints.get(column, set())
 
+    def get_column_constraints_by_id(self, column: ColumnId):
+        return self._constraints_by_column_id.get(column, set())
+
     def get_check_constraints(self, table: exp.Table | str) -> List[exp.Expression]:
         """Return parsed CHECK constraint expressions for a table."""
-        table = self._identity_key(table, is_table=True)
         results = []
-        for col_constraints in self.constraints.get(table, {}).values():
+        relation = self.table_id(table)
+        columns = [
+            column
+            for column in self._catalog_columns
+            if column.relation == relation
+        ]
+        for column_id in columns:
+            col_constraints = self.get_column_constraints_by_id(column_id)
             for c in col_constraints:
                 if isinstance(c.kind, exp.CheckColumnConstraint):
                     results.append(c.kind.this)
@@ -409,14 +640,17 @@ class Catalog(MappingSchema):
 
     def nullable(
         self,
-        table: exp.Table | str,
-        column: exp.Column | str,
-        normalize: Optional[bool] = None,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | str,
     ):
-        del normalize
         for constraint in self.get_column_constraints(table, column):
             if isinstance(constraint.kind, exp.NotNullColumnConstraint):
                 return constraint.kind.args.get("allow_null", False)
+        if isinstance(column, ColumnId):
+            return column not in self.get_primary_key_ids(column.relation)
+        if self._primary_key_ids_by_relation_id:
+            col_id = self._column_id_for_metadata_lookup(table, column)
+            return col_id not in self.get_primary_key_ids(col_id.relation)
         column_name = self._identity_key(column)
         if column_name in self._primary_key_names(table):
             return False
@@ -424,18 +658,29 @@ class Catalog(MappingSchema):
 
     def is_unique(
         self,
-        table: exp.Table | str,
-        column: exp.Column | str,
-        normalize: Optional[bool] = None,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | str,
     ):
-        del normalize
-        pk_columns = self._primary_key_names(table)
         for constraint in self.get_column_constraints(table, column):
             if isinstance(
                 constraint.kind,
                 (exp.UniqueColumnConstraint, exp.PrimaryKeyColumnConstraint),
             ):
                 return True
+        if isinstance(column, ColumnId):
+            pk_columns = self.get_primary_key_ids(column.relation)
+            unique_constraints = self.get_unique_constraint_ids(column.relation)
+            return (
+                (len(pk_columns) == 1 and column in pk_columns)
+                or any(
+                    len(unique_columns) == 1 and unique_columns[0] == column
+                    for unique_columns in unique_constraints
+                )
+            )
+        if self._unique_constraint_ids_by_relation_id:
+            col_id = self._column_id_for_metadata_lookup(table, column)
+            return self.is_unique(col_id.relation, col_id)
+        pk_columns = self._primary_key_names(table)
         column_name = self._identity_key(column)
         for unique_columns in self.get_unique_constraints(table):
             if len(unique_columns) == 1 and unique_columns[0] == column_name:
@@ -604,82 +849,28 @@ class Catalog(MappingSchema):
         table_columns = self._ddl_columns or self.tables
         for table_name, column_types in table_columns.items():
             table_source = self._table_sources.get(table_name, table_name)
+            table_id = self.table_id(table_source)
+            pk_column_ids = self.get_primary_key_ids(table_id)
+            unique_constraint_ids = self.get_unique_constraint_ids(table_id)
             pk_columns = list(self._primary_key_names(table_source))
             for column_name in column_types:
                 column_source = self._column_sources.get(
                     (table_name, column_name),
                     column_name,
                 )
-                raw_constraints = self.get_column_constraints(
-                    table_source,
-                    column_source,
-                )
+                column_id = self.column_id(table_source, column_source)
+                raw_constraints = self.get_column_constraints_by_id(column_id)
                 if any(
                     isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint)
                     for constraint in raw_constraints
                 ) and column_name not in pk_columns:
                     pk_columns.append(column_name)
             unique_constraints = tuple(self.get_unique_constraints(table_source))
-            fk_nodes = self.get_foreign_key(table_source)
-            fk_specs: List[ForeignKeySpec] = []
-            single_column_fk_map: Dict[str, ForeignKeySpec] = {}
-            for fk_node in fk_nodes:
-                reference = fk_node.args.get("reference")
-                if reference is None:
-                    continue
-                target_table = reference.find(exp.Table)
-                if target_table is None:
-                    continue
-                source_columns = tuple(
-                    self._resolve_declared_column_key(table_name, identifier)
-                    for identifier in fk_node.expressions
-                )
-                target_table_key = self._resolve_declared_table_key(target_table)
-                target_columns = tuple(
-                    self._resolve_declared_column_key(target_table_key, identifier)
-                    for identifier in reference.this.expressions
-                )
-                # If target columns not specified, infer from parent PK.
-                if not target_columns:
-                    target_columns = self.resolve_fk_ref_columns(fk_node)
-                if len(source_columns) != len(target_columns):
-                    raise ValueError(
-                        "Foreign key column count does not match referenced columns: "
-                        f"{table_name}({', '.join(source_columns)}) -> "
-                        f"{target_table.name}({', '.join(target_columns)})"
-                    )
-                source_column_ids = tuple(
-                    self.column_id(
-                        table_source,
-                        self._column_sources.get((table_name, col), col),
-                    )
-                    for col in source_columns
-                )
-                target_table_source = self._table_sources.get(
-                    target_table_key,
-                    target_table,
-                )
-                target_table_id = self.table_id(target_table_source)
-                target_column_ids = tuple(
-                    self.column_id(
-                        target_table_source,
-                        self._column_sources.get((target_table_key, col), col),
-                    )
-                    for col in target_columns
-                )
-                fk_spec = ForeignKeySpec(
-                    source_table=table_name,
-                    source_columns=source_columns,
-                    target_table=target_table_key,
-                    target_columns=target_columns,
-                    source_table_id=self.table_id(table_source),
-                    source_column_ids=source_column_ids,
-                    target_table_id=target_table_id,
-                    target_column_ids=target_column_ids,
-                )
-                fk_specs.append(fk_spec)
-                if len(source_columns) == 1:
-                    single_column_fk_map[source_columns[0]] = fk_spec
+            fk_specs = list(self.get_foreign_keys_by_relation_id(table_id))
+            single_column_fk_map: Dict[ColumnId, ForeignKeySpec] = {}
+            for fk_spec in fk_specs:
+                if len(fk_spec.source_column_ids) == 1:
+                    single_column_fk_map[fk_spec.source_column_ids[0]] = fk_spec
 
             column_specs: List[ColumnSpec] = []
             for column_name, type_sql in column_types.items():
@@ -687,10 +878,8 @@ class Catalog(MappingSchema):
                     (table_name, column_name),
                     column_name,
                 )
-                raw_constraints = self.get_column_constraints(
-                    table_source,
-                    column_source,
-                )
+                column_id = self.column_id(table_source, column_source)
+                raw_constraints = self.get_column_constraints_by_id(column_id)
                 column_pk = any(
                     isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint)
                     for constraint in raw_constraints
@@ -700,14 +889,14 @@ class Catalog(MappingSchema):
                     for constraint in raw_constraints
                 )
                 single_column_unique = any(
-                    len(columns) == 1 and columns[0] == column_name
-                    for columns in unique_constraints
+                    len(columns) == 1 and columns[0] == column_id
+                    for columns in unique_constraint_ids
                 )
                 nullable = not any(
                     isinstance(constraint.kind, exp.NotNullColumnConstraint)
                     for constraint in raw_constraints
                 )
-                is_pk = column_pk or column_name in pk_columns
+                is_pk = column_pk or column_id in pk_column_ids
                 datatype_node = self._datatype_node_for(column_name, type_sql)
                 column_specs.append(
                     ColumnSpec(
@@ -717,15 +906,15 @@ class Catalog(MappingSchema):
                         nullable=nullable and not is_pk,
                         unique=column_unique or single_column_unique,
                         primary_key=is_pk,
-                        foreign_key=single_column_fk_map.get(column_name),
+                        foreign_key=single_column_fk_map.get(column_id),
                         default=None,
                         native_type=type_sql,
                         dialect=self.dialect,
                         length=getattr(datatype_node, "length", None),
                         precision=getattr(datatype_node, "precision", None),
                         scale=getattr(datatype_node, "scale", None),
-                        id=self.column_id(table_source, column_source),
-                        table_id=self.table_id(table_source),
+                        id=column_id,
+                        table_id=table_id,
                     )
                 )
 
@@ -736,24 +925,9 @@ class Catalog(MappingSchema):
                     primary_key=tuple(pk_columns),
                     unique_constraints=tuple(unique_constraints),
                     foreign_keys=tuple(fk_specs),
-                    id=self.table_id(table_source),
-                    primary_key_ids=tuple(
-                        self.column_id(
-                            table_source,
-                            self._column_sources.get((table_name, column), column),
-                        )
-                        for column in pk_columns
-                    ),
-                    unique_constraint_ids=tuple(
-                        tuple(
-                            self.column_id(
-                                table_source,
-                                self._column_sources.get((table_name, column), column),
-                            )
-                            for column in columns
-                        )
-                        for columns in unique_constraints
-                    ),
+                    id=table_id,
+                    primary_key_ids=pk_column_ids,
+                    unique_constraint_ids=unique_constraint_ids,
                 )
             )
 
@@ -776,7 +950,9 @@ class Instance(Catalog):
         self.data: Dict[str, List[Row]] = defaultdict(list)
         self.symbols: SymbolIndex = SymbolIndex()
         self.name_seq = name_sequence(self.name)
-        self._bootstrapping: set[str] = set()
+        self._bootstrapping: set[RelationId] = set()
+        self._bootstrapping_values: Dict[RelationId, Dict[ColumnId, Any]] = {}
+        self._bootstrapping_locked_columns: Dict[RelationId, set[ColumnId]] = {}
 
         # Parse the DDL exactly once, into the sqlglot-native catalog state
         # this Instance inherits. ``schema_spec`` is a lazy domain-module
@@ -800,21 +976,24 @@ class Instance(Catalog):
     def __repr__(self):
         return f"Instance(name={self.name}, tables={list(self.tables.keys())})"
 
-    def add_row(self, table_name: str, row: Row):
-        table_name = self._normalize_table(table_name, dialect=self.dialect)
-        self.data[table_name].append(row)
+    def add_row(self, table: RelationId | exp.Table | str, row: Row):
+        table_key = self._table_key_for_storage(table)
+        self.data[table_key].append(row)
 
-    def get_rows(self, table_name) -> List[Row]:
-        table_name = self._normalize_table(table_name, dialect=self.dialect)
-        return self.data[table_name]
+    def get_rows(self, table: RelationId | exp.Table | str) -> List[Row]:
+        table_key = self._table_key_for_storage(table)
+        return self.data[table_key]
 
-    def get_row(self, table_name, index):
-        return self.get_rows(table_name)[index]
+    def get_row(self, table: RelationId | exp.Table | str, index):
+        return self.get_rows(table)[index]
 
-    def get_column_data(self, table_name, column_name) -> List[Symbol]:
-        table_name = self._normalize_table(table_name, dialect=self.dialect)
-        col_id = self._stored_column_id(table_name, column_name)
-        return [row[col_id] for row in self.get_rows(table_name)]
+    def get_column_data(
+        self,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
+    ) -> List[Symbol]:
+        col_id = self._stored_column_id(table, column)
+        return [row[col_id] for row in self.get_rows(table)]
 
     @staticmethod
     def _row_value_dict(row: Row) -> dict[str, Any]:
@@ -824,78 +1003,126 @@ class Instance(Catalog):
             values[key] = symbol.concrete
         return values
 
-    def _table_key_for_storage(self, table_name: str) -> str:
-        return self._resolve_declared_table_key(table_name)
+    def _table_key_for_storage(self, table: RelationId | exp.Table | str) -> str:
+        if isinstance(table, RelationId):
+            return self._relation_keys_by_id[table]
+        return self._resolve_declared_table_key(table)
 
-    def _table_columns_for_storage(self, table_name: str):
-        table_key = self._table_key_for_storage(table_name)
-        return (self._ddl_columns or self.tables).get(table_key, self.tables[table_name])
+    def _table_source_for_storage(self, table: RelationId | exp.Table | str):
+        table_key = self._table_key_for_storage(table)
+        return self._table_sources.get(table_key, table_key)
 
-    def _column_source_for_storage(self, table_name: str, column_name: str):
-        table_key = self._table_key_for_storage(table_name)
-        column_key = self._resolve_declared_column_key(table_key, column_name)
+    def _table_columns_for_storage(self, table: RelationId | exp.Table | str):
+        table_key = self._table_key_for_storage(table)
+        return (self._ddl_columns or self.tables)[table_key]
+
+    def _column_key_for_storage(
+        self,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
+    ) -> str:
+        table_key = self._table_key_for_storage(table)
+        if isinstance(column, ColumnId):
+            column_table_key, column_key = self._column_keys_by_id[column]
+            if column_table_key != table_key:
+                raise KeyError(f"Column {column.display} does not belong to {table_key}")
+            return column_key
+        return self._resolve_declared_column_key(table_key, column)
+
+    def _column_source_for_storage(
+        self,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
+    ):
+        table_key = self._table_key_for_storage(table)
+        column_key = self._column_key_for_storage(table, column)
         return self._column_sources.get((table_key, column_key), column_key)
 
-    def _stored_column_id(self, table_name: str, column_name: str):
-        table_key = self._table_key_for_storage(table_name)
+    def _stored_column_id(
+        self,
+        table: RelationId | exp.Table | str,
+        column: ColumnId | exp.Column | exp.Identifier | str,
+    ):
+        if isinstance(column, ColumnId):
+            self._column_key_for_storage(table, column)
+            return column
+        table_key = self._table_key_for_storage(table)
         table_source = self._table_sources.get(table_key, table_key)
-        column_source = self._column_source_for_storage(table_name, column_name)
+        column_source = self._column_source_for_storage(table, column)
         return self.column_id(table_source, column_source)
 
+    def _resolve_relation_for_storage(
+        self,
+        table: RelationId | exp.Table | str,
+    ) -> RelationId:
+        return table if isinstance(table, RelationId) else self.table_id(table)
+
+    def _normalize_row_values_by_id(
+        self,
+        table: RelationId,
+        values: Mapping[ColumnId | exp.Column | exp.Identifier | str, Any],
+    ) -> Dict[ColumnId, Any]:
+        return {
+            self._stored_column_id(table, column): value
+            for column, value in values.items()
+        }
+
+    def _builder_values(self, values: Mapping[ColumnId, Any]) -> Dict[str, Any]:
+        return {
+            self._column_keys_by_id[column][1]: value
+            for column, value in values.items()
+        }
+
     def create_rows(
-        self, concretes: Dict[str, Dict[str, List[Any]]], sync_db: bool = False
-    ) -> Dict[str, List[RowCreationResult]]:
-        del sync_db
-        created = {}
-        normalized_concretes = {}
-        for table_name, table_data in concretes.items():
-            if not table_name:
+        self,
+        concretes: Mapping[
+            RelationId | exp.Table | str,
+            Mapping[ColumnId | exp.Column | exp.Identifier | str, Sequence[Any]],
+        ],
+    ) -> Dict[RelationId, List[RowCreationResult]]:
+        created: Dict[RelationId, List[RowCreationResult]] = {}
+        normalized_concretes: Dict[RelationId, Dict[ColumnId, Sequence[Any]]] = {}
+        for table, table_data in concretes.items():
+            if not table:
                 continue
-            normalized_table = self._normalize_table(table_name, dialect=self.dialect)
-            for column_name, values in table_data.items():
-                normalized_column = self._normalize_name(column_name, dialect=self.dialect)
-                normalized_concretes.setdefault(normalized_table, {})[
-                    normalized_column
-                ] = values
-        for normalized_table in self._creation_order(normalized_concretes):
-            table_data = normalized_concretes[normalized_table]
+            relation = self._resolve_relation_for_storage(table)
+            normalized_concretes.setdefault(relation, {})
+            for column, values in table_data.items():
+                column_id = self._stored_column_id(relation, column)
+                normalized_concretes.setdefault(relation, {})[column_id] = values
+        for relation in self._creation_order(normalized_concretes):
+            table_data = normalized_concretes[relation]
             num_rows = max(len(v) for v in table_data.values()) if table_data else 1
-            created[normalized_table] = []
+            created[relation] = []
             for index in range(num_rows):
                 row_values = {
                     column: values[index]
                     for column, values in table_data.items()
                     if index < len(values)
                 }
-                created[normalized_table].append(
-                    self.create_row(table_name=normalized_table, values=row_values)
-                )
+                created[relation].append(self.create_row(relation, values=row_values))
         return created
 
-    def _creation_order(self, concretes: Dict[str, Dict[str, List[Any]]]) -> List[str]:
+    def _creation_order(
+        self,
+        concretes: Mapping[RelationId, Mapping[ColumnId, Sequence[Any]]],
+    ) -> List[RelationId]:
         requested = list(concretes.keys())
         requested_set = set(requested)
-        visited: Set[str] = set()
-        ordered: List[str] = []
+        visited: Set[RelationId] = set()
+        ordered: List[RelationId] = []
 
-        def visit(table_name: str) -> None:
-            if table_name in visited:
+        def visit(relation: RelationId) -> None:
+            if relation in visited:
                 return
-            visited.add(table_name)
-            for fk in self.get_foreign_key(table_name):
-                reference = fk.args.get("reference")
-                if reference is None:
-                    continue
-                ref_table_expr = reference.find(exp.Table)
-                if ref_table_expr is None:
-                    continue
-                ref_table = self._normalize_table(ref_table_expr.name, dialect=self.dialect)
-                if ref_table in requested_set:
-                    visit(ref_table)
-            ordered.append(table_name)
+            visited.add(relation)
+            for fk in self.get_foreign_keys_by_relation_id(relation):
+                if fk.target_table_id in requested_set:
+                    visit(fk.target_table_id)
+            ordered.append(relation)
 
-        for table_name in requested:
-            visit(table_name)
+        for relation in requested:
+            visit(relation)
         return ordered
 
     # ------------------------------------------------------------------
@@ -904,8 +1131,8 @@ class Instance(Catalog):
 
     def place_row(
         self,
-        table_name: str,
-        values: Dict[str, Any],
+        table: RelationId | exp.Table | str,
+        values: Mapping[ColumnId | exp.Column | exp.Identifier | str, Any],
     ) -> Row:
         """Append a row with explicit values. No FK/unique validation.
 
@@ -917,32 +1144,22 @@ class Instance(Catalog):
         ``values`` must contain an entry for every column in the table.
         Missing columns are filled with ``None`` (SQL NULL).
         """
-        table_name = self._normalize_name(table_name, dialect=self.dialect, is_table=True)
-        if table_name not in self.tables:
-            raise KeyError(f"Unknown table: {table_name}")
-        tuple_index = len(self.get_rows(table_name))
-        rowid = f"{table_name}_rowid_{tuple_index}"
-        normalized_values = {
-            self._normalize_name(k, dialect=self.dialect): v for k, v in values.items()
-        }
-        table_columns = self._table_columns_for_storage(table_name)
+        relation = self._resolve_relation_for_storage(table)
+        table_key = self._table_key_for_storage(relation)
+        tuple_index = len(self.get_rows(relation))
+        rowid = f"{table_key}_rowid_{tuple_index}"
+        values_by_id = self._normalize_row_values_by_id(relation, values)
+        table_columns = self._table_columns_for_storage(relation)
         row_cells: Dict[Any, Variable] = {}
-        table_key = self._table_key_for_storage(table_name)
-        table_source = self._table_sources.get(table_key, table_key)
-        relation_id = self.table_id(table_source)
         for column, datatype in table_columns.items():
-            col_id = self._stored_column_id(table_name, column)
-            z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
-            concrete = normalized_values.get(
-                self._normalize_name(column, dialect=self.dialect)
-            )
+            col_id = self._stored_column_id(relation, column)
+            z_name = f"{table_key}_{column}_{datatype}_{tuple_index}"
+            concrete = values_by_id.get(col_id)
             z_value = Variable(
                 this=z_name,
                 _type=datatype,
                 concrete=concrete,
-                table=table_name,
-                column=column,
-                relation_id=relation_id,
+                relation_id=relation,
                 column_id=col_id,
                 rowid=rowid,
             )
@@ -950,7 +1167,7 @@ class Instance(Catalog):
             row_cells[col_id] = z_value
             self.symbols.register(z_value)
         row = Row(this=rowid, columns=row_cells)
-        self.add_row(table_name, row)
+        self.add_row(relation, row)
         return row
 
     # ------------------------------------------------------------------
@@ -959,42 +1176,42 @@ class Instance(Catalog):
 
     def create_row(
         self,
-        table_name: str,
-        values: Dict[str, Any] | None = None,
-        sync_db: bool = False,
+        table: RelationId | exp.Table | str,
+        values: Mapping[ColumnId | exp.Column | exp.Identifier | str, Any] | None = None,
     ) -> RowCreationResult:
-        del sync_db
-        table_name = self._normalize_name(table_name, dialect=self.dialect)
-        values = values or {}
-        provided_columns = {
-            self._normalize_name(column, dialect=self.dialect) for column in values
-        }
-        new_tuples = defaultdict(list)
-        positions: Dict[str, int] = {}
-        self._bootstrapping.add(table_name)
+        relation = self._resolve_relation_for_storage(table)
+        values_by_id = self._normalize_row_values_by_id(relation, values or {})
+        provided_columns = set(values_by_id)
+        new_tuples: Dict[RelationId, List[Row]] = defaultdict(list)
+        positions: Dict[RelationId, int] = {}
+        previous_bootstrap_values = self._bootstrapping_values.get(relation)
+        previous_locked_columns = self._bootstrapping_locked_columns.get(relation)
+        self._bootstrapping.add(relation)
+        self._bootstrapping_values[relation] = values_by_id
+        self._bootstrapping_locked_columns[relation] = provided_columns
         try:
             self._merge_created_rows(
                 new_tuples,
                 self._bootstrap_reference_rows(
-                    table_name,
-                    values,
+                    relation,
+                    values_by_id,
                     locked_columns=provided_columns,
                 ),
             )
             self._merge_created_rows(
                 new_tuples,
                 self._resolve_composite_reference_conflicts(
-                    table_name,
-                    values,
+                    relation,
+                    values_by_id,
                     locked_columns=provided_columns,
                 ),
             )
             try:
-                main_pos = self._create_row(table_name, values)
+                main_pos = self._create_row(relation, values_by_id)
             except UniqueConflictError:
                 created = self._bootstrap_reference_rows(
-                    table_name,
-                    values,
+                    relation,
+                    values_by_id,
                     prefer_new_for_unique=True,
                     locked_columns=provided_columns,
                 )
@@ -1004,16 +1221,24 @@ class Instance(Catalog):
                 self._merge_created_rows(
                     new_tuples,
                     self._resolve_composite_reference_conflicts(
-                        table_name,
-                        values,
+                        relation,
+                        values_by_id,
                         locked_columns=provided_columns,
                     ),
                 )
-                main_pos = self._create_row(table_name, values)
+                main_pos = self._create_row(relation, values_by_id)
         finally:
-            self._bootstrapping.discard(table_name)
-        new_tuples[table_name].append(self.get_row(table_name, main_pos))
-        positions[table_name] = main_pos
+            self._bootstrapping.discard(relation)
+            if previous_bootstrap_values is None:
+                self._bootstrapping_values.pop(relation, None)
+            else:
+                self._bootstrapping_values[relation] = previous_bootstrap_values
+            if previous_locked_columns is None:
+                self._bootstrapping_locked_columns.pop(relation, None)
+            else:
+                self._bootstrapping_locked_columns[relation] = previous_locked_columns
+        new_tuples[relation].append(self.get_row(relation, main_pos))
+        positions[relation] = main_pos
         return RowCreationResult(
             created={table: tuple(rows) for table, rows in new_tuples.items()},
             positions=positions,
@@ -1021,44 +1246,42 @@ class Instance(Catalog):
 
     def _create_row(
         self,
-        table_name: str,
-        concretes: Dict[str, Any],
+        relation: RelationId,
+        concretes: Dict[ColumnId, Any],
     ):
-        table_name = self._normalize_name(table_name, dialect=self.dialect, is_table=True)
-        if table_name not in self.tables:
+        table_key = self._table_key_for_storage(relation)
+        if table_key not in (self._ddl_columns or self.tables):
             return None
-        tuple_index = len(self.get_rows(table_name))
-        concretes = {self._normalize_name(k): v for k, v in concretes.items()}
+        tuple_index = len(self.get_rows(relation))
 
-        existing_index = self._find_existing_row(table_name, concretes)
+        existing_index = self._find_existing_row(relation, concretes)
         if existing_index is not None:
             return existing_index
-        conflict_index = self._find_conflicting_unique_row(table_name, concretes)
+        conflict_index = self._find_conflicting_unique_row(relation, concretes)
         if conflict_index is not None:
             return conflict_index
+        if self._has_bootstrapping_foreign_key(relation):
+            return self._create_row_circular_fk(relation, concretes, tuple_index)
 
         for _ in range(10):
             try:
                 completed = self.builder.complete_row(
-                    table_name,
-                    preset_values=concretes,
+                    table_key,
+                    preset_values=self._builder_values(concretes),
                     persist=False,
                 )
             except UniqueConflictError:
                 raise
             except Exception:
-                if table_name in self._bootstrapping:
-                    return self._create_row_circular_fk(table_name, concretes, tuple_index)
+                if relation in self._bootstrapping:
+                    return self._create_row_circular_fk(relation, concretes, tuple_index)
                 raise
             new_values = {}
-            rowid = f"{table_name}_rowid_{tuple_index}"
-            table_key = self._table_key_for_storage(table_name)
-            table_source = self._table_sources.get(table_key, table_key)
-            relation_id = self.table_id(table_source)
-            table_columns = self._table_columns_for_storage(table_name)
+            rowid = f"{table_key}_rowid_{tuple_index}"
+            table_columns = self._table_columns_for_storage(relation)
             for column, datatype in table_columns.items():
-                col_id = self._stored_column_id(table_name, column)
-                z_name = f"{table_name}_{column}_{datatype}_{tuple_index}"
+                col_id = self._stored_column_id(relation, column)
+                z_name = f"{table_key}_{column}_{datatype}_{tuple_index}"
                 concrete = completed.get(
                     column,
                     completed.get(self._normalize_name(column, dialect=self.dialect)),
@@ -1067,32 +1290,29 @@ class Instance(Catalog):
                     this=z_name,
                     _type=datatype,
                     concrete=concrete,
-                    table=table_name,
-                    column=column,
-                    relation_id=relation_id,
+                    relation_id=relation,
                     column_id=col_id,
                     rowid=rowid,
                 )
                 z_value.type = datatype
                 new_values[col_id] = z_value
                 self.symbols.register(z_value)
-            if self._row_violates_unique_constraints(table_name, new_values):
+            if self._row_violates_unique_constraints(relation, new_values):
                 continue
-            self.add_row(table_name, Row(this=rowid, columns=new_values))
+            self.add_row(relation, Row(this=rowid, columns=new_values))
             self.builder.runtime.remember_row(
-                table_name,
-                {
-                    column.name.normalized: value.concrete
-                    for column, value in new_values.items()
-                },
+                table_key,
+                self._builder_values(
+                    {column: value.concrete for column, value in new_values.items()}
+                ),
             )
             return tuple_index
-        raise_exception(f"Failed to create row for table {table_name} after 10 attempts")
+        raise_exception(f"Failed to create row for table {table_key} after 10 attempts")
 
     def _create_row_circular_fk(
         self,
-        table_name: str,
-        concretes: Dict[str, Any],
+        relation: RelationId,
+        concretes: Dict[ColumnId, Any],
         tuple_index: int,
     ) -> int:
         """Create a row bypassing FK validation for circular dependencies.
@@ -1100,38 +1320,118 @@ class Instance(Catalog):
         Uses place_row with preset values and defaults for FK columns that
         reference tables currently being bootstrapped.
         """
-        row_values: Dict[str, Any] = {}
-        fk_cols: list[str] = []
-        for column, datatype in self.tables[table_name].items():
-            if column in concretes:
-                row_values[column] = concretes[column]
+        row_values: Dict[ColumnId, Any] = {}
+        table_columns = self._table_columns_for_storage(relation)
+        for column, datatype in table_columns.items():
+            col_id = self._stored_column_id(relation, column)
+            if col_id in concretes:
+                row_values[col_id] = concretes[col_id]
             else:
-                row_values[column] = self._default_for_type(datatype)
+                row_values[col_id] = self._default_for_type(datatype)
 
-        for fk in self.get_foreign_key(table_name):
-            local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
-            ref = fk.args.get("reference")
-            if ref is None:
+        for fk in self.get_foreign_keys_by_relation_id(relation):
+            if fk.target_table_id not in self._bootstrapping:
                 continue
-            ref_table_node = ref.find(exp.Table)
-            if ref_table_node is None:
+            nullable_unset = [
+                column
+                for column in fk.source_column_ids
+                if self.nullable(relation, column) and column not in concretes
+            ]
+            if nullable_unset:
+                for column in nullable_unset:
+                    row_values[column] = None
                 continue
-            ref_table_str = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
-            if ref_table_str in self._bootstrapping:
-                if self.nullable(table_name, local_col):
-                    row_values[local_col] = None
-                else:
-                    row_values[local_col] = self._default_for_type(
-                        self.tables[table_name].get(local_col, "TEXT")
-                    )
-                fk_cols.append(local_col)
+            if any(row_values.get(column) is None for column in fk.source_column_ids):
+                continue
+            for local_col, target_col in zip(
+                fk.source_column_ids,
+                fk.target_column_ids,
+            ):
+                preferred = (
+                    row_values[local_col]
+                    if local_col in concretes and row_values[local_col] is not None
+                    else _BOOTSTRAP_MISSING
+                )
+                target_value = self._ensure_bootstrapping_value(
+                    fk.target_table_id,
+                    target_col,
+                    preferred=preferred,
+                )
+                row_values[local_col] = target_value
+                if fk.target_table_id == relation:
+                    row_values[target_col] = target_value
 
-        row = self.place_row(table_name, row_values)
+        row = self.place_row(relation, row_values)
         self.builder.runtime.remember_row(
-            table_name,
+            self._table_key_for_storage(relation),
             self._row_value_dict(row),
         )
         return tuple_index
+
+    def _ensure_bootstrapping_value(
+        self,
+        relation: RelationId,
+        column: ColumnId,
+        *,
+        preferred: Any = _BOOTSTRAP_MISSING,
+    ) -> Any:
+        active_values = self._bootstrapping_values.get(relation)
+        if active_values is None:
+            return (
+                preferred
+                if preferred is not _BOOTSTRAP_MISSING
+                else self._fresh_default_for_column(relation, column)
+            )
+        current = active_values.get(column, _BOOTSTRAP_MISSING)
+        if current is not _BOOTSTRAP_MISSING and current is not None:
+            if (
+                preferred is not _BOOTSTRAP_MISSING
+                and preferred is not None
+                and current != preferred
+            ):
+                raise ForeignKeyResolutionError(
+                    f"Circular foreign key requires {column.display}={preferred!r}, "
+                    f"but the bootstrapped row already has {current!r}"
+                )
+            return current
+        if column in self._bootstrapping_locked_columns.get(relation, set()):
+            raise ForeignKeyResolutionError(
+                f"Circular foreign key cannot bind explicit NULL for {column.display}"
+            )
+        value = (
+            preferred
+            if preferred is not _BOOTSTRAP_MISSING and preferred is not None
+            else self._fresh_default_for_column(relation, column)
+        )
+        active_values[column] = value
+        return value
+
+    def _fresh_default_for_column(self, relation: RelationId, column: ColumnId) -> Any:
+        column_key = self._column_key_for_storage(relation, column)
+        datatype = self._table_columns_for_storage(relation).get(column_key, "TEXT")
+        candidate = self._default_for_type(datatype)
+        if not self.is_unique(relation, column):
+            return candidate
+        used_values = {
+            symbol.concrete
+            for symbol in self.get_column_data(relation, column)
+            if symbol.concrete is not None
+        }
+        attempt = 1
+        while candidate in used_values:
+            candidate = self._next_default_value(candidate, attempt)
+            attempt += 1
+        return candidate
+
+    @staticmethod
+    def _next_default_value(value: Any, attempt: int) -> Any:
+        if isinstance(value, bool):
+            return attempt
+        if isinstance(value, int):
+            return value + 1
+        if isinstance(value, float):
+            return value + 1.0
+        return f"{value}_{attempt}"
 
     @staticmethod
     def _default_for_type(datatype: str) -> Any:
@@ -1147,37 +1447,27 @@ class Instance(Catalog):
 
     def _bootstrap_reference_rows(
         self,
-        table_name: str,
-        values: Dict[str, Any],
+        relation: RelationId,
+        values: Dict[ColumnId, Any],
         prefer_new_for_unique: bool = False,
-        locked_columns: Optional[set[str]] = None,
-    ) -> dict[str, list[Row]]:
-        created_rows: dict[str, list[Row]] = defaultdict(list)
+        locked_columns: Optional[set[ColumnId]] = None,
+    ) -> dict[RelationId, list[Row]]:
+        created_rows: dict[RelationId, list[Row]] = defaultdict(list)
         locked_columns = locked_columns or set()
-        normalized_values = {
-            self._normalize_name(key, dialect=self.dialect): value
-            for key, value in values.items()
-        }
-        values.clear()
-        values.update(normalized_values)
 
-        for fk in self.get_foreign_key(table_name):
-            local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
-            ref = fk.args.get("reference")
-            if ref is None:
+        for fk in self.get_foreign_keys_by_relation_id(relation):
+            if len(fk.source_column_ids) != 1 or len(fk.target_column_ids) != 1:
+                self._bootstrap_composite_reference_row(
+                    created_rows,
+                    fk,
+                    values,
+                )
                 continue
-            ref_table_node = ref.find(exp.Table)
-            if ref_table_node is None:
-                continue
-            ref_table = self._normalize_table(ref_table_node.name, dialect=self.dialect)
-            ref_table_str = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
-            ref_col = self.resolve_fk_ref_column(fk)
-            if ref_col is None:
-                continue
+            local_col = fk.source_column_ids[0]
+            ref_table = fk.target_table_id
+            ref_col = fk.target_column_ids[0]
 
-            # Circular FK: ref_table is already being bootstrapped.
-            # Skip entirely — _create_row_circular_fk will handle the value.
-            if ref_table_str in self._bootstrapping:
+            if ref_table in self._bootstrapping:
                 continue
 
             explicit_value = values.get(local_col)
@@ -1185,19 +1475,19 @@ class Instance(Catalog):
                 symbol.concrete for symbol in self.get_column_data(ref_table, ref_col)
             ]
             used_child_values = {
-                symbol.concrete for symbol in self.get_column_data(table_name, local_col)
+                symbol.concrete for symbol in self.get_column_data(relation, local_col)
             }
 
             if explicit_value is not None:
                 if (
                     prefer_new_for_unique
                     and local_col not in locked_columns
-                    and self.is_unique(table_name, local_col)
+                    and self.is_unique(relation, local_col)
                     and explicit_value in used_child_values
                 ):
                     created = self.create_row(ref_table, {})
                     self._merge_created_rows(created_rows, created.created)
-                    ref_position = next(iter(created.positions.values()))
+                    ref_position = created.positions[ref_table]
                     ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
                     values[local_col] = ref_value.concrete
                     continue
@@ -1211,7 +1501,7 @@ class Instance(Catalog):
 
             should_force_new_parent = (
                 prefer_new_for_unique
-                and self.is_unique(table_name, local_col)
+                and self.is_unique(relation, local_col)
                 and bool(existing_parent_values)
             )
             if not should_force_new_parent:
@@ -1219,7 +1509,7 @@ class Instance(Catalog):
                     value
                     for value in existing_parent_values
                     if not (
-                        self.is_unique(table_name, local_col) and value in used_child_values
+                        self.is_unique(relation, local_col) and value in used_child_values
                     )
                 ]
                 if available_values:
@@ -1228,41 +1518,106 @@ class Instance(Catalog):
 
             created = self.create_row(ref_table, {})
             self._merge_created_rows(created_rows, created.created)
-            ref_position = next(iter(created.positions.values()))
+            ref_position = created.positions[ref_table]
             ref_value = self.get_column_data(ref_table, ref_col)[ref_position]
             values[local_col] = ref_value.concrete
 
         return created_rows
 
+    def _bootstrap_composite_reference_row(
+        self,
+        created_rows: dict[RelationId, list[Row]],
+        fk,
+        values: Dict[ColumnId, Any],
+    ) -> None:
+        ref_table = fk.target_table_id
+        if ref_table in self._bootstrapping:
+            return
+
+        explicit_values = tuple(values.get(column) for column in fk.source_column_ids)
+        existing_parent_rows = self.get_rows(ref_table)
+        if all(value is not None for value in explicit_values):
+            if any(
+                tuple(row[column].concrete for column in fk.target_column_ids)
+                == explicit_values
+                for row in existing_parent_rows
+            ):
+                return
+            created = self.create_row(
+                ref_table,
+                dict(zip(fk.target_column_ids, explicit_values)),
+            )
+            self._merge_created_rows(created_rows, created.created)
+            return
+
+        candidates = []
+        for row in existing_parent_rows:
+            target_values = tuple(row[column].concrete for column in fk.target_column_ids)
+            if all(
+                explicit is None or explicit == target
+                for explicit, target in zip(explicit_values, target_values)
+            ):
+                candidates.append(target_values)
+        if candidates:
+            target_values = random.choice(candidates)
+            for source_column, target_value in zip(fk.source_column_ids, target_values):
+                values.setdefault(source_column, target_value)
+            return
+
+        parent_values = {
+            target_column: source_value
+            for source_column, target_column, source_value in zip(
+                fk.source_column_ids,
+                fk.target_column_ids,
+                explicit_values,
+            )
+            if source_value is not None
+        }
+        created = self.create_row(ref_table, parent_values)
+        self._merge_created_rows(created_rows, created.created)
+        ref_position = created.positions[ref_table]
+        ref_row = self.get_row(ref_table, ref_position)
+        for source_column, target_column in zip(
+            fk.source_column_ids,
+            fk.target_column_ids,
+        ):
+            values[source_column] = ref_row[target_column].concrete
+
+    def _has_bootstrapping_foreign_key(self, relation: RelationId) -> bool:
+        return any(
+            fk.target_table_id in self._bootstrapping
+            for fk in self.get_foreign_keys_by_relation_id(relation)
+        )
+
     def _merge_created_rows(
         self,
-        target: dict[str, list[Row]],
-        created: dict[str, list[Row]],
+        target: dict[RelationId, list[Row]],
+        created: Mapping[RelationId, Sequence[Row]],
     ) -> None:
-        for table_name, rows in created.items():
-            target[table_name].extend(rows)
+        for relation, rows in created.items():
+            target[relation].extend(rows)
 
     def _find_conflicting_unique_row(
-        self, table_name: str, concretes: Dict[str, Any]
+        self, relation: RelationId, concretes: Dict[ColumnId, Any]
     ) -> Optional[int]:
         for column, concrete in concretes.items():
-            if concrete is None or not self.is_unique(table_name, column):
+            if concrete is None or not self.is_unique(relation, column):
                 continue
-            for idx, symbol in enumerate(self.get_column_data(table_name, column)):
+            for idx, symbol in enumerate(self.get_column_data(relation, column)):
                 if symbol.concrete == concrete:
                     return idx
         return None
 
     def _find_existing_row(
-        self, table_name: str, concretes: Dict[str, Any]
+        self, relation: RelationId, concretes: Dict[ColumnId, Any]
     ) -> Optional[int]:
-        grouped_index = self._find_existing_row_for_constraint_groups(table_name, concretes)
+        grouped_index = self._find_existing_row_for_constraint_groups(relation, concretes)
         if grouped_index is not None:
             return grouped_index
         unique_columns = [
             column
             for column in concretes
-            if column in self.tables[table_name] and self.is_unique(table_name, column)
+            if self.is_unique(relation, column)
         ]
         if not unique_columns:
             return None
@@ -1270,7 +1625,7 @@ class Instance(Catalog):
         for column in unique_columns:
             matching_indexes = {
                 idx
-                for idx, symbol in enumerate(self.get_column_data(table_name, column))
+                for idx, symbol in enumerate(self.get_column_data(relation, column))
                 if symbol.concrete == concretes[column]
             }
             if not matching_indexes:
@@ -1283,87 +1638,90 @@ class Instance(Catalog):
             if not candidate_indexes:
                 return None
         for idx in sorted(candidate_indexes):
-            row = self.get_row(table_name, idx)
-            if all(row[column].concrete == concrete for column, concrete in concretes.items()):
+            row = self.get_row(relation, idx)
+            if all(
+                row[column].concrete == concrete
+                for column, concrete in concretes.items()
+            ):
                 return idx
         return None
 
     def _find_existing_row_for_constraint_groups(
         self,
-        table_name: str,
-        concretes: Dict[str, Any],
+        relation: RelationId,
+        concretes: Dict[ColumnId, Any],
     ) -> Optional[int]:
-        for columns in self._constraint_groups(table_name):
-            if not all(column in concretes for column in columns):
+        for column_ids in self._constraint_groups(relation):
+            if not all(column in concretes for column in column_ids):
                 continue
-            target = tuple(concretes[column] for column in columns)
-            for idx, row in enumerate(self.get_rows(table_name)):
-                candidate = tuple(row[column].concrete for column in columns)
+            target = tuple(concretes[column] for column in column_ids)
+            for idx, row in enumerate(self.get_rows(relation)):
+                candidate = tuple(row[column_id].concrete for column_id in column_ids)
                 if candidate == target:
                     return idx
         return None
 
     def _row_violates_unique_constraints(
-        self, table_name: str, row_values: Dict[str, Variable]
+        self, relation: RelationId, row_values: Dict[ColumnId, Variable]
     ) -> bool:
-        for columns in self._constraint_groups(table_name):
+        for columns in self._constraint_groups(relation):
             concretes = tuple(
-                row_values[self._stored_column_id(table_name, column)].concrete
+                row_values[column].concrete
                 for column in columns
             )
             if any(value is None for value in concretes):
                 continue
-            for existing_row in self.get_rows(table_name):
+            for existing_row in self.get_rows(relation):
                 existing = tuple(existing_row[column].concrete for column in columns)
                 if existing == concretes:
                     return True
-        unique_columns = [
-            column_name
-            for column_name in self.tables[table_name]
-            if self.is_unique(table_name, column_name)
-        ]
+        unique_columns = []
+        for column_name in self._table_columns_for_storage(relation):
+            column_id = self._stored_column_id(relation, column_name)
+            if self.is_unique(relation, column_id):
+                unique_columns.append(column_id)
         for column in unique_columns:
-            concrete = row_values[self._stored_column_id(table_name, column)].concrete
+            concrete = row_values[column].concrete
             if concrete is None:
                 continue
-            for existing in self.get_column_data(table_name, column):
-                if existing.concrete == concrete:
+            for existing_row in self.get_rows(relation):
+                if existing_row[column].concrete == concrete:
                     return True
         return False
 
-    def _constraint_groups(self, table_name: str) -> list[tuple[str, ...]]:
-        table = self.schema_spec.get_table(table_name)
-        groups: list[tuple[str, ...]] = []
-        if len(table.primary_key) > 1:
-            groups.append(tuple(column.lower() for column in table.primary_key))
-        for columns in table.unique_constraints:
+    def _constraint_groups(self, relation: RelationId) -> list[tuple[ColumnId, ...]]:
+        table = self.schema_spec.get_table(self._table_key_for_storage(relation))
+        groups: list[tuple[ColumnId, ...]] = []
+        if len(table.primary_key_ids) > 1:
+            groups.append(table.primary_key_ids)
+        for columns in table.unique_constraint_ids:
             if len(columns) > 1:
-                groups.append(tuple(column.lower() for column in columns))
+                groups.append(columns)
         return groups
 
     def _resolve_composite_reference_conflicts(
         self,
-        table_name: str,
-        values: Dict[str, Any],
-        locked_columns: Optional[set[str]] = None,
-    ) -> dict[str, list[Row]]:
-        created_rows: dict[str, list[Row]] = defaultdict(list)
+        relation: RelationId,
+        values: Dict[ColumnId, Any],
+        locked_columns: Optional[set[ColumnId]] = None,
+    ) -> dict[RelationId, list[Row]]:
+        created_rows: dict[RelationId, list[Row]] = defaultdict(list)
         locked_columns = locked_columns or set()
-        fk_map = self._foreign_key_map(table_name)
+        fk_map = self._foreign_key_map(relation)
 
         for _ in range(20):
             duplicate_group = None
-            for columns in self._constraint_groups(table_name):
-                if not all(column in values for column in columns):
+            for column_ids in self._constraint_groups(relation):
+                if not all(column in values for column in column_ids):
                     continue
-                target = tuple(values[column] for column in columns)
+                target = tuple(values[column] for column in column_ids)
                 if any(value is None for value in target):
                     continue
                 if any(
-                    tuple(row[column].concrete for column in columns) == target
-                    for row in self.get_rows(table_name)
+                    tuple(row[column].concrete for column in column_ids) == target
+                    for row in self.get_rows(relation)
                 ):
-                    duplicate_group = columns
+                    duplicate_group = column_ids
                     break
             if duplicate_group is None:
                 return created_rows
@@ -1376,12 +1734,11 @@ class Instance(Catalog):
                 if fk_target is None:
                     continue
                 ref_table, ref_col = fk_target
-                # Skip if ref_table is already being bootstrapped (circular FK).
                 if ref_table in self._bootstrapping:
                     continue
                 created = self.create_row(ref_table, {})
                 self._merge_created_rows(created_rows, created.created)
-                ref_position = next(iter(created.positions.values()))
+                ref_position = created.positions[ref_table]
                 ref_value = self.get_column_data(ref_table, ref_col)[ref_position].concrete
                 values[column] = ref_value
                 progress = True
@@ -1391,21 +1748,18 @@ class Instance(Catalog):
 
         return created_rows
 
-    def _foreign_key_map(self, table_name: str) -> dict[str, tuple[str, str]]:
-        mapping: dict[str, tuple[str, str]] = {}
-        for fk in self.get_foreign_key(table_name):
-            local_col = self._normalize_name(fk.expressions[0].name, dialect=self.dialect)
-            ref = fk.args.get("reference")
-            if ref is None:
+    def _foreign_key_map(
+        self,
+        relation: RelationId,
+    ) -> dict[ColumnId, tuple[RelationId, ColumnId]]:
+        mapping: dict[ColumnId, tuple[RelationId, ColumnId]] = {}
+        for fk in self.get_foreign_keys_by_relation_id(relation):
+            if len(fk.source_column_ids) != 1 or len(fk.target_column_ids) != 1:
                 continue
-            ref_table_node = ref.find(exp.Table)
-            if ref_table_node is None:
-                continue
-            ref_table = self._normalize_name(ref_table_node.name, dialect=self.dialect, is_table=True)
-            ref_col = self.resolve_fk_ref_column(fk)
-            if ref_col is None:
-                continue
-            mapping[local_col] = (ref_table, ref_col)
+            mapping[fk.source_column_ids[0]] = (
+                fk.target_table_id,
+                fk.target_column_ids[0],
+            )
         return mapping
 
     def reset(self):
@@ -1419,6 +1773,12 @@ class Instance(Catalog):
         self.primary_keys.clear()
         self.foreign_keys.clear()
         self.unique_constraints.clear()
+        self._relation_keys_by_id.clear()
+        self._column_keys_by_id.clear()
+        self._constraints_by_column_id.clear()
+        self._primary_key_ids_by_relation_id.clear()
+        self._unique_constraint_ids_by_relation_id.clear()
+        self._foreign_keys_by_relation_id.clear()
         self.__dict__.pop("schema_spec", None)  # clear cached_property
         self._ingest_ddls(self.ddls, self.dialect)
 

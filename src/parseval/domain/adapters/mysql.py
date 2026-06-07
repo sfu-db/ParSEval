@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from parseval.dtype import DataType
+from parseval.dtype import DataType, TypeFamily
 
 from .generic import GenericTypeAdapter
-from ..types import TypeFamily
 
 
 class MySQLTypeAdapter(GenericTypeAdapter):

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Optional, Union
 from sqlglot.expressions import DataType as sqlglot_datatype
@@ -76,6 +77,55 @@ class TypeFamily(str, Enum):
     JSON = "json"
     BINARY = "binary"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class TypeProfile:
+    """A normalized snapshot of SQL datatype characteristics."""
+
+    datatype: DataType
+    dialect: Optional[str]
+    family: TypeFamily
+    exact_type: str
+    length: Optional[int] = None
+    precision: Optional[int] = None
+    scale: Optional[int] = None
+    unsigned: Optional[bool] = None
+    timezone: Optional[bool] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class TypeService:
+    """Resolve and cache dialect-aware type profiles."""
+
+    def __init__(self, registry=None) -> None:
+        if registry is None:
+            from parseval.domain.adapters.registry import TypeAdapterRegistry
+
+            registry = TypeAdapterRegistry.with_builtin_adapters()
+        self.registry = registry
+        self._profile_cache: dict[tuple[str, Optional[str]], TypeProfile] = {}
+
+    def profile(self, column_spec) -> TypeProfile:
+        """Resolve the TypeProfile for a ColumnSpec, caching the result."""
+        datatype = DataType.build(column_spec.datatype)
+        dialect = getattr(column_spec, "dialect", None)
+        key = (datatype.sql(dialect=dialect), dialect)
+        if key not in self._profile_cache:
+            adapter = self.registry.resolve(datatype, dialect)
+            self._profile_cache[key] = adapter.profile(datatype, dialect)
+        return self._profile_cache[key]
+
+    def profile_datatype(
+        self, datatype: DataType, dialect: Optional[str] = None
+    ) -> TypeProfile:
+        """Resolve the TypeProfile for a raw DataType, caching the result."""
+        datatype = DataType.build(datatype)
+        key = (datatype.sql(dialect=dialect), dialect)
+        if key not in self._profile_cache:
+            adapter = self.registry.resolve(datatype, dialect)
+            self._profile_cache[key] = adapter.profile(datatype, dialect)
+        return self._profile_cache[key]
 
 
 def type_family(dtype: DataType) -> TypeFamily:

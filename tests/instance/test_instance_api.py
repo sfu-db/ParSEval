@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import inspect
 import unittest
 
 from parseval.instance import Instance
 
 
 SCHEMA = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score REAL);"
+
+
+class TestInstanceSignatures(unittest.TestCase):
+    def test_removed_parameters_are_not_part_of_instance_api(self):
+        self.assertNotIn("sync_db", inspect.signature(Instance.create_rows).parameters)
+        self.assertNotIn("sync_db", inspect.signature(Instance.create_row).parameters)
+        self.assertNotIn("normalize", inspect.signature(Instance.nullable).parameters)
+        self.assertNotIn("normalize", inspect.signature(Instance.is_unique).parameters)
 
 
 class TestPlaceRow(unittest.TestCase):
@@ -32,10 +41,10 @@ class TestPlaceRow(unittest.TestCase):
         id_cells = inst.symbols.by_column(id_col)
         self.assertEqual(len(id_cells), 1)
         self.assertEqual(id_cells[0].concrete, 1)
-        self.assertEqual(id_cells[0].args.get("table"), "t")
-        self.assertEqual(id_cells[0].args.get("column"), "id")
-        self.assertEqual(id_cells[0].args.get("relation_id"), inst.table_id("t"))
-        self.assertEqual(id_cells[0].args.get("column_id"), id_col)
+        self.assertEqual(id_cells[0].relation_id, inst.table_id("t"))
+        self.assertEqual(id_cells[0].column_id, id_col)
+        self.assertEqual(id_cells[0].table_name, "t")
+        self.assertEqual(id_cells[0].column_name, "id")
 
     def test_place_row_allows_duplicate_pk_without_error(self):
         """place_row is unchecked — no unique validation."""

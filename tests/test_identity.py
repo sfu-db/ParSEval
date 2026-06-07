@@ -2,6 +2,7 @@ from sqlglot import exp, parse_one
 
 from parseval.identity import (
     PARSEVAL_COLUMN_ID,
+    PARSEVAL_SEMANTIC_DATATYPE,
     ColumnId,
     ColumnKind,
     IdentifierName,
@@ -70,3 +71,7 @@ def test_column_id_is_safe_when_sqlglot_ast_mutates():
 
 def test_parseval_column_id_constant_is_stable():
     assert PARSEVAL_COLUMN_ID == "parseval_column_id"
+
+
+def test_parseval_semantic_datatype_constant_is_stable():
+    assert PARSEVAL_SEMANTIC_DATATYPE == "parseval_semantic_datatype"
