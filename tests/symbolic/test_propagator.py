@@ -181,3 +181,40 @@ def test_subplan_correlation_has_identity():
     for col in sub.correlation:
         cid = column_identity(col)
         assert cid is not None, f"Correlation column {col.sql()} lacks identity"
+
+
+def test_propagate_uses_identity_not_strings():
+    """Propagator must not use string-based table resolution for column resolution."""
+    from unittest.mock import patch
+    import parseval.symbolic.speculate as speculate_module
+
+    sql = """
+        SELECT c.name, COUNT(o.id) AS cnt
+        FROM orders AS o
+        JOIN customers AS c ON o.customer_id = c.id
+        GROUP BY c.name
+        HAVING COUNT(o.id) > 2
+    """
+    tables = {
+        "orders": {"id": "INT", "customer_id": "INT", "amount": "REAL"},
+        "customers": {"id": "INT", "name": "TEXT"},
+    }
+    instance = _make_instance(tables)
+    plan = _make_plan(sql, instance)
+
+    call_count = 0
+    original_rel = Propagator._rel
+
+    def patched_rel(self, name):
+        nonlocal call_count
+        call_count += 1
+        return original_rel(self, name)
+
+    with patch.object(Propagator, '_rel', patched_rel):
+        propagator = Propagator(plan, instance, "sqlite")
+        specs = propagator.propagate()
+
+    # After removing fallbacks, _rel (string-based resolution) should only be
+    # called for Scan step registration (2 tables) and _annotate_column_types.
+    # Before the fix, GROUP BY, COUNT, and Join key handling also called _rel.
+    assert call_count <= 3, f"Expected <=3 _rel calls, got {call_count}"
