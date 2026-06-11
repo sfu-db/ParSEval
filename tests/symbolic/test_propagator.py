@@ -4,7 +4,7 @@ import sqlglot
 from sqlglot import exp
 
 from parseval.instance import Instance
-from parseval.plan.planner import Plan, Scan, Filter, Join, Aggregate, Having, Project
+from parseval.plan.planner import Plan, Scan, Filter, Join, Aggregate, Having, Project, SubPlan
 from parseval.symbolic.speculate import Propagator, BranchSpec, SpeculateConfig
 
 
@@ -148,3 +148,36 @@ def test_having_sets_min_rows():
     for tc in spec.requirements.values():
         if tc.table == "orders":
             assert tc.min_rows >= 3, f"Expected min_rows >= 3 for COUNT > 2, got {tc.min_rows}"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: SubPlan correlation identity
+# ---------------------------------------------------------------------------
+
+
+def test_subplan_correlation_has_identity():
+    """SubPlan correlation columns must carry PARSEVAL_COLUMN_ID."""
+    from parseval.identity import column_identity
+
+    sql = """
+        SELECT o.id FROM orders AS o
+        WHERE EXISTS (SELECT 1 FROM customers AS c WHERE c.id = o.customer_id)
+    """
+    tables = {
+        "orders": {"id": "INT", "customer_id": "INT"},
+        "customers": {"id": "INT", "name": "TEXT"},
+    }
+    instance = _make_instance(tables)
+    plan = _make_plan(sql, instance)
+    # Trigger annotation (lazy)
+    _ = plan.annotations
+
+    # Find the SubPlan
+    subplans = [s for s in plan.ordered_steps if isinstance(s, SubPlan)]
+    assert len(subplans) >= 1
+    sub = subplans[0]
+
+    # Correlation columns should have identity
+    for col in sub.correlation:
+        cid = column_identity(col)
+        assert cid is not None, f"Correlation column {col.sql()} lacks identity"
