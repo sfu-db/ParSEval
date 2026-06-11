@@ -105,15 +105,18 @@ def _column_type_family(
         return default
 
 
-def _match_column(
+def _resolve_column_name(
     instance: Instance, relation: RelationId, col_name: str
 ) -> Optional[str]:
-    """Find the canonical column name in the instance (case-insensitive)."""
+    """Resolve canonical column name. Uses identity first, falls back to schema check."""
     table = _table_name(relation)
-    if table not in instance.tables:
+    if not table or table not in instance.tables:
         return None
+    schema = instance.tables[table]
+    if col_name in schema:
+        return col_name
     lower = col_name.lower()
-    return next((s for s in instance.tables[table] if s.lower() == lower), None)
+    return next((s for s in schema if s.lower() == lower), None)
 
 
 # =============================================================================
@@ -793,7 +796,7 @@ class Propagator:
             # Add IS NOT NULL for projected columns.
             for relation_id, tc in spec.requirements.items():
                 for col_name in projected:
-                    matched = _match_column(
+                    matched = _resolve_column_name(
                         self.instance, relation_id, col_name
                     )
                     if matched and not _has_is_not_null(
@@ -805,7 +808,7 @@ class Propagator:
                         tc.constraints.append(_make_is_not_null(col_node))
                 dup_ids = []
                 for col_name in projected:
-                    matched = _match_column(
+                    matched = _resolve_column_name(
                         self.instance, relation_id, col_name
                     )
                     if matched:
@@ -886,7 +889,7 @@ class Propagator:
                             relation = _relation_for_table(
                                 self.instance, col.table or ""
                             )
-                            matched = _match_column(
+                            matched = _resolve_column_name(
                                 self.instance, relation, col.name
                             )
                         if matched and relation.name:
@@ -917,7 +920,7 @@ class Propagator:
                                 relation = _relation_for_table(
                                     self.instance, col.table or ""
                                 )
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance, relation, col.name
                                 )
                             if (
@@ -984,7 +987,7 @@ class Propagator:
                             self.instance, sk_table
                         )
                         sk_name = getattr(sk, "name", str(sk))
-                        sk_matched = _match_column(
+                        sk_matched = _resolve_column_name(
                             self.instance, sk_relation, sk_name
                         )
                         if sk_matched:
@@ -994,7 +997,7 @@ class Propagator:
                             self.instance, join_name
                         )
                         jk_name = getattr(jk, "name", str(jk))
-                        jk_matched = _match_column(
+                        jk_matched = _resolve_column_name(
                             self.instance, jk_relation, jk_name
                         )
                         if jk_matched:
@@ -1288,7 +1291,7 @@ class Propagator:
                                 matched = col_id.name.normalized
                             else:
                                 tname = tc.table
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance,
                                     relation_id,
                                     col.name,
@@ -1322,7 +1325,7 @@ class Propagator:
                                     if rel.name
                                     else ""
                                 )
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance,
                                     _relation_for_table(
                                         self.instance, tname
@@ -1358,7 +1361,7 @@ class Propagator:
                             tname = (
                                 rel.name.normalized if rel.name else ""
                             )
-                            matched = _match_column(
+                            matched = _resolve_column_name(
                                 self.instance,
                                 _relation_for_table(self.instance, tname),
                                 col.name,
@@ -1410,7 +1413,7 @@ class Propagator:
                             if col_id:
                                 matched = col_id.name.normalized
                             else:
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance, relation_id, col.name
                                 )
                             if matched == target_col:
@@ -1426,7 +1429,7 @@ class Propagator:
                             if col_id:
                                 matched = col_id.name.normalized
                             else:
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance, relation_id, col.name
                                 )
                             if matched == target_col:
@@ -1466,7 +1469,7 @@ class Propagator:
                             if col_id:
                                 matched = col_id.name.normalized
                             else:
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance, relation_id, col.name
                                 )
                             if matched and matched in targets.get(
@@ -1484,7 +1487,7 @@ class Propagator:
                             if col_id:
                                 matched = col_id.name.normalized
                             else:
-                                matched = _match_column(
+                                matched = _resolve_column_name(
                                     self.instance, relation_id, col.name
                                 )
                             if matched and matched in targets.get(
@@ -1546,7 +1549,7 @@ class Propagator:
             relation = _relation_for_table(
                 self.instance, col_node.table or ""
             )
-            matched = _match_column(
+            matched = _resolve_column_name(
                 self.instance, relation, col_node.name
             )
         if not matched:
@@ -1656,7 +1659,7 @@ class Propagator:
             relation = _relation_for_table(
                 self.instance, col.table or ""
             )
-            matched = _match_column(self.instance, relation, col.name)
+            matched = _resolve_column_name(self.instance, relation, col.name)
         table_name = relation.name.normalized if relation.name else ""
         if matched and table_name in self.instance.tables:
             req = spec.require(relation)
@@ -1697,7 +1700,7 @@ class Propagator:
                 sk_id = column_identity(sk) if isinstance(sk, exp.Column) else None
                 if sk_id is None:
                     sk_name = getattr(sk, "name", str(sk))
-                    sk_matched = _match_column(
+                    sk_matched = _resolve_column_name(
                         self.instance, source_relation, sk_name
                     )
                     if sk_matched:
@@ -1756,7 +1759,7 @@ class Propagator:
             jk_id = column_identity(jk) if isinstance(jk, exp.Column) else None
             if jk_id is None:
                 jk_name = getattr(jk, "name", str(jk))
-                jk_matched = _match_column(
+                jk_matched = _resolve_column_name(
                     self.instance, join_relation, jk_name
                 )
                 if jk_matched:
@@ -1820,7 +1823,7 @@ class Propagator:
                     outer_relation = _relation_for_table(
                         self.instance, corr_col.table or ""
                     )
-                    outer_matched = _match_column(
+                    outer_matched = _resolve_column_name(
                         self.instance, outer_relation, corr_col.name
                     )
                 if outer_matched:
@@ -1903,7 +1906,7 @@ class Propagator:
             outer_relation = _relation_for_table(
                 self.instance, outer_col.table or ""
             )
-            outer_matched = _match_column(
+            outer_matched = _resolve_column_name(
                 self.instance, outer_relation, outer_col.name
             )
         if not outer_matched:
@@ -1964,7 +1967,7 @@ class Propagator:
                     outer_relation = _relation_for_table(
                         self.instance, corr_col.table or ""
                     )
-                    outer_matched = _match_column(
+                    outer_matched = _resolve_column_name(
                         self.instance, outer_relation, corr_col.name
                     )
                 if not outer_matched:
@@ -2042,7 +2045,7 @@ class Propagator:
                     rel = _relation_for_table(self.instance, name)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
-                        matched = _match_column(
+                        matched = _resolve_column_name(
                             self.instance, rel, proj_col_name
                         )
                         if matched:
@@ -2071,7 +2074,7 @@ class Propagator:
                         inner_relation = _relation_for_table(
                             self.instance, col.table or ""
                         )
-                        matched = _match_column(
+                        matched = _resolve_column_name(
                             self.instance, inner_relation, col.name
                         )
                     tname = (
@@ -2110,7 +2113,7 @@ class Propagator:
                             inner_relation = _relation_for_table(
                                 self.instance, col.table or ""
                             )
-                            matched = _match_column(
+                            matched = _resolve_column_name(
                                 self.instance, inner_relation, col.name
                             )
                         tname = (
@@ -2126,7 +2129,7 @@ class Propagator:
                     rel = _relation_for_table(self.instance, name)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
-                        matched = _match_column(
+                        matched = _resolve_column_name(
                             self.instance, rel, col_name
                         )
                         if matched:
@@ -2157,14 +2160,14 @@ class Propagator:
                     lt = _relation_for_table(
                         self.instance, left.table or ""
                     )
-                    lc = _match_column(self.instance, lt, left.name)
+                    lc = _resolve_column_name(self.instance, lt, left.name)
                     if lc:
                         l_id = physical_column(lc, lt)
                 if r_id is None:
                     rt = _relation_for_table(
                         self.instance, right.table or ""
                     )
-                    rc = _match_column(self.instance, rt, right.name)
+                    rc = _resolve_column_name(self.instance, rt, right.name)
                     if rc:
                         r_id = physical_column(rc, rt)
                 if l_id and r_id and l_id.relation and r_id.relation:
@@ -2388,7 +2391,7 @@ class Propagator:
                     relation = _relation_for_table(
                         self.instance, target_col.table or ""
                     )
-                    matched = _match_column(
+                    matched = _resolve_column_name(
                         self.instance, relation, target_col.name
                     )
                 tname = relation.name.normalized if relation.name else ""
@@ -2885,7 +2888,7 @@ def _gold_fk_columns(instance: Instance, table: str) -> Set[str]:
     columns: Set[str] = set()
     for fk in instance.get_foreign_key(table):
         for identifier in fk.expressions:
-            matched = _match_column(instance, _relation_for_table(instance, table), identifier.name)
+            matched = _resolve_column_name(instance, _relation_for_table(instance, table), identifier.name)
             if matched:
                 columns.add(matched)
     return columns
@@ -3154,12 +3157,12 @@ def _bindings_for_scalar_expression(
     for col in expression.find_all(exp.Column):
         raw_table = normalize_name(col.table or "")
         # Try to find the physical table.
-        matched = _match_column(instance, _relation_for_table(instance, raw_table), col.name)
+        matched = _resolve_column_name(instance, _relation_for_table(instance, raw_table), col.name)
         physical = raw_table
         if not matched:
             # Search all tables for the column.
             for table_name in instance.tables:
-                found = _match_column(instance, _relation_for_table(instance, table_name), col.name)
+                found = _resolve_column_name(instance, _relation_for_table(instance, table_name), col.name)
                 if found:
                     physical = table_name
                     matched = found
