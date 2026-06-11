@@ -771,7 +771,7 @@ class Propagator:
                     tc.duplicate_columns = dup_ids
                     tc.min_rows = max(tc.min_rows, 2)
                     # Propagate min_rows to joined tables.
-                    for rep, members in spec.equivalences.groups().items():
+                    for _rep, members in spec.equivalences.groups().items():
                         if len(members) < 2:
                             continue
                         member_relations = {
@@ -1212,7 +1212,7 @@ class Propagator:
         targets: Dict[str, Set[str]] = {}
 
         # 1. Columns with IS NOT NULL in constraints.
-        for relation_id, tc in spec.requirements.items():
+        for _relation_id, tc in spec.requirements.items():
             for constraint in tc.constraints:
                 if isinstance(constraint, exp.Is):
                     right = constraint.expression
@@ -1320,7 +1320,7 @@ class Propagator:
         self, spec: BranchSpec, target_table: str, target_col: str
     ):
         """Replace IS NOT NULL with IS NULL for a single target column."""
-        for relation_id, tc in spec.requirements.items():
+        for _relation_id, tc in spec.requirements.items():
             table = tc.table
             if table != target_table:
                 continue
@@ -1372,7 +1372,7 @@ class Propagator:
         if not targets:
             return
 
-        for relation_id, tc in spec.requirements.items():
+        for _relation_id, tc in spec.requirements.items():
             table = tc.table
             if table not in targets:
                 continue
@@ -1500,7 +1500,7 @@ class Propagator:
 
     def _annotate_column_types(self, spec: BranchSpec):
         """Set .type on Column nodes from metadata or instance schema."""
-        for relation_id, tc in spec.requirements.items():
+        for _relation_id, tc in spec.requirements.items():
             for constraint in tc.constraints:
                 for col in constraint.find_all(exp.Column):
                     if getattr(col, "type", None) is not None:
@@ -2458,11 +2458,11 @@ def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
     """Build RowBinding objects for every table x row in the spec."""
     bindings: Dict[str, RowBinding] = {}
     alias_scoped_tables: Set[str] = set()
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         if req.alias:
             alias_scoped_tables.add(req.table)
 
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         physical = req.table
         if physical in alias_scoped_tables and not req.alias:
             # For self-join tables, only create bindings for alias-scoped entries.
@@ -2477,7 +2477,7 @@ def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
 
 
 def _bindings_for_requirement(
-    relation: RelationId,
+    _relation: RelationId,
     req: TableConstraint,
     row_bindings: Dict[str, RowBinding],
 ) -> List[RowBinding]:
@@ -2509,7 +2509,7 @@ def _requirement_for_binding(
     binding: RowBinding,
 ) -> Optional[TableConstraint]:
     """Find the TableConstraint for a binding."""
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         if req.table != binding.table:
             continue
         if req.alias:
@@ -2518,7 +2518,7 @@ def _requirement_for_binding(
         elif binding.alias == binding.table or binding.alias is None:
             return req
     # Fallback: match by table name only.
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         if req.table == binding.table:
             return req
     return None
@@ -2608,7 +2608,7 @@ def _dtype_for_solver_var(var: SolverVar, instance: Instance) -> Optional[DataTy
 def _build_join_equalities(
     spec: BranchSpec,
     row_bindings: Dict[str, RowBinding],
-    instance: Instance,
+    _instance: Instance,
 ) -> List[Tuple[SolverVar, SolverVar]]:
     """Convert ColumnUnionFind groups to solver join equalities."""
     equalities: List[Tuple[SolverVar, SolverVar]] = []
@@ -2657,7 +2657,7 @@ def _build_join_equalities(
 
 def _rows_from_solver_result(
     assignments: Dict[SolverVar, Any],
-    row_bindings: Dict[str, RowBinding],
+    _row_bindings: Dict[str, RowBinding],
     instance: Instance,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Extract concrete rows from solver assignments.
@@ -2743,7 +2743,7 @@ def _gold_domain_value(
 def _fallback_rows(
     spec: BranchSpec,
     instance: Instance,
-    row_bindings: Dict[str, RowBinding],
+    _row_bindings: Dict[str, RowBinding],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Build rows using heuristic values when solver fails.
 
@@ -2751,12 +2751,12 @@ def _fallback_rows(
     for remaining columns.
     """
     rows: Dict[str, List[Dict[str, Any]]] = {}
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         physical = req.table
         if physical not in instance.tables:
             continue
         fixed = _extract_fixed_values(req.constraints)
-        for row_index in range(max(req.min_rows, 1)):
+        for _row_index in range(max(req.min_rows, 1)):
             row: Dict[str, Any] = dict(fixed)
             for col_name in instance.tables[physical]:
                 if col_name in row:
@@ -2897,7 +2897,7 @@ def _complete_gold_rows(
 
     # High LIMIT support: clone rows to satisfy min_rows.
     MAX_TOTAL_ROWS = 500
-    for relation, req in spec.requirements.items():
+    for _relation, req in spec.requirements.items():
         physical = req.table
         if physical not in completed or not completed[physical]:
             continue
