@@ -3175,7 +3175,7 @@ def _bindings_for_scalar_expression(
 def _merge_scalar_solver_assignments(
     rows: Dict[str, List[Dict[str, Any]]],
     assignments: Dict[SolverVar, Any],
-    row_bindings: Dict[str, RowBinding],
+    _row_bindings: Dict[str, RowBinding],
 ) -> Set[Tuple[str, int]]:
     """Merge solver assignments into rows. Returns set of (table, row_index) touched."""
     touched: Set[Tuple[str, int]] = set()
