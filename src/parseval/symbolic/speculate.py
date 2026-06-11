@@ -16,19 +16,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from itertools import product
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
-from parseval.dtype import DataType, TypeFamily, type_family
+from parseval.dtype import DataType
 from parseval.helper import normalize_name
 from parseval.identity import (
     ColumnId,
-    ColumnKind,
     RelationId,
     RelationKind,
-    column_id,
     column_identity,
     identifier_name,
     physical_column,
@@ -49,7 +46,7 @@ from parseval.plan.planner import (
     Sort,
     SubPlan,
 )
-from parseval.plan.rex import Environment, column_meta, concrete, negate_predicate
+from parseval.plan.rex import column_meta, concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var, solver_var
 from parseval.solver.types import col_type
 
@@ -88,21 +85,6 @@ def _lookup_col_type(
             return schema_dtype
     return None
 
-
-def _column_type_family(
-    instance: Instance,
-    relation: RelationId,
-    col_name: str,
-    default: TypeFamily = TypeFamily.TEXT,
-) -> TypeFamily:
-    """Resolve the TypeFamily for a column from the instance schema."""
-    col_type_str = _lookup_col_type(instance, relation, col_name)
-    if not col_type_str:
-        return default
-    try:
-        return type_family(DataType.build(col_type_str))
-    except Exception:
-        return default
 
 
 # =============================================================================
