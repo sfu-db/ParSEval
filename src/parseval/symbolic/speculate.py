@@ -418,6 +418,18 @@ class Propagator:
     annotation (via ``_solver_column`` or identity-based inline setup).
     """
 
+    _HANDLER_MAP = {
+        Scan: "_derive_scan",
+        Filter: "_derive_filter",
+        Join: "_derive_join",
+        Aggregate: "_derive_aggregate",
+        Having: "_derive_having",
+        Project: "_derive_project",
+        Sort: "_derive_sort",
+        Limit: "_derive_limit",
+        SetOperation: "_derive_set_op",
+    }
+
     def __init__(
         self,
         plan: Plan,
@@ -436,6 +448,8 @@ class Propagator:
             and self.config.right_unmatched == 0
             and self.config.having_fail == 0
         )
+        self._negate_step: Optional[Step] = None
+        self._negate_conjunct: int = 0
 
     def _solver_col(
         self, table: str, col_name: str, row_scope: Optional[str] = None
@@ -445,6 +459,360 @@ class Propagator:
         return _solver_column(
             self.instance, relation, col_name, row_scope=row_scope,
         )
+
+    # -----------------------------------------------------------------
+    # Dispatch infrastructure
+    # -----------------------------------------------------------------
+
+    def _walk_step(self, step: Step, spec: BranchSpec) -> None:
+        """Walk the plan top-down, dispatching to step handlers."""
+        # Recurse into chain dependencies first (bottom-up data flow).
+        for dep in step.chain_dependencies:
+            self._walk_step(dep, spec)
+        handler_name = self._HANDLER_MAP.get(type(step))
+        if handler_name:
+            getattr(self, handler_name)(step, spec)
+        for sub in step.subplan_dependencies:
+            self._derive_subplan(
+                sub, spec,
+                parent_condition=getattr(step, "condition", None),
+            )
+
+    def _walk_plan(self, spec: BranchSpec) -> None:
+        """Walk the full plan from root."""
+        self._walk_step(self.plan.root, spec)
+
+    # -----------------------------------------------------------------
+    # Step handlers
+    # -----------------------------------------------------------------
+
+    def _derive_scan(self, step: Scan, spec: BranchSpec) -> None:
+        """Register table requirements for a Scan step."""
+        # Use the identity-based RelationId from annotations to ensure
+        # it matches the RelationId used by filter/join columns.
+        ann = self.plan.annotations.get(id(step))
+        if ann and ann.projected_columns:
+            relation = ann.projected_columns[0].relation
+            table_name = relation.name.normalized if relation.name else ""
+            if table_name in self.instance.tables:
+                spec.require(relation)
+        elif isinstance(step.source, exp.Table):
+            name = normalize_name(step.source.name)
+            relation = _relation_for_table(self.instance, name)
+            table_name = relation.name.normalized if relation.name else ""
+            if table_name in self.instance.tables:
+                spec.require(relation)
+        # For FROM-subquery scans, propagate into the inner plan.
+        for sub in step.subplan_dependencies:
+            if sub.inner:
+                self._walk_step(sub.inner, spec)
+
+    def _derive_filter(self, step: Filter, spec: BranchSpec) -> None:
+        """Store WHERE conditions, handle negation."""
+        if step.condition:
+            if step is self._negate_step:
+                conjuncts = self._split_conjuncts(step.condition)
+                if len(conjuncts) > 1:
+                    for idx, conjunct in enumerate(conjuncts):
+                        if idx == self._negate_conjunct:
+                            negated = negate_predicate(conjunct.copy())
+                            self._store_expression(negated, spec)
+                        else:
+                            self._store_expression(conjunct, spec)
+                else:
+                    negated = negate_predicate(step.condition.copy())
+                    self._store_expression(negated, spec)
+            else:
+                self._store_expression(step.condition, spec)
+            self._extract_column_equalities(step.condition, spec)
+            for atom in self._iter_scalar_subquery_atoms(step.condition):
+                spec.deferred.append(atom)
+
+    def _derive_join(self, step: Join, spec: BranchSpec) -> None:
+        """Link join keys via equivalences and store join equalities."""
+        for join_name, join_data in (step.joins or {}).items():
+            source_keys = join_data.get("source_key", [])
+            join_keys = join_data.get("join_key", [])
+            for sk, jk in zip(source_keys, join_keys):
+                sk_id = column_identity(sk) if isinstance(sk, exp.Column) else None
+                jk_id = column_identity(jk) if isinstance(jk, exp.Column) else None
+                if sk_id is None or jk_id is None:
+                    raise ValueError(f"Join key lacks identity: sk={sk}, jk={jk}")
+                if sk_id and jk_id:
+                    sk_rel = sk_id.relation
+                    jk_rel = jk_id.relation
+                    if sk_rel and jk_rel:
+                        spec.require(sk_rel)
+                        spec.require(jk_rel)
+                        spec.equate(sk_id, jk_id)
+                        # Store join equality as expression.
+                        sk_table = (
+                            sk_rel.name.normalized
+                            if sk_rel.name
+                            else ""
+                        )
+                        jk_table = (
+                            jk_rel.name.normalized
+                            if jk_rel.name
+                            else ""
+                        )
+                        if sk_table and jk_table:
+                            eq_expr = exp.EQ(
+                                this=self._solver_col(
+                                    sk_table,
+                                    sk_id.name.normalized,
+                                ),
+                                expression=self._solver_col(
+                                    jk_table,
+                                    jk_id.name.normalized,
+                                ),
+                            )
+                            spec.requirements[sk_rel].constraints.append(
+                                eq_expr
+                            )
+                            spec.requirements[jk_rel].constraints.append(
+                                eq_expr
+                            )
+                            # Mark join key as group_key_column.
+                            req_jk = spec.require(jk_rel)
+                            if jk_id not in req_jk.group_key_columns:
+                                req_jk.group_key_columns.append(jk_id)
+
+    def _derive_aggregate(self, step: Aggregate, spec: BranchSpec) -> None:
+        """Mark group key columns and add aggregate NULL constraints."""
+        # GROUP BY: mark group columns.
+        if step.group:
+            for group_expr in step.group.values():
+                for col in group_expr.find_all(exp.Column):
+                    col_id = column_identity(col)
+                    if col_id is None:
+                        continue
+                    relation = col_id.relation
+                    matched = col_id.name.normalized
+                    if matched and relation.name:
+                        table_name = relation.name.normalized
+                        if table_name in self.instance.tables:
+                            req = spec.require(relation)
+                            gid = physical_column(matched, relation)
+                            spec.equivalences.find(gid)
+                            if gid not in req.group_key_columns:
+                                req.group_key_columns.append(gid)
+        # Aggregate NULL detection.
+        if not self._is_gold_mode:
+            for agg_expr in step.aggregations:
+                self._add_aggregate_null_constraints(agg_expr, spec)
+        else:
+            for agg_expr in step.aggregations:
+                for count_node in agg_expr.find_all(exp.Count):
+                    if isinstance(count_node.this, exp.Star):
+                        continue
+                    if count_node.args.get("distinct"):
+                        continue
+                    for col in count_node.find_all(exp.Column):
+                        col_id = column_identity(col)
+                        if col_id is None:
+                            continue
+                        relation = col_id.relation
+                        matched = col_id.name.normalized
+                        if (
+                            matched
+                            and relation.name
+                            and relation.name.normalized
+                            in self.instance.tables
+                        ):
+                            req = spec.require(relation)
+                            if not _has_is_null(
+                                req.constraints, matched
+                            ) and not _has_is_not_null(
+                                req.constraints, matched
+                            ):
+                                col_node = self._solver_col(
+                                    relation.name.normalized,
+                                    matched,
+                                )
+                                req.constraints.append(
+                                    _make_is_not_null(col_node)
+                                )
+
+    def _derive_having(self, step: Having, spec: BranchSpec) -> None:
+        """Store HAVING conditions and extract min group size."""
+        if step.condition and step is not self._negate_step:
+            if self._is_gold_mode:
+                for scalar_cond in self._gold_having_scalar_constraints(
+                    step.condition
+                ):
+                    self._store_expression(scalar_cond, spec)
+            else:
+                self._store_expression(step.condition, spec)
+            counted_relation = self._find_counted_table(step.condition)
+            min_size = self._extract_min_group_size(step.condition)
+            if (
+                counted_relation
+                and counted_relation in spec.requirements
+            ):
+                spec.requirements[counted_relation].min_rows = max(
+                    spec.requirements[counted_relation].min_rows,
+                    min_size,
+                )
+            else:
+                for req in spec.requirements.values():
+                    req.min_rows = max(req.min_rows, min_size)
+            self._extract_having_value_constraints(
+                step.condition, spec, min_size
+            )
+        elif step is self._negate_step and step.condition:
+            # Negate the HAVING condition.
+            negated = negate_predicate(step.condition.copy())
+            self._store_expression(negated, spec)
+
+    def _derive_project(self, step: Project, spec: BranchSpec) -> None:
+        """Add IS NOT NULL for projected columns and handle DISTINCT."""
+        projected = self._projected_columns(step)
+        # Route each projected column to its correct table.
+        for col_name, table_alias in projected:
+            for relation_id, tc in spec.requirements.items():
+                norm_alias = normalize_name(table_alias)
+                if tc.table != norm_alias and (
+                    tc.alias is None
+                    or normalize_name(tc.alias) != norm_alias
+                ):
+                    continue
+                if not _has_is_not_null(tc.constraints, col_name):
+                    col_node = self._solver_col(tc.table, col_name)
+                    tc.constraints.append(_make_is_not_null(col_node))
+                break
+        # Duplicate / DISTINCT handling.
+        for relation_id, tc in spec.requirements.items():
+            dup_ids = []
+            for col_name, table_alias in projected:
+                norm_alias = normalize_name(table_alias)
+                if tc.table == norm_alias or (
+                    tc.alias is not None
+                    and normalize_name(tc.alias) == norm_alias
+                ):
+                    dup_ids.append(
+                        physical_column(col_name, relation_id)
+                    )
+            if step.distinct and dup_ids:
+                tc.duplicate_columns = dup_ids
+                tc.min_rows = max(tc.min_rows, 2)
+                for _rep, members in spec.equivalences.groups().items():
+                    if len(members) < 2:
+                        continue
+                    member_relations = {
+                        m.relation for m in members if m.relation
+                    }
+                    if relation_id in member_relations:
+                        for other_rel in member_relations:
+                            if (
+                                other_rel != relation_id
+                                and other_rel in spec.requirements
+                            ):
+                                spec.requirements[
+                                    other_rel
+                                ].min_rows = max(
+                                    spec.requirements[other_rel].min_rows,
+                                    2,
+                                )
+
+    def _derive_sort(self, step: Sort, spec: BranchSpec) -> None:
+        """No-op for Sort steps."""
+        pass
+
+    def _derive_limit(self, step: Limit, spec: BranchSpec) -> None:
+        """Set min_rows on driving table."""
+        offset = getattr(step, "offset", 0) or 0
+        limit_val = step.limit if step.limit != float("inf") else 1
+        if self._is_gold_mode:
+            needed = offset + 1 if int(limit_val) > 0 else 0
+        else:
+            needed = offset + int(limit_val)
+        # Apply min_rows to the driving table.
+        driving_alias = getattr(step, "source", None)
+        if driving_alias:
+            driving_relation = _relation_for_table(
+                 self.instance, driving_alias
+            )
+            if driving_relation in spec.requirements:
+                spec.requirements[driving_relation].min_rows = max(
+                    spec.requirements[driving_relation].min_rows, needed
+                )
+            else:
+                spec.requirements[driving_relation] = TableConstraint(
+                    relation=driving_relation, min_rows=needed
+                )
+
+    def _derive_set_op(self, step: SetOperation, spec: BranchSpec) -> None:
+        """No-op for SetOperation steps."""
+        pass
+
+    def _derive_subplan(
+        self,
+        sub: SubPlan,
+        spec: BranchSpec,
+        parent_condition: Optional[exp.Expression] = None,
+    ) -> None:
+        """Handle EXISTS/IN/SCALAR subplan correlation."""
+        negated_exists = (
+            sub.kind.value == "exists"
+            and self._subplan_anchor_is_negated(
+                parent_condition, sub.anchor
+            )
+        )
+        if sub.kind.value == "exists" and sub.correlation and not negated_exists:
+            for corr_col in sub.correlation:
+                corr_id = column_identity(corr_col)
+                if corr_id and corr_id.relation:
+                    outer_relation = corr_id.relation
+                    outer_matched = corr_id.name.normalized
+                else:
+                    outer_relation = _relation_for_table(
+                         self.instance, corr_col.table or ""
+                    )
+                    outer_matched = corr_col.name
+                if outer_matched:
+                    spec.require(outer_relation)
+                    inner_key = self._find_inner_corr_column(sub, spec)
+                    if inner_key:
+                        inner_relation, inner_matched = inner_key
+                        outer_col_id = physical_column(
+                            outer_matched, outer_relation
+                        )
+                        inner_col_id = physical_column(
+                            inner_matched, inner_relation
+                        )
+                        spec.equate(outer_col_id, inner_col_id)
+                        eq_expr = exp.EQ(
+                            this=self._solver_col(
+                                outer_relation.name.normalized
+                                if outer_relation.name
+                                else "",
+                                outer_matched,
+                            ),
+                            expression=self._solver_col(
+                                inner_relation.name.normalized
+                                if inner_relation.name
+                                else "",
+                                inner_matched,
+                            ),
+                        )
+                        spec.requirements[outer_relation].constraints.append(
+                            eq_expr
+                        )
+
+        elif sub.kind.value == "in":
+            self._propagate_in_subplan(sub, spec)
+
+        elif sub.kind.value == "scalar":
+            self._propagate_scalar_subplan(sub, spec)
+
+        # Scalar subqueries are repaired from deferred predicates.
+        if (
+            sub.inner
+            and not negated_exists
+            and sub.kind.value != "scalar"
+        ):
+            self._walk_step(sub.inner, spec)
 
     # -----------------------------------------------------------------
     # Top-level propagation
@@ -458,7 +826,7 @@ class Propagator:
         if self.config.positive > 0:
             try:
                 pos = BranchSpec(branch="positive")
-                self._propagate_step(self.plan.root, pos)
+                self._walk_plan(pos)
                 if self.config.boundary > 0:
                     self._collect_boundary_values(pos)
                 self._add_schema_constraints(pos)
@@ -478,12 +846,9 @@ class Propagator:
                         conjuncts = self._split_conjuncts(step.condition)
                         for idx in range(len(conjuncts)):
                             neg = BranchSpec(branch=f"negative_c{idx}")
-                            self._propagate_step(
-                                self.plan.root,
-                                neg,
-                                negate_step=step,
-                                negate_conjunct=idx,
-                            )
+                            self._negate_step = step
+                            self._negate_conjunct = idx
+                            self._walk_plan(neg)
                             self._add_schema_constraints(neg)
                             self._annotate_column_types(neg)
                             specs.append(neg)
@@ -493,6 +858,8 @@ class Propagator:
                         type(step).__name__,
                         exc,
                     )
+        self._negate_step = None
+        self._negate_conjunct = 0
 
         # Unmatched join branches.
         if self.config.left_unmatched > 0 or self.config.right_unmatched > 0:
@@ -527,14 +894,14 @@ class Propagator:
                 try:
                     if isinstance(step, Having) and step.condition:
                         fail = BranchSpec(branch="having_fail")
-                        self._propagate_step(
-                            self.plan.root, fail, negate_step=step
-                        )
+                        self._negate_step = step
+                        self._walk_plan(fail)
                         self._add_schema_constraints(fail)
                         self._annotate_column_types(fail)
                         specs.append(fail)
                 except Exception as exc:
                     logger.debug("having_fail propagation failed: %s", exc)
+        self._negate_step = None
 
         # Null branches.
         if self.config.null > 0:
@@ -546,7 +913,7 @@ class Propagator:
                             null_spec = BranchSpec(
                                 branch=f"null_{table}.{col_name}"
                             )
-                            self._propagate_step(self.plan.root, null_spec)
+                            self._walk_plan(null_spec)
                             self._apply_single_null_override(
                                 null_spec, table, col_name
                             )
@@ -555,7 +922,7 @@ class Propagator:
                             specs.append(null_spec)
                 else:
                     null_spec = BranchSpec(branch="null_branch")
-                    self._propagate_step(self.plan.root, null_spec)
+                    self._walk_plan(null_spec)
                     self._apply_null_overrides(null_spec)
                     self._add_schema_constraints(null_spec)
                     self._annotate_column_types(null_spec)
@@ -570,7 +937,7 @@ class Propagator:
                     self._collect_case_when_conditions()
                 ):
                     case_spec = BranchSpec(branch=f"case_else_{case_idx}")
-                    self._propagate_step(self.plan.root, case_spec)
+                    self._walk_plan(case_spec)
                     for cond in when_conditions:
                         negated = negate_predicate(cond.copy())
                         self._store_expression(negated, case_spec)
@@ -581,296 +948,6 @@ class Propagator:
                 logger.debug("CASE WHEN propagation failed: %s", exc)
 
         return specs
-
-    # -----------------------------------------------------------------
-    # Recursive step propagation
-    # -----------------------------------------------------------------
-
-    def _propagate_step(
-        self,
-        step: Step,
-        spec: BranchSpec,
-        negate_step: Optional[Step] = None,
-        negate_conjunct: int = 0,
-    ):
-        """Recursively propagate requirements top-down."""
-        if isinstance(step, Limit):
-            offset = getattr(step, "offset", 0) or 0
-            limit_val = step.limit if step.limit != float("inf") else 1
-            if self._is_gold_mode:
-                needed = offset + 1 if int(limit_val) > 0 else 0
-            else:
-                needed = offset + int(limit_val)
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            # Apply min_rows to the driving table.
-            driving_alias = getattr(step, "source", None)
-            if driving_alias:
-                driving_relation = _relation_for_table(
-                     self.instance, driving_alias
-                )
-                if driving_relation in spec.requirements:
-                    spec.requirements[driving_relation].min_rows = max(
-                        spec.requirements[driving_relation].min_rows, needed
-                    )
-                else:
-                    spec.requirements[driving_relation] = TableConstraint(
-                        relation=driving_relation, min_rows=needed
-                    )
-
-        elif isinstance(step, Project):
-            projected = self._projected_columns(step)
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            # Route each projected column to its correct table.
-            for col_name, table_alias in projected:
-                for relation_id, tc in spec.requirements.items():
-                    norm_alias = normalize_name(table_alias)
-                    if tc.table != norm_alias and (
-                        tc.alias is None
-                        or normalize_name(tc.alias) != norm_alias
-                    ):
-                        continue
-                    if not _has_is_not_null(tc.constraints, col_name):
-                        col_node = self._solver_col(tc.table, col_name)
-                        tc.constraints.append(_make_is_not_null(col_node))
-                    break
-            # Duplicate / DISTINCT handling.
-            for relation_id, tc in spec.requirements.items():
-                dup_ids = []
-                for col_name, table_alias in projected:
-                    norm_alias = normalize_name(table_alias)
-                    if tc.table == norm_alias or (
-                        tc.alias is not None
-                        and normalize_name(tc.alias) == norm_alias
-                    ):
-                        dup_ids.append(
-                            physical_column(col_name, relation_id)
-                        )
-                if step.distinct and dup_ids:
-                    tc.duplicate_columns = dup_ids
-                    tc.min_rows = max(tc.min_rows, 2)
-                    for _rep, members in spec.equivalences.groups().items():
-                        if len(members) < 2:
-                            continue
-                        member_relations = {
-                            m.relation for m in members if m.relation
-                        }
-                        if relation_id in member_relations:
-                            for other_rel in member_relations:
-                                if (
-                                    other_rel != relation_id
-                                    and other_rel in spec.requirements
-                                ):
-                                    spec.requirements[
-                                        other_rel
-                                    ].min_rows = max(
-                                        spec.requirements[other_rel].min_rows,
-                                        2,
-                                    )
-
-        elif isinstance(step, Sort):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-
-        elif isinstance(step, Having):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            if step.condition and step is not negate_step:
-                if self._is_gold_mode:
-                    for scalar_cond in self._gold_having_scalar_constraints(
-                        step.condition
-                    ):
-                        self._store_expression(scalar_cond, spec)
-                else:
-                    self._store_expression(step.condition, spec)
-                counted_relation = self._find_counted_table(step.condition)
-                min_size = self._extract_min_group_size(step.condition)
-                if (
-                    counted_relation
-                    and counted_relation in spec.requirements
-                ):
-                    spec.requirements[counted_relation].min_rows = max(
-                        spec.requirements[counted_relation].min_rows,
-                        min_size,
-                    )
-                else:
-                    for req in spec.requirements.values():
-                        req.min_rows = max(req.min_rows, min_size)
-                self._extract_having_value_constraints(
-                    step.condition, spec, min_size
-                )
-            elif step is negate_step and step.condition:
-                # Negate the HAVING condition.
-                negated = negate_predicate(step.condition.copy())
-                self._store_expression(negated, spec)
-
-        elif isinstance(step, Aggregate):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            # GROUP BY: mark group columns.
-            if step.group:
-                for group_expr in step.group.values():
-                    for col in group_expr.find_all(exp.Column):
-                        col_id = column_identity(col)
-                        if col_id is None:
-                            continue
-                        relation = col_id.relation
-                        matched = col_id.name.normalized
-                        if matched and relation.name:
-                            table_name = relation.name.normalized
-                            if table_name in self.instance.tables:
-                                req = spec.require(relation)
-                                gid = physical_column(matched, relation)
-                                spec.equivalences.find(gid)
-                                if gid not in req.group_key_columns:
-                                    req.group_key_columns.append(gid)
-            # Aggregate NULL detection.
-            if not self._is_gold_mode:
-                for agg_expr in step.aggregations:
-                    self._add_aggregate_null_constraints(agg_expr, spec)
-            else:
-                for agg_expr in step.aggregations:
-                    for count_node in agg_expr.find_all(exp.Count):
-                        if isinstance(count_node.this, exp.Star):
-                            continue
-                        if count_node.args.get("distinct"):
-                            continue
-                        for col in count_node.find_all(exp.Column):
-                            col_id = column_identity(col)
-                            if col_id is None:
-                                continue
-                            relation = col_id.relation
-                            matched = col_id.name.normalized
-                            if (
-                                matched
-                                and relation.name
-                                and relation.name.normalized
-                                in self.instance.tables
-                            ):
-                                req = spec.require(relation)
-                                if not _has_is_null(
-                                    req.constraints, matched
-                                ) and not _has_is_not_null(
-                                    req.constraints, matched
-                                ):
-                                    col_node = self._solver_col(
-                                        relation.name.normalized,
-                                        matched,
-                                    )
-                                    req.constraints.append(
-                                        _make_is_not_null(col_node)
-                                    )
-
-        elif isinstance(step, Filter):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            if step.condition:
-                if step is negate_step:
-                    conjuncts = self._split_conjuncts(step.condition)
-                    if len(conjuncts) > 1:
-                        for idx, conjunct in enumerate(conjuncts):
-                            if idx == negate_conjunct:
-                                negated = negate_predicate(conjunct.copy())
-                                self._store_expression(negated, spec)
-                            else:
-                                self._store_expression(conjunct, spec)
-                    else:
-                        negated = negate_predicate(step.condition.copy())
-                        self._store_expression(negated, spec)
-                else:
-                    self._store_expression(step.condition, spec)
-                self._extract_column_equalities(step.condition, spec)
-                for atom in self._iter_scalar_subquery_atoms(
-                    step.condition
-                ):
-                    spec.deferred.append(atom)
-
-        elif isinstance(step, Join):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-            # Link join keys via equivalences.
-            for join_name, join_data in (step.joins or {}).items():
-                source_keys = join_data.get("source_key", [])
-                join_keys = join_data.get("join_key", [])
-                for sk, jk in zip(source_keys, join_keys):
-                    sk_id = column_identity(sk) if isinstance(sk, exp.Column) else None
-                    jk_id = column_identity(jk) if isinstance(jk, exp.Column) else None
-                    if sk_id is None or jk_id is None:
-                        raise ValueError(f"Join key lacks identity: sk={sk}, jk={jk}")
-                    if sk_id and jk_id:
-                        sk_rel = sk_id.relation
-                        jk_rel = jk_id.relation
-                        if sk_rel and jk_rel:
-                            spec.require(sk_rel)
-                            spec.require(jk_rel)
-                            spec.equate(sk_id, jk_id)
-                            # Store join equality as expression.
-                            sk_table = (
-                                sk_rel.name.normalized
-                                if sk_rel.name
-                                else ""
-                            )
-                            jk_table = (
-                                jk_rel.name.normalized
-                                if jk_rel.name
-                                else ""
-                            )
-                            if sk_table and jk_table:
-                                eq_expr = exp.EQ(
-                                    this=self._solver_col(
-                                        sk_table,
-                                        sk_id.name.normalized,
-                                    ),
-                                    expression=self._solver_col(
-                                        jk_table,
-                                        jk_id.name.normalized,
-                                    ),
-                                )
-                                spec.requirements[sk_rel].constraints.append(
-                                    eq_expr
-                                )
-                                spec.requirements[jk_rel].constraints.append(
-                                    eq_expr
-                                )
-                                # Mark join key as group_key_column.
-                                req_jk = spec.require(jk_rel)
-                                if jk_id not in req_jk.group_key_columns:
-                                    req_jk.group_key_columns.append(jk_id)
-
-        elif isinstance(step, SetOperation):
-            for dep in step.chain_dependencies:
-                self._propagate_step(dep, spec, negate_step, negate_conjunct)
-
-        elif isinstance(step, Scan):
-            # Use the identity-based RelationId from annotations to ensure
-            # it matches the RelationId used by filter/join columns.
-            ann = self.plan.annotations.get(id(step))
-            if ann and ann.projected_columns:
-                relation = ann.projected_columns[0].relation
-                table_name = relation.name.normalized if relation.name else ""
-                if table_name in self.instance.tables:
-                    spec.require(relation)
-            elif isinstance(step.source, exp.Table):
-                name = normalize_name(step.source.name)
-                relation = _relation_for_table(self.instance, name)
-                table_name = relation.name.normalized if relation.name else ""
-                if table_name in self.instance.tables:
-                    spec.require(relation)
-            # For FROM-subquery scans, propagate into the inner plan.
-            for sub in step.subplan_dependencies:
-                if sub.inner:
-                    self._propagate_step(
-                        sub.inner, spec, negate_step, negate_conjunct
-                    )
-
-        # Handle SubPlan dependencies.
-        for sub in step.subplan_dependencies:
-            self._propagate_subplan(
-                sub,
-                spec,
-                parent_condition=getattr(step, "condition", None),
-            )
 
     # -----------------------------------------------------------------
     # Expression storage
@@ -1526,74 +1603,6 @@ class Propagator:
                         )
                     )
                     req.constraints.append(not_in)
-
-    def _propagate_subplan(
-        self,
-        sub: SubPlan,
-        spec: BranchSpec,
-        parent_condition: Optional[exp.Expression] = None,
-    ):
-        """Handle EXISTS/IN/SCALAR subplan correlation."""
-        negated_exists = (
-            sub.kind.value == "exists"
-            and self._subplan_anchor_is_negated(
-                parent_condition, sub.anchor
-            )
-        )
-        if sub.kind.value == "exists" and sub.correlation and not negated_exists:
-            for corr_col in sub.correlation:
-                corr_id = column_identity(corr_col)
-                if corr_id and corr_id.relation:
-                    outer_relation = corr_id.relation
-                    outer_matched = corr_id.name.normalized
-                else:
-                    outer_relation = _relation_for_table(
-                         self.instance, corr_col.table or ""
-                    )
-                    outer_matched = corr_col.name
-                if outer_matched:
-                    spec.require(outer_relation)
-                    inner_key = self._find_inner_corr_column(sub, spec)
-                    if inner_key:
-                        inner_relation, inner_matched = inner_key
-                        outer_col_id = physical_column(
-                            outer_matched, outer_relation
-                        )
-                        inner_col_id = physical_column(
-                            inner_matched, inner_relation
-                        )
-                        spec.equate(outer_col_id, inner_col_id)
-                        eq_expr = exp.EQ(
-                            this=self._solver_col(
-                                outer_relation.name.normalized
-                                if outer_relation.name
-                                else "",
-                                outer_matched,
-                            ),
-                            expression=self._solver_col(
-                                inner_relation.name.normalized
-                                if inner_relation.name
-                                else "",
-                                inner_matched,
-                            ),
-                        )
-                        spec.requirements[outer_relation].constraints.append(
-                            eq_expr
-                        )
-
-        elif sub.kind.value == "in":
-            self._propagate_in_subplan(sub, spec)
-
-        elif sub.kind.value == "scalar":
-            self._propagate_scalar_subplan(sub, spec)
-
-        # Scalar subqueries are repaired from deferred predicates.
-        if (
-            sub.inner
-            and not negated_exists
-            and sub.kind.value != "scalar"
-        ):
-            self._propagate_step(sub.inner, spec)
 
     def _subplan_anchor_is_negated(
         self,
