@@ -66,25 +66,6 @@ def _table_name(relation: RelationId) -> str:
     return relation.name.normalized if relation.name else ""
 
 
-def _lookup_col_type(
-    instance: Instance, relation: RelationId, col_name: str
-) -> Optional[str]:
-    """Look up column type with case-insensitive fallback."""
-    table = _table_name(relation)
-    schema = instance.tables.get(table)
-    if not schema:
-        return None
-    # Direct lookup first.
-    dtype = schema.get(normalize_name(col_name))
-    if dtype:
-        return dtype
-    # Case-insensitive fallback.
-    lower = col_name.lower()
-    for schema_col, schema_dtype in schema.items():
-        if schema_col.lower() == lower:
-            return schema_dtype
-    return None
-
 
 
 # =============================================================================
@@ -92,28 +73,12 @@ def _lookup_col_type(
 # =============================================================================
 
 
-def _build_alias_map(plan: "Plan") -> Dict[str, str]:
-    """Build alias -> real table name mapping from plan annotations."""
-    alias_map: Dict[str, str] = {}
-    for _step_id, ann in plan.annotations.items():
-        if ann.step_type == "Scan":
-            for col in ann.projected_columns:
-                r = col.relation
-                if r.alias:
-                    alias_map[r.alias.normalized] = r.name.normalized
-                break
-    return alias_map
-
-
 def _relation_for_table(
     instance: Instance,
     name: str,
-    alias_map: Optional[Dict[str, str]] = None,
 ) -> RelationId:
     """Get RelationId for a table name, creating a synthetic one if needed."""
     normalized = normalize_name(name)
-    if alias_map and normalized in alias_map:
-        normalized = alias_map[normalized]
     try:
         return instance.table_id(normalized)
     except (KeyError, Exception):
@@ -122,56 +87,28 @@ def _relation_for_table(
 
 def _solver_column(
     instance: Instance,
-    table: str,
+    relation: RelationId,
     col_name: str,
     row_scope: Optional[str] = None,
-    alias_map: Optional[Dict[str, str]] = None,
 ) -> exp.Column:
-    """Create a Column annotated with SolverVar + type from the instance schema.
-
-    This is the KEY helper that replaces all string-based column creation.
-    Every Column that enters a solver constraint must go through here (or
-    _ensure_solver_var for columns already in the plan).
-    """
-    relation = _relation_for_table(instance, table, alias_map=alias_map)
+    """Create a Column annotated with SolverVar + type from the instance schema."""
     col_id = physical_column(col_name, relation)
     var = SolverVar(column_id=col_id, relation_id=relation, row_scope=row_scope)
-
     table_display = relation.display
     col_node = exp.column(col_name, table=table_display)
     set_solver_var(col_node, var)
     # Set type from instance schema.
-    col_type_str = _lookup_col_type(instance, relation, col_name)
-    if col_type_str:
-        try:
-            col_node.type = DataType.build(col_type_str)
-        except Exception:
-            pass
+    table = relation.name.normalized if relation.name else ""
+    schema = instance.tables.get(table)
+    if schema:
+        dtype = schema.get(normalize_name(col_name))
+        if dtype:
+            try:
+                col_node.type = DataType.build(dtype)
+            except Exception:
+                pass
     return col_node
 
-
-def _ensure_solver_var(
-    col: exp.Column, instance: Instance, alias_map: Optional[Dict[str, str]] = None
-) -> None:
-    """Ensure a Column has SolverVar metadata.
-
-    For Columns that already exist in the plan (and thus carry
-    PARSEVAL_COLUMN_ID metadata set by the planner), this reads the
-    identity and attaches a SolverVar. The solver requires every
-    Column in constraints to carry both a type annotation and SolverVar.
-    """
-    if solver_var(col) is not None:
-        return
-    col_id = column_identity(col)
-    if col_id is None:
-        return
-    # Derive relation from the column identity.
-    if col_id.relation is not None:
-        relation = col_id.relation
-    else:
-        relation = _relation_for_table(instance, col.table or "", alias_map=alias_map)
-    var = SolverVar(column_id=col_id, relation_id=relation)
-    set_solver_var(col, var)
 
 
 # =============================================================================
@@ -478,7 +415,7 @@ class Propagator:
 
     The Propagator stores constraints as ``exp.Expression`` objects
     directly.  Every column entering a constraint carries a ``SolverVar``
-    annotation (via ``_solver_column`` or ``_ensure_solver_var``).
+    annotation (via ``_solver_column`` or identity-based inline setup).
     """
 
     def __init__(
@@ -492,7 +429,6 @@ class Propagator:
         self.instance = instance
         self.dialect = dialect
         self.config = config or SpeculateConfig.gold_non_empty()
-        self._alias_map = _build_alias_map(plan)
         self._is_gold_mode = (
             self.config.negative == 0
             and self.config.null == 0
@@ -501,17 +437,13 @@ class Propagator:
             and self.config.having_fail == 0
         )
 
-    def _rel(self, name: str) -> RelationId:
-        """Resolve table name (including aliases) to RelationId."""
-        return _relation_for_table(self.instance, name, alias_map=self._alias_map)
-
     def _solver_col(
         self, table: str, col_name: str, row_scope: Optional[str] = None
     ) -> exp.Column:
-        """Create a solver column, resolving aliases."""
+        """Create a solver column from a table name string."""
+        relation = _relation_for_table(self.instance, table)
         return _solver_column(
-            self.instance, table, col_name, row_scope=row_scope,
-            alias_map=self._alias_map,
+            self.instance, relation, col_name, row_scope=row_scope,
         )
 
     # -----------------------------------------------------------------
@@ -674,8 +606,8 @@ class Propagator:
             # Apply min_rows to the driving table.
             driving_alias = getattr(step, "source", None)
             if driving_alias:
-                driving_relation = self._rel(
-                     driving_alias
+                driving_relation = _relation_for_table(
+                     self.instance, driving_alias
                 )
                 if driving_relation in spec.requirements:
                     spec.requirements[driving_relation].min_rows = max(
@@ -692,24 +624,26 @@ class Propagator:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
             # Route each projected column to its correct table.
             for col_name, table_alias in projected:
-                real_table = self._alias_map.get(
-                    normalize_name(table_alias), normalize_name(table_alias)
-                )
                 for relation_id, tc in spec.requirements.items():
-                    if tc.table != real_table:
+                    norm_alias = normalize_name(table_alias)
+                    if tc.table != norm_alias and (
+                        tc.alias is None
+                        or normalize_name(tc.alias) != norm_alias
+                    ):
                         continue
                     if not _has_is_not_null(tc.constraints, col_name):
-                        col_node = self._solver_col(real_table, col_name)
+                        col_node = self._solver_col(tc.table, col_name)
                         tc.constraints.append(_make_is_not_null(col_node))
                     break
             # Duplicate / DISTINCT handling.
             for relation_id, tc in spec.requirements.items():
                 dup_ids = []
                 for col_name, table_alias in projected:
-                    real_table = self._alias_map.get(
-                        normalize_name(table_alias), normalize_name(table_alias)
-                    )
-                    if tc.table == real_table:
+                    norm_alias = normalize_name(table_alias)
+                    if tc.table == norm_alias or (
+                        tc.alias is not None
+                        and normalize_name(tc.alias) == norm_alias
+                    ):
                         dup_ids.append(
                             physical_column(col_name, relation_id)
                         )
@@ -909,11 +843,20 @@ class Propagator:
                 self._propagate_step(dep, spec, negate_step, negate_conjunct)
 
         elif isinstance(step, Scan):
-            name = step.name or ""
-            relation = self._rel( name)
-            table_name = relation.name.normalized if relation.name else ""
-            if table_name in self.instance.tables:
-                spec.require(relation)
+            # Use the identity-based RelationId from annotations to ensure
+            # it matches the RelationId used by filter/join columns.
+            ann = self.plan.annotations.get(id(step))
+            if ann and ann.projected_columns:
+                relation = ann.projected_columns[0].relation
+                table_name = relation.name.normalized if relation.name else ""
+                if table_name in self.instance.tables:
+                    spec.require(relation)
+            elif isinstance(step.source, exp.Table):
+                name = normalize_name(step.source.name)
+                relation = _relation_for_table(self.instance, name)
+                table_name = relation.name.normalized if relation.name else ""
+                if table_name in self.instance.tables:
+                    spec.require(relation)
             # For FROM-subquery scans, propagate into the inner plan.
             for sub in step.subplan_dependencies:
                 if sub.inner:
@@ -992,7 +935,11 @@ class Propagator:
     def _resolve_columns(self, expr: exp.Expression) -> exp.Expression:
         """Resolve column table qualifiers and ensure SolverVar metadata."""
         for col in expr.find_all(exp.Column):
-            _ensure_solver_var(col, self.instance, alias_map=self._alias_map)
+            if solver_var(col) is None:
+                col_id = column_identity(col)
+                if col_id is not None and col_id.relation is not None:
+                    var = SolverVar(column_id=col_id, relation_id=col_id.relation)
+                    set_solver_var(col, var)
             col_id = column_identity(col)
             if col_id and col_id.relation:
                 display = col_id.relation.display
@@ -1075,8 +1022,8 @@ class Propagator:
                 if not fk_cols:
                     continue
                 fk_col = fk_cols[0]
-                ref_relation = self._rel(
-                     ref_table
+                ref_relation = _relation_for_table(
+                     self.instance, ref_table
                 )
                 parent_rows = self.instance.get_rows(ref_relation)
                 if parent_rows:
@@ -1181,7 +1128,7 @@ class Propagator:
         for table in list(targets.keys()):
             if table not in self.instance.tables:
                 continue
-            rel = _relation_for_table(self.instance, table, alias_map=self._alias_map)
+            rel = _relation_for_table(self.instance, table)
             targets[table] = {
                 col
                 for col in targets[table]
@@ -1385,14 +1332,15 @@ class Propagator:
                     else:
                         col_id = column_identity(col)
                         if col_id and col_id.relation:
-                            col_type_str = _lookup_col_type(
-                                self.instance, col_id.relation, col.name
-                            )
-                            if col_type_str:
-                                try:
-                                    col.type = DataType.build(col_type_str)
-                                except Exception:
-                                    pass
+                            table = _table_name(col_id.relation)
+                            schema = self.instance.tables.get(table)
+                            if schema:
+                                dtype = schema.get(normalize_name(col.name))
+                                if dtype:
+                                    try:
+                                        col.type = DataType.build(dtype)
+                                    except Exception:
+                                        pass
 
         # Also annotate columns in deferred atoms.
         for atom in spec.deferred:
@@ -1405,14 +1353,15 @@ class Propagator:
                 else:
                     col_id = column_identity(col)
                     if col_id and col_id.relation:
-                        col_type_str = _lookup_col_type(
-                            self.instance, col_id.relation, col.name
-                        )
-                        if col_type_str:
-                            try:
-                                col.type = DataType.build(col_type_str)
-                            except Exception:
-                                pass
+                        table = _table_name(col_id.relation)
+                        schema = self.instance.tables.get(table)
+                        if schema:
+                            dtype = schema.get(normalize_name(col.name))
+                            if dtype:
+                                try:
+                                    col.type = DataType.build(dtype)
+                                except Exception:
+                                    pass
 
     # -----------------------------------------------------------------
     # Aggregate NULL constraints
@@ -1465,7 +1414,7 @@ class Propagator:
     ):
         """Generate a left-table row with no matching right-table row."""
         source_name = join_step.source_name or join_step.name or ""
-        source_relation = self._rel( source_name)
+        source_relation = _relation_for_table(self.instance, source_name)
         source_table = (
             source_relation.name.normalized
             if source_relation.name
@@ -1475,7 +1424,7 @@ class Propagator:
             return
         req = spec.require(source_relation)
         for join_name, join_data in (join_step.joins or {}).items():
-            join_relation = self._rel( join_name)
+            join_relation = _relation_for_table(self.instance, join_name)
             join_table = (
                 join_relation.name.normalized
                 if join_relation.name
@@ -1526,7 +1475,7 @@ class Propagator:
         self, join_step: Join, join_name: str, spec: BranchSpec
     ):
         """Generate a right-table row with no matching left-table row."""
-        join_relation = self._rel( join_name)
+        join_relation = _relation_for_table(self.instance, join_name)
         join_table = (
             join_relation.name.normalized if join_relation.name else ""
         )
@@ -1534,7 +1483,7 @@ class Propagator:
             return
         req = spec.require(join_relation)
         source_name = join_step.source_name or join_step.name or ""
-        source_relation = self._rel( source_name)
+        source_relation = _relation_for_table(self.instance, source_name)
         join_data = (join_step.joins or {}).get(join_name, {})
         join_keys = join_data.get("join_key", [])
         for jk in join_keys:
@@ -1598,8 +1547,8 @@ class Propagator:
                     outer_relation = corr_id.relation
                     outer_matched = corr_id.name.normalized
                 else:
-                    outer_relation = self._rel(
-                         corr_col.table or ""
+                    outer_relation = _relation_for_table(
+                         self.instance, corr_col.table or ""
                     )
                     outer_matched = corr_col.name
                 if outer_matched:
@@ -1677,8 +1626,8 @@ class Propagator:
             outer_relation = outer_id.relation
             outer_matched = outer_id.name.normalized
         else:
-            outer_relation = self._rel(
-                 outer_col.table or ""
+            outer_relation = _relation_for_table(
+                 self.instance, outer_col.table or ""
             )
             outer_matched = outer_col.name
         if not outer_matched:
@@ -1720,7 +1669,7 @@ class Propagator:
             if isinstance(step, Scan) and step.source:
                 if isinstance(step.source, exp.Table):
                     name = step.source.name
-                    rel = self._rel( name)
+                    rel = _relation_for_table(self.instance, name)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
                         spec.require(rel)
@@ -1734,8 +1683,8 @@ class Propagator:
                     outer_relation = corr_id.relation
                     outer_matched = corr_id.name.normalized
                 else:
-                    outer_relation = self._rel(
-                         corr_col.table or ""
+                    outer_relation = _relation_for_table(
+                         self.instance, corr_col.table or ""
                     )
                     outer_matched = corr_col.name
                 if not outer_matched:
@@ -1808,7 +1757,7 @@ class Propagator:
             if isinstance(step, Scan) and step.source:
                 if isinstance(step.source, exp.Table):
                     name = step.source.name
-                    rel = self._rel( name)
+                    rel = _relation_for_table(self.instance, name)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
                         spec.require(rel)
@@ -1876,7 +1825,7 @@ class Propagator:
             if isinstance(step, Scan) and step.source:
                 if isinstance(step.source, exp.Table):
                     name = step.source.name
-                    rel = _relation_for_table(self.instance, name, alias_map=self._alias_map)
+                    rel = _relation_for_table(self.instance, name)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
                         return (rel, col_name)
@@ -1903,13 +1852,13 @@ class Propagator:
                 l_id = column_identity(left)
                 r_id = column_identity(right)
                 if l_id is None:
-                    lt = self._rel(
-                         left.table or ""
+                    lt = _relation_for_table(
+                         self.instance, left.table or ""
                     )
                     l_id = physical_column(left.name, lt)
                 if r_id is None:
-                    rt = self._rel(
-                         right.table or ""
+                    rt = _relation_for_table(
+                         self.instance, right.table or ""
                     )
                     r_id = physical_column(right.name, rt)
                 if l_id and r_id and l_id.relation and r_id.relation:
@@ -2385,14 +2334,15 @@ def _rewrite_constraint_for_binding(
             set_solver_var(col, new_var)
             ct = col_type(col)
             if ct is None:
-                col_type_str = _lookup_col_type(
-                    instance, sv.relation_id, col.name
-                )
-                if col_type_str:
-                    try:
-                        col.type = DataType.build(col_type_str)
-                    except Exception:
-                        pass
+                table = sv.relation_id.name.normalized if sv.relation_id.name else ""
+                schema = instance.tables.get(table)
+                if schema:
+                    dtype = schema.get(normalize_name(col.name))
+                    if dtype:
+                        try:
+                            col.type = DataType.build(dtype)
+                        except Exception:
+                            pass
             if scoped_vars is not None:
                 scoped_vars[(binding.table, normalize_name(col.name))] = new_var
             matched = True
@@ -2410,17 +2360,18 @@ def _rewrite_constraint_for_binding(
                 set_solver_var(col, existing)
                 ct = col_type(col)
                 if ct is None:
-                    col_type_str = _lookup_col_type(
-                        instance, existing.relation_id, col.name
-                    )
-                    if col_type_str:
-                        try:
-                            col.type = DataType.build(col_type_str)
-                        except Exception:
-                            pass
+                    table = existing.relation_id.name.normalized if existing.relation_id.name else ""
+                    schema = instance.tables.get(table)
+                    if schema:
+                        dtype = schema.get(normalize_name(col.name))
+                        if dtype:
+                            try:
+                                col.type = DataType.build(dtype)
+                            except Exception:
+                                pass
             else:
                 new_col = _solver_column(
-                    instance, binding.table, col.name,
+                    instance, binding.relation, col.name,
                     row_scope=f"r{binding.row}",
                 )
                 set_solver_var(col, solver_var(new_col))
@@ -2447,12 +2398,15 @@ def _collect_solver_vars(
 
 def _dtype_for_solver_var(var: SolverVar, instance: Instance) -> Optional[DataType]:
     """Look up DataType for a SolverVar from instance schema."""
-    col_type_str = _lookup_col_type(instance, var.relation_id, var.column_id.name.normalized)
-    if col_type_str:
-        try:
-            return DataType.build(col_type_str)
-        except Exception:
-            return None
+    table = var.relation_id.name.normalized if var.relation_id.name else ""
+    schema = instance.tables.get(table)
+    if schema:
+        dtype = schema.get(normalize_name(var.column_id.name.normalized))
+        if dtype:
+            try:
+                return DataType.build(dtype)
+            except Exception:
+                return None
     return None
 
 
@@ -2966,13 +2920,14 @@ def _solve_scalar_witness_values(
             if getattr(col, "type", None) is not None:
                 continue
             table = normalize_name(col.table or "")
-            relation = _relation_for_table(instance, table)
-            col_type_str = _lookup_col_type(instance, relation, col.name)
-            if col_type_str:
-                try:
-                    col.type = DataType.build(col_type_str)
-                except Exception:
-                    pass
+            schema = instance.tables.get(table)
+            if schema:
+                dtype = schema.get(normalize_name(col.name))
+                if dtype:
+                    try:
+                        col.type = DataType.build(dtype)
+                    except Exception:
+                        pass
 
     outer_bindings = _bindings_for_scalar_expression(outer_scoped, instance, row_index=0)
     inner_bindings = _bindings_for_scalar_expression(inner_scoped, instance, row_index=inner_row_index)
@@ -2986,7 +2941,7 @@ def _solve_scalar_witness_values(
         binding = _find_binding_for_column(table, all_bindings)
         if binding is None:
             continue
-        new_col = _solver_column(instance, binding.table, col.name, row_scope=f"r{binding.row}")
+        new_col = _solver_column(instance, binding.relation, col.name, row_scope=f"r{binding.row}")
         set_solver_var(col, solver_var(new_col))
         if hasattr(new_col, "type") and new_col.type is not None:
             col.type = new_col.type
@@ -2996,7 +2951,7 @@ def _solve_scalar_witness_values(
         binding = _find_binding_for_column(table, all_bindings)
         if binding is None:
             continue
-        new_col = _solver_column(instance, binding.table, col.name, row_scope=f"r{binding.row}")
+        new_col = _solver_column(instance, binding.relation, col.name, row_scope=f"r{binding.row}")
         set_solver_var(col, solver_var(new_col))
         if hasattr(new_col, "type") and new_col.type is not None:
             col.type = new_col.type
@@ -3255,7 +3210,7 @@ class Resolver:
                 seen_not_null.add(key)
                 col_node = _solver_column(
                     self.instance,
-                    var.relation_id.name.normalized,
+                    var.relation_id,
                     var.column_id.name.normalized,
                     row_scope=var.row_scope,
                 )
@@ -3317,6 +3272,7 @@ def speculate(
     if config is None:
         config = SpeculateConfig.gold_non_empty()
 
+    _ = plan.annotations  # Ensure identity is prepared on all steps
     propagator = Propagator(plan, instance, dialect, config=config)
     solver = Solver(dialect=dialect)
     resolver = Resolver(plan, instance, dialect, solver=solver)

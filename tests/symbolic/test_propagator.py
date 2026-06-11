@@ -203,18 +203,18 @@ def test_propagate_uses_identity_not_strings():
     plan = _make_plan(sql, instance)
 
     call_count = 0
-    original_rel = Propagator._rel
+    original_fn = speculate_module._relation_for_table
 
-    def patched_rel(self, name):
+    def patched_fn(instance, name):
         nonlocal call_count
         call_count += 1
-        return original_rel(self, name)
+        return original_fn(instance, name)
 
-    with patch.object(Propagator, '_rel', patched_rel):
+    with patch.object(speculate_module, '_relation_for_table', patched_fn):
         propagator = Propagator(plan, instance, "sqlite")
         specs = propagator.propagate()
 
-    # After removing fallbacks, _rel (string-based resolution) should only be
-    # called for Scan step registration (2 tables) and _annotate_column_types.
-    # Before the fix, GROUP BY, COUNT, and Join key handling also called _rel.
-    assert call_count <= 3, f"Expected <=3 _rel calls, got {call_count}"
+    # _relation_for_table should only be called for Scan step table
+    # resolution and FK reference tables, not for column resolution
+    # (which uses identity instead).
+    assert call_count <= 5, f"Expected <=5 _relation_for_table calls, got {call_count}"
