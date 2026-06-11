@@ -818,27 +818,23 @@ class Propagator:
     # Top-level propagation
     # -----------------------------------------------------------------
 
-    def propagate(self) -> List[BranchSpec]:
-        """Produce specs for branches based on config thresholds."""
-        specs: List[BranchSpec] = []
-
-        # Positive path.
-        if self.config.positive > 0:
-            try:
-                pos = BranchSpec(branch="positive")
-                self._walk_plan(pos)
-                if self.config.boundary > 0:
-                    self._collect_boundary_values(pos)
-                self._add_schema_constraints(pos)
-                self._annotate_column_types(pos)
-                specs.append(pos)
-            except Exception as exc:
-                logger.debug("positive spec propagation failed: %s", exc)
-                pos = BranchSpec(branch="positive")
-        else:
+    def _positive_spec(self) -> Optional[BranchSpec]:
+        """Build the positive branch spec."""
+        if self.config.positive <= 0:
+            return None
+        try:
             pos = BranchSpec(branch="positive")
+            self._walk_plan(pos)
+            if self.config.boundary > 0:
+                self._collect_boundary_values(pos)
+            return pos
+        except Exception as exc:
+            logger.debug("positive spec propagation failed: %s", exc)
+            return None
 
-        # Negative branches per decision site.
+    def _negative_specs(self) -> List[BranchSpec]:
+        """Build negative branch specs per filter conjunct."""
+        specs: List[BranchSpec] = []
         if self.config.negative > 0:
             for step in self.plan.ordered_steps:
                 try:
@@ -849,8 +845,6 @@ class Propagator:
                             self._negate_step = step
                             self._negate_conjunct = idx
                             self._walk_plan(neg)
-                            self._add_schema_constraints(neg)
-                            self._annotate_column_types(neg)
                             specs.append(neg)
                 except Exception as exc:
                     logger.debug(
@@ -860,35 +854,38 @@ class Propagator:
                     )
         self._negate_step = None
         self._negate_conjunct = 0
+        return specs
 
-        # Unmatched join branches.
-        if self.config.left_unmatched > 0 or self.config.right_unmatched > 0:
-            for step in self.plan.ordered_steps:
-                try:
-                    if isinstance(step, Join):
-                        if self.config.left_unmatched > 0:
-                            left_un = BranchSpec(branch="left_unmatched")
-                            self._propagate_unmatched_left(step, left_un)
-                            self._add_schema_constraints(left_un)
-                            self._annotate_column_types(left_un)
-                            specs.append(left_un)
-                        if self.config.right_unmatched > 0:
-                            for join_name in step.joins or {}:
-                                right_un = BranchSpec(
-                                    branch=f"right_unmatched_{join_name}"
-                                )
-                                self._propagate_unmatched_right(
-                                    step, join_name, right_un
-                                )
-                                self._add_schema_constraints(right_un)
-                                self._annotate_column_types(right_un)
-                                specs.append(right_un)
-                except Exception as exc:
-                    logger.debug(
-                        "unmatched join propagation failed: %s", exc
-                    )
+    def _unmatched_join_specs(self) -> List[BranchSpec]:
+        """Build left_unmatched and right_unmatched branch specs."""
+        specs: List[BranchSpec] = []
+        if self.config.left_unmatched <= 0 and self.config.right_unmatched <= 0:
+            return specs
+        for step in self.plan.ordered_steps:
+            try:
+                if isinstance(step, Join):
+                    if self.config.left_unmatched > 0:
+                        left_un = BranchSpec(branch="left_unmatched")
+                        self._propagate_unmatched_left(step, left_un)
+                        specs.append(left_un)
+                    if self.config.right_unmatched > 0:
+                        for join_name in step.joins or {}:
+                            right_un = BranchSpec(
+                                branch=f"right_unmatched_{join_name}"
+                            )
+                            self._propagate_unmatched_right(
+                                step, join_name, right_un
+                            )
+                            specs.append(right_un)
+            except Exception as exc:
+                logger.debug(
+                    "unmatched join propagation failed: %s", exc
+                )
+        return specs
 
-        # Having fail branches.
+    def _having_fail_specs(self) -> List[BranchSpec]:
+        """Build having_fail branch specs."""
+        specs: List[BranchSpec] = []
         if self.config.having_fail > 0:
             for step in self.plan.ordered_steps:
                 try:
@@ -896,57 +893,73 @@ class Propagator:
                         fail = BranchSpec(branch="having_fail")
                         self._negate_step = step
                         self._walk_plan(fail)
-                        self._add_schema_constraints(fail)
-                        self._annotate_column_types(fail)
                         specs.append(fail)
                 except Exception as exc:
                     logger.debug("having_fail propagation failed: %s", exc)
         self._negate_step = None
+        return specs
 
-        # Null branches.
-        if self.config.null > 0:
-            try:
-                null_targets = self._collect_null_target_columns(pos)
-                if null_targets:
-                    for table, cols in null_targets.items():
-                        for col_name in cols:
-                            null_spec = BranchSpec(
-                                branch=f"null_{table}.{col_name}"
-                            )
-                            self._walk_plan(null_spec)
-                            self._apply_single_null_override(
-                                null_spec, table, col_name
-                            )
-                            self._add_schema_constraints(null_spec)
-                            self._annotate_column_types(null_spec)
-                            specs.append(null_spec)
-                else:
-                    null_spec = BranchSpec(branch="null_branch")
-                    self._walk_plan(null_spec)
-                    self._apply_null_overrides(null_spec)
-                    self._add_schema_constraints(null_spec)
-                    self._annotate_column_types(null_spec)
-                    specs.append(null_spec)
-            except Exception as exc:
-                logger.debug("null branch propagation failed: %s", exc)
+    def _null_specs(self, pos: Optional[BranchSpec]) -> List[BranchSpec]:
+        """Build null branch specs."""
+        specs: List[BranchSpec] = []
+        if self.config.null <= 0:
+            return specs
+        try:
+            pos = pos or BranchSpec(branch="positive")
+            null_targets = self._collect_null_target_columns(pos)
+            if null_targets:
+                for table, cols in null_targets.items():
+                    for col_name in cols:
+                        null_spec = BranchSpec(
+                            branch=f"null_{table}.{col_name}"
+                        )
+                        self._walk_plan(null_spec)
+                        self._apply_single_null_override(
+                            null_spec, table, col_name
+                        )
+                        specs.append(null_spec)
+            else:
+                null_spec = BranchSpec(branch="null_branch")
+                self._walk_plan(null_spec)
+                self._apply_null_overrides(null_spec)
+                specs.append(null_spec)
+        except Exception as exc:
+            logger.debug("null branch propagation failed: %s", exc)
+        return specs
 
-        # CASE WHEN branches.
-        if self.config.case_else > 0:
-            try:
-                for case_idx, when_conditions in enumerate(
-                    self._collect_case_when_conditions()
-                ):
-                    case_spec = BranchSpec(branch=f"case_else_{case_idx}")
-                    self._walk_plan(case_spec)
-                    for cond in when_conditions:
-                        negated = negate_predicate(cond.copy())
-                        self._store_expression(negated, case_spec)
-                    self._add_schema_constraints(case_spec)
-                    self._annotate_column_types(case_spec)
-                    specs.append(case_spec)
-            except Exception as exc:
-                logger.debug("CASE WHEN propagation failed: %s", exc)
+    def _case_else_specs(self) -> List[BranchSpec]:
+        """Build CASE WHEN ELSE branch specs."""
+        specs: List[BranchSpec] = []
+        if self.config.case_else <= 0:
+            return specs
+        try:
+            for case_idx, when_conditions in enumerate(
+                self._collect_case_when_conditions()
+            ):
+                case_spec = BranchSpec(branch=f"case_else_{case_idx}")
+                self._walk_plan(case_spec)
+                for cond in when_conditions:
+                    negated = negate_predicate(cond.copy())
+                    self._store_expression(negated, case_spec)
+                specs.append(case_spec)
+        except Exception as exc:
+            logger.debug("CASE WHEN propagation failed: %s", exc)
+        return specs
 
+    def propagate(self) -> List[BranchSpec]:
+        """Produce specs for branches based on config thresholds."""
+        specs: List[BranchSpec] = []
+        pos = self._positive_spec()
+        if pos:
+            specs.append(pos)
+        specs.extend(self._negative_specs())
+        specs.extend(self._unmatched_join_specs())
+        specs.extend(self._having_fail_specs())
+        specs.extend(self._null_specs(pos))
+        specs.extend(self._case_else_specs())
+        for spec in specs:
+            self._add_schema_constraints(spec)
+            self._annotate_column_types(spec)
         return specs
 
     # -----------------------------------------------------------------
