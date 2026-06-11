@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from itertools import product
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
@@ -2542,11 +2543,1035 @@ class Propagator:
 # Resolver: solver integration and row materialization
 # =============================================================================
 
-# (Task 3: Resolver class will be added here)
+def _row_value_dict(row) -> Dict[str, Any]:
+    """Convert a Row to a plain dict keyed by column name string."""
+    values: Dict[str, Any] = {}
+    for column, value in row.items():
+        key = column.name.normalized if isinstance(column, ColumnId) else str(column)
+        values[key] = value.concrete if hasattr(value, "concrete") else value
+    return values
+
+
+# ---------------------------------------------------------------------------
+# RowBinding construction
+# ---------------------------------------------------------------------------
+
+
+def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
+    """Build RowBinding objects for every table x row in the spec."""
+    bindings: Dict[str, RowBinding] = {}
+    alias_scoped_tables: Set[str] = set()
+    for relation, req in spec.requirements.items():
+        if req.alias:
+            alias_scoped_tables.add(req.table)
+
+    for relation, req in spec.requirements.items():
+        physical = req.table
+        if physical in alias_scoped_tables and not req.alias:
+            # For self-join tables, only create bindings for alias-scoped entries.
+            # If this entry has no alias and the table is alias-scoped, skip it
+            # UNLESS there is no alias-scoped version with this specific alias.
+            continue
+        binding_relation = req.relation
+        for row_index in range(max(req.min_rows, 1)):
+            binding = RowBinding(relation=binding_relation, row=row_index)
+            bindings[_solver_table_key(binding)] = binding
+    return bindings
+
+
+def _bindings_for_requirement(
+    relation: RelationId,
+    req: TableConstraint,
+    row_bindings: Dict[str, RowBinding],
+) -> List[RowBinding]:
+    """Find bindings matching a requirement."""
+    target_table = req.table
+    target_alias = req.alias
+    return [
+        binding
+        for binding in row_bindings.values()
+        if binding.table == target_table
+        and (target_alias is None or normalize_name(binding.alias or "") == normalize_name(target_alias))
+    ]
+
+
+def _find_binding_for_column(
+    table_name: str,
+    row_bindings: Dict[str, RowBinding],
+) -> Optional[RowBinding]:
+    """Find the first RowBinding for a physical table name."""
+    normalized = normalize_name(table_name)
+    for binding in row_bindings.values():
+        if binding.table == normalized:
+            return binding
+    return None
+
+
+def _requirement_for_binding(
+    spec: BranchSpec,
+    binding: RowBinding,
+) -> Optional[TableConstraint]:
+    """Find the TableConstraint for a binding."""
+    for relation, req in spec.requirements.items():
+        if req.table != binding.table:
+            continue
+        if req.alias:
+            if normalize_name(req.alias) == normalize_name(binding.alias or ""):
+                return req
+        elif binding.alias == binding.table or binding.alias is None:
+            return req
+    # Fallback: match by table name only.
+    for relation, req in spec.requirements.items():
+        if req.table == binding.table:
+            return req
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Constraint rewriting for row scoping
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_constraint_for_binding(
+    constraint: exp.Expression,
+    binding: RowBinding,
+    instance: Instance,
+) -> Optional[exp.Expression]:
+    """Copy constraint, replace Column nodes with _solver_column scoped to the binding.
+
+    Returns None if no columns match the binding's table.
+    """
+    rewritten = constraint.copy()
+    matched = False
+    for col in rewritten.find_all(exp.Column):
+        sv = solver_var(col)
+        if sv is not None:
+            # Check if this column's relation matches the binding.
+            if sv.relation_id.name.normalized != binding.table:
+                continue
+            # Create a new solver column with the binding's row scope.
+            new_col = _solver_column(
+                instance, binding.table, col.name,
+                row_scope=f"r{binding.row}",
+            )
+            set_solver_var(col, solver_var(new_col))
+            if hasattr(new_col, "type") and new_col.type is not None:
+                col.type = new_col.type
+            matched = True
+        else:
+            col_table = normalize_name(col.table or "")
+            if col_table and col_table != binding.table:
+                # Try alias match.
+                if binding.alias and col_table != normalize_name(binding.alias):
+                    continue
+                elif not binding.alias:
+                    continue
+            new_col = _solver_column(
+                instance, binding.table, col.name,
+                row_scope=f"r{binding.row}",
+            )
+            set_solver_var(col, solver_var(new_col))
+            if hasattr(new_col, "type") and new_col.type is not None:
+                col.type = new_col.type
+            matched = True
+    return rewritten if matched else None
+
+
+def _collect_solver_vars(
+    expr: exp.Expression,
+) -> Dict[SolverVar, DataType]:
+    """Collect SolverVar + DataType from all columns in expression."""
+    variables: Dict[SolverVar, DataType] = {}
+    for col in expr.find_all(exp.Column):
+        sv = solver_var(col)
+        if sv is None:
+            continue
+        dt = col_type(col)
+        if dt is not None:
+            variables[sv] = dt
+    return variables
+
+
+def _dtype_for_solver_var(var: SolverVar, instance: Instance) -> Optional[DataType]:
+    """Look up DataType for a SolverVar from instance schema."""
+    col_type_str = _lookup_col_type(instance, var.relation_id, var.column_id.name.normalized)
+    if col_type_str:
+        try:
+            return DataType.build(col_type_str)
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Join equalities from ColumnUnionFind
+# ---------------------------------------------------------------------------
+
+
+def _build_join_equalities(
+    spec: BranchSpec,
+    row_bindings: Dict[str, RowBinding],
+    instance: Instance,
+) -> List[Tuple[SolverVar, SolverVar]]:
+    """Convert ColumnUnionFind groups to solver join equalities."""
+    equalities: List[Tuple[SolverVar, SolverVar]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for _rep, members in spec.equivalences.groups().items():
+        if len(members) < 2:
+            continue
+        # Find bindings for each member.
+        member_bindings: List[Tuple[ColumnId, RowBinding]] = []
+        for member in members:
+            table = member.relation.name.normalized if member.relation.name else ""
+            binding = _find_binding_for_column(table, row_bindings)
+            if binding is not None:
+                member_bindings.append((member, binding))
+
+        # Create SolverVar pairs for consecutive members.
+        for i in range(len(member_bindings) - 1):
+            col_a, binding_a = member_bindings[i]
+            col_b, binding_b = member_bindings[i + 1]
+            var_a = SolverVar(
+                column_id=col_a,
+                relation_id=binding_a.relation,
+                row_scope=f"r{binding_a.row}",
+            )
+            var_b = SolverVar(
+                column_id=col_b,
+                relation_id=binding_b.relation,
+                row_scope=f"r{binding_b.row}",
+            )
+            key_a = var_a.display
+            key_b = var_b.display
+            pair_key = (min(key_a, key_b), max(key_a, key_b))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            equalities.append((var_a, var_b))
+
+    return equalities
+
+
+# ---------------------------------------------------------------------------
+# Row extraction from solver results
+# ---------------------------------------------------------------------------
+
+
+def _rows_from_solver_result(
+    assignments: Dict[SolverVar, Any],
+    row_bindings: Dict[str, RowBinding],
+    instance: Instance,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Extract concrete rows from solver assignments.
+
+    Groups by (table, row_index). Maps SolverVar fields to table/row/column.
+    Skips boundary rows (row_idx >= 1000).
+    """
+    rows_by_slot: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+    for var, value in assignments.items():
+        table_name = var.relation_id.name.normalized if var.relation_id.name else ""
+        if not table_name:
+            continue
+
+        # Parse row index from row_scope (e.g., "r0" -> 0).
+        row_scope = var.row_scope or "r0"
+        if not row_scope.startswith("r"):
+            continue
+        try:
+            row_idx = int(row_scope[1:])
+        except ValueError:
+            continue
+
+        # Skip boundary rows.
+        if row_idx >= 1000:
+            continue
+
+        column_name = var.column_id.name.normalized if var.column_id.name else ""
+        if not column_name:
+            continue
+
+        # Verify column exists in schema.
+        schema = instance.tables.get(table_name)
+        if schema is None or column_name not in schema:
+            continue
+
+        slot = (table_name, row_idx)
+        rows_by_slot.setdefault(slot, {})[column_name] = value
+
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    for (table, _row_idx), values in sorted(rows_by_slot.items()):
+        rows.setdefault(table, []).append(values)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Fallback row generation
+# ---------------------------------------------------------------------------
+
+
+def _gold_domain_value(
+    instance: Instance,
+    table: str,
+    column: str,
+    row_context: Optional[Dict[str, Any]] = None,
+    rows: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    builder=None,
+) -> Any:
+    """Generate a single value for a column, respecting constraints."""
+    context = dict(row_context or {})
+    context.pop(column, None)
+    if builder is None:
+        if rows:
+            from parseval.domain.builder import DatabaseBuilder
+
+            builder = DatabaseBuilder(instance.schema_spec)
+            for table_name in instance.tables:
+                for existing_row in instance.get_rows(table_name):
+                    builder.runtime.remember_row(
+                        table_name, _row_value_dict(existing_row),
+                    )
+            for tbl_name, tbl_rows in rows.items():
+                if tbl_name not in instance.tables:
+                    continue
+                for row in tbl_rows:
+                    if row:
+                        builder.runtime.remember_row(tbl_name, row)
+        else:
+            builder = instance.builder
+    return builder.generate_value(table, column, row_context=context)
+
+
+def _fallback_rows(
+    spec: BranchSpec,
+    instance: Instance,
+    row_bindings: Dict[str, RowBinding],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build rows using heuristic values when solver fails.
+
+    Extracts fixed values from EQ constraints and generates defaults
+    for remaining columns.
+    """
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    for relation, req in spec.requirements.items():
+        physical = req.table
+        if physical not in instance.tables:
+            continue
+        fixed = _extract_fixed_values(req.constraints)
+        for row_index in range(max(req.min_rows, 1)):
+            row: Dict[str, Any] = dict(fixed)
+            for col_name in instance.tables[physical]:
+                if col_name in row:
+                    continue
+                try:
+                    row[col_name] = _gold_domain_value(
+                        instance, physical, col_name,
+                        row_context=row, rows=rows,
+                    )
+                except Exception:
+                    pass
+            rows.setdefault(physical, []).append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Row completion
+# ---------------------------------------------------------------------------
+
+
+def _gold_fk_columns(instance: Instance, table: str) -> Set[str]:
+    """Get FK column names for a table."""
+    columns: Set[str] = set()
+    for fk in instance.get_foreign_key(table):
+        for identifier in fk.expressions:
+            matched = _match_column(instance, _relation_for_table(instance, table), identifier.name)
+            if matched:
+                columns.add(matched)
+    return columns
+
+
+def _complete_gold_rows(
+    rows: Dict[str, List[Dict[str, Any]]],
+    row_bindings: Dict[str, RowBinding],
+    spec: BranchSpec,
+    instance: Instance,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Fill missing columns using instance.builder.generate_value."""
+    builder = type(instance.builder)(instance.schema_spec)
+    for table_name in instance.tables:
+        for existing_row in instance.get_rows(table_name):
+            builder.runtime.remember_row(table_name, _row_value_dict(existing_row))
+
+    pending_rows = {
+        table: [dict(row) for row in table_rows]
+        for table, table_rows in rows.items()
+    }
+    completed: Dict[str, List[Dict[str, Any]]] = {}
+    group_values: Dict[Tuple[str, str], Any] = {}
+    unique_values: Dict[Tuple[str, str], Set[Any]] = {}
+
+    # Collect existing unique values.
+    for table_name in instance.tables:
+        schema = instance.tables.get(table_name)
+        if not schema:
+            continue
+        for col_name in schema:
+            if not instance.is_unique(table_name, col_name):
+                continue
+            key = (table_name, col_name)
+            values = unique_values.setdefault(key, set())
+            for existing_row in instance.get_rows(table_name):
+                if col_name in existing_row:
+                    cell = existing_row[col_name]
+                    if cell is not None:
+                        values.add(cell.concrete if hasattr(cell, "concrete") else cell)
+
+    ordered_bindings = sorted(
+        row_bindings.values(),
+        key=lambda b: (b.table, normalize_name(b.alias or ""), b.row),
+    )
+    for binding in ordered_bindings:
+        table_rows = pending_rows.setdefault(binding.table, [])
+        row = table_rows.pop(0) if table_rows else {}
+        req = _requirement_for_binding(spec, binding)
+
+        if req is not None:
+            fk_columns = _gold_fk_columns(instance, binding.table)
+
+            # Apply group_key_columns.
+            for cid in req.group_key_columns:
+                col_name = cid.name.normalized
+                key = (binding.table, col_name)
+                if col_name in row:
+                    group_values.setdefault(key, row[col_name])
+                if key not in group_values:
+                    try:
+                        group_values[key] = builder.generate_value(
+                            binding.table, col_name, row_context=row,
+                        )
+                    except Exception:
+                        pass
+                if key in group_values:
+                    row[col_name] = group_values[key]
+
+            # Fill missing columns from schema.
+            for col_name in instance.tables.get(binding.table, {}):
+                if col_name in row:
+                    continue
+                try:
+                    row[col_name] = builder.generate_value(
+                        binding.table, col_name, row_context=row,
+                    )
+                except Exception:
+                    pass
+
+            # Ensure unique columns have distinct values.
+            for col_name in instance.tables.get(binding.table, {}):
+                if not instance.is_unique(binding.table, col_name):
+                    continue
+                key = (binding.table, col_name)
+                seen_values = unique_values.setdefault(key, set())
+                value = row.get(col_name)
+                if value is None or value in seen_values:
+                    if col_name in fk_columns:
+                        row.pop(col_name, None)
+                        continue
+                    context = dict(row)
+                    context.pop(col_name, None)
+                    generated = False
+                    for _ in range(16):
+                        try:
+                            value = builder.generate_value(
+                                binding.table, col_name, row_context=context,
+                            )
+                            if value not in seen_values:
+                                row[col_name] = value
+                                generated = True
+                                break
+                        except Exception:
+                            break
+                    if not generated:
+                        row.pop(col_name, None)
+                        continue
+                if col_name in row:
+                    seen_values.add(row[col_name])
+
+        builder.runtime.remember_row(binding.table, row)
+        completed.setdefault(binding.table, []).append(row)
+
+    # High LIMIT support: clone rows to satisfy min_rows.
+    MAX_TOTAL_ROWS = 500
+    for relation, req in spec.requirements.items():
+        physical = req.table
+        if physical not in completed or not completed[physical]:
+            continue
+        target = min(req.min_rows, MAX_TOTAL_ROWS)
+        current_rows = completed[physical]
+        while len(current_rows) < target:
+            base_row = current_rows[-1]
+            new_row = dict(base_row)
+            for col_name in instance.tables.get(physical, {}):
+                if instance.is_unique(physical, col_name):
+                    context = dict(new_row)
+                    context.pop(col_name, None)
+                    try:
+                        new_row[col_name] = builder.generate_value(
+                            physical, col_name, row_context=context,
+                        )
+                    except Exception:
+                        pass
+            builder.runtime.remember_row(physical, new_row)
+            current_rows.append(new_row)
+
+    for table, table_rows in pending_rows.items():
+        completed.setdefault(table, []).extend(table_rows)
+    return completed
+
+
+# ---------------------------------------------------------------------------
+# Materialization
+# ---------------------------------------------------------------------------
+
+
+def _gold_materialization_order(
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> List[str]:
+    """Topological sort of tables by FK dependencies."""
+    requested = [table for table in rows if table in instance.tables]
+    requested_set = set(requested)
+    ordered: List[str] = []
+    visiting: Set[str] = set()
+    visited: Set[str] = set()
+
+    def visit(table_name: str) -> None:
+        if table_name in visited:
+            return
+        if table_name in visiting:
+            return
+        visiting.add(table_name)
+        for fk in instance.get_foreign_key(table_name):
+            ref = fk.args.get("reference")
+            if ref is None:
+                continue
+            ref_table_node = ref.find(exp.Table)
+            if ref_table_node is None:
+                continue
+            ref_table = normalize_name(ref_table_node.name)
+            if ref_table in requested_set:
+                visit(ref_table)
+        visiting.remove(table_name)
+        visited.add(table_name)
+        ordered.append(table_name)
+
+    for table_name in requested:
+        visit(table_name)
+    return ordered
+
+
+def _materialize_rows(
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Write rows to instance in FK dependency order."""
+    for table_name in _gold_materialization_order(instance, rows):
+        for row in rows.get(table_name, []):
+            instance.create_row(table_name, values=row)
+
+
+# ---------------------------------------------------------------------------
+# Scalar subquery satisfaction
+# ---------------------------------------------------------------------------
+
+
+def _iter_steps_with_subplans(step: Step):
+    """Yield all steps including those inside SubPlans."""
+    seen: Set[int] = set()
+
+    def walk(current: Step):
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        yield current
+        if isinstance(current, SubPlan) and current.inner is not None:
+            yield from walk(current.inner)
+        for subplan in current.subplan_dependencies:
+            yield subplan
+            if subplan.inner is not None:
+                yield from walk(subplan.inner)
+        for dep in current.chain_dependencies:
+            yield from walk(dep)
+
+    yield from walk(step)
+
+
+def _iter_all_plan_steps(plan: Plan):
+    for step in plan.ordered_steps:
+        yield from _iter_steps_with_subplans(step)
+
+
+def _find_subplan_for_subquery(
+    plan: Plan,
+    subquery: exp.Subquery,
+    dialect: str,
+) -> Optional[SubPlan]:
+    """Find SubPlan for a subquery anchor."""
+    target_sql = subquery.sql(dialect=dialect)
+    for step in _iter_all_plan_steps(plan):
+        if isinstance(step, SubPlan) and step.anchor is not None:
+            if step.anchor is subquery or step.anchor.sql(dialect=dialect) == target_sql:
+                return step
+    return None
+
+
+def _scalar_subquery_operand_expression(
+    subplan: Optional[SubPlan],
+) -> Optional[exp.Expression]:
+    """Extract the aggregate operand expression from a subplan."""
+    if subplan is None or subplan.inner is None:
+        return None
+    for step in _iter_steps_with_subplans(subplan.inner):
+        if not isinstance(step, Aggregate):
+            continue
+        for operand in getattr(step, "operands", ()) or ():
+            if isinstance(operand, exp.Alias):
+                return operand.this.copy()
+        for agg_expr in step.aggregations:
+            agg = agg_expr.this if isinstance(agg_expr, exp.Alias) else agg_expr
+            if isinstance(agg, (exp.Avg, exp.Sum, exp.Min, exp.Max)):
+                return agg.this.copy()
+    return None
+
+
+def _bindings_for_scalar_expression(
+    expression: exp.Expression,
+    instance: Instance,
+    row_index: int,
+) -> Dict[str, RowBinding]:
+    """Build row bindings for columns in a scalar expression."""
+    bindings: Dict[str, RowBinding] = {}
+    for col in expression.find_all(exp.Column):
+        raw_table = normalize_name(col.table or "")
+        # Try to find the physical table.
+        matched = _match_column(instance, _relation_for_table(instance, raw_table), col.name)
+        physical = raw_table
+        if not matched:
+            # Search all tables for the column.
+            for table_name in instance.tables:
+                found = _match_column(instance, _relation_for_table(instance, table_name), col.name)
+                if found:
+                    physical = table_name
+                    matched = found
+                    break
+        if not matched or physical not in instance.tables:
+            continue
+        relation = _relation_for_table(instance, physical)
+        binding = RowBinding(relation=relation, row=row_index)
+        bindings[_solver_table_key(binding)] = binding
+    return bindings
+
+
+def _merge_scalar_solver_assignments(
+    rows: Dict[str, List[Dict[str, Any]]],
+    assignments: Dict[SolverVar, Any],
+    row_bindings: Dict[str, RowBinding],
+) -> Set[Tuple[str, int]]:
+    """Merge solver assignments into rows. Returns set of (table, row_index) touched."""
+    touched: Set[Tuple[str, int]] = set()
+    for var, value in assignments.items():
+        table_name = var.relation_id.name.normalized if var.relation_id.name else ""
+        column_name = var.column_id.name.normalized if var.column_id.name else ""
+        row_scope = var.row_scope or "r0"
+        if not row_scope.startswith("r"):
+            continue
+        try:
+            row_idx = int(row_scope[1:])
+        except ValueError:
+            continue
+        if not table_name or not column_name:
+            continue
+        table_rows = rows.setdefault(table_name, [])
+        while len(table_rows) <= row_idx:
+            table_rows.append({})
+        table_rows[row_idx][column_name] = value
+        touched.add((table_name, row_idx))
+    return touched
+
+
+def _solve_scalar_witness_values(
+    atom: exp.Expression,
+    outer_expr: exp.Expression,
+    inner_expr: exp.Expression,
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    dialect: str,
+    inner_row_index: int,
+) -> Set[Tuple[str, int]]:
+    """Use the solver to find values satisfying a scalar subquery comparison."""
+    outer_scoped = outer_expr.copy()
+    inner_scoped = inner_expr.copy()
+
+    # Ensure columns have type annotations.
+    for expr in (outer_scoped, inner_scoped):
+        for col in expr.find_all(exp.Column):
+            if getattr(col, "type", None) is not None:
+                continue
+            table = normalize_name(col.table or "")
+            relation = _relation_for_table(instance, table)
+            _annotate_col_type(col, instance, relation, col.name)
+
+    outer_bindings = _bindings_for_scalar_expression(outer_scoped, instance, row_index=0)
+    inner_bindings = _bindings_for_scalar_expression(inner_scoped, instance, row_index=inner_row_index)
+    all_bindings = {**outer_bindings, **inner_bindings}
+    if not all_bindings:
+        return set()
+
+    # Rewrite with row scopes.
+    for col in outer_scoped.find_all(exp.Column):
+        table = normalize_name(col.table or "")
+        binding = _find_binding_for_column(table, all_bindings)
+        if binding is None:
+            continue
+        new_col = _solver_column(instance, binding.table, col.name, row_scope=f"r{binding.row}")
+        set_solver_var(col, solver_var(new_col))
+        if hasattr(new_col, "type") and new_col.type is not None:
+            col.type = new_col.type
+
+    for col in inner_scoped.find_all(exp.Column):
+        table = normalize_name(col.table or "")
+        binding = _find_binding_for_column(table, all_bindings)
+        if binding is None:
+            continue
+        new_col = _solver_column(instance, binding.table, col.name, row_scope=f"r{binding.row}")
+        set_solver_var(col, solver_var(new_col))
+        if hasattr(new_col, "type") and new_col.type is not None:
+            col.type = new_col.type
+
+    # Build the comparison expression.
+    if isinstance(atom.this, exp.Subquery) or (atom.this and atom.this.find(exp.Subquery)):
+        constraint_expr = type(atom)(this=inner_scoped, expression=outer_scoped)
+    else:
+        constraint_expr = type(atom)(this=outer_scoped, expression=inner_scoped)
+
+    # Collect target relations.
+    target_relations: Set[RelationId] = set()
+    for binding in all_bindings.values():
+        target_relations.add(binding.relation)
+
+    result = Solver(dialect=dialect).solve(
+        SolverConstraint(
+            target_relations=tuple(target_relations),
+            constraints=[constraint_expr],
+        ),
+    )
+    if result.sat:
+        return _merge_scalar_solver_assignments(rows, result.assignments, all_bindings)
+    return set()
+
+
+def _satisfy_gold_scalar_subqueries(
+    spec: BranchSpec,
+    plan: Plan,
+    rows: Dict[str, List[Dict[str, Any]]],
+    instance: Instance,
+    dialect: str,
+) -> None:
+    """Handle deferred scalar subquery atoms."""
+    seen: Set[str] = set()
+    for atom in spec.deferred:
+        if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+            continue
+        atom_key = atom.sql(dialect=dialect)
+        if atom_key in seen:
+            continue
+        seen.add(atom_key)
+
+        left, right = atom.this, atom.expression
+        if right and right.find(exp.Subquery):
+            outer_expr, subquery_expr = left, right
+        elif left and left.find(exp.Subquery):
+            outer_expr, subquery_expr = right, left
+        else:
+            continue
+        if outer_expr is None or subquery_expr is None:
+            continue
+
+        subquery = subquery_expr if isinstance(subquery_expr, exp.Subquery) else subquery_expr.find(exp.Subquery)
+        if subquery is None:
+            continue
+        subplan = _find_subplan_for_subquery(plan, subquery, dialect)
+        inner_expr = _scalar_subquery_operand_expression(subplan)
+        if inner_expr is None:
+            continue
+
+        inner_row_index = 1
+        # Check if inner_expr has rows at index 1, otherwise use 0.
+        inner_table = None
+        for col in inner_expr.find_all(exp.Column):
+            t = normalize_name(col.table or "")
+            if t in instance.tables:
+                inner_table = t
+                break
+        if inner_table and (inner_table not in rows or len(rows[inner_table]) <= 1):
+            inner_row_index = 0
+
+        _solve_scalar_witness_values(
+            atom, outer_expr, inner_expr,
+            rows, instance, dialect, inner_row_index,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation validation
+# ---------------------------------------------------------------------------
+
+
+def _gold_has_positive_evaluator_observations(tree: BranchTree) -> bool:
+    """Check if evaluator observations support a positive witness."""
+    has_filter_nodes = False
+    for node in tree.nodes:
+        if node.site in {"filter", "join_on", "having", "case_arm"}:
+            has_filter_nodes = True
+            all_true = True
+            for atom_id, _atom in enumerate(node.atoms):
+                if BranchType.ATOM_TRUE not in node.observed_outcomes(atom_id):
+                    all_true = False
+                    break
+            if all_true:
+                return True
+        elif node.site == "group":
+            has_filter_nodes = True
+            if node.observed_outcomes(0):
+                return True
+    return not has_filter_nodes
+
+
+def _gold_candidate_has_output(
+    plan: Plan,
+    instance: Instance,
+    rows_per_table: Dict[str, List[Dict[str, Any]]],
+    dialect: str = "sqlite",
+) -> bool:
+    """Verify rows produce evaluator-observable output."""
+    checkpoint = instance.checkpoint() if rows_per_table else None
+    try:
+        if rows_per_table:
+            _materialize_rows(instance, rows_per_table)
+        tree = BranchTree()
+        ctx = PlanEvaluator(plan, instance, dialect).evaluate_context(tree)
+        if any(table.rows for table in ctx.tables.values()):
+            return True
+        if _gold_has_positive_evaluator_observations(tree):
+            return True
+        return False
+    except Exception as exc:
+        logger.debug("gold_non_empty validation failed: %s", exc)
+        return False
+    finally:
+        if checkpoint is not None:
+            instance.rollback(checkpoint)
+
+
+# ---------------------------------------------------------------------------
+# Resolver class
+# ---------------------------------------------------------------------------
+
+
+class Resolver:
+    """Turn BranchSpec into concrete row values via global constraint solving."""
+
+    def __init__(
+        self,
+        plan: Plan,
+        instance: Instance,
+        dialect: str = "sqlite",
+        solver=None,
+    ):
+        self.plan = plan
+        self.instance = instance
+        self.dialect = dialect
+        self.solver = solver
+
+    def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
+        """Produce concrete rows for each table in the spec."""
+        # Build global constraint.
+        constraint, row_bindings = self._build_global_constraint(spec)
+
+        # Solve.
+        if self.solver is not None:
+            result = self.solver.solve(constraint)
+            if result.sat:
+                rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
+            else:
+                logger.debug(
+                    "Solver failed for spec=%s reason=%s; using fallback",
+                    spec.branch, result.reason,
+                )
+                rows = _fallback_rows(spec, self.instance, row_bindings)
+        else:
+            rows = _fallback_rows(spec, self.instance, row_bindings)
+
+        if not rows:
+            return {}
+
+        # Complete missing columns.
+        rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
+
+        # Satisfy scalar subqueries.
+        _satisfy_gold_scalar_subqueries(
+            spec, self.plan, rows, self.instance, self.dialect,
+        )
+
+        # Materialize and validate.
+        checkpoint = self.instance.checkpoint()
+        try:
+            _materialize_rows(self.instance, rows)
+            if _gold_candidate_has_output(
+                self.plan, self.instance, {}, dialect=self.dialect,
+            ):
+                return rows
+            self.instance.rollback(checkpoint)
+            return {}
+        except Exception:
+            self.instance.rollback(checkpoint)
+            return {}
+
+    def _build_global_constraint(
+        self,
+        spec: BranchSpec,
+    ) -> Tuple[SolverConstraint, Dict[str, RowBinding]]:
+        """Build a single SolverConstraint for ALL tables in the spec."""
+        row_bindings = _build_gold_row_bindings(spec)
+        constraints: List[exp.Expression] = []
+
+        for relation, req in spec.requirements.items():
+            req_bindings = _bindings_for_requirement(relation, req, row_bindings)
+            if not req_bindings:
+                continue
+            for constraint_expr in req.constraints:
+                # Skip subquery constraints.
+                if constraint_expr.find(exp.Subquery):
+                    continue
+                # Skip cross-table EQ constraints (handled by join equalities).
+                if (
+                    isinstance(constraint_expr, exp.EQ)
+                    and isinstance(constraint_expr.this, exp.Column)
+                    and isinstance(constraint_expr.expression, exp.Column)
+                ):
+                    this_sv = solver_var(constraint_expr.this)
+                    expr_sv = solver_var(constraint_expr.expression)
+                    if this_sv and expr_sv and this_sv.relation_id != expr_sv.relation_id:
+                        continue
+
+                for binding in req_bindings:
+                    rewritten = _rewrite_constraint_for_binding(
+                        constraint_expr, binding, self.instance,
+                    )
+                    if rewritten is not None:
+                        constraints.append(rewritten)
+
+        # Build join equalities.
+        join_equalities = _build_join_equalities(spec, row_bindings, self.instance)
+
+        # Add IS NOT NULL for join equality columns.
+        seen_not_null: Set[str] = set()
+        for left_var, right_var in join_equalities:
+            for var in (left_var, right_var):
+                key = var.display
+                if key in seen_not_null:
+                    continue
+                seen_not_null.add(key)
+                col_node = _solver_column(
+                    self.instance,
+                    var.relation_id.name.normalized,
+                    var.column_id.name.normalized,
+                    row_scope=var.row_scope,
+                )
+                constraints.append(_make_is_not_null(col_node))
+
+        # Collect variables.
+        variables: Dict[SolverVar, DataType] = {}
+        for expr in constraints:
+            variables.update(_collect_solver_vars(expr))
+        for left_var, right_var in join_equalities:
+            if left_var not in variables:
+                dt = _dtype_for_solver_var(left_var, self.instance)
+                if dt is not None:
+                    variables[left_var] = dt
+            if right_var not in variables:
+                dt = _dtype_for_solver_var(right_var, self.instance)
+                if dt is not None:
+                    variables[right_var] = dt
+
+        # Build target relations.
+        target_relations: Set[RelationId] = set()
+        for binding in row_bindings.values():
+            target_relations.add(binding.relation)
+
+        solver_constraint = SolverConstraint(
+            target_relations=tuple(target_relations),
+            constraints=constraints,
+            join_equalities=join_equalities,
+            variables=variables,
+        )
+        return solver_constraint, row_bindings
 
 
 # =============================================================================
 # Public API
 # =============================================================================
 
-# (Task 3: speculate() function will be added here)
+def speculate(
+    plan: Plan,
+    instance: Instance,
+    dialect: str = "sqlite",
+    config: Optional[SpeculateConfig] = None,
+) -> List[Tuple[str, Dict[str, List[Dict[str, Any]]]]]:
+    """One-call API: propagate + resolve.
+
+    Returns one entry per branch (positive + negatives).
+    Each entry is (branch_name, rows_per_table).
+
+    Args:
+        plan: The query plan to generate data for.
+        instance: The database instance to materialize rows into.
+        dialect: SQL dialect (default: "sqlite").
+        config: SpeculateConfig controlling which branches to generate.
+            If None, uses SpeculateConfig.gold_non_empty().
+
+    Returns:
+        List of (branch_name, rows_per_table) tuples.
+    """
+    if config is None:
+        config = SpeculateConfig.gold_non_empty()
+
+    propagator = Propagator(plan, instance, dialect, config=config)
+    solver = Solver(dialect=dialect)
+    resolver = Resolver(plan, instance, dialect, solver=solver)
+
+    branch_specs = propagator.propagate()
+    logger.info("Generated %d branch specs", len(branch_specs))
+
+    results = []
+    for spec in branch_specs:
+        if not spec.requirements:
+            continue
+        try:
+            rows = resolver.resolve(spec)
+        except Exception as exc:
+            logger.debug("spec %s failed: %s", spec.branch, exc)
+            rows = {}
+        if rows:
+            results.append((spec.branch, rows))
+    return results
+
+
+__all__ = [
+    "BranchSpec",
+    "Propagator",
+    "Resolver",
+    "SpeculateConfig",
+    "TableConstraint",
+    "speculate",
+]
