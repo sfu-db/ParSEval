@@ -194,6 +194,12 @@ class Plan:
                         )
                 else:
                     resolve_exprs = exprs
+                # For SubPlan correlation columns, resolve against the
+                # consumer (outer step) which has visible columns.
+                resolve_target = step
+                if isinstance(step, SubPlan) and step.consumer is not None:
+                    _prepare_step_identity(step.consumer, self._instance)
+                    resolve_target = step.consumer
                 for expr in resolve_exprs:
                     for col in _iter_scope_columns(expr):
                         allow_unresolved = isinstance(step, SubPlan) or (
@@ -202,7 +208,7 @@ class Plan:
                         )
                         resolved_id = _resolve_column_id(
                             col,
-                            step,
+                            resolve_target,
                             self._instance,
                             allow_unresolved=allow_unresolved,
                         )
@@ -1396,10 +1402,10 @@ def _query_column_for_physical(
         (instance._identity_key(table, is_table=True), column_key),
         column_key,
     )
-    physical_column = instance.column_id(table, column_source)
+    physical_column = instance.column_id(table, exp.to_identifier(column_source))
     return column_id(
         ColumnKind.PHYSICAL,
-        physical_column.name,
+        identifier_name(column_key),
         relation,
         scope_id=scope_id,
         ordinal=ordinal,
@@ -1610,7 +1616,7 @@ def _enrich_identity_column(
     if source is None or source.relation is None or source.relation.name is None:
         return
     try:
-        catalog_column = instance.catalog_column(source.relation.name.normalized, source.name.normalized)
+        catalog_column = instance.catalog_column(source.relation, exp.to_identifier(source.name.raw))
     except Exception:
         return
     meta = {
