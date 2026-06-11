@@ -976,11 +976,6 @@ class Propagator:
                     )
                     if tname in self.instance.tables:
                         return col_id.relation
-                if left.table:
-                    rel = self._rel( left.table)
-                    tname = rel.name.normalized if rel.name else ""
-                    if tname in self.instance.tables:
-                        return rel
         # Default: first column's relation.
         for col in expr.find_all(exp.Column):
             col_id = column_identity(col)
@@ -992,11 +987,6 @@ class Propagator:
                 )
                 if tname in self.instance.tables:
                     return col_id.relation
-            if col.table:
-                rel = self._rel( col.table)
-                tname = rel.name.normalized if rel.name else ""
-                if tname in self.instance.tables:
-                    return rel
         return None
 
     def _resolve_columns(self, expr: exp.Expression) -> exp.Expression:
@@ -1142,16 +1132,10 @@ class Propagator:
                         if isinstance(constraint.this, exp.Column):
                             col = constraint.this
                             col_id = column_identity(col)
-                            if col_id and col_id.relation:
-                                tname = (
-                                    col_id.relation.name.normalized
-                                    if col_id.relation.name
-                                    else ""
-                                )
-                                matched = col_id.name.normalized
-                            else:
-                                tname = tc.table
-                                matched = col.name
+                            if col_id is None or col_id.relation is None:
+                                continue
+                            tname = col_id.relation.name.normalized if col_id.relation.name else ""
+                            matched = col_id.name.normalized
                             if matched and tname:
                                 targets.setdefault(tname, set()).add(
                                     matched
@@ -1164,24 +1148,10 @@ class Propagator:
                     if isinstance(proj, exp.Expression):
                         for col in proj.find_all(exp.Column):
                             col_id = column_identity(col)
-                            if col_id and col_id.relation:
-                                tname = (
-                                    col_id.relation.name.normalized
-                                    if col_id.relation.name
-                                    else ""
-                                )
-                                matched = col_id.name.normalized
-                            else:
-                                tname = col.table or ""
-                                rel = self._rel(
-                                     tname
-                                )
-                                tname = (
-                                    rel.name.normalized
-                                    if rel.name
-                                    else ""
-                                )
-                                matched = col.name
+                            if col_id is None or col_id.relation is None:
+                                continue
+                            tname = col_id.relation.name.normalized if col_id.relation.name else ""
+                            matched = col_id.name.normalized
                             if (
                                 matched
                                 and tname
@@ -1196,22 +1166,10 @@ class Propagator:
                 for agg_expr in step.aggregations:
                     for col in agg_expr.find_all(exp.Column):
                         col_id = column_identity(col)
-                        if col_id and col_id.relation:
-                            tname = (
-                                col_id.relation.name.normalized
-                                if col_id.relation.name
-                                else ""
-                            )
-                            matched = col_id.name.normalized
-                        else:
-                            tname = col.table or ""
-                            rel = self._rel(
-                                 tname
-                            )
-                            tname = (
-                                rel.name.normalized if rel.name else ""
-                            )
-                            matched = col.name
+                        if col_id is None or col_id.relation is None:
+                            continue
+                        tname = col_id.relation.name.normalized if col_id.relation.name else ""
+                        matched = col_id.name.normalized
                         if (
                             matched
                             and tname
@@ -1223,7 +1181,7 @@ class Propagator:
         for table in list(targets.keys()):
             if table not in self.instance.tables:
                 continue
-            rel = self._rel( table)
+            rel = _relation_for_table(self.instance, table, alias_map=self._alias_map)
             targets[table] = {
                 col
                 for col in targets[table]
@@ -1380,14 +1338,10 @@ class Propagator:
             return
 
         col_id = column_identity(col_node)
-        if col_id and col_id.relation:
-            relation = col_id.relation
-            matched = col_id.name.normalized
-        else:
-            relation = self._rel(
-                 col_node.table or ""
-            )
-            matched = col_node.name
+        if col_id is None or col_id.relation is None:
+            return
+        relation = col_id.relation
+        matched = col_id.name.normalized
         if not matched:
             return
         table_name = relation.name.normalized if relation.name else ""
@@ -1431,19 +1385,14 @@ class Propagator:
                     else:
                         col_id = column_identity(col)
                         if col_id and col_id.relation:
-                            col_relation = col_id.relation
-                        else:
-                            col_relation = self._rel(
-                                 col.table or ""
+                            col_type_str = _lookup_col_type(
+                                self.instance, col_id.relation, col.name
                             )
-                        col_type_str = _lookup_col_type(
-                            self.instance, col_relation, col.name
-                        )
-                        if col_type_str:
-                            try:
-                                col.type = DataType.build(col_type_str)
-                            except Exception:
-                                pass
+                            if col_type_str:
+                                try:
+                                    col.type = DataType.build(col_type_str)
+                                except Exception:
+                                    pass
 
         # Also annotate columns in deferred atoms.
         for atom in spec.deferred:
@@ -1456,19 +1405,14 @@ class Propagator:
                 else:
                     col_id = column_identity(col)
                     if col_id and col_id.relation:
-                        col_relation = col_id.relation
-                    else:
-                        col_relation = self._rel(
-                             col.table or ""
+                        col_type_str = _lookup_col_type(
+                            self.instance, col_id.relation, col.name
                         )
-                    col_type_str = _lookup_col_type(
-                        self.instance, col_relation, col.name
-                    )
-                    if col_type_str:
-                        try:
-                            col.type = DataType.build(col_type_str)
-                        except Exception:
-                            pass
+                        if col_type_str:
+                            try:
+                                col.type = DataType.build(col_type_str)
+                            except Exception:
+                                pass
 
     # -----------------------------------------------------------------
     # Aggregate NULL constraints
@@ -1498,14 +1442,10 @@ class Propagator:
     ) -> None:
         """Add IS NULL constraint for a single column."""
         col_id = column_identity(col)
-        if col_id and col_id.relation:
-            relation = col_id.relation
-            matched = col_id.name.normalized
-        else:
-            relation = self._rel(
-                 col.table or ""
-            )
-            matched = col.name
+        if col_id is None or col_id.relation is None:
+            return
+        relation = col_id.relation
+        matched = col_id.name.normalized
         table_name = relation.name.normalized if relation.name else ""
         if matched and table_name in self.instance.tables:
             req = spec.require(relation)
@@ -1889,14 +1829,10 @@ class Propagator:
             if isinstance(step, Filter) and step.condition:
                 for col in step.condition.find_all(exp.Column):
                     col_id = column_identity(col)
-                    if col_id and col_id.relation:
-                        inner_relation = col_id.relation
-                        matched = col_id.name.normalized
-                    else:
-                        inner_relation = self._rel(
-                             col.table or ""
-                        )
-                        matched = col.name
+                    if col_id is None or col_id.relation is None:
+                        continue
+                    inner_relation = col_id.relation
+                    matched = col_id.name.normalized
                     tname = (
                         inner_relation.name.normalized
                         if inner_relation.name
@@ -1926,14 +1862,10 @@ class Propagator:
                 for col in step.condition.find_all(exp.Column):
                     if col.name.lower() == col_name.lower():
                         col_id = column_identity(col)
-                        if col_id and col_id.relation:
-                            inner_relation = col_id.relation
-                            matched = col_id.name.normalized
-                        else:
-                            inner_relation = self._rel(
-                                 col.table or ""
-                            )
-                            matched = col.name
+                        if col_id is None or col_id.relation is None:
+                            continue
+                        inner_relation = col_id.relation
+                        matched = col_id.name.normalized
                         tname = (
                             inner_relation.name.normalized
                             if inner_relation.name
@@ -1944,7 +1876,7 @@ class Propagator:
             if isinstance(step, Scan) and step.source:
                 if isinstance(step.source, exp.Table):
                     name = step.source.name
-                    rel = self._rel( name)
+                    rel = _relation_for_table(self.instance, name, alias_map=self._alias_map)
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
                         return (rel, col_name)
@@ -2029,17 +1961,6 @@ class Propagator:
                                     )
                                     if tname in self.instance.tables:
                                         return col_id.relation
-                                if col.table:
-                                    rel = self._rel(
-                                         col.table
-                                    )
-                                    tname = (
-                                        rel.name.normalized
-                                        if rel.name
-                                        else ""
-                                    )
-                                    if tname in self.instance.tables:
-                                        return rel
         # Fallback: check the HAVING condition directly.
         for comp_node in condition.find_all(_COMPARISON_NODES):
             agg_side, _, _ = self._extract_agg_and_threshold(comp_node)
@@ -2058,13 +1979,6 @@ class Propagator:
                         )
                         if tname in self.instance.tables:
                             return col_id.relation
-                    if col.table:
-                        rel = self._rel(
-                             col.table
-                        )
-                        tname = rel.name.normalized if rel.name else ""
-                        if tname in self.instance.tables:
-                            return rel
         return None
 
     def _extract_min_group_size(
@@ -2194,14 +2108,10 @@ class Propagator:
 
             if target_col and per_row_value is not None:
                 col_id = column_identity(target_col)
-                if col_id and col_id.relation:
-                    relation = col_id.relation
-                    matched = col_id.name.normalized
-                else:
-                    relation = self._rel(
-                         target_col.table or ""
-                    )
-                    matched = target_col.name
+                if col_id is None or col_id.relation is None:
+                    continue
+                relation = col_id.relation
+                matched = col_id.name.normalized
                 tname = relation.name.normalized if relation.name else ""
                 if matched and tname and relation in spec.requirements:
                     if not _has_equality_constraint(
