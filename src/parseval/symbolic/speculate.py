@@ -46,7 +46,7 @@ from parseval.plan.planner import (
     Sort,
     SubPlan,
 )
-from parseval.plan.rex import column_meta, concrete, negate_predicate
+from parseval.plan.rex import concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var, solver_var
 from parseval.solver.types import col_type
 
@@ -61,11 +61,6 @@ logger = logging.getLogger("parseval.speculate")
 # =============================================================================
 
 
-def _table_name(relation: RelationId) -> str:
-    """Extract normalized table name from a RelationId."""
-    return relation.name.normalized if relation.name else ""
-
-
 
 
 # =============================================================================
@@ -77,12 +72,8 @@ def _relation_for_table(
     instance: Instance,
     name: str,
 ) -> RelationId:
-    """Get RelationId for a table name, creating a synthetic one if needed."""
-    normalized = normalize_name(name)
-    try:
-        return instance.table_id(normalized)
-    except (KeyError, Exception):
-        return relation_id(RelationKind.TABLE, identifier_name(normalized))
+    """Get RelationId for a table name from the instance."""
+    return instance.table_id(normalize_name(name))
 
 
 def _solver_column(
@@ -988,7 +979,6 @@ class Propagator:
         specs.extend(self._case_else_specs())
         for spec in specs:
             self._add_schema_constraints(spec)
-            self._annotate_column_types(spec)
             # Remove requirements for virtual tables (SubPlan aliases).
             # These are not real tables — their rows come from inner plans.
             virtual_keys = [
@@ -1443,50 +1433,6 @@ class Propagator:
     # -----------------------------------------------------------------
     # Column type annotation
     # -----------------------------------------------------------------
-
-    def _annotate_column_types(self, spec: BranchSpec):
-        """Set .type on Column nodes from metadata or instance schema."""
-        for _relation_id, tc in spec.requirements.items():
-            for constraint in tc.constraints:
-                for col in constraint.find_all(exp.Column):
-                    if getattr(col, "type", None) is not None:
-                        continue
-                    meta = column_meta(col)
-                    if meta and "domain" in meta:
-                        col.type = meta["domain"]
-                    else:
-                        col_id = column_identity(col)
-                        if col_id and col_id.relation:
-                            table = _table_name(col_id.relation)
-                            schema = self.instance.tables.get(table)
-                            if schema:
-                                dtype = schema.get(normalize_name(col.name))
-                                if dtype:
-                                    try:
-                                        col.type = DataType.build(dtype)
-                                    except Exception:
-                                        pass
-
-        # Also annotate columns in deferred atoms.
-        for atom in spec.deferred:
-            for col in atom.find_all(exp.Column):
-                if getattr(col, "type", None) is not None:
-                    continue
-                meta = column_meta(col)
-                if meta and "domain" in meta:
-                    col.type = meta["domain"]
-                else:
-                    col_id = column_identity(col)
-                    if col_id and col_id.relation:
-                        table = _table_name(col_id.relation)
-                        schema = self.instance.tables.get(table)
-                        if schema:
-                            dtype = schema.get(normalize_name(col.name))
-                            if dtype:
-                                try:
-                                    col.type = DataType.build(dtype)
-                                except Exception:
-                                    pass
 
     # -----------------------------------------------------------------
     # Aggregate NULL constraints
