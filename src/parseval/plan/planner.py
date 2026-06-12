@@ -189,6 +189,9 @@ class Plan:
                                     inner_step,
                                     self._instance,
                                 )
+                                # Propagate updated output_column_ids to downstream
+                                # steps (Limit, Sort) that copy from Project.
+                                _propagate_output_columns(inner_step)
                         step.output_column_ids = tuple(
                             getattr(inner, "output_column_ids", ())
                         )
@@ -1284,6 +1287,22 @@ def _iter_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
                 for item in child:
                     if isinstance(item, exp.Expression):
                         stack.append(item)
+
+
+def _propagate_output_columns(source_step: "Step") -> None:
+    """Propagate updated output_column_ids to downstream dependents.
+
+    When a step's output_column_ids are re-computed (e.g., Project after
+    identity stamping), downstream steps that copy from it (Limit, Sort)
+    need to be updated too.
+    """
+    for dependent in source_step.dependents:
+        if isinstance(dependent, (Limit, Sort)):
+            columns: t.List[ColumnId] = []
+            for dep in dependent.chain_dependencies:
+                columns.extend(getattr(dep, "output_column_ids", ()))
+            dependent.output_column_ids = tuple(columns)
+            _propagate_output_columns(dependent)
 
 
 def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
