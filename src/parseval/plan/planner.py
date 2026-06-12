@@ -1636,11 +1636,11 @@ def _visible_columns(step: "Step") -> t.Tuple[ColumnId, ...]:
 def _relation_matches(relation: RelationId | None, qualifier: str, dialect: str | None) -> bool:
     if relation is None:
         return False
-    key = identifier_name(qualifier, dialect=dialect).normalized
+    key = identifier_name(qualifier, dialect=dialect).normalized.lower()
     return (
-        relation.alias is not None and relation.alias.normalized == key
+        relation.alias is not None and relation.alias.normalized.lower() == key
     ) or (
-        relation.name is not None and relation.name.normalized == key
+        relation.name is not None and relation.name.normalized.lower() == key
     )
 
 
