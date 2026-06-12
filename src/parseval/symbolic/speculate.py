@@ -90,23 +90,33 @@ def _solver_column(
     relation: RelationId,
     col_name: str,
     row_scope: Optional[str] = None,
+    source_col_name: Optional[str] = None,
 ) -> exp.Column:
-    """Create a Column annotated with SolverVar + type from the instance schema."""
+    """Create a Column annotated with SolverVar + type from the instance schema.
+
+    Args:
+        source_col_name: Real column name for type lookup when col_name is a
+            synthetic alias (e.g., _g0 -> county).
+    """
     col_id = physical_column(col_name, relation)
     var = SolverVar(column_id=col_id, relation_id=relation, row_scope=row_scope)
     table_display = relation.display
     col_node = exp.column(col_name, table=table_display)
     set_solver_var(col_node, var)
-    # Set type from instance schema.
+    # Set type from instance schema, trying source_col_name as fallback.
     table = relation.name.normalized if relation.name else ""
     schema = instance.tables.get(table)
     if schema:
-        dtype = schema.get(normalize_name(col_name))
-        if dtype:
-            try:
-                col_node.type = DataType.build(dtype)
-            except Exception:
-                pass
+        for lookup_name in (col_name, source_col_name):
+            if not lookup_name:
+                continue
+            dtype = schema.get(normalize_name(lookup_name))
+            if dtype:
+                try:
+                    col_node.type = DataType.build(dtype)
+                except Exception:
+                    pass
+                break
     return col_node
 
 
@@ -452,12 +462,14 @@ class Propagator:
         self._negate_conjunct: int = 0
 
     def _solver_col(
-        self, table: str, col_name: str, row_scope: Optional[str] = None
+        self, table: str, col_name: str, row_scope: Optional[str] = None,
+        source_col_name: Optional[str] = None,
     ) -> exp.Column:
         """Create a solver column from a table name string."""
         relation = _relation_for_table(self.instance, table)
         return _solver_column(
             self.instance, relation, col_name, row_scope=row_scope,
+            source_col_name=source_col_name,
         )
 
     # -----------------------------------------------------------------
@@ -593,10 +605,9 @@ class Propagator:
                         table_name = relation.name.normalized
                         if table_name in self.instance.tables:
                             req = spec.require(relation)
-                            gid = physical_column(matched, relation)
-                            spec.equivalences.find(gid)
-                            if gid not in req.group_key_columns:
-                                req.group_key_columns.append(gid)
+                            spec.equivalences.find(col_id)
+                            if col_id not in req.group_key_columns:
+                                req.group_key_columns.append(col_id)
         # Aggregate NULL detection.
         if not self._is_gold_mode:
             for agg_expr in step.aggregations:
@@ -668,6 +679,20 @@ class Propagator:
     def _derive_project(self, step: Project, spec: BranchSpec) -> None:
         """Add IS NOT NULL for projected columns and handle DISTINCT."""
         projected = self._projected_columns(step)
+        # Build col_name -> (source_col_name, ColumnId) mapping from column identity.
+        source_names: dict[str, str] = {}
+        col_ids: dict[str, ColumnId] = {}
+        for proj in step.projections:
+            if not isinstance(proj, exp.Expression):
+                continue
+            for col in proj.find_all(exp.Column):
+                cid = column_identity(col)
+                if cid is None:
+                    continue
+                col_ids[cid.name.normalized] = cid
+                src = cid.source_column_id or cid
+                if src.name.normalized != cid.name.normalized:
+                    source_names[cid.name.normalized] = src.name.normalized
         # Route each projected column to its correct table.
         for col_name, table_alias in projected:
             for relation_id, tc in spec.requirements.items():
@@ -678,7 +703,8 @@ class Propagator:
                 ):
                     continue
                 if not _has_is_not_null(tc.constraints, col_name):
-                    col_node = self._solver_col(tc.table, col_name)
+                    src = source_names.get(normalize_name(col_name))
+                    col_node = self._solver_col(tc.table, col_name, source_col_name=src)
                     tc.constraints.append(_make_is_not_null(col_node))
                 break
         # Duplicate / DISTINCT handling.
@@ -690,9 +716,9 @@ class Propagator:
                     tc.alias is not None
                     and normalize_name(tc.alias) == norm_alias
                 ):
-                    dup_ids.append(
-                        physical_column(col_name, relation_id)
-                    )
+                    cid = col_ids.get(normalize_name(col_name))
+                    if cid is not None:
+                        dup_ids.append(cid)
             if step.distinct and dup_ids:
                 tc.duplicate_columns = dup_ids
                 tc.min_rows = max(tc.min_rows, 2)
@@ -727,20 +753,35 @@ class Propagator:
             needed = offset + 1 if int(limit_val) > 0 else 0
         else:
             needed = offset + int(limit_val)
-        # Apply min_rows to the driving table.
+        # Apply min_rows to the driving table, resolving alias to real relation.
         driving_alias = getattr(step, "source", None)
         if driving_alias:
-            driving_relation = _relation_for_table(
-                 self.instance, driving_alias
-            )
-            if driving_relation in spec.requirements:
-                spec.requirements[driving_relation].min_rows = max(
-                    spec.requirements[driving_relation].min_rows, needed
+            resolved = self._resolve_table_alias(driving_alias)
+            if resolved is not None and resolved in spec.requirements:
+                spec.requirements[resolved].min_rows = max(
+                    spec.requirements[resolved].min_rows, needed
                 )
-            else:
-                spec.requirements[driving_relation] = TableConstraint(
-                    relation=driving_relation, min_rows=needed
-                )
+
+    def _resolve_table_alias(self, alias: str) -> RelationId | None:
+        """Resolve a table alias to the real RelationId via plan annotations."""
+        alias_norm = normalize_name(alias)
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Scan):
+                continue
+            ann = self.plan.annotations.get(id(step))
+            if ann and ann.projected_columns:
+                rel = ann.projected_columns[0].relation
+                # Match by alias or real name
+                if rel.alias and normalize_name(rel.alias.normalized) == alias_norm:
+                    return rel
+                if rel.name and normalize_name(rel.name.normalized) == alias_norm:
+                    return rel
+            # Also check step.name
+            if step.name and normalize_name(step.name) == alias_norm:
+                rid = getattr(step, "relation_id", None)
+                if rid is not None:
+                    return rid
+        return None
 
     def _derive_set_op(self, step: SetOperation, spec: BranchSpec) -> None:
         """No-op for SetOperation steps."""
@@ -772,14 +813,10 @@ class Propagator:
                     outer_matched = corr_col.name
                 if outer_matched:
                     spec.require(outer_relation)
-                    inner_key = self._find_inner_corr_column(sub, spec)
-                    if inner_key:
-                        inner_relation, inner_matched = inner_key
-                        outer_col_id = physical_column(
+                    inner_col_id = self._find_inner_corr_column(sub, spec)
+                    if inner_col_id is not None:
+                        outer_col_id = corr_id if corr_id is not None else physical_column(
                             outer_matched, outer_relation
-                        )
-                        inner_col_id = physical_column(
-                            inner_matched, inner_relation
                         )
                         spec.equate(outer_col_id, inner_col_id)
                         eq_expr = exp.EQ(
@@ -790,10 +827,10 @@ class Propagator:
                                 outer_matched,
                             ),
                             expression=self._solver_col(
-                                inner_relation.name.normalized
-                                if inner_relation.name
+                                inner_col_id.relation.name.normalized
+                                if inner_col_id.relation and inner_col_id.relation.name
                                 else "",
-                                inner_matched,
+                                inner_col_id.name.normalized,
                             ),
                         )
                         spec.requirements[outer_relation].constraints.append(
@@ -1402,8 +1439,7 @@ class Propagator:
 
         if boundary_val is not None:
             tc = spec.require(relation)
-            col_id_b = physical_column(matched, relation)
-            tc.boundary_rows.append({col_id_b: boundary_val})
+            tc.boundary_rows.append({col_id: boundary_val})
 
     # -----------------------------------------------------------------
     # Column type annotation
@@ -1524,8 +1560,7 @@ class Propagator:
             for sk in source_keys:
                 sk_id = column_identity(sk) if isinstance(sk, exp.Column) else None
                 if sk_id is None:
-                    sk_name = getattr(sk, "name", str(sk))
-                    sk_id = physical_column(sk_name, source_relation)
+                    raise ValueError(f"Unmatched left join key lacks identity: {sk}")
                 if (
                     sk_id
                     and join_table in self.instance.tables
@@ -1579,8 +1614,7 @@ class Propagator:
         for jk in join_keys:
             jk_id = column_identity(jk) if isinstance(jk, exp.Column) else None
             if jk_id is None:
-                jk_name = getattr(jk, "name", str(jk))
-                jk_id = physical_column(jk_name, join_relation)
+                raise ValueError(f"Unmatched right join key lacks identity: {jk}")
             if (
                 jk_id
                 and source_relation.name
@@ -1654,12 +1688,12 @@ class Propagator:
             outer_matched = outer_col.name
         if not outer_matched:
             return
-        inner_key = self._find_inner_select_column(sub, spec)
-        if inner_key:
-            inner_relation, inner_matched = inner_key
+        inner_cid = self._find_inner_select_column(sub, spec)
+        if inner_cid is not None:
             spec.require(outer_relation)
-            outer_cid = physical_column(outer_matched, outer_relation)
-            inner_cid = physical_column(inner_matched, inner_relation)
+            outer_cid = outer_id if outer_id is not None else physical_column(
+                outer_matched, outer_relation
+            )
             spec.equate(outer_cid, inner_cid)
             eq_expr = exp.EQ(
                 this=self._solver_col(
@@ -1669,10 +1703,10 @@ class Propagator:
                     outer_matched,
                 ),
                 expression=self._solver_col(
-                    inner_relation.name.normalized
-                    if inner_relation.name
+                    inner_cid.relation.name.normalized
+                    if inner_cid.relation and inner_cid.relation.name
                     else "",
-                    inner_matched,
+                    inner_cid.name.normalized,
                 ),
             )
             spec.requirements[outer_relation].constraints.append(eq_expr)
@@ -1711,17 +1745,13 @@ class Propagator:
                     outer_matched = corr_col.name
                 if not outer_matched:
                     continue
-                inner_key = self._find_corr_inner_column(
+                inner_cid = self._find_corr_inner_column(
                     sub, corr_col.name
                 )
-                if inner_key:
-                    inner_relation, inner_matched = inner_key
+                if inner_cid is not None:
                     spec.require(outer_relation)
-                    outer_cid = physical_column(
+                    outer_cid = corr_id if corr_id is not None else physical_column(
                         outer_matched, outer_relation
-                    )
-                    inner_cid = physical_column(
-                        inner_matched, inner_relation
                     )
                     spec.equate(outer_cid, inner_cid)
                     eq_expr = exp.EQ(
@@ -1732,10 +1762,10 @@ class Propagator:
                             outer_matched,
                         ),
                         expression=self._solver_col(
-                            inner_relation.name.normalized
-                            if inner_relation.name
+                            inner_cid.relation.name.normalized
+                            if inner_cid.relation and inner_cid.relation.name
                             else "",
-                            inner_matched,
+                            inner_cid.name.normalized,
                         ),
                     )
                     if outer_relation in spec.requirements:
@@ -1745,12 +1775,12 @@ class Propagator:
 
     def _find_inner_select_column(
         self, sub: SubPlan, spec: BranchSpec
-    ) -> Optional[tuple]:
-        """Find the inner plan's source column for IN subqueries.
+    ) -> Optional[ColumnId]:
+        """Find the inner plan's source column for IN subqueries with full identity.
 
-        Returns (RelationId, matched_col_name) or None.
+        Returns ColumnId or None.
         """
-        proj_col_name = None
+        proj_col_id = None
         stack = [sub.inner]
         visited: set = set()
         while stack:
@@ -1762,13 +1792,16 @@ class Propagator:
                 proj = step.projections[0]
                 if isinstance(proj, exp.Expression):
                     for col in proj.find_all(exp.Column):
-                        proj_col_name = col.name
-                        break
+                        cid = column_identity(col)
+                        if cid is not None:
+                            proj_col_id = cid
+                            break
             stack.extend(step.chain_dependencies)
 
-        if not proj_col_name:
+        if proj_col_id is None:
             return None
 
+        # Ensure the Scan table is required.
         stack = [sub.inner]
         visited = set()
         while stack:
@@ -1783,16 +1816,15 @@ class Propagator:
                     tname = rel.name.normalized if rel.name else ""
                     if tname in self.instance.tables:
                         spec.require(rel)
-                        return (rel, proj_col_name)
             stack.extend(step.chain_dependencies)
-        return None
+        return proj_col_id
 
     def _find_inner_corr_column(
         self, sub: SubPlan, spec: BranchSpec
-    ) -> Optional[tuple]:
-        """Find the inner plan's correlated column.
+    ) -> Optional[ColumnId]:
+        """Find the inner plan's correlated column with full identity.
 
-        Returns (RelationId, matched_col_name) or None.
+        Returns ColumnId or None.
         """
         stack = [sub.inner]
         while stack:
@@ -1802,25 +1834,23 @@ class Propagator:
                     col_id = column_identity(col)
                     if col_id is None or col_id.relation is None:
                         continue
-                    inner_relation = col_id.relation
-                    matched = col_id.name.normalized
                     tname = (
-                        inner_relation.name.normalized
-                        if inner_relation.name
+                        col_id.relation.name.normalized
+                        if col_id.relation.name
                         else ""
                     )
-                    if matched and tname in self.instance.tables:
-                        spec.require(inner_relation)
-                        return (inner_relation, matched)
+                    if col_id.name.normalized and tname in self.instance.tables:
+                        spec.require(col_id.relation)
+                        return col_id
             stack.extend(step.chain_dependencies)
         return None
 
     def _find_corr_inner_column(
         self, sub: SubPlan, col_name: str
-    ) -> Optional[tuple]:
-        """Find the inner plan's column matching col_name.
+    ) -> Optional[ColumnId]:
+        """Find the inner plan's column matching col_name with full identity.
 
-        Returns (RelationId, matched_col_name) or None.
+        Returns ColumnId or None.
         """
         stack = [sub.inner]
         visited: set = set()
@@ -1835,22 +1865,13 @@ class Propagator:
                         col_id = column_identity(col)
                         if col_id is None or col_id.relation is None:
                             continue
-                        inner_relation = col_id.relation
-                        matched = col_id.name.normalized
                         tname = (
-                            inner_relation.name.normalized
-                            if inner_relation.name
+                            col_id.relation.name.normalized
+                            if col_id.relation.name
                             else ""
                         )
-                        if matched and tname in self.instance.tables:
-                            return (inner_relation, matched)
-            if isinstance(step, Scan) and step.source:
-                if isinstance(step.source, exp.Table):
-                    name = step.source.name
-                    rel = _relation_for_table(self.instance, name)
-                    tname = rel.name.normalized if rel.name else ""
-                    if tname in self.instance.tables:
-                        return (rel, col_name)
+                        if col_id.name.normalized and tname in self.instance.tables:
+                            return col_id
             stack.extend(step.chain_dependencies)
         return None
 
@@ -1873,17 +1894,9 @@ class Propagator:
             ):
                 l_id = column_identity(left)
                 r_id = column_identity(right)
-                if l_id is None:
-                    lt = _relation_for_table(
-                         self.instance, left.table or ""
-                    )
-                    l_id = physical_column(left.name, lt)
-                if r_id is None:
-                    rt = _relation_for_table(
-                         self.instance, right.table or ""
-                    )
-                    r_id = physical_column(right.name, rt)
-                if l_id and r_id and l_id.relation and r_id.relation:
+                if l_id is None or r_id is None:
+                    continue
+                if l_id.relation and r_id.relation:
                     spec.require(l_id.relation)
                     spec.require(r_id.relation)
                     spec.equate(l_id, r_id)
@@ -2442,42 +2455,37 @@ def _build_join_equalities(
     row_bindings: Dict[str, RowBinding],
     _instance: Instance,
 ) -> List[Tuple[SolverVar, SolverVar]]:
-    """Convert ColumnUnionFind groups to solver join equalities."""
+    """Extract solver join equalities from join EQ expressions in constraints.
+
+    Rather than rebuilding SolverVar from Union-Find (which loses plan identity),
+    extract SolverVar pairs directly from the EQ expressions that _derive_join
+    already stored in spec.requirements.
+    """
     equalities: List[Tuple[SolverVar, SolverVar]] = []
     seen: Set[Tuple[str, str]] = set()
 
-    for _rep, members in spec.equivalences.groups().items():
-        if len(members) < 2:
-            continue
-        # Find bindings for each member.
-        member_bindings: List[Tuple[ColumnId, RowBinding]] = []
-        for member in members:
-            table = member.relation.name.normalized if member.relation.name else ""
-            binding = _find_binding_for_column(table, row_bindings)
-            if binding is not None:
-                member_bindings.append((member, binding))
-
-        # Create SolverVar pairs for consecutive members.
-        for i in range(len(member_bindings) - 1):
-            col_a, binding_a = member_bindings[i]
-            col_b, binding_b = member_bindings[i + 1]
-            var_a = SolverVar(
-                column_id=col_a,
-                relation_id=binding_a.relation,
-                row_scope=f"r{binding_a.row}",
+    for _relation, req in spec.requirements.items():
+        for constraint in req.constraints:
+            if not isinstance(constraint, exp.EQ):
+                continue
+            left, right = constraint.this, constraint.expression
+            if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                continue
+            left_sv = solver_var(left)
+            right_sv = solver_var(right)
+            if left_sv is None or right_sv is None:
+                continue
+            # Only cross-table equalities are join equalities.
+            if left_sv.relation_id == right_sv.relation_id:
+                continue
+            pair_key = (
+                min(left_sv.display, right_sv.display),
+                max(left_sv.display, right_sv.display),
             )
-            var_b = SolverVar(
-                column_id=col_b,
-                relation_id=binding_b.relation,
-                row_scope=f"r{binding_b.row}",
-            )
-            key_a = var_a.display
-            key_b = var_b.display
-            pair_key = (min(key_a, key_b), max(key_a, key_b))
             if pair_key in seen:
                 continue
             seen.add(pair_key)
-            equalities.append((var_a, var_b))
+            equalities.append((left_sv, right_sv))
 
     return equalities
 
