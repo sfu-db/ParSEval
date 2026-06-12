@@ -994,6 +994,16 @@ class Propagator:
         """Decompose AND, ensure SolverVar, store per-table."""
         conjuncts = self._split_conjuncts(expr)
         for conjunct in conjuncts:
+            # Try to unwrap comparison subqueries before deferring.
+            # e.g., t2.district_id = (SELECT district_id FROM client WHERE gender = 'F')
+            # → inner constraint: gender = 'F', join equality: t2.district_id = client.district_id
+            # e.g., t1.amount > (SELECT AVG(amount) FROM orders WHERE status = 'open')
+            # → inner constraint: status = 'open', outer comparison deferred
+            if isinstance(conjunct, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NEQ)) and (
+                conjunct.this.find(exp.Subquery) or conjunct.expression.find(exp.Subquery)
+            ):
+                if self._unwrap_comparison_subquery(conjunct, spec):
+                    continue
             # Subquery-containing conjuncts must be deferred.
             if conjunct.find(exp.Exists) or conjunct.find(exp.Subquery):
                 spec.deferred.append(conjunct.copy())
@@ -1016,6 +1026,101 @@ class Propagator:
             if relation:
                 tc = spec.require(relation)
                 tc.constraints.append(conjunct)
+
+    def _unwrap_comparison_subquery(
+        self, conjunct: exp.Expression, spec: BranchSpec
+    ) -> bool:
+        """Unwrap column op (SELECT col FROM table WHERE condition) into:
+        - Inner WHERE conditions added to the inner table's constraints
+        - For EQ: join equality outer_column = inner_column
+        - For other comparisons: outer comparison deferred (needs scalar value)
+
+        Returns True if successfully unwrapped, False otherwise.
+        """
+        left, right = conjunct.this, conjunct.expression
+        # Find which side has the subquery.
+        if right.find(exp.Subquery):
+            outer_col, subquery_side = left, right
+        elif left.find(exp.Subquery):
+            outer_col, subquery_side = right, left
+        else:
+            return False
+
+        # Must be a simple column on the outer side.
+        if not isinstance(outer_col, exp.Column):
+            return False
+
+        # Extract the subquery.
+        subquery = subquery_side.find(exp.Subquery) if not isinstance(subquery_side, exp.Subquery) else subquery_side
+        if subquery is None:
+            return False
+
+        inner_expr = subquery.this if isinstance(subquery, exp.Subquery) else subquery
+        if not isinstance(inner_expr, exp.Select):
+            return False
+
+        # Find the inner SELECT column (first projection).
+        inner_col_name = None
+        for proj in inner_expr.expressions:
+            if isinstance(proj, exp.Column):
+                inner_col_name = proj.name
+                break
+            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
+                inner_col_name = proj.this.name
+                break
+        if inner_col_name is None:
+            return False
+
+        # Find the inner table.
+        from_clause = inner_expr.args.get("from")
+        if from_clause is None:
+            return False
+        inner_table_node = from_clause.this if isinstance(from_clause, exp.From) else from_clause
+        if not isinstance(inner_table_node, exp.Table):
+            return False
+        inner_table_name = normalize_name(inner_table_node.name)
+
+        if inner_table_name not in self.instance.tables:
+            return False
+
+        # Get the outer column's identity.
+        outer_id = column_identity(outer_col)
+        if outer_id is None or outer_id.relation is None:
+            return False
+
+        # Add inner WHERE conditions to the inner table's constraints.
+        where = inner_expr.args.get("where")
+        if where:
+            for conjunct_inner in self._split_conjuncts(where.this):
+                if conjunct_inner.find(exp.Subquery) or conjunct_inner.find(exp.Exists):
+                    continue
+                for col in conjunct_inner.find_all(exp.Column):
+                    if solver_var(col) is None:
+                        col_id = column_identity(col)
+                        if col_id is not None and col_id.relation is not None:
+                            set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
+                inner_relation = _relation_for_table(self.instance, inner_table_name)
+                tc = spec.require(inner_relation)
+                tc.constraints.append(conjunct_inner.copy())
+
+        inner_relation = _relation_for_table(self.instance, inner_table_name)
+        inner_cid = physical_column(inner_col_name, inner_relation)
+
+        if isinstance(conjunct, exp.EQ):
+            # For EQ: add join equality outer_column = inner_column.
+            inner_col_node = _solver_column(self.instance, inner_cid)
+            outer_col_node = _solver_column(self.instance, outer_id)
+            eq_expr = exp.EQ(this=outer_col_node, expression=inner_col_node)
+            spec.require(outer_id.relation).constraints.append(eq_expr)
+            spec.require(inner_relation).constraints.append(eq_expr)
+            spec.equate(outer_id, inner_cid)
+        else:
+            # For GT/GTE/LT/LTE/NEQ: add inner table requirement and
+            # defer the outer comparison (needs scalar value from subquery).
+            spec.require(inner_relation)
+            spec.deferred.append(conjunct.copy())
+
+        return True
 
     def _split_conjuncts(self, expr: exp.Expression) -> List[exp.Expression]:
         """Split a conjunction into its top-level conjuncts."""
