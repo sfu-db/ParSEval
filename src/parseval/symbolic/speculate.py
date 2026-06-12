@@ -229,24 +229,6 @@ def _has_equality_constraint(
     return False
 
 
-def _extract_fixed_values(
-    constraints: List[exp.Expression],
-) -> Dict[str, Any]:
-    """Extract column->value mappings from EQ(column, literal) constraints."""
-    values: Dict[str, Any] = {}
-    for expr in constraints:
-        if not isinstance(expr, exp.EQ):
-            continue
-        left, right = expr.this, expr.expression
-        if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
-            val = concrete(right)
-            if val is not None:
-                values[left.name] = val
-        elif isinstance(right, exp.Column) and not isinstance(left, exp.Column):
-            val = concrete(left)
-            if val is not None:
-                values[right.name] = val
-    return values
 
 
 # =============================================================================
@@ -1089,18 +1071,31 @@ class Propagator:
     # -----------------------------------------------------------------
 
     def _store_expression(self, expr: exp.Expression, spec: BranchSpec):
-        """Decompose AND, resolve columns, store per-table."""
+        """Decompose AND, ensure SolverVar, store per-table."""
         conjuncts = self._split_conjuncts(expr)
         for conjunct in conjuncts:
             # Subquery-containing conjuncts must be deferred.
             if conjunct.find(exp.Exists) or conjunct.find(exp.Subquery):
                 spec.deferred.append(conjunct.copy())
                 continue
-            resolved = self._resolve_columns(conjunct.copy())
-            relation = self._find_table_for_expr(resolved)
+            # Ensure SolverVar on all columns.
+            for col in conjunct.find_all(exp.Column):
+                if solver_var(col) is None:
+                    col_id = column_identity(col)
+                    if col_id is not None and col_id.relation is not None:
+                        set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
+            # Find the primary relation from the first column with identity.
+            relation = None
+            for col in conjunct.find_all(exp.Column):
+                col_id = column_identity(col)
+                if col_id and col_id.relation:
+                    tname = col_id.relation.name.normalized if col_id.relation.name else ""
+                    if tname in self.instance.tables:
+                        relation = col_id.relation
+                        break
             if relation:
                 tc = spec.require(relation)
-                tc.constraints.append(resolved)
+                tc.constraints.append(conjunct)
 
     def _split_conjuncts(self, expr: exp.Expression) -> List[exp.Expression]:
         """Split a conjunction into its top-level conjuncts."""
@@ -1113,51 +1108,6 @@ class Propagator:
         else:
             parts.append(expr)
         return parts
-
-    def _find_table_for_expr(
-        self, expr: exp.Expression
-    ) -> Optional[RelationId]:
-        """Find the primary RelationId for an expression."""
-        # For EQ with two columns, prefer the left side.
-        if isinstance(expr, exp.EQ):
-            left = expr.this
-            if isinstance(left, exp.Column):
-                col_id = column_identity(left)
-                if col_id and col_id.relation:
-                    tname = (
-                        col_id.relation.name.normalized
-                        if col_id.relation.name
-                        else ""
-                    )
-                    if tname in self.instance.tables:
-                        return col_id.relation
-        # Default: first column's relation.
-        for col in expr.find_all(exp.Column):
-            col_id = column_identity(col)
-            if col_id and col_id.relation:
-                tname = (
-                    col_id.relation.name.normalized
-                    if col_id.relation.name
-                    else ""
-                )
-                if tname in self.instance.tables:
-                    return col_id.relation
-        return None
-
-    def _resolve_columns(self, expr: exp.Expression) -> exp.Expression:
-        """Resolve column table qualifiers and ensure SolverVar metadata."""
-        for col in expr.find_all(exp.Column):
-            if solver_var(col) is None:
-                col_id = column_identity(col)
-                if col_id is not None and col_id.relation is not None:
-                    var = SolverVar(column_id=col_id, relation_id=col_id.relation)
-                    set_solver_var(col, var)
-            col_id = column_identity(col)
-            if col_id and col_id.relation:
-                display = col_id.relation.display
-                if display and col.table and display != col.table:
-                    col.set("table", exp.to_identifier(display))
-        return expr
 
     # -----------------------------------------------------------------
     # Schema constraints
@@ -2673,70 +2623,6 @@ def _rows_from_solver_result(
 # ---------------------------------------------------------------------------
 
 
-def _gold_domain_value(
-    instance: Instance,
-    table: str,
-    column: str,
-    row_context: Optional[Dict[str, Any]] = None,
-    rows: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-    builder=None,
-) -> Any:
-    """Generate a single value for a column, respecting constraints."""
-    context = dict(row_context or {})
-    context.pop(column, None)
-    if builder is None:
-        if rows:
-            from parseval.domain.builder import DatabaseBuilder
-
-            builder = DatabaseBuilder(instance.schema_spec)
-            for table_name in instance.tables:
-                for existing_row in instance.get_rows(table_name):
-                    builder.runtime.remember_row(
-                        table_name, _row_value_dict(existing_row),
-                    )
-            for tbl_name, tbl_rows in rows.items():
-                if tbl_name not in instance.tables:
-                    continue
-                for row in tbl_rows:
-                    if row:
-                        builder.runtime.remember_row(tbl_name, row)
-        else:
-            builder = instance.builder
-    return builder.generate_value(table, column, row_context=context)
-
-
-def _fallback_rows(
-    spec: BranchSpec,
-    instance: Instance,
-    _row_bindings: Dict[str, RowBinding],
-) -> Dict[str, List[Dict[str, Any]]]:
-    """Build rows using heuristic values when solver fails.
-
-    Extracts fixed values from EQ constraints and generates defaults
-    for remaining columns.
-    """
-    rows: Dict[str, List[Dict[str, Any]]] = {}
-    for _relation, req in spec.requirements.items():
-        physical = req.table
-        if physical not in instance.tables:
-            continue
-        fixed = _extract_fixed_values(req.constraints)
-        for _row_index in range(max(req.min_rows, 1)):
-            row: Dict[str, Any] = dict(fixed)
-            for col_name in instance.tables[physical]:
-                if col_name in row:
-                    continue
-                try:
-                    row[col_name] = _gold_domain_value(
-                        instance, physical, col_name,
-                        row_context=row, rows=rows,
-                    )
-                except Exception:
-                    pass
-            rows.setdefault(physical, []).append(row)
-    return rows
-
-
 # ---------------------------------------------------------------------------
 # Row completion
 # ---------------------------------------------------------------------------
@@ -3268,12 +3154,12 @@ class Resolver:
                 rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
             else:
                 logger.debug(
-                    "Solver failed for spec=%s reason=%s; using fallback",
+                    "Solver failed for spec=%s reason=%s",
                     spec.branch, result.reason,
                 )
-                rows = _fallback_rows(spec, self.instance, row_bindings)
+                rows = {}
         else:
-            rows = _fallback_rows(spec, self.instance, row_bindings)
+            rows = {}
 
         # Complete missing columns (generates rows from min_rows even when solver output is empty).
         rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
