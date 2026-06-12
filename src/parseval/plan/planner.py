@@ -437,13 +437,16 @@ class Step:
                 for node in projection.walk():
                     name = intermediate.get(node)
                     if name:
-                        node.replace(exp.column(name, step.name))
+                        # Preserve the original column's table qualifier.
+                        table = node.table if isinstance(node, exp.Column) and node.table else step.name
+                        node.replace(exp.column(name, table))
 
             if aggregate.condition is not None:
                 for node in aggregate.condition.walk():
                     name = intermediate.get(node) or intermediate.get(node.name)
                     if name:
-                        node.replace(exp.column(name, step.name))
+                        table = node.table if isinstance(node, exp.Column) and node.table else step.name
+                        node.replace(exp.column(name, table))
 
             aggregate.add_dependency(step)
             step = aggregate
@@ -1291,7 +1294,40 @@ def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
         for inner_step in _identity_order(step.inner):
             _prepare_step_identity(inner_step, instance)
         output_columns = getattr(step.inner, "output_column_ids", ())
-        step.output_column_ids = tuple(output_columns)
+        # Resolve source_column_id for columns that don't have it yet.
+        # This ensures every output column tracks its physical source.
+        inner_agg = next(
+            (s for s in _identity_order(step.inner) if isinstance(s, Aggregate)),
+            None,
+        )
+        resolved_columns: t.List[ColumnId] = []
+        for col in output_columns:
+            src = col.source_column_id
+            if src is not None and col.name.normalized.startswith("_"):
+                # Synthetic alias with known source: use source name.
+                resolved_columns.append(column_id(
+                    col.kind, src.name, col.relation,
+                    scope_id=col.scope_id, ordinal=col.ordinal,
+                    source_column_id=src,
+                ))
+            elif col.name.normalized.startswith("_") and inner_agg is not None:
+                # Synthetic alias without source: resolve from group expression.
+                group_expr = inner_agg.group.get(col.name.normalized)
+                if group_expr is not None and isinstance(group_expr, exp.Column):
+                    group_cid = _resolve_group_source(group_expr, inner_agg, instance)
+                    if group_cid is not None:
+                        resolved_columns.append(column_id(
+                            col.kind, group_cid.name, col.relation,
+                            scope_id=col.scope_id, ordinal=col.ordinal,
+                            source_column_id=group_cid,
+                        ))
+                    else:
+                        resolved_columns.append(col)
+                else:
+                    resolved_columns.append(col)
+            else:
+                resolved_columns.append(col)
+        step.output_column_ids = tuple(resolved_columns)
         step.relation_id = relation_id(
             RelationKind.CTE if step.kind is SubPlanKind.CTE else RelationKind.SUBQUERY,
             identifier_name(step.alias or step.name or step.kind.value, dialect=getattr(instance, "dialect", None)),
@@ -1448,28 +1484,70 @@ def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[C
     return tuple(result)
 
 
+def _resolve_group_source(
+    expression: exp.Expression,
+    step: "Step",
+    instance: t.Any,
+) -> "ColumnId | None":
+    """Resolve the source ColumnId for a GROUP BY expression.
+
+    Walks the dependency chain to find the step that owns the column,
+    since the Aggregate step can't resolve qualified columns directly.
+
+    For simple column references (GROUP BY col): returns the ColumnId.
+    For complex expressions (GROUP BY a + b): returns the ColumnId of the
+    first column found in the expression.
+    """
+    # Find the first column in the expression.
+    col = expression.find(exp.Column)
+    if col is None:
+        return None
+
+    # Walk dependency chain to find a step that can resolve this column.
+    visited: t.Set[int] = set()
+
+    def _try_resolve(s: "Step") -> "ColumnId | None":
+        if id(s) in visited:
+            return None
+        visited.add(id(s))
+        resolved = _resolve_column_id(col, s, instance, allow_unresolved=True)
+        if resolved is not None:
+            return resolved
+        # If qualified column failed, try unqualified (strip table qualifier).
+        if col.table:
+            unqualified = col.copy()
+            unqualified.set("table", None)
+            resolved = _resolve_column_id(unqualified, s, instance, allow_unresolved=True)
+            if resolved is not None:
+                return resolved
+        for dep in s.chain_dependencies:
+            result = _try_resolve(dep)
+            if result is not None:
+                return result
+        return None
+
+    return _try_resolve(step)
+
+
 def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tuple[ColumnId, ...]:
     result: t.List[ColumnId] = []
     dialect = getattr(instance, "dialect", None)
     aggregate_relation = _aggregate_output_relation(step, instance)
 
     for ordinal, (name, expression) in enumerate(step.group.items()):
-        source = None
-        if isinstance(expression, exp.Column):
-            source = _resolve_column_id(
-                expression,
-                step,
-                instance,
-                allow_unresolved=True,
-            )
+        # Resolve source column by walking the dependency chain.
+        # The Aggregate step can't resolve qualified columns (e.g., t1.col)
+        # because its visible columns come from the Scan which has no alias.
+        # Walk deps to find the step that owns the column.
+        source = _resolve_group_source(expression, step, instance)
         result.append(
             column_id(
                 ColumnKind.PROJECTED,
                 identifier_name(name, dialect=dialect),
-                source.relation if isinstance(source, ColumnId) else aggregate_relation,
+                source.relation if source is not None else aggregate_relation,
                 scope_id=_scope_id_for(step),
                 ordinal=ordinal,
-                source_column_id=source if isinstance(source, ColumnId) else None,
+                source_column_id=source,
             )
         )
 
