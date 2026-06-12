@@ -136,6 +136,29 @@ def _make_is_null(col_node: exp.Column) -> exp.Is:
     return exp.Is(this=col_node, expression=exp.Null())
 
 
+def _update_solver_var_identity(
+    constraints: List[exp.Expression], col_name: str, plan_cid: ColumnId
+) -> None:
+    """Update existing IS NOT NULL constraint's SolverVar with plan identity."""
+    for expr in constraints:
+        if not isinstance(expr, exp.Is):
+            continue
+        if not isinstance(expr.expression, exp.Not):
+            continue
+        if not isinstance(expr.expression.this, exp.Null):
+            continue
+        col = expr.this
+        if not isinstance(col, exp.Column):
+            continue
+        if normalize_name(col.name) != normalize_name(col_name):
+            continue
+        sv = solver_var(col)
+        if sv is not None and sv.column_id.scope_id is None:
+            plan_sv = SolverVar(column_id=plan_cid, relation_id=sv.relation_id, row_scope=sv.row_scope)
+            set_solver_var(col, plan_sv)
+            return
+
+
 def _has_is_not_null(
     constraints: List[exp.Expression], col_name: str
 ) -> bool:
@@ -703,8 +726,20 @@ class Propagator:
                 ):
                     continue
                 if not _has_is_not_null(tc.constraints, col_name):
-                    src = source_names.get(normalize_name(col_name))
-                    col_node = self._solver_col(tc.table, col_name, source_col_name=src)
+                    # Use plan identity if available to avoid duplicate SolverVars.
+                    plan_cid = col_ids.get(normalize_name(col_name))
+                    if plan_cid is not None:
+                        col_node = _solver_column(
+                            self.instance, relation_id, col_name,
+                            source_col_name=plan_cid.source_column_id.name.normalized if plan_cid.source_column_id else None,
+                        )
+                        sv = solver_var(col_node)
+                        if sv is not None:
+                            plan_sv = SolverVar(column_id=plan_cid, relation_id=sv.relation_id, row_scope=sv.row_scope)
+                            set_solver_var(col_node, plan_sv)
+                    else:
+                        src = source_names.get(normalize_name(col_name))
+                        col_node = self._solver_col(tc.table, col_name, source_col_name=src)
                     tc.constraints.append(_make_is_not_null(col_node))
                 break
         # Duplicate / DISTINCT handling.
@@ -1080,6 +1115,24 @@ class Propagator:
 
     def _add_schema_constraints(self, spec: BranchSpec):
         """Add NOT NULL, UNIQUE, FK as expression constraints."""
+        # Build (table, col_name) -> ColumnId mapping from plan annotations.
+        # This ensures we use the planner's full identity (with scope_id, ordinal,
+        # source_column_id) rather than minimal physical_column() identities.
+        plan_col_ids: dict[tuple[str, str], ColumnId] = {}
+        for step in self.plan.ordered_steps:
+            ann = self.plan.annotations.get(id(step))
+            if ann is None:
+                continue
+            for col_id in ann.referenced_columns + ann.projected_columns:
+                if col_id.relation and col_id.relation.name:
+                    key = (col_id.relation.name.normalized, col_id.name.normalized)
+                    plan_col_ids[key] = col_id
+                # Also map by source_column_id name for synthetic aliases.
+                src = col_id.source_column_id
+                if src and src.relation and src.relation.name and col_id.relation and col_id.relation.name:
+                    key = (col_id.relation.name.normalized, src.name.normalized)
+                    plan_col_ids[key] = col_id
+
         for relation_id, tc in list(spec.requirements.items()):
             table = tc.table
             if table not in self.instance.tables:
@@ -1087,15 +1140,29 @@ class Propagator:
 
             # NOT NULL columns.
             for col_name in self.instance.tables[table]:
+                plan_cid = plan_col_ids.get((table, normalize_name(col_name)))
+                # Update existing IS NOT NULL with plan identity (regardless of nullability).
+                if _has_is_not_null(tc.constraints, col_name):
+                    if plan_cid is not None:
+                        _update_solver_var_identity(tc.constraints, col_name, plan_cid)
+                    continue
                 col_id = physical_column(col_name, relation_id)
                 if not self.instance.nullable(relation_id, col_id):
                     if _has_is_null(tc.constraints, col_name):
                         continue
-                    if not _has_is_not_null(tc.constraints, col_name):
-                        col_node = self._solver_col(
-                             table, col_name
+                    # Add new IS NOT NULL with plan identity.
+                    if plan_cid is not None:
+                        col_node = _solver_column(
+                            self.instance, relation_id, col_name,
+                            source_col_name=plan_cid.source_column_id.name.normalized if plan_cid.source_column_id else None,
                         )
-                        tc.constraints.append(_make_is_not_null(col_node))
+                        sv = solver_var(col_node)
+                        if sv is not None:
+                            plan_sv = SolverVar(column_id=plan_cid, relation_id=sv.relation_id, row_scope=sv.row_scope)
+                            set_solver_var(col_node, plan_sv)
+                    else:
+                        col_node = self._solver_col(table, col_name)
+                    tc.constraints.append(_make_is_not_null(col_node))
 
             # UNIQUE columns with existing data -> exclude existing values.
             existing_rows = self.instance.get_rows(relation_id)
