@@ -424,7 +424,7 @@ class Catalog(MappingSchema):
             self._column_sources.get((table_key, column_key), column_key),
         )
 
-    def table_id(self, table: RelationId | exp.Table | str):
+    def table_id(self, table: RelationId | exp.Table):
         if isinstance(table, RelationId):
             return table
         key = self._identity_key(table, is_table=True)
@@ -434,8 +434,8 @@ class Catalog(MappingSchema):
 
     def column_id(
         self,
-        table: RelationId | exp.Table | str,
-        column: exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table,
+        column: exp.Column | exp.Identifier,
     ):
         table_key = (
             self._relation_keys_by_id[table]
@@ -443,7 +443,12 @@ class Catalog(MappingSchema):
             else self._resolve_declared_table_key(table)
         )
         column_key = self._identity_key(column)
-        return self._column_ids[(table_key, column_key)]
+        try:
+            return self._column_ids[(table_key, column_key)]
+        except KeyError:
+            # Fallback: try the raw key (for quoted identifiers stored with original case).
+            raw_key = column.name if isinstance(column, exp.Identifier) else str(column)
+            return self._column_ids[(table_key, raw_key)]
 
     def _column_id_for_metadata_lookup(
         self,
@@ -465,13 +470,13 @@ class Catalog(MappingSchema):
 
     def catalog_column(
         self,
-        table: exp.Table | str,
-        column: exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table,
+        column: exp.Column | exp.Identifier,
     ) -> CatalogColumn:
         return self._catalog_columns[self.column_id(table, column)]
 
     def add_primary_key(
-        self, table: exp.Table | str, columns: List[exp.Identifier] | exp.Identifier
+        self, table: RelationId | exp.Table, columns: List[exp.Identifier] | exp.Identifier
     ):
         table = self._identity_key(table, is_table=True)
         pk_columns = self.primary_keys.setdefault(table, [])
@@ -483,20 +488,20 @@ class Catalog(MappingSchema):
                 pk_columns.append(column)
                 seen.add(key)
 
-    def get_primary_key(self, table: exp.Table | str):
+    def get_primary_key(self, table: RelationId | exp.Table):
         table = self._identity_key(table, is_table=True)
         return tuple(self.primary_keys.get(table, ()))
 
     def get_primary_key_ids(
         self,
-        table: RelationId | exp.Table | str,
+        table: RelationId | exp.Table,
     ) -> Tuple[ColumnId, ...]:
         return self._primary_key_ids_by_relation_id.get(
             self._resolve_relation_id(table),
             (),
         )
 
-    def _primary_key_names(self, table: exp.Table | str) -> Tuple[str, ...]:
+    def _primary_key_names(self, table: RelationId | exp.Table) -> Tuple[str, ...]:
         return tuple(
             self._identity_key(identifier)
             for identifier in self.get_primary_key(table)
@@ -547,14 +552,14 @@ class Catalog(MappingSchema):
         return columns[0] if len(columns) == 1 else None
 
     def add_foreign_key(
-        self, table: exp.Table | str, foreign_key: List[exp.ForeignKey] | exp.ForeignKey
+        self, table: RelationId | exp.Table, foreign_key: List[exp.ForeignKey] | exp.ForeignKey
     ):
         table = self._identity_key(table, is_table=True)
         fk_list = self.foreign_keys.setdefault(table, [])
         fks = [foreign_key] if isinstance(foreign_key, exp.ForeignKey) else foreign_key
         fk_list.extend(fks)
 
-    def get_foreign_key(self, table: exp.Table | str):
+    def get_foreign_key(self, table: RelationId | exp.Table):
         table = self._identity_key(table, is_table=True)
         return self.foreign_keys.get(table, [])
 
@@ -563,7 +568,7 @@ class Catalog(MappingSchema):
 
     def add_unique_constraint(
         self,
-        table: exp.Table | str,
+        table: RelationId | exp.Table,
         columns: List[exp.Identifier],
     ):
         table = self._identity_key(table, is_table=True)
@@ -577,13 +582,13 @@ class Catalog(MappingSchema):
         if normalized_columns not in unique_constraints:
             unique_constraints.append(normalized_columns)
 
-    def get_unique_constraints(self, table: exp.Table | str):
+    def get_unique_constraints(self, table: RelationId | exp.Table):
         table = self._identity_key(table, is_table=True)
         return tuple(self.unique_constraints.get(table, ()))
 
     def get_unique_constraint_ids(
         self,
-        table: RelationId | exp.Table | str,
+        table: RelationId | exp.Table,
     ) -> Tuple[Tuple[ColumnId, ...], ...]:
         return self._unique_constraint_ids_by_relation_id.get(
             self._resolve_relation_id(table),
@@ -592,8 +597,8 @@ class Catalog(MappingSchema):
 
     def add_constraint(
         self,
-        table: exp.Table | str,
-        column: exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table,
+        column: exp.Column | exp.Identifier,
         constraint,
     ):
         table = self._identity_key(table, is_table=True)
@@ -605,8 +610,8 @@ class Catalog(MappingSchema):
 
     def get_column_constraints(
         self,
-        table: RelationId | exp.Table | str,
-        column: ColumnId | exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table,
+        column: ColumnId | exp.Column | exp.Identifier,
     ):
         if isinstance(column, ColumnId):
             return self.get_column_constraints_by_id(column)
@@ -622,7 +627,7 @@ class Catalog(MappingSchema):
     def get_column_constraints_by_id(self, column: ColumnId):
         return self._constraints_by_column_id.get(column, set())
 
-    def get_check_constraints(self, table: exp.Table | str) -> List[exp.Expression]:
+    def get_check_constraints(self, table: RelationId | exp.Table) -> List[exp.Expression]:
         """Return parsed CHECK constraint expressions for a table."""
         results = []
         relation = self.table_id(table)
@@ -640,8 +645,8 @@ class Catalog(MappingSchema):
 
     def nullable(
         self,
-        table: RelationId | exp.Table | str,
-        column: ColumnId | exp.Column | str,
+        table: RelationId | exp.Table,
+        column: ColumnId | exp.Column,
     ):
         for constraint in self.get_column_constraints(table, column):
             if isinstance(constraint.kind, exp.NotNullColumnConstraint):
@@ -658,8 +663,8 @@ class Catalog(MappingSchema):
 
     def is_unique(
         self,
-        table: RelationId | exp.Table | str,
-        column: ColumnId | exp.Column | str,
+        table: RelationId | exp.Table,
+        column: ColumnId | exp.Column,
     ):
         for constraint in self.get_column_constraints(table, column):
             if isinstance(
@@ -791,7 +796,7 @@ class Catalog(MappingSchema):
                 tbl_constraints=table_constraints,
             )
         self._ddl_columns = OrderedDict(
-            (table_name, OrderedDict(columns))
+            (self._resolve_declared_table_key(table_name), OrderedDict(columns))
             for table_name, columns in mappings.items()
         )
         normalized_dependency: Dict[str, int] = {}
@@ -976,21 +981,21 @@ class Instance(Catalog):
     def __repr__(self):
         return f"Instance(name={self.name}, tables={list(self.tables.keys())})"
 
-    def add_row(self, table: RelationId | exp.Table | str, row: Row):
+    def add_row(self, table: RelationId | exp.Table, row: Row):
         table_key = self._table_key_for_storage(table)
         self.data[table_key].append(row)
 
-    def get_rows(self, table: RelationId | exp.Table | str) -> List[Row]:
+    def get_rows(self, table: RelationId | exp.Table) -> List[Row]:
         table_key = self._table_key_for_storage(table)
         return self.data[table_key]
 
-    def get_row(self, table: RelationId | exp.Table | str, index):
+    def get_row(self, table: RelationId | exp.Table, index):
         return self.get_rows(table)[index]
 
     def get_column_data(
         self,
-        table: RelationId | exp.Table | str,
-        column: ColumnId | exp.Column | exp.Identifier | str,
+        table: RelationId | exp.Table,
+        column: ColumnId | exp.Column | exp.Identifier,
     ) -> List[Symbol]:
         col_id = self._stored_column_id(table, column)
         return [row[col_id] for row in self.get_rows(table)]
@@ -1005,7 +1010,13 @@ class Instance(Catalog):
 
     def _table_key_for_storage(self, table: RelationId | exp.Table | str) -> str:
         if isinstance(table, RelationId):
-            return self._relation_keys_by_id[table]
+            try:
+                return self._relation_keys_by_id[table]
+            except KeyError:
+                # Fallback: look up by physical table name (ignoring alias).
+                if table.name:
+                    return table.name.normalized
+                raise
         return self._resolve_declared_table_key(table)
 
     def _table_source_for_storage(self, table: RelationId | exp.Table | str):
@@ -1076,8 +1087,8 @@ class Instance(Catalog):
     def create_rows(
         self,
         concretes: Mapping[
-            RelationId | exp.Table | str,
-            Mapping[ColumnId | exp.Column | exp.Identifier | str, Sequence[Any]],
+            RelationId | exp.Table,
+            Mapping[ColumnId | exp.Column | exp.Identifier, Sequence[Any]],
         ],
     ) -> Dict[RelationId, List[RowCreationResult]]:
         created: Dict[RelationId, List[RowCreationResult]] = {}
@@ -1131,8 +1142,8 @@ class Instance(Catalog):
 
     def place_row(
         self,
-        table: RelationId | exp.Table | str,
-        values: Mapping[ColumnId | exp.Column | exp.Identifier | str, Any],
+        table: RelationId | exp.Table,
+        values: Mapping[ColumnId | exp.Column | exp.Identifier, Any],
     ) -> Row:
         """Append a row with explicit values. No FK/unique validation.
 
@@ -1176,8 +1187,8 @@ class Instance(Catalog):
 
     def create_row(
         self,
-        table: RelationId | exp.Table | str,
-        values: Mapping[ColumnId | exp.Column | exp.Identifier | str, Any] | None = None,
+        table: RelationId | exp.Table,
+        values: Mapping[ColumnId | exp.Column | exp.Identifier, Any] | None = None,
     ) -> RowCreationResult:
         relation = self._resolve_relation_for_storage(table)
         values_by_id = self._normalize_row_values_by_id(relation, values or {})
@@ -1835,7 +1846,17 @@ class Instance(Catalog):
         tables: list[TableBatch] = []
         for table_name in self.tables:
             rows = self._row_dicts(table_name)
-            columns = tuple(self.column_names(table_name))
+            # Derive column names from the Row's ColumnId objects so that
+            # quoted identifiers preserve their original casing (matching
+            # _row_value_dict keys).  Fall back to column_names() when the
+            # table has no rows yet.
+            instance_rows = self.get_rows(table_name)
+            if instance_rows:
+                columns = tuple(
+                    cid.name.normalized for cid in instance_rows[0].columns
+                )
+            else:
+                columns = tuple(self.column_names(table_name))
             tables.append(
                 TableBatch(
                     table_name=table_name,
