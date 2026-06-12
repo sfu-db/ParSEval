@@ -85,28 +85,57 @@ def _relation_for_table(
         return relation_id(RelationKind.TABLE, identifier_name(normalized))
 
 
+def _find_physical_source(col_id: ColumnId, instance: Optional[Instance] = None) -> Optional[ColumnId]:
+    """Follow source_column_id chain to find the physical column with a real table relation.
+
+    If instance is provided, only returns columns whose relation exists in instance.tables.
+    """
+    current = col_id
+    for _ in range(10):  # prevent infinite loops
+        if current is None:
+            return None
+        if current.relation is not None:
+            if instance is None:
+                return current
+            table = current.relation.name.normalized if current.relation.name else ""
+            if table in instance.tables:
+                return current
+        current = current.source_column_id
+    return None
+
+
 def _solver_column(
     instance: Instance,
     relation: RelationId,
     col_name: str,
     row_scope: Optional[str] = None,
     source_col_name: Optional[str] = None,
+    source_table: Optional[str] = None,
+    column_id: Optional[ColumnId] = None,
 ) -> exp.Column:
     """Create a Column annotated with SolverVar + type from the instance schema.
 
     Args:
         source_col_name: Real column name for type lookup when col_name is a
             synthetic alias (e.g., _g0 -> county).
+        source_table: Real table name for type lookup when relation is a
+            SubPlan alias (e.g., t2 -> schools).
+        column_id: Pre-built ColumnId to use (preserves source_column_id chain).
     """
-    col_id = physical_column(col_name, relation)
-    var = SolverVar(column_id=col_id, relation_id=relation, row_scope=row_scope)
+    if column_id is None:
+        column_id = physical_column(col_name, relation)
+    var = SolverVar(column_id=column_id, relation_id=relation, row_scope=row_scope)
     table_display = relation.display
     col_node = exp.column(col_name, table=table_display)
     set_solver_var(col_node, var)
-    # Set type from instance schema, trying source_col_name as fallback.
+    # Set type from instance schema, trying source table/column as fallback.
     table = relation.name.normalized if relation.name else ""
-    schema = instance.tables.get(table)
-    if schema:
+    for lookup_table in (table, source_table):
+        if not lookup_table:
+            continue
+        schema = instance.tables.get(lookup_table)
+        if not schema:
+            continue
         for lookup_name in (col_name, source_col_name):
             if not lookup_name:
                 continue
@@ -116,7 +145,7 @@ def _solver_column(
                     col_node.type = DataType.build(dtype)
                 except Exception:
                     pass
-                break
+                return col_node
     return col_node
 
 
@@ -487,12 +516,14 @@ class Propagator:
     def _solver_col(
         self, table: str, col_name: str, row_scope: Optional[str] = None,
         source_col_name: Optional[str] = None,
+        source_table: Optional[str] = None,
     ) -> exp.Column:
         """Create a solver column from a table name string."""
         relation = _relation_for_table(self.instance, table)
         return _solver_column(
             self.instance, relation, col_name, row_scope=row_scope,
             source_col_name=source_col_name,
+            source_table=source_table,
         )
 
     # -----------------------------------------------------------------
@@ -592,14 +623,22 @@ class Propagator:
                             else ""
                         )
                         if sk_table and jk_table:
+                            # Use source column/table for type lookup when join key
+                            # references a SubPlan alias (e.g., t2.admfname1).
+                            sk_src = _find_physical_source(sk_id, self.instance)
+                            jk_src = _find_physical_source(jk_id, self.instance)
                             eq_expr = exp.EQ(
-                                this=self._solver_col(
-                                    sk_table,
-                                    sk_id.name.normalized,
+                                this=_solver_column(
+                                    self.instance, sk_rel, sk_id.name.normalized,
+                                    source_col_name=sk_src.name.normalized if sk_src else None,
+                                    source_table=sk_src.relation.name.normalized if sk_src and sk_src.relation else None,
+                                    column_id=sk_id,
                                 ),
-                                expression=self._solver_col(
-                                    jk_table,
-                                    jk_id.name.normalized,
+                                expression=_solver_column(
+                                    self.instance, jk_rel, jk_id.name.normalized,
+                                    source_col_name=jk_src.name.normalized if jk_src else None,
+                                    source_table=jk_src.relation.name.normalized if jk_src and jk_src.relation else None,
+                                    column_id=jk_id,
                                 ),
                             )
                             spec.requirements[sk_rel].constraints.append(
@@ -1035,6 +1074,14 @@ class Propagator:
         for spec in specs:
             self._add_schema_constraints(spec)
             self._annotate_column_types(spec)
+            # Remove requirements for virtual tables (SubPlan aliases).
+            # These are not real tables — their rows come from inner plans.
+            virtual_keys = [
+                rel for rel, tc in spec.requirements.items()
+                if tc.table not in self.instance.tables
+            ]
+            for key in virtual_keys:
+                del spec.requirements[key]
         return specs
 
     # -----------------------------------------------------------------
@@ -2333,20 +2380,14 @@ def _row_value_dict(row) -> Dict[str, Any]:
 
 
 def _build_gold_row_bindings(spec: BranchSpec) -> Dict[str, RowBinding]:
-    """Build RowBinding objects for every table x row in the spec."""
-    bindings: Dict[str, RowBinding] = {}
-    alias_scoped_tables: Set[str] = set()
-    for _relation, req in spec.requirements.items():
-        if req.alias:
-            alias_scoped_tables.add(req.table)
+    """Build RowBinding objects for every table x row in the spec.
 
+    Each requirement (including different aliases of the same physical table)
+    gets its own bindings. This supports self-joins where the same table
+    appears with different aliases and different constraints.
+    """
+    bindings: Dict[str, RowBinding] = {}
     for _relation, req in spec.requirements.items():
-        physical = req.table
-        if physical in alias_scoped_tables and not req.alias:
-            # For self-join tables, only create bindings for alias-scoped entries.
-            # If this entry has no alias and the table is alias-scoped, skip it
-            # UNLESS there is no alias-scoped version with this specific alias.
-            continue
         binding_relation = req.relation
         for row_index in range(max(req.min_rows, 1)):
             binding = RowBinding(relation=binding_relation, row=row_index)
@@ -2439,15 +2480,29 @@ def _rewrite_constraint_for_binding(
             set_solver_var(col, new_var)
             ct = col_type(col)
             if ct is None:
-                table = sv.relation_id.name.normalized if sv.relation_id.name else ""
-                schema = instance.tables.get(table)
-                if schema:
-                    dtype = schema.get(normalize_name(col.name))
-                    if dtype:
-                        try:
-                            col.type = DataType.build(dtype)
-                        except Exception:
-                            pass
+                # Try primary table, then follow source_column_id chain.
+                phys = _find_physical_source(sv.column_id, instance)
+                for lookup_table in (
+                    sv.relation_id.name.normalized if sv.relation_id.name else "",
+                    phys.relation.name.normalized if phys and phys.relation and phys.relation.name else "",
+                ):
+                    if not lookup_table:
+                        continue
+                    schema = instance.tables.get(lookup_table)
+                    if not schema:
+                        continue
+                    for lookup_name in (col.name, phys.name.normalized if phys else None):
+                        if not lookup_name:
+                            continue
+                        dtype = schema.get(normalize_name(lookup_name))
+                        if dtype:
+                            try:
+                                col.type = DataType.build(dtype)
+                            except Exception:
+                                pass
+                            break
+                    if col_type(col) is not None:
+                        break
             if scoped_vars is not None:
                 scoped_vars[(binding.table, normalize_name(col.name))] = new_var
             matched = True
@@ -3220,11 +3275,11 @@ class Resolver:
         else:
             rows = _fallback_rows(spec, self.instance, row_bindings)
 
+        # Complete missing columns (generates rows from min_rows even when solver output is empty).
+        rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
+
         if not rows:
             return {}
-
-        # Complete missing columns.
-        rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
 
         # Satisfy scalar subqueries.
         _satisfy_gold_scalar_subqueries(
@@ -3308,11 +3363,14 @@ class Resolver:
                 if key in seen_not_null:
                     continue
                 seen_not_null.add(key)
+                phys = _find_physical_source(var.column_id, self.instance)
                 col_node = _solver_column(
                     self.instance,
                     var.relation_id,
                     var.column_id.name.normalized,
                     row_scope=var.row_scope,
+                    source_col_name=phys.name.normalized if phys else None,
+                    source_table=phys.relation.name.normalized if phys and phys.relation else None,
                 )
                 constraints.append(_make_is_not_null(col_node))
 

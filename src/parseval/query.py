@@ -142,10 +142,9 @@ def preprocess_sql(
         type_inferencer = TypeInferencer(mappingschema, dialect)
     sql = re.sub(r'(?<!["\'])\bSEX\b(?!["\'])', '"SEX"', sql)
     parsed = parse_one(sql, dialect=dialect)
-    tbls = list(parsed.find_all(exp.Table))
 
-    def transform(node, tables):
-        ## Transform SUM/COUNT/AVG with predicate into CASE WHEN structure
+    def transform(node, _tables):
+        # Transform SUM/COUNT/AVG with predicate into CASE WHEN structure.
         if isinstance(node, (exp.Sum, exp.Count, exp.Avg)) and isinstance(
             node.this, exp.Predicate
         ):
@@ -153,21 +152,12 @@ def preprocess_sql(
             default = exp.Literal.number(0)
             node.set("this", exp.Case(ifs=whens, default=default))
             return node
-        ## Transform quoted literal to unquoted
-        if isinstance(node, exp.Column) and not node.table:
-            for table in tables:
-                if mappingschema.has_column(
-                    table, column=node, dialect=dialect, normalize=True
-                ):
-                    node.set("table", exp.to_identifier(table.alias_or_name))
-                    break
-            if not node.table:
-                return exp.convert(node.this.this)
+        # Simplify UPPER/LOWER.
         if isinstance(node, (exp.Upper, exp.Lower)):
             return node.this
         return node
 
-    parsed = parsed.transform(transform, tbls)
+    parsed = parsed.transform(transform, None)
     try:
         parsed = qualify.qualify(parsed, schema=mappingschema, dialect=dialect)
     except Exception:
