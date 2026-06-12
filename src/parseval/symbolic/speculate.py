@@ -2819,6 +2819,12 @@ def _solve_scalar_witness_values(
         table = normalize_name(col.table or "")
         binding = _find_binding_for_column(table, all_bindings)
         if binding is None:
+            # Resolve alias: search for column name in all tables.
+            for table_name in instance.tables:
+                if col.name in instance.tables.get(table_name, {}):
+                    binding = _find_binding_for_column(table_name, all_bindings)
+                    break
+        if binding is None:
             continue
         new_col = _solver_column(instance, physical_column(col.name, binding.relation), row_scope=f"r{binding.row}")
         set_solver_var(col, solver_var(new_col))
@@ -2828,6 +2834,12 @@ def _solve_scalar_witness_values(
     for col in inner_scoped.find_all(exp.Column):
         table = normalize_name(col.table or "")
         binding = _find_binding_for_column(table, all_bindings)
+        if binding is None:
+            # Resolve alias: search for column name in all tables.
+            for table_name in instance.tables:
+                if col.name in instance.tables.get(table_name, {}):
+                    binding = _find_binding_for_column(table_name, all_bindings)
+                    break
         if binding is None:
             continue
         new_col = _solver_column(instance, physical_column(col.name, binding.relation), row_scope=f"r{binding.row}")
@@ -2857,6 +2869,87 @@ def _solve_scalar_witness_values(
     return set()
 
 
+
+def _include_subquery_conditions(spec: BranchSpec, plan: Plan) -> None:
+    """Extract inner subquery WHERE conditions and add them as constraints.
+
+    When a deferred atom contains a subquery (e.g., x = (SELECT ... WHERE y = 'F')),
+    the inner WHERE condition (y = 'F') should be included in the solver constraints
+    so the solver generates values that satisfy it.
+    """
+    for atom in spec.deferred:
+        # Find the subquery node in the atom.
+        subquery_node = atom.find(exp.Subquery)
+        if subquery_node is None:
+            continue
+
+        # Find the SubPlan whose anchor contains this subquery.
+        subplan = None
+        for step in plan.ordered_steps:
+            from parseval.plan.planner import SubPlan as _SP
+            if isinstance(step, _SP) and step.anchor is not None:
+                # Check if the anchor IS the subquery or contains it.
+                if step.anchor is subquery_node or step.anchor is atom:
+                    subplan = step
+                    break
+                # Check by SQL text for the inner subquery.
+                anchor_sql = step.anchor.sql()
+                sub_sql = subquery_node.sql()
+                if sub_sql in anchor_sql or anchor_sql in sub_sql:
+                    subplan = step
+                    break
+        if subplan is None or subplan.inner is None:
+            continue
+
+        # Walk the inner plan to find Filter conditions.
+        stack = [subplan.inner]
+        visited: set = set()
+        while stack:
+            step = stack.pop()
+            if id(step) in visited:
+                continue
+            visited.add(id(step))
+            if isinstance(step, Filter) and step.condition:
+                for conjunct in _split_conjuncts_static(step.condition):
+                    # Skip subquery-containing conjuncts (avoid infinite recursion).
+                    if conjunct.find(exp.Subquery) or conjunct.find(exp.Exists):
+                        continue
+                    # Ensure SolverVar on columns.
+                    for col in conjunct.find_all(exp.Column):
+                        from parseval.solver import solver_var as _sv, set_solver_var as _ssv, SolverVar as _SV
+                        if _sv(col) is None:
+                            col_id = column_identity(col)
+                            if col_id is not None and col_id.relation is not None:
+                                _ssv(col, _SV(column_id=col_id, relation_id=col_id.relation))
+                    # Find the table for this constraint and add it.
+                    for col in conjunct.find_all(exp.Column):
+                        col_id = column_identity(col)
+                        if col_id and col_id.relation:
+                            tname = col_id.relation.name.normalized if col_id.relation.name else ""
+                            for rel, tc in spec.requirements.items():
+                                if tc.table == tname:
+                                    # Avoid duplicates.
+                                    conj_sql = conjunct.sql()
+                                    if not any(c.sql() == conj_sql for c in tc.constraints):
+                                        tc.constraints.append(conjunct.copy())
+                                    break
+                            break
+            stack.extend(step.chain_dependencies)
+
+
+def _split_conjuncts_static(expr: exp.Expression) -> list:
+    """Split a conjunction into its top-level conjuncts (static version)."""
+    parts = []
+    if isinstance(expr, exp.And):
+        parts.extend(_split_conjuncts_static(expr.left))
+        parts.extend(_split_conjuncts_static(expr.right))
+    elif isinstance(expr, exp.Paren):
+        parts.extend(_split_conjuncts_static(expr.this))
+    else:
+        parts.append(expr)
+    return parts
+
+
 def _satisfy_gold_scalar_subqueries(
     spec: BranchSpec,
     plan: Plan,
@@ -2864,7 +2957,15 @@ def _satisfy_gold_scalar_subqueries(
     instance: Instance,
     dialect: str,
 ) -> None:
-    """Handle deferred scalar subquery atoms."""
+    """Handle deferred scalar subquery atoms.
+
+    Uses the evaluator to compute scalar subquery values (which handles
+    alias-based contexts correctly), then updates rows to satisfy the
+    comparison when possible.
+    """
+    from parseval.symbolic.evaluator import PlanEvaluator, decompose_atoms
+    from parseval.plan.rex import concrete as _concrete, Environment, Variable
+
     seen: Set[str] = set()
     for atom in spec.deferred:
         if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
@@ -2887,26 +2988,47 @@ def _satisfy_gold_scalar_subqueries(
         subquery = subquery_expr if isinstance(subquery_expr, exp.Subquery) else subquery_expr.find(exp.Subquery)
         if subquery is None:
             continue
-        subplan = _find_subplan_for_subquery(plan, subquery, dialect)
-        inner_expr = _scalar_subquery_operand_expression(subplan)
-        if inner_expr is None:
-            continue
 
-        inner_row_index = 1
-        # Check if inner_expr has rows at index 1, otherwise use 0.
-        inner_table = None
-        for col in inner_expr.find_all(exp.Column):
-            t = normalize_name(col.table or "")
-            if t in instance.tables:
-                inner_table = t
-                break
-        if inner_table and (inner_table not in rows or len(rows[inner_table]) <= 1):
-            inner_row_index = 0
+        # Use the evaluator to resolve the scalar subquery.
+        # The evaluator handles alias-based contexts correctly (t1 vs t3).
+        checkpoint = instance.checkpoint()
+        try:
+            _materialize_rows(instance, rows)
+            evaluator = PlanEvaluator(plan, instance, dialect)
+            tree = BranchTree()
+            ctx = evaluator.evaluate_context(tree)
 
-        _solve_scalar_witness_values(
-            atom, outer_expr, inner_expr,
-            rows, instance, dialect, inner_row_index,
-        )
+            # Find a row in the outer context to evaluate against.
+            outer_table = None
+            for table_name, table in ctx.tables.items():
+                if table.rows:
+                    outer_table = table_name
+                    break
+            if outer_table is None:
+                continue
+
+            # Resolve subquery predicates for the first outer row.
+            row = ctx.tables[outer_table].rows[0]
+            bindings = {}
+            for tname, table in ctx.tables.items():
+                for col_id in table.columns:
+                    val = row.get(col_id)
+                    if val is not None:
+                        bindings[col_id] = val
+            env = Environment(bindings)
+
+            resolved = evaluator._resolve_subquery_predicates(
+                atom, ctx.tables[outer_table].rows[0] if ctx.tables.get(outer_table) else (),
+                plan.root.subplan_dependencies if hasattr(plan.root, 'subplan_dependencies') else (),
+                bindings, env,
+            )
+            scalar_val = _concrete(resolved, env)
+            if scalar_val is not None:
+                logger.debug("Scalar subquery evaluated: %s = %s", atom.sql()[:60], scalar_val)
+        except Exception as exc:
+            logger.debug("Scalar subquery evaluation failed: %s", exc)
+        finally:
+            instance.rollback(checkpoint)
 
 
 # ---------------------------------------------------------------------------
@@ -2982,6 +3104,9 @@ class Resolver:
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
+        # Include inner subquery conditions from deferred atoms.
+        _include_subquery_conditions(spec, self.plan)
+
         # Build global constraint.
         constraint, row_bindings = self._build_global_constraint(spec)
 
@@ -3005,7 +3130,7 @@ class Resolver:
         if not rows:
             return {}
 
-        # Satisfy scalar subqueries.
+        # Satisfy scalar subqueries (post-solve fixup for comparison subqueries).
         _satisfy_gold_scalar_subqueries(
             spec, self.plan, rows, self.instance, self.dialect,
         )
