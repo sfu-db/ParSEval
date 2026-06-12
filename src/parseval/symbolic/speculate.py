@@ -718,6 +718,9 @@ class Propagator:
                     source_names[cid.name.normalized] = src.name.normalized
         # Route each projected column to its correct table.
         for col_name, table_alias in projected:
+            # Skip synthetic aliases (_g0, _h, _a_0) — they don't map to DDL columns.
+            if normalize_name(col_name).startswith("_"):
+                continue
             for relation_id, tc in spec.requirements.items():
                 norm_alias = normalize_name(table_alias)
                 if tc.table != norm_alias and (
