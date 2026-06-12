@@ -25,11 +25,8 @@ from parseval.helper import normalize_name
 from parseval.identity import (
     ColumnId,
     RelationId,
-    RelationKind,
     column_identity,
-    identifier_name,
     physical_column,
-    relation_id,
 )
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
