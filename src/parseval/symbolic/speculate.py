@@ -69,15 +69,8 @@ def _relation_for_table(
     instance: Instance,
     name: str,
 ) -> RelationId:
-    """Get RelationId for a table name from the instance.
-
-    Returns a synthetic RelationId if the name is not found (e.g., for
-    subquery aliases like t1, t2).
-    """
-    try:
-        return instance.table_id(normalize_name(name))
-    except KeyError:
-        return relation_id(RelationKind.TABLE, identifier_name(normalize_name(name)))
+    """Get RelationId for a table name from the instance."""
+    return instance.table_id(normalize_name(name))
 
 
 def _solver_column(
@@ -1893,10 +1886,12 @@ class Propagator:
         if not isinstance(outer_col, exp.Column):
             return
         outer_id = column_identity(outer_col)
-        if outer_id is None or outer_id.relation is None:
+        if outer_id and outer_id.relation:
+            outer_relation = outer_id.relation
+            outer_matched = outer_id.name.normalized
+        else:
+            # Skip if no identity — can't resolve alias-based references.
             return
-        outer_relation = outer_id.relation
-        outer_matched = outer_id.name.normalized
         if not outer_matched:
             return
         inner_cid = self._find_inner_select_column(sub, spec)
