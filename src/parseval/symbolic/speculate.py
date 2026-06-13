@@ -1399,43 +1399,31 @@ class Propagator:
                             tc.constraints.append(not_in)
 
             # FK constraints -> parent values must be present.
-            for fk in self.instance.get_foreign_key(relation_id):
-                ref = fk.args.get("reference")
-                if not ref:
+            for fk_spec in self.instance.get_foreign_keys_by_relation_id(relation_id):
+                if not fk_spec.target_table_id or not fk_spec.target_column_ids:
                     continue
-                ref_table_node = ref.find(exp.Table)
-                if not ref_table_node:
+                if not fk_spec.source_column_ids:
                     continue
-                ref_table = normalize_name(ref_table_node.name)
-                fk_cols = [
-                    identifier.name for identifier in fk.expressions
-                ]
-                if not fk_cols:
-                    continue
-                fk_col = fk_cols[0]
-                ref_relation = _relation_for_table(
-                     self.instance, ref_table
-                )
+                ref_relation = fk_spec.target_table_id
+                ref_col_id = fk_spec.target_column_ids[0]
+                src_col_id = fk_spec.source_column_ids[0]
                 parent_rows = self.instance.get_rows(ref_relation)
                 if parent_rows:
                     parent_vals: list = []
-                    ref_col_name = self.instance.resolve_fk_ref_column(fk)
-                    if ref_col_name:
-                        for row in parent_rows:
-                            try:
-                                sym = row[ref_col_name]
-                                if (
-                                    sym is not None
-                                    and hasattr(sym, "concrete")
-                                    and sym.concrete is not None
-                                ):
-                                    parent_vals.append(sym.concrete)
-                            except (KeyError, TypeError):
-                                pass
+                    ref_col_name = ref_col_id.name.normalized
+                    for row in parent_rows:
+                        try:
+                            sym = row[ref_col_name]
+                            if (
+                                sym is not None
+                                and hasattr(sym, "concrete")
+                                and sym.concrete is not None
+                            ):
+                                parent_vals.append(sym.concrete)
+                        except (KeyError, TypeError):
+                            pass
                     if parent_vals:
-                        col_node = self._solver_col(
-                             physical_column(fk_col, relation_id)
-                        )
+                        col_node = self._solver_col(src_col_id)
                         literals = [
                             (
                                 exp.Literal.number(v)
@@ -2752,9 +2740,13 @@ def _rows_from_solver_result(
 def _gold_fk_columns(instance: Instance, table: str) -> Set[str]:
     """Get FK column names for a table."""
     columns: Set[str] = set()
-    for fk in instance.get_foreign_key(table):
-        for identifier in fk.expressions:
-            columns.add(identifier.name)
+    try:
+        rel_id = instance.table_id(table)
+    except KeyError:
+        return columns
+    for fk_spec in instance.get_foreign_keys_by_relation_id(rel_id):
+        for col_id in fk_spec.source_column_ids:
+            columns.add(col_id.name.normalized)
     return columns
 
 
@@ -2918,16 +2910,17 @@ def _gold_materialization_order(
         if table_name in visiting:
             return
         visiting.add(table_name)
-        for fk in instance.get_foreign_key(table_name):
-            ref = fk.args.get("reference")
-            if ref is None:
-                continue
-            ref_table_node = ref.find(exp.Table)
-            if ref_table_node is None:
-                continue
-            ref_table = normalize_name(ref_table_node.name)
-            if ref_table in requested_set:
-                visit(ref_table)
+        try:
+            rel_id = instance.table_id(table_name)
+        except KeyError:
+            visiting.remove(table_name)
+            visited.add(table_name)
+            return
+        for fk_spec in instance.get_foreign_keys_by_relation_id(rel_id):
+            if fk_spec.target_table_id and fk_spec.target_table_id.name:
+                ref_table = fk_spec.target_table_id.name.normalized
+                if ref_table in requested_set:
+                    visit(ref_table)
         visiting.remove(table_name)
         visited.add(table_name)
         ordered.append(table_name)
