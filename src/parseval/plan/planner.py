@@ -1591,6 +1591,25 @@ def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tup
             )
         )
 
+    # Include all non-aggregated columns from input tables as pass-through columns.
+    # This handles MySQL-style GROUP BY where non-aggregated columns are allowed
+    # (they are functionally dependent on the GROUP BY keys).
+    seen_normalized = {column.name.normalized for column in result}
+    for visible_col in _visible_columns(step):
+        if visible_col.name.normalized in seen_normalized:
+            continue
+        result.append(
+            column_id(
+                ColumnKind.PROJECTED,
+                visible_col.name,
+                visible_col.relation,
+                scope_id=_scope_id_for(step),
+                ordinal=len(result),
+                source_column_id=visible_col,
+            )
+        )
+        seen_normalized.add(visible_col.name.normalized)
+
     return tuple(result)
 
 
