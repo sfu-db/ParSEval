@@ -683,7 +683,17 @@ class Join(Step):
 
         for join in joins:
             source_key, join_key, condition = join_condition(join)
-            step.joins[join.alias_or_name] = {
+            # Create RelationId from the join table expression.
+            join_table = join.this
+            if isinstance(join_table, exp.Subquery):
+                join_table = join_table.this
+            join_name = join.alias_or_name
+            join_rel = relation_id(
+                RelationKind.TABLE,
+                identifier_name(join_table.name if isinstance(join_table, exp.Table) else join_name),
+                alias=identifier_name(join_name) if isinstance(join_table, exp.Table) and join_name != join_table.name else None,
+            )
+            step.joins[join_rel] = {
                 "side": join.side,  # type: ignore
                 "join_key": join_key,
                 "source_key": source_key,
@@ -698,12 +708,13 @@ class Join(Step):
 
     def __init__(self) -> None:
         super().__init__()
-        self.source_name: t.Optional[str] = None
-        self.joins: t.Dict[str, t.Dict[str, t.List[str] | exp.Expression]] = {}
+        self.source_relation: t.Optional[RelationId] = None
+        self.joins: t.Dict[RelationId, t.Dict[str, t.Any]] = {}
 
     def _to_s(self, indent: str) -> t.List[str]:
-        lines = [f"{indent}Source: {self.source_name or self.name}"]
-        for name, join in self.joins.items():
+        lines = [f"{indent}Source: {self.source_relation.name.normalized if self.source_relation and self.source_relation.name else self.name}"]
+        for rel, join in self.joins.items():
+            name = rel.alias.normalized if rel.alias else (rel.name.normalized if rel.name else "?")
             lines.append(f"{indent}{name}: {join['side'] or 'INNER'}")
             join_key = ", ".join(str(key) for key in t.cast(list, join.get("join_key") or []))
             if join_key:

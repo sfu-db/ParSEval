@@ -525,7 +525,7 @@ class Propagator:
 
     def _derive_join(self, step: Join, spec: BranchSpec) -> None:
         """Link join keys via equivalences and store join equalities."""
-        for join_name, join_data in (step.joins or {}).items():
+        for join_rel, join_data in (step.joins or {}).items():
             source_keys = join_data.get("source_key", [])
             join_keys = join_data.get("join_key", [])
             for sk, jk in zip(source_keys, join_keys):
@@ -879,12 +879,13 @@ class Propagator:
                         self._propagate_unmatched_left(step, left_un)
                         specs.append(left_un)
                     if self.config.right_unmatched > 0:
-                        for join_name in step.joins or {}:
+                        for join_rel in step.joins or {}:
+                            join_display = join_rel.alias.normalized if join_rel.alias else (join_rel.name.normalized if join_rel.name else "?")
                             right_un = BranchSpec(
-                                branch=f"right_unmatched_{join_name}"
+                                branch=f"right_unmatched_{join_display}"
                             )
                             self._propagate_unmatched_right(
-                                step, join_name, right_un
+                                step, join_rel, right_un
                             )
                             specs.append(right_un)
             except Exception as exc:
@@ -1752,8 +1753,15 @@ class Propagator:
         self, join_step: Join, spec: BranchSpec
     ):
         """Generate a left-table row with no matching right-table row."""
-        source_name = join_step.source_name or join_step.name or ""
-        source_relation = _relation_for_table(self.instance, source_name)
+        # Get source relation from the Join step's first chain dependency.
+        source_relation = None
+        for dep in join_step.chain_dependencies:
+            rid = getattr(dep, 'relation_id', None)
+            if rid is not None:
+                source_relation = rid
+                break
+        if source_relation is None:
+            return
         source_table = (
             source_relation.name.normalized
             if source_relation.name
@@ -1762,8 +1770,8 @@ class Propagator:
         if source_table not in self.instance.tables:
             return
         req = spec.require(source_relation)
-        for join_name, join_data in (join_step.joins or {}).items():
-            join_relation = _relation_for_table(self.instance, join_name)
+        for join_rel, join_data in (join_step.joins or {}).items():
+            join_relation = join_rel
             join_table = (
                 join_relation.name.normalized
                 if join_relation.name
@@ -1808,19 +1816,26 @@ class Propagator:
                         req.constraints.append(not_in)
 
     def _propagate_unmatched_right(
-        self, join_step: Join, join_name: str, spec: BranchSpec
+        self, join_step: Join, join_rel: RelationId, spec: BranchSpec
     ):
         """Generate a right-table row with no matching left-table row."""
-        join_relation = _relation_for_table(self.instance, join_name)
+        join_relation = join_rel
         join_table = (
             join_relation.name.normalized if join_relation.name else ""
         )
         if join_table not in self.instance.tables:
             return
         req = spec.require(join_relation)
-        source_name = join_step.source_name or join_step.name or ""
-        source_relation = _relation_for_table(self.instance, source_name)
-        join_data = (join_step.joins or {}).get(join_name, {})
+        # Get source relation from the Join step's first chain dependency.
+        source_relation = None
+        for dep in join_step.chain_dependencies:
+            rid = getattr(dep, 'relation_id', None)
+            if rid is not None:
+                source_relation = rid
+                break
+        if source_relation is None:
+            return
+        join_data = (join_step.joins or {}).get(join_rel, {})
         join_keys = join_data.get("join_key", [])
         for jk in join_keys:
             jk_id = column_identity(jk) if isinstance(jk, exp.Column) else None
