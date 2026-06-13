@@ -72,8 +72,18 @@ from sqlglot.optimizer.simplify import simplify
 import functools
 
 from parseval.dtype import DataType
-from parseval.helper import like_to_pattern, normalize_name
-from parseval.identity import ColumnId, RelationId
+from parseval.helper import like_to_pattern
+from parseval.identity import (
+    PARSEVAL_COLUMN_ID,
+    ColumnId,
+    ColumnKind,
+    RelationId,
+    RelationKind,
+    column_id,
+    column_identity,
+    identifier_name,
+    relation_id,
+)
 
 from .context import Row  # noqa: F401
 
@@ -324,13 +334,6 @@ for _klass in [Symbol, Const, Variable, ITE, Row]:
         lambda self, expression: expression.sql(dialect=self.dialect)
     )
 
-
-# Legacy alias for ``exp.Column`` kept because some downstream code still
-# imports :data:`ColumnRef`. Thin alias; removal tracked for the consumer
-# migration phase.
-ColumnRef = exp.Column
-
-
 # =============================================================================
 # Environment
 # =============================================================================
@@ -339,11 +342,10 @@ ColumnRef = exp.Column
 class Environment:
     """Column → value resolver with scope chaining for correlated subqueries.
 
-    Construct with a dict of bindings keyed by either ``"name"`` or
-    ``"table.name"`` strings. Resolution first checks the fully-qualified
-    ``table.name`` key, then the bare column name, then the outer
-    environment (if any). Binding stores under the fully-qualified key
-    when the column is qualified.
+    Construct with a dict of bindings keyed by :class:`ColumnId`. Resolution
+    uses ``PARSEVAL_COLUMN_ID`` metadata on :class:`exp.Column` nodes for
+    direct :class:`ColumnId` lookup. No name-based fallback — columns must
+    carry identity metadata.
 
     Environments are immutable in intent: to extend with new bindings for
     a nested scope, call :meth:`extend`, which returns a child
@@ -354,61 +356,61 @@ class Environment:
 
     def __init__(
         self,
-        bindings: Optional[Dict[str, Any]] = None,
+        bindings: Optional[Dict[ColumnId, Any]] = None,
         outer: Optional["Environment"] = None,
     ) -> None:
-        self._bindings: Dict[str, Any] = dict(bindings) if bindings else {}
+        self._bindings: Dict[ColumnId, Any] = dict(bindings) if bindings else {}
         self._outer: Optional[Environment] = outer
 
-    @staticmethod
-    def _column_key(column: Union[exp.Column, str]) -> str:
-        if isinstance(column, exp.Column):
-            if column.table:
-                return f"{normalize_name(column.table)}.{normalize_name(column.name)}"
-            return normalize_name(column.name)
-        return normalize_name(str(column))
+    def _resolve_by_id(self, col_id: ColumnId) -> Any:
+        """Direct ColumnId lookup with source_column_id chain fallback."""
+        if col_id in self._bindings:
+            return self._bindings[col_id]
+        source = col_id.source_column_id
+        while source is not None:
+            if source in self._bindings:
+                return self._bindings[source]
+            source = source.source_column_id
+        return _MISSING
 
-    def resolve(self, column: Union[exp.Column, str]) -> Any:
+    def resolve(self, column: Union[exp.Column, ColumnId]) -> Any:
         """Return the value bound to ``column``, or ``None`` if unresolved."""
-        if isinstance(column, exp.Column):
-            if column.table:
-                full_key = f"{normalize_name(column.table)}.{normalize_name(column.name)}"
-                if full_key in self._bindings:
-                    return self._bindings[full_key]
-            bare_key = normalize_name(column.name)
-            if bare_key in self._bindings:
-                return self._bindings[bare_key]
-        else:
-            key = normalize_name(str(column))
-            if key in self._bindings:
-                return self._bindings[key]
+        if isinstance(column, ColumnId):
+            result = self._resolve_by_id(column)
+            if result is not _MISSING:
+                return result
+        elif isinstance(column, exp.Column):
+            col_id = column_identity(column)
+            if col_id is not None:
+                result = self._resolve_by_id(col_id)
+                if result is not _MISSING:
+                    return result
 
         if self._outer is not None:
             return self._outer.resolve(column)
         return None
 
-    def bind(self, column: Union[exp.Column, str], value: Any) -> None:
+    def bind(self, column: ColumnId, value: Any) -> None:
         """Bind ``column`` to ``value`` in this environment."""
-        key = self._column_key(column)
-        self._bindings[key] = value
+        self._bindings[column] = value
 
-    def extend(self, bindings: Dict[str, Any]) -> "Environment":
+    def extend(self, bindings: Dict[ColumnId, Any]) -> "Environment":
         """Return a child environment layering ``bindings`` on top of this one."""
         return Environment(bindings=bindings, outer=self)
 
-    def contains(self, column: Union[exp.Column, str]) -> bool:
+    def contains(self, column: Union[exp.Column, ColumnId]) -> bool:
         """Return True if ``column`` resolves in this or any outer env."""
-        if isinstance(column, exp.Column):
-            if column.table:
-                full_key = f"{normalize_name(column.table)}.{normalize_name(column.name)}"
-                if full_key in self._bindings:
-                    return True
-            if normalize_name(column.name) in self._bindings:
+        if isinstance(column, ColumnId):
+            if self._resolve_by_id(column) is not _MISSING:
                 return True
-        else:
-            if normalize_name(str(column)) in self._bindings:
+        elif isinstance(column, exp.Column):
+            col_id = column_identity(column)
+            if col_id is not None and self._resolve_by_id(col_id) is not _MISSING:
                 return True
         return self._outer.contains(column) if self._outer is not None else False
+
+
+_MISSING = object()
 
 
 # =============================================================================
@@ -845,8 +847,8 @@ def _eval_const(node: Const, env: Environment) -> Any:
 def _eval_variable(node: Variable, env: Environment) -> Any:
     if node.is_bound:
         return None if node.is_null else node.args.get("concrete")
-    # For unbound variables, try the environment by name.
-    resolved = env.resolve(node.name)
+    # For unbound variables, try the environment by ColumnId.
+    resolved = env.resolve(node.column_id)
     if isinstance(resolved, Symbol):
         return resolved.concrete
     if resolved is not None:
@@ -1309,7 +1311,19 @@ def _unicode(val: Any) -> Any:
     return ord(s[0]) if s else None
 
 
+def _substr(text: Any, start: Any, length: Any = None) -> Any:
+    if text is None or start is None:
+        return None
+    s = str(text)
+    idx = max(int(start) - 1, 0)  # SQL is 1-indexed
+    if length is None:
+        return s[idx:]
+    return s[idx : idx + int(length)]
+
+
 _ANONYMOUS_HANDLERS = {
+    "SUBSTR": _substr,
+    "SUBSTRING": _substr,
     "JULIANDAY": _julianday,
     "INSTR": _instr,
     "REPLACE": _replace,
@@ -1322,6 +1336,15 @@ _ANONYMOUS_HANDLERS = {
     "LTRIM": lambda s, *a: str(s).lstrip(a[0] if a else None) if s is not None else None,
     "RTRIM": lambda s, *a: str(s).rstrip(a[0] if a else None) if s is not None else None,
     "PRINTF": lambda fmt, *a: str(fmt) % tuple(a) if fmt is not None and all(x is not None for x in a) else None,
+    "UPPER": lambda s: str(s).upper() if s is not None else None,
+    "LOWER": lambda s: str(s).lower() if s is not None else None,
+    "TRIM": lambda s, *a: str(s).strip(a[0] if a else None) if s is not None else None,
+    "ABS": lambda x: abs(x) if x is not None else None,
+    "ROUND": lambda x, *a: round(x, int(a[0])) if a and x is not None else round(x) if x is not None else None,
+    "COALESCE": lambda *args: next((a for a in args if a is not None), None),
+    "IFNULL": lambda a, b: a if a is not None else b,
+    "NULLIF": lambda a, b: None if a == b else a,
+    "LENGTH": lambda s: len(str(s)) if s is not None else None,
 }
 
 
@@ -1464,7 +1487,6 @@ __all__ = [
     "Const",
     "Variable",
     "ITE",
-    "ColumnRef",
     # Environment + evaluator
     "Environment",
     "concrete",
