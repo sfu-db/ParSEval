@@ -69,8 +69,15 @@ def _relation_for_table(
     instance: Instance,
     name: str,
 ) -> RelationId:
-    """Get RelationId for a table name from the instance."""
-    return instance.table_id(normalize_name(name))
+    """Get RelationId for a table name from the instance.
+
+    Returns a synthetic RelationId if the name is not found (e.g., for
+    subquery aliases like t1, t2).
+    """
+    try:
+        return instance.table_id(normalize_name(name))
+    except KeyError:
+        return relation_id(RelationKind.TABLE, identifier_name(normalize_name(name)))
 
 
 def _solver_column(
@@ -96,11 +103,8 @@ def _solver_column(
             break
         table = current.relation.name.normalized if current.relation and current.relation.name else ""
         dtype = instance.tables.get(table, {}).get(normalize_name(current.name.normalized))
-        if dtype:
-            try:
-                col_node.type = DataType.build(dtype)
-            except Exception:
-                pass
+        if dtype:            
+            col_node.type = DataType.build(dtype)            
             return col_node
         current = current.source_column_id
     return col_node
@@ -995,16 +999,24 @@ class Propagator:
         conjuncts = self._split_conjuncts(expr)
         for conjunct in conjuncts:
             # Try to unwrap comparison subqueries before deferring.
-            # e.g., t2.district_id = (SELECT district_id FROM client WHERE gender = 'F')
-            # → inner constraint: gender = 'F', join equality: t2.district_id = client.district_id
-            # e.g., t1.amount > (SELECT AVG(amount) FROM orders WHERE status = 'open')
-            # → inner constraint: status = 'open', outer comparison deferred
             if isinstance(conjunct, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NEQ)) and (
                 conjunct.this.find(exp.Subquery) or conjunct.expression.find(exp.Subquery)
             ):
                 if self._unwrap_comparison_subquery(conjunct, spec):
                     continue
-            # Subquery-containing conjuncts must be deferred.
+            # Handle IN (SELECT ...) — extract inner conditions + equality.
+            if isinstance(conjunct, exp.In) and conjunct.args.get("query"):
+                if self._unwrap_in_subquery(conjunct, spec):
+                    continue
+            # Handle NOT IN (SELECT ...) — build != constraints.
+            if isinstance(conjunct, exp.Not) and isinstance(conjunct.this, exp.In) and conjunct.this.args.get("query"):
+                if self._unwrap_not_in_subquery(conjunct.this, spec):
+                    continue
+            # Handle EXISTS (SELECT ...) — extract inner WHERE conditions.
+            if isinstance(conjunct, exp.Exists):
+                if self._unwrap_exists_subquery(conjunct, spec):
+                    continue
+            # Other subquery-containing conjuncts must be deferred.
             if conjunct.find(exp.Exists) or conjunct.find(exp.Subquery):
                 spec.deferred.append(conjunct.copy())
                 continue
@@ -1121,6 +1133,168 @@ class Propagator:
             spec.deferred.append(conjunct.copy())
 
         return True
+
+    def _unwrap_in_subquery(
+        self, conjunct: exp.In, spec: BranchSpec
+    ) -> bool:
+        """Unwrap x IN (SELECT col FROM table WHERE condition) into:
+        - Inner WHERE conditions added to the inner table's constraints
+        - Join equality outer_column = inner_column
+        """
+        outer_col = conjunct.this
+        if not isinstance(outer_col, exp.Column):
+            return False
+
+        query = conjunct.args.get("query")
+        if not isinstance(query, exp.Subquery):
+            return False
+        inner_expr = query.this
+        if not isinstance(inner_expr, exp.Select):
+            return False
+
+        # Find the inner SELECT column.
+        inner_col_name = None
+        for proj in inner_expr.expressions:
+            if isinstance(proj, exp.Column):
+                inner_col_name = proj.name
+                break
+            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
+                inner_col_name = proj.this.name
+                break
+        if inner_col_name is None:
+            return False
+
+        # Find the inner table.
+        inner_table_name = self._find_inner_table_name(inner_expr)
+        if inner_table_name is None or inner_table_name not in self.instance.tables:
+            return False
+
+        # Get the outer column's identity.
+        outer_id = column_identity(outer_col)
+        if outer_id is None or outer_id.relation is None:
+            return False
+
+        # Add inner WHERE conditions.
+        self._add_inner_where_conditions(inner_expr, inner_table_name, spec)
+
+        # Add join equality: outer_column = inner_column.
+        inner_relation = _relation_for_table(self.instance, inner_table_name)
+        inner_cid = physical_column(inner_col_name, inner_relation)
+        self._add_join_equality(outer_id, inner_cid, spec)
+
+        return True
+
+    def _unwrap_not_in_subquery(
+        self, conjunct: exp.In, spec: BranchSpec
+    ) -> bool:
+        """Unwrap x NOT IN (SELECT col FROM table WHERE condition) into:
+        - Inner WHERE conditions added to the inner table's constraints
+        - Non-equality constraint x != inner_column (deferred)
+        """
+        outer_col = conjunct.this
+        if not isinstance(outer_col, exp.Column):
+            return False
+
+        query = conjunct.args.get("query")
+        if not isinstance(query, exp.Subquery):
+            return False
+        inner_expr = query.this
+        if not isinstance(inner_expr, exp.Select):
+            return False
+
+        # Find the inner SELECT column.
+        inner_col_name = None
+        for proj in inner_expr.expressions:
+            if isinstance(proj, exp.Column):
+                inner_col_name = proj.name
+                break
+            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
+                inner_col_name = proj.this.name
+                break
+        if inner_col_name is None:
+            return False
+
+        # Find the inner table.
+        inner_table_name = self._find_inner_table_name(inner_expr)
+        if inner_table_name is None or inner_table_name not in self.instance.tables:
+            return False
+
+        # Get the outer column's identity.
+        outer_id = column_identity(outer_col)
+        if outer_id is None or outer_id.relation is None:
+            return False
+
+        # Add inner WHERE conditions.
+        self._add_inner_where_conditions(inner_expr, inner_table_name, spec)
+
+        # For NOT IN, we can't directly build != constraints because the
+        # subquery may return multiple values. Defer the evaluation.
+        spec.deferred.append(conjunct.copy())
+        return True
+
+    def _unwrap_exists_subquery(
+        self, conjunct: exp.Exists, spec: BranchSpec
+    ) -> bool:
+        """Unwrap EXISTS (SELECT ... WHERE condition) into:
+        - Inner WHERE conditions added to the inner table's constraints
+        """
+        inner = conjunct.this
+        if isinstance(inner, exp.Subquery):
+            inner = inner.this
+        if not isinstance(inner, exp.Select):
+            return False
+
+        # Find the inner table.
+        inner_table_name = self._find_inner_table_name(inner)
+        if inner_table_name is None or inner_table_name not in self.instance.tables:
+            return False
+
+        # Add inner WHERE conditions.
+        self._add_inner_where_conditions(inner, inner_table_name, spec)
+
+        # EXISTS just needs the inner table to have rows — the WHERE
+        # conditions are already added. No further constraint needed.
+        return True
+
+    def _find_inner_table_name(self, inner_expr: exp.Select) -> Optional[str]:
+        """Find the first real table name in an inner SELECT's FROM clause."""
+        from_clause = inner_expr.args.get("from")
+        if from_clause is None:
+            return None
+        inner_table_node = from_clause.this if isinstance(from_clause, exp.From) else from_clause
+        if isinstance(inner_table_node, exp.Table):
+            return normalize_name(inner_table_node.name)
+        return None
+
+    def _add_inner_where_conditions(
+        self, inner_expr: exp.Select, inner_table_name: str, spec: BranchSpec
+    ) -> None:
+        """Extract WHERE conditions from an inner SELECT and add them to the spec."""
+        where = inner_expr.args.get("where")
+        if not where:
+            return
+        inner_relation = _relation_for_table(self.instance, inner_table_name)
+        for conjunct_inner in self._split_conjuncts(where.this):
+            if conjunct_inner.find(exp.Subquery) or conjunct_inner.find(exp.Exists):
+                continue
+            for col in conjunct_inner.find_all(exp.Column):
+                if solver_var(col) is None:
+                    col_id = column_identity(col)
+                    if col_id is not None and col_id.relation is not None:
+                        set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
+            tc = spec.require(inner_relation)
+            tc.constraints.append(conjunct_inner.copy())
+
+    def _add_join_equality(
+        self, outer_id: ColumnId, inner_cid: ColumnId, spec: BranchSpec
+    ) -> None:
+        """Add a join equality between outer and inner columns."""
+        inner_col_node = _solver_column(self.instance, inner_cid)
+        outer_col_node = _solver_column(self.instance, outer_id)
+        eq_expr = exp.EQ(this=outer_col_node, expression=inner_col_node)
+        spec.require(outer_id.relation).constraints.append(eq_expr)
+        spec.require(inner_cid.relation).constraints.append(eq_expr)
+        spec.equate(outer_id, inner_cid)
 
     def _split_conjuncts(self, expr: exp.Expression) -> List[exp.Expression]:
         """Split a conjunction into its top-level conjuncts."""
@@ -1719,14 +1893,10 @@ class Propagator:
         if not isinstance(outer_col, exp.Column):
             return
         outer_id = column_identity(outer_col)
-        if outer_id and outer_id.relation:
-            outer_relation = outer_id.relation
-            outer_matched = outer_id.name.normalized
-        else:
-            outer_relation = _relation_for_table(
-                 self.instance, outer_col.table or ""
-            )
-            outer_matched = outer_col.name
+        if outer_id is None or outer_id.relation is None:
+            return
+        outer_relation = outer_id.relation
+        outer_matched = outer_id.name.normalized
         if not outer_matched:
             return
         inner_cid = self._find_inner_select_column(sub, spec)
