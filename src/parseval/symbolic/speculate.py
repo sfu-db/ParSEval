@@ -492,8 +492,8 @@ class Propagator:
             if table_name in self.instance.tables:
                 spec.require(relation)
         elif isinstance(step.source, exp.Table):
-            name = normalize_name(step.source.name)
-            relation = _relation_for_table(self.instance, name)
+            # Use the Scan's relation_id from plan identity.
+            relation = step.relation_id
             table_name = relation.name.normalized if relation.name else ""
             if table_name in self.instance.tables:
                 spec.require(relation)
@@ -790,14 +790,10 @@ class Propagator:
         if sub.kind.value == "exists" and sub.correlation and not negated_exists:
             for corr_col in sub.correlation:
                 corr_id = column_identity(corr_col)
-                if corr_id and corr_id.relation:
-                    outer_relation = corr_id.relation
-                    outer_matched = corr_id.name.normalized
-                else:
-                    outer_relation = _relation_for_table(
-                         self.instance, corr_col.table or ""
-                    )
-                    outer_matched = corr_col.name
+                if corr_id is None or corr_id.relation is None:
+                    continue
+                outer_relation = corr_id.relation
+                outer_matched = corr_id.name.normalized
                 if outer_matched:
                     spec.require(outer_relation)
                     inner_col_id = self._find_inner_corr_column(sub, spec)
@@ -1076,16 +1072,9 @@ class Propagator:
         if inner_col_name is None:
             return False
 
-        # Find the inner table.
-        from_clause = inner_expr.args.get("from")
-        if from_clause is None:
-            return False
-        inner_table_node = from_clause.this if isinstance(from_clause, exp.From) else from_clause
-        if not isinstance(inner_table_node, exp.Table):
-            return False
-        inner_table_name = normalize_name(inner_table_node.name)
-
-        if inner_table_name not in self.instance.tables:
+        # Find the inner table's RelationId from the plan.
+        inner_relation = self._find_inner_table_relation(inner_expr)
+        if inner_relation is None:
             return False
 
         # Get the outer column's identity.
@@ -1104,12 +1093,12 @@ class Propagator:
                         col_id = column_identity(col)
                         if col_id is not None and col_id.relation is not None:
                             set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
-                inner_relation = _relation_for_table(self.instance, inner_table_name)
                 tc = spec.require(inner_relation)
                 tc.constraints.append(conjunct_inner.copy())
 
-        inner_relation = _relation_for_table(self.instance, inner_table_name)
-        inner_cid = physical_column(inner_col_name, inner_relation)
+        inner_cid = physical_column(
+            inner_col_name, inner_relation
+        )
 
         if isinstance(conjunct, exp.EQ):
             # For EQ: add join equality outer_column = inner_column.
@@ -1157,9 +1146,9 @@ class Propagator:
         if inner_col_name is None:
             return False
 
-        # Find the inner table.
-        inner_table_name = self._find_inner_table_name(inner_expr)
-        if inner_table_name is None or inner_table_name not in self.instance.tables:
+        # Find the inner table's RelationId from the plan.
+        inner_relation = self._find_inner_table_relation(inner_expr)
+        if inner_relation is None:
             return False
 
         # Get the outer column's identity.
@@ -1168,10 +1157,9 @@ class Propagator:
             return False
 
         # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner_expr, inner_table_name, spec)
+        self._add_inner_where_conditions(inner_expr, inner_relation, spec)
 
         # Add join equality: outer_column = inner_column.
-        inner_relation = _relation_for_table(self.instance, inner_table_name)
         inner_cid = physical_column(inner_col_name, inner_relation)
         self._add_join_equality(outer_id, inner_cid, spec)
 
@@ -1207,9 +1195,9 @@ class Propagator:
         if inner_col_name is None:
             return False
 
-        # Find the inner table.
-        inner_table_name = self._find_inner_table_name(inner_expr)
-        if inner_table_name is None or inner_table_name not in self.instance.tables:
+        # Find the inner table's RelationId from the plan.
+        inner_relation = self._find_inner_table_relation(inner_expr)
+        if inner_relation is None:
             return False
 
         # Get the outer column's identity.
@@ -1218,7 +1206,7 @@ class Propagator:
             return False
 
         # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner_expr, inner_table_name, spec)
+        self._add_inner_where_conditions(inner_expr, inner_relation, spec)
 
         # For NOT IN, we can't directly build != constraints because the
         # subquery may return multiple values. Defer the evaluation.
@@ -1237,13 +1225,13 @@ class Propagator:
         if not isinstance(inner, exp.Select):
             return False
 
-        # Find the inner table.
-        inner_table_name = self._find_inner_table_name(inner)
-        if inner_table_name is None or inner_table_name not in self.instance.tables:
+        # Find the inner table's RelationId from the plan.
+        inner_relation = self._find_inner_table_relation(inner)
+        if inner_relation is None:
             return False
 
         # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner, inner_table_name, spec)
+        self._add_inner_where_conditions(inner, inner_relation, spec)
 
         # EXISTS just needs the inner table to have rows — the WHERE
         # conditions are already added. No further constraint needed.
@@ -1259,14 +1247,32 @@ class Propagator:
             return normalize_name(inner_table_node.name)
         return None
 
+    def _find_inner_table_relation(self, inner_expr: exp.Select) -> Optional[RelationId]:
+        """Find the inner table's RelationId from the plan.
+
+        Walks the plan's Scan steps to find one matching the inner table name.
+        """
+        inner_table_name = self._find_inner_table_name(inner_expr)
+        if inner_table_name is None:
+            return None
+        for step in self.plan.ordered_steps:
+            if isinstance(step, Scan) and step.relation_id is not None:
+                rid = step.relation_id
+                table_name = rid.name.normalized if rid.name else ""
+                if table_name == inner_table_name:
+                    return rid
+        # Fallback: try instance lookup.
+        if inner_table_name in self.instance.tables:
+            return _relation_for_table(self.instance, inner_table_name)
+        return None
+
     def _add_inner_where_conditions(
-        self, inner_expr: exp.Select, inner_table_name: str, spec: BranchSpec
+        self, inner_expr: exp.Select, inner_relation: RelationId, spec: BranchSpec
     ) -> None:
         """Extract WHERE conditions from an inner SELECT and add them to the spec."""
         where = inner_expr.args.get("where")
         if not where:
             return
-        inner_relation = _relation_for_table(self.instance, inner_table_name)
         for conjunct_inner in self._split_conjuncts(where.this):
             if conjunct_inner.find(exp.Subquery) or conjunct_inner.find(exp.Exists):
                 continue
@@ -1513,7 +1519,14 @@ class Propagator:
         for table in list(targets.keys()):
             if table not in self.instance.tables:
                 continue
-            rel = _relation_for_table(self.instance, table)
+            # Find the RelationId from spec requirements.
+            rel = None
+            for r in spec.requirements:
+                if r.name and r.name.normalized == table:
+                    rel = r
+                    break
+            if rel is None:
+                continue
             targets[table] = {
                 col
                 for col in targets[table]
