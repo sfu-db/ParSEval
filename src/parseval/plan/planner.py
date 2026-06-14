@@ -441,7 +441,22 @@ class Step:
                     name = intermediate.get(node)
                     if name:
                         # Preserve the original column's table qualifier.
-                        table = node.table if isinstance(node, exp.Column) and node.table else step.name
+                        # For non-column expressions (e.g., SUBSTRING), look up
+                        # the original GROUP BY expression's table qualifier.
+                        if isinstance(node, exp.Column) and node.table:
+                            table = node.table
+                        else:
+                            # Find the matching GROUP BY expression's table qualifier.
+                            table = step.name
+                            for gk, gv in aggregate.group.items():
+                                if gv is node or intermediate.get(gv) == name:
+                                    if isinstance(gv, exp.Column) and gv.table:
+                                        table = gv.table
+                                    elif hasattr(gv, 'find'):
+                                        inner_col = gv.find(exp.Column)
+                                        if inner_col and inner_col.table:
+                                            table = inner_col.table
+                                    break
                         node.replace(exp.column(name, table))
 
             if aggregate.condition is not None:
