@@ -6,7 +6,8 @@ from parseval.query import preprocess_sql
 from parseval.solver import Solver
 from parseval.symbolic.constraints import ConstraintGenerator
 from parseval.symbolic.evaluator import build_branch_tree
-from parseval.symbolic.types import BranchType
+from parseval.symbolic.types import BranchTree, BranchType
+from sqlglot import parse_one
 
 
 JOIN_SCHEMA = """
@@ -139,3 +140,26 @@ def test_row_path_coverage_dedupes_same_branch_for_same_row_path():
 
     node = next(node for node in tree.nodes if node.site == "filter")
     assert node.observation_count(0, BranchType.ATOM_TRUE) == 1
+
+
+def test_branch_tree_keeps_distinct_sites_for_same_step_predicate():
+    predicate = parse_one("a = 1")
+    tree = BranchTree()
+
+    first = tree.get_or_create_node(
+        step_id="project_1",
+        step_type="Project",
+        site="case_arm",
+        predicate=predicate,
+        atoms=(predicate,),
+    )
+    second = tree.get_or_create_node(
+        step_id="project_1",
+        step_type="Project",
+        site="distinct",
+        predicate=predicate,
+        atoms=(predicate,),
+    )
+
+    assert first is not second
+    assert len(tree.nodes) == 2
