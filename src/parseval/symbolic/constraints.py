@@ -18,107 +18,275 @@ everything simultaneously — no post-hoc FK fixup needed.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
-from parseval.identity import ColumnId
+from parseval.constants import PlausibleBit, PlausibleType, StepType
+from parseval.identity import (
+    ColumnId,
+    ColumnKind,
+    RelationId,
+    column_id,
+    column_identity,
+    identifier_name,
+    physical_column,
+    table_relation,
+)
 from parseval.plan import Plan, Step
 from parseval.plan.planner import Filter, Join, Aggregate, Project, Scan, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
 from parseval.helper import normalize_name
 from parseval.instance import Instance
 from parseval.solver import SolverConstraint
+from parseval.solver.types import SolverVar, set_solver_var, solver_var
 
-from .types import BranchType, CoverageTarget
+from .types import BranchNode, BranchPath, BranchType, CoverageTarget, PathPredicate
+
+_POSITIVE_BITS = {
+    PlausibleBit.TRUE,
+    PlausibleBit.JOIN_TRUE,
+    PlausibleBit.HAVING_TRUE,
+    PlausibleBit.CASE_TAKEN,
+    PlausibleBit.EXISTS_TRUE,
+    PlausibleBit.IN_MATCH,
+}
+_NEGATIVE_BITS = {
+    PlausibleBit.FALSE,
+    PlausibleBit.HAVING_FALSE,
+    PlausibleBit.CASE_SKIPPED,
+    PlausibleBit.EXISTS_FALSE,
+    PlausibleBit.IN_NO_MATCH,
+}
+_NULL_BITS = {
+    PlausibleBit.NULL,
+    PlausibleBit.JOIN_NULL,
+    PlausibleBit.HAVING_NULL,
+    PlausibleBit.GROUP_NULL,
+}
 
 
-def _row_env_bindings(row) -> Dict[str, Any]:
-    bindings: Dict[str, Any] = {}
+def _step_type_for_node(node: BranchNode) -> StepType:
+    raw = (node.step_type or node.site or "").lower()
+    mapping = {
+        "aggregate": StepType.AGGREGATE,
+        "case_arm": StepType.PROJECT,
+        "distinct": StepType.PROJECT,
+        "filter": StepType.FILTER,
+        "group": StepType.GROUPBY,
+        "having": StepType.HAVING,
+        "join": StepType.JOIN,
+        "join_on": StepType.JOIN,
+        "project": StepType.PROJECT,
+        "subplan": StepType.FILTER,
+    }
+    return mapping.get(raw, StepType.ROOT)
+
+
+@dataclass(frozen=True)
+class PlausibleBranch:
+    """One unexplored plausible branch selected for constraint generation."""
+
+    step_type: StepType
+    bit: PlausibleBit
+    status: PlausibleType
+    node: BranchNode
+    atom_id: int = 0
+
+    @classmethod
+    def from_coverage_target(cls, target: CoverageTarget) -> "PlausibleBranch":
+        return cls(
+            step_type=_step_type_for_node(target.node),
+            bit=PlausibleBit.from_int(target.target_outcome),
+            status=PlausibleType.UNEXPLORED,
+            node=target.node,
+            atom_id=target.atom_id,
+        )
+
+    @property
+    def atom(self) -> exp.Expression:
+        if self.atom_id < 0:
+            return self.node.predicate
+        return self.node.atoms[self.atom_id]
+
+    @property
+    def target_outcome(self) -> BranchType:
+        return BranchType.from_int(self.bit)
+
+    @property
+    def relation_ids(self) -> Tuple[RelationId, ...]:
+        return self.node.tables
+
+
+@dataclass
+class PlausiblePath:
+    """Plan path and branch constraints for one plausible branch."""
+
+    branch: PlausibleBranch
+    path_constraints: List[exp.Expression]
+    branch_constraints: List[exp.Expression]
+    join_equalities: List[Tuple[ColumnId, ColumnId]]
+
+
+def _row_env_bindings(row) -> Dict[ColumnId, Any]:
+    bindings: Dict[ColumnId, Any] = {}
     for column, symbol in row.items():
-        key = column.name.normalized if isinstance(column, ColumnId) else str(column)
-        bindings[key] = symbol.concrete
+        if isinstance(column, ColumnId):
+            bindings[column] = symbol.concrete
     return bindings
 
 
-def _collect_path_predicates_and_joins(
-    plan: Plan, target_step: Step
-) -> Tuple[List[exp.Expression], List[Tuple[str, str, str, str]]]:
-    """Walk from the target step down to leaves, collecting:
-    - Predicates (WHERE conditions) that must be TRUE.
-    - JOIN key equalities that link tables together.
-    """
-    predicates: List[exp.Expression] = []
-    join_equalities: List[Tuple[str, str, str, str]] = []
-    visited: Set[int] = set()
-
-    def walk(step: Step) -> None:
-        if id(step) in visited:
-            return
-        visited.add(id(step))
-        if step is not target_step:
-            condition = getattr(step, "condition", None)
-            if isinstance(condition, exp.Expression):
-                predicates.append(condition)
-        if isinstance(step, Join):
-            source_name = step.source_name or step.name
-            for join_name, join_data in (step.joins or {}).items():
-                source_keys = join_data.get("source_key", [])
-                join_keys = join_data.get("join_key", [])
-                for sk, jk in zip(source_keys, join_keys):
-                    sk_name = sk.name if hasattr(sk, "name") else str(sk)
-                    jk_name = jk.name if hasattr(jk, "name") else str(jk)
-                    join_equalities.append((source_name, sk_name, join_name, jk_name))
-        for dep in step.chain_dependencies:
-            walk(dep)
-
-    for dep in target_step.chain_dependencies:
-        walk(dep)
-    return predicates, join_equalities
+def _relation_table_name(rel: RelationId) -> str:
+    """Extract the physical table name from a RelationId."""
+    return rel.name.normalized if rel.name is not None else rel.display
 
 
-class ConstraintGenerator:
-    """Translate a :class:`CoverageTarget` into a full :class:`SolverConstraint`.
+def _relation_matches_name(rel: RelationId, name: str) -> bool:
+    candidates = []
+    if rel.name is not None:
+        candidates.append(rel.name.normalized)
+    if rel.alias is not None:
+        candidates.append(rel.alias.normalized)
+    return normalize_name(name) in candidates
+
+
+def _column_expr_from_id(column: ColumnId) -> exp.Column:
+    relation = column.relation
+    table_name = ""
+    if relation is not None:
+        visible = relation.alias or relation.name
+        if visible is not None:
+            table_name = visible.raw
+    return exp.Column(
+        this=exp.to_identifier(column.name.raw, quoted=column.name.quoted),
+        table=exp.to_identifier(table_name) if table_name else None,
+    )
+
+
+def _is_trivial_true(expression: exp.Expression) -> bool:
+    simplified = expression.sql().upper()
+    return simplified in {"TRUE", "1", "1 = 1", "TRUE AND TRUE"}
+
+
+def _path_from_node_chain(target: CoverageTarget) -> BranchPath:
+    nodes: List[BranchNode] = []
+    current: Optional[BranchNode] = target.node
+    while current is not None:
+        nodes.append(current)
+        current = current.parent
+    nodes.reverse()
+
+    predicates: List[PathPredicate] = []
+    join_facts = []
+    relations: List[RelationId] = []
+    seen_relations: Set[RelationId] = set()
+    for node in nodes:
+        for relation in node.tables:
+            if relation not in seen_relations:
+                seen_relations.add(relation)
+                relations.append(relation)
+        join_facts.extend(node.join_facts)
+        if node is target.node:
+            predicates.append(
+                PathPredicate(
+                    node=node,
+                    expression=target.atom,
+                    outcome=target.target_outcome,
+                )
+            )
+        elif node.site in {"filter", "having", "join_on"}:
+            predicates.append(
+                PathPredicate(
+                    node=node,
+                    expression=node.predicate,
+                    outcome=BranchType.ATOM_TRUE,
+                )
+            )
+
+    return BranchPath(
+        target=target,
+        predicates=tuple(predicates),
+        join_facts=tuple(join_facts),
+        relations=tuple(relations),
+    )
+
+
+class PlausibleConstraintCompiler:
+    """Compile a :class:`PlausibleBranch` into a full :class:`SolverConstraint`.
 
     Collects query predicates + database constraints + JOIN conditions into
     one constraint set the solver satisfies simultaneously.
     """
 
-    def __init__(self, plan: Plan, instance: Instance, dialect: str = "sqlite", alias_map=None):
+    def __init__(self, plan: Plan, instance: Instance, dialect: str = "sqlite"):
         self.plan = plan
         self.instance = instance
         self.dialect = dialect
-        self.alias_map = alias_map or plan.alias_map
 
     def generate(self, target: CoverageTarget) -> SolverConstraint:
-        atom = target.atom
-        outcome = target.target_outcome
-        node = target.node
+        return self.compile(PlausibleBranch.from_coverage_target(target))
+
+    def compile_path(self, path: BranchPath) -> SolverConstraint:
+        constraints: List[exp.Expression] = []
+        join_equalities: List[Tuple[ColumnId, ColumnId]] = []
+        tables = path.relations or path.target.node.tables
+
+        for predicate in path.predicates:
+            constraints.extend(self._constraints_for_path_predicate(predicate))
+        for fact in path.join_facts:
+            join_equalities.extend(fact.equalities)
+            if fact.predicate is not None and not _is_trivial_true(fact.predicate):
+                constraints.append(fact.predicate.copy())
+
+        constraints, extra_join_equalities = self._apply_database_constraints(
+            constraints=constraints,
+            tables=tables,
+        )
+        join_equalities.extend(extra_join_equalities)
+        self._annotate_solver_vars(constraints, tables)
+        return SolverConstraint(
+            target_relations=tables,
+            constraints=constraints,
+            join_equalities=self._lower_join_equalities(join_equalities, tables),
+        )
+
+    def compile(self, branch: PlausibleBranch) -> SolverConstraint:
+        atom = branch.atom
+        bit = branch.bit
+        node = branch.node
         tables = node.tables
 
-        step = self._find_step(node.step_id)
+        step = node.step
 
         # --- Handle SubPlan branches ---
         if node.site == "exists":
-            return self._generate_exists_constraint(target)
+            return self._generate_exists_constraint(branch)
         elif node.site == "in":
-            return self._generate_in_constraint(target)
+            return self._generate_in_constraint(branch)
 
         # --- Handle DISTINCT branches ---
         if node.site == "distinct":
-            return self._generate_distinct_constraint(target)
+            return self._generate_distinct_constraint(branch)
 
         # --- Handle GROUP branches ---
         if node.site == "group":
-            return self._generate_group_constraint(target)
+            return self._generate_group_constraint(branch)
+
+        target = CoverageTarget(
+            node=node,
+            atom_id=branch.atom_id,
+            target_outcome=branch.target_outcome,
+        )
+        return self.compile_path(_path_from_node_chain(target))
 
         # --- Transform atom for target outcome ---
         null_columns: List[exp.Column] = []
-        if outcome == BranchType.ATOM_TRUE:
+        if bit in _POSITIVE_BITS:
             atom_constraint = atom.copy()
-        elif outcome == BranchType.ATOM_FALSE:
+        elif bit in _NEGATIVE_BITS:
             atom_constraint = negate_predicate(atom.copy())
-        elif outcome == BranchType.ATOM_NULL:
+        elif bit in _NULL_BITS:
             atom_constraint = atom.copy()
             columns = list(atom.find_all(exp.Column))
             for col in columns:
@@ -127,9 +295,8 @@ class ConstraintGenerator:
                     null_columns.append(col)
                     break
                 elif meta is None:
-                    # Fallback: resolve via instance directly.
-                    table_name = self._resolve_table(col, tables)
-                    if table_name and self.instance.nullable(table_name, col.name):
+                    rel = self._resolve_relation(col, tables)
+                    if rel and self.instance.nullable(rel, col.name):
                         null_columns.append(col)
                         break
             else:
@@ -138,110 +305,104 @@ class ConstraintGenerator:
         else:
             atom_constraint = atom.copy()
 
-        # --- Collect path predicates + JOIN equalities ---
-        path_predicates: List[exp.Expression] = []
-        join_equalities: List[Tuple[str, str, str, str]] = []
-        if step is not None:
-            path_predicates, join_equalities = _collect_path_predicates_and_joins(
-                self.plan, step
-            )
+        # --- Path predicates + JOIN equalities from cached hierarchy ---
+        path_predicates = list(node.path_predicates)
+        join_equalities = list(node.join_equalities)
 
         # --- Database constraints from columns in the atom + path predicates ---
-        not_null_columns: List[Tuple[str, str]] = []
-        avoid_values: Dict[str, Set[Any]] = {}
-        foreign_keys: List[Tuple[str, str, str, str]] = []
+        not_null_columns: List[ColumnId] = []
+        avoid_values: Dict[ColumnId, Set[Any]] = {}
+        foreign_keys: List[Tuple[ColumnId, RelationId, ColumnId]] = []
 
-        # Read NOT NULL and UNIQUE from enriched column metadata — only for
-        # columns that actually appear in the target predicate or path.
-        seen_cols: Set[Tuple[str, str]] = set()
+        seen_cols: Set[ColumnId] = set()
         all_exprs = [atom_constraint] + path_predicates
         for expr in all_exprs:
             for col in expr.find_all(exp.Column):
                 meta = column_meta(col)
                 if meta is None:
                     continue
-                real_table = meta["table"]
-                col_name = normalize_name(col.name)
-                key = (real_table, col_name)
-                if key in seen_cols:
+                col_id = column_identity(col)
+                if col_id is None:
+                    rel = self._resolve_relation(col, tables)
+                    if rel is None:
+                        continue
+                    col_id = physical_column(col.name, rel, dialect=self.dialect)
+                if col_id in seen_cols:
                     continue
-                seen_cols.add(key)
+                seen_cols.add(col_id)
 
                 if not meta["nullable"]:
-                    not_null_columns.append(key)
+                    not_null_columns.append(col_id)
                 if meta["unique"]:
+                    rel = col_id.relation
+                    if rel is None:
+                        continue
                     existing = {
                         sym.concrete
-                        for sym in self.instance.get_column_data(real_table, col_name)
+                        for sym in self.instance.get_column_data(rel, col_id)
                         if sym.concrete is not None
                     }
                     if existing:
-                        avoid_values[f"{real_table}.{col_name}"] = existing
+                        avoid_values[col_id] = existing
 
-        # FK and CHECK constraints are table-level — still require per-table iteration.
-        # Also add NOT NULL and UNIQUE constraints for ALL columns in target tables.
-        for table_name in tables:
-            real_table = self._resolve_table_name(table_name)
-            if real_table not in self.instance.tables:
+        # Table-level constraints: NOT NULL, UNIQUE, FK, CHECK for all target tables.
+        for rel in tables:
+            table_name = _relation_table_name(rel)
+            if table_name not in self.instance.tables:
                 continue
 
-            # Add NOT NULL and UNIQUE for ALL columns in the table.
-            schema = self.instance.tables[real_table]
+            schema = self.instance.tables[table_name]
             for col_name in schema:
-                key = (real_table, col_name)
-                if key in seen_cols:
+                col_id = physical_column(col_name, rel, dialect=self.dialect)
+                if col_id in seen_cols:
                     continue
-                seen_cols.add(key)
+                seen_cols.add(col_id)
 
-                if not self.instance.nullable(real_table, col_name):
-                    not_null_columns.append(key)
+                if not self.instance.nullable(rel, col_id):
+                    not_null_columns.append(col_id)
 
-                if self.instance.is_unique(real_table, col_name):
+                if self.instance.is_unique(rel, col_id):
                     existing = {
                         sym.concrete
-                        for sym in self.instance.get_column_data(real_table, col_name)
+                        for sym in self.instance.get_column_data(rel, col_id)
                         if sym.concrete is not None
                     }
                     if existing:
-                        avoid_values[f"{real_table}.{col_name}"] = existing
+                        avoid_values[col_id] = existing
 
-            for fk in self.instance.get_foreign_key(real_table):
-                local_col = normalize_name(fk.expressions[0].name)
+            for fk in self.instance.get_foreign_key(rel):
+                local_col = physical_column(fk.expressions[0].name, rel, dialect=self.dialect)
                 ref = fk.args.get("reference")
                 if ref is None:
                     continue
                 ref_table_node = ref.find(exp.Table)
                 if ref_table_node is None:
                     continue
-                ref_table = normalize_name(ref_table_node.name)
+                ref_rel = self._resolve_table_relation(ref_table_node, tables)
                 ref_col = self.instance.resolve_fk_ref_column(fk)
-                if ref_col is None:
+                if ref_rel is None or ref_col is None:
                     continue
-                foreign_keys.append((real_table, local_col, ref_table, ref_col))
+                foreign_keys.append((
+                    local_col,
+                    ref_rel,
+                    physical_column(ref_col, ref_rel, dialect=self.dialect),
+                ))
 
-            # Include CHECK constraints as path predicates.
-            for check_expr in self.instance.get_check_constraints(real_table):
+            for check_expr in self.instance.get_check_constraints(rel):
                 path_predicates.append(check_expr)
 
         # Build unified constraints list: atom + path + DB constraints
         constraints: List[exp.Expression] = [atom_constraint] + path_predicates
         for col in null_columns:
             constraints.append(exp.Is(this=col.copy(), expression=exp.Null()))
-        for table_name, col_name in not_null_columns:
+        for col_id in not_null_columns:
             constraints.append(exp.Is(
-                this=exp.Column(
-                    this=exp.to_identifier(col_name),
-                    table=exp.to_identifier(table_name),
-                ),
+                this=self._constraint_column(col_id),
                 expression=exp.Not(this=exp.Null()),
             ))
-        for col_key, vals in avoid_values.items():
-            tname, cname = col_key.split(".", 1)
+        for col_id, vals in avoid_values.items():
             constraints.append(exp.Not(this=exp.In(
-                this=exp.Column(
-                    this=exp.to_identifier(cname),
-                    table=exp.to_identifier(tname),
-                ),
+                this=self._constraint_column(col_id),
                 expressions=[
                     exp.Literal.number(v) if isinstance(v, (int, float))
                     else exp.Literal.string(str(v))
@@ -249,13 +410,16 @@ class ConstraintGenerator:
                 ],
             )))
 
-        # FK constraints: local column must reference an existing parent row.
-        for real_table, local_col, ref_table, ref_col in foreign_keys:
+        for local_col, ref_rel, ref_col in foreign_keys:
             parent_vals = []
-            if ref_table in self.instance.tables:
-                for row in self.instance.get_rows(ref_table):
-                    if ref_col in row.columns:
+            ref_table_name = _relation_table_name(ref_rel)
+            if ref_table_name in self.instance.tables:
+                for row in self.instance.get_rows(ref_rel):
+                    try:
                         val = row[ref_col].concrete
+                    except KeyError:
+                        continue
+                    else:
                         if val is not None:
                             parent_vals.append(val)
             if parent_vals:
@@ -265,91 +429,233 @@ class ConstraintGenerator:
                     for v in parent_vals
                 ]
                 constraints.append(exp.In(
-                    this=exp.Column(
-                        this=exp.to_identifier(local_col),
-                        table=exp.to_identifier(real_table),
-                    ),
+                    this=self._constraint_column(local_col),
                     expressions=literals,
                 ))
 
-        self._annotate_column_types(constraints)
+        self._annotate_solver_vars(constraints, tables)
 
         return SolverConstraint(
-            target_tables=tables,
+            target_relations=tables,
             constraints=constraints,
-            join_equalities=join_equalities,
-            alias_map=dict(self.alias_map),
+            join_equalities=self._lower_join_equalities(join_equalities, tables),
         )
 
-    def _generate_exists_constraint(self, target: CoverageTarget) -> SolverConstraint:
-        """Generate constraint for EXISTS_TRUE or EXISTS_FALSE."""
-        # For EXISTS_FALSE: generate an outer row where the inner query returns empty
-        # Strategy: set the correlation column to a value not in the inner table
+    def _constraints_for_path_predicate(self, predicate: PathPredicate) -> List[exp.Expression]:
+        expression = predicate.expression.copy()
+        if predicate.outcome in _POSITIVE_BITS:
+            if predicate.node.site == "filter":
+                return [predicate.node.predicate.copy()]
+            return [] if _is_trivial_true(expression) else [expression]
+        if predicate.outcome in _NEGATIVE_BITS:
+            return [negate_predicate(expression)]
+        if predicate.outcome in _NULL_BITS:
+            columns = list(expression.find_all(exp.Column))
+            if not columns:
+                return [expression]
+            return [
+                expression,
+                exp.Is(this=columns[0].copy(), expression=exp.Null()),
+            ]
+        if predicate.outcome in {PlausibleBit.JOIN_MATCH, PlausibleBit.JOIN_TRUE}:
+            return [] if _is_trivial_true(expression) else [expression]
+        if predicate.outcome == PlausibleBit.JOIN_NO_MATCH:
+            return [negate_predicate(expression)] if not _is_trivial_true(expression) else []
+        return [expression]
 
-        # Find the SubPlan from the plan
+    def _apply_database_constraints(
+        self,
+        constraints: List[exp.Expression],
+        tables: Tuple[RelationId, ...],
+    ) -> Tuple[List[exp.Expression], List[Tuple[ColumnId, ColumnId]]]:
+        path_predicates = list(constraints)
+        not_null_columns: List[ColumnId] = []
+        avoid_values: Dict[ColumnId, Set[Any]] = {}
+        foreign_keys: List[Tuple[ColumnId, RelationId, ColumnId]] = []
+        seen_cols: Set[ColumnId] = set()
+
+        for expr in path_predicates:
+            for col in expr.find_all(exp.Column):
+                col_id = column_identity(col)
+                if col_id is None:
+                    rel = self._resolve_relation(col, tables)
+                    if rel is None:
+                        continue
+                    col_id = physical_column(col.name, rel, dialect=self.dialect)
+                if col_id in seen_cols:
+                    continue
+                seen_cols.add(col_id)
+                meta = column_meta(col)
+                if meta is not None and not meta["nullable"]:
+                    not_null_columns.append(col_id)
+                if meta is not None and meta["unique"] and col_id.relation is not None:
+                    existing = {
+                        sym.concrete
+                        for sym in self.instance.get_column_data(col_id.relation, col_id)
+                        if sym.concrete is not None
+                    }
+                    if existing:
+                        avoid_values[col_id] = existing
+
+        for rel in tables:
+            table_name = _relation_table_name(rel)
+            if table_name not in self.instance.tables:
+                continue
+            for col_name in self.instance.tables[table_name]:
+                col_id = physical_column(col_name, rel, dialect=self.dialect)
+                if col_id in seen_cols:
+                    continue
+                seen_cols.add(col_id)
+                if not self.instance.nullable(rel, col_id):
+                    not_null_columns.append(col_id)
+                if self.instance.is_unique(rel, col_id):
+                    existing = {
+                        sym.concrete
+                        for sym in self.instance.get_column_data(rel, col_id)
+                        if sym.concrete is not None
+                    }
+                    if existing:
+                        avoid_values[col_id] = existing
+
+            for fk in self.instance.get_foreign_key(rel):
+                local_col = physical_column(fk.expressions[0].name, rel, dialect=self.dialect)
+                ref = fk.args.get("reference")
+                ref_table_node = ref.find(exp.Table) if ref is not None else None
+                ref_col = self.instance.resolve_fk_ref_column(fk)
+                ref_rel = (
+                    self._resolve_table_relation(ref_table_node, tables)
+                    if ref_table_node is not None
+                    else None
+                )
+                if ref_rel is not None and ref_col is not None:
+                    foreign_keys.append(
+                        (
+                            local_col,
+                            ref_rel,
+                            physical_column(ref_col, ref_rel, dialect=self.dialect),
+                        )
+                    )
+
+            for check_expr in self.instance.get_check_constraints(rel):
+                constraints.append(check_expr)
+
+        for col_id in not_null_columns:
+            constraints.append(
+                exp.Is(this=self._constraint_column(col_id), expression=exp.Not(this=exp.Null()))
+            )
+        for col_id, vals in avoid_values.items():
+            constraints.append(
+                exp.Not(
+                    this=exp.In(
+                        this=self._constraint_column(col_id),
+                        expressions=[
+                            exp.Literal.number(v)
+                            if isinstance(v, (int, float))
+                            else exp.Literal.string(str(v))
+                            for v in vals
+                        ],
+                    )
+                )
+            )
+        for local_col, ref_rel, ref_col in foreign_keys:
+            parent_vals = []
+            if _relation_table_name(ref_rel) in self.instance.tables:
+                for row in self.instance.get_rows(ref_rel):
+                    try:
+                        val = row[ref_col].concrete
+                    except KeyError:
+                        continue
+                    if val is not None:
+                        parent_vals.append(val)
+            if parent_vals:
+                constraints.append(
+                    exp.In(
+                        this=self._constraint_column(local_col),
+                        expressions=[
+                            exp.Literal.number(v)
+                            if isinstance(v, (int, float))
+                            else exp.Literal.string(str(v))
+                            for v in parent_vals
+                        ],
+                    )
+                )
+        return constraints, []
+
+    def _lower_join_equalities(
+        self,
+        join_equalities: List[Tuple[ColumnId, ColumnId] | Tuple[SolverVar, SolverVar]],
+        tables: Tuple[RelationId, ...],
+    ) -> List[Tuple[SolverVar, SolverVar]]:
+        del tables
+        lowered: List[Tuple[SolverVar, SolverVar]] = []
+        for item in join_equalities:
+            if len(item) == 2 and all(isinstance(part, SolverVar) for part in item):
+                lowered.append(item)
+                continue
+            if len(item) != 2 or not all(isinstance(part, ColumnId) for part in item):
+                continue
+            left_id, right_id = item
+            if left_id.relation is None or right_id.relation is None:
+                continue
+            lowered.append((
+                SolverVar(column_id=left_id, relation_id=left_id.relation),
+                SolverVar(column_id=right_id, relation_id=right_id.relation),
+            ))
+        return lowered
+
+    def _generate_exists_constraint(self, target: PlausibleBranch) -> SolverConstraint:
         subplan = self._find_subplan_for_target(target)
         if subplan and subplan.correlation:
-            # Correlated EXISTS
             corr_col = subplan.correlation[0]
-            outer_table = self._resolve_table(corr_col, target.node.tables)
+            outer_rel = self._resolve_relation(corr_col, target.node.tables)
 
-            if target.target_outcome == BranchType.EXISTS_FALSE:
-                # Generate outer row with correlation value not in inner table
+            if outer_rel is not None and target.bit == PlausibleBit.EXISTS_FALSE:
                 inner_table = self._find_inner_scan_table(subplan)
                 if inner_table:
+                    from parseval.identity import table_relation as _tr3
+                    inner_rel = _tr3(inner_table, dialect=self.dialect)
                     existing = set()
-                    for row in self.instance.get_rows(inner_table):
+                    for row in self.instance.get_rows(inner_rel):
                         if corr_col.name in row.columns:
                             val = row[corr_col.name].concrete
                             if val is not None:
                                 existing.add(val)
 
-                    # Generate a fresh value using column type
                     corr_copy = corr_col.copy()
                     meta = column_meta(corr_col)
                     if meta and "domain" in meta:
                         corr_copy.type = meta["domain"]
                     fresh = self._generate_fresh_value(existing, meta)
 
-                    # Build the constraint expression
                     if isinstance(fresh, str):
                         lit = exp.Literal.string(fresh)
                     else:
                         lit = exp.Literal.number(fresh)
                     atom = exp.EQ(this=corr_copy, expression=lit)
+                    self._annotate_solver_vars([atom], (outer_rel,))
                     return SolverConstraint(
-                        target_tables=(outer_table,),
+                        target_relations=(outer_rel,),
                         constraints=[atom],
-                        alias_map=dict(self.alias_map),
                     )
 
-        # Non-correlated or EXISTS_TRUE — return minimal constraint
         return SolverConstraint(
-            target_tables=target.node.tables,
+            target_relations=target.node.tables,
             constraints=[target.atom] if target.atom else [],
-            alias_map=dict(self.alias_map),
         )
 
-    def _generate_in_constraint(self, target: CoverageTarget) -> SolverConstraint:
-        """Generate constraint for IN_MATCH or IN_NO_MATCH.
-
-        Evaluates the inner query to get existing values, then builds
-        col IN (values) or col NOT IN (values) expressions.
-        """
+    def _generate_in_constraint(self, target: PlausibleBranch) -> SolverConstraint:
         atom = target.atom
         if not isinstance(atom, exp.In):
             return SolverConstraint(
-                target_tables=target.node.tables,
+                target_relations=target.node.tables,
                 constraints=[atom] if atom else [],
-                alias_map=dict(self.alias_map),
             )
 
         subplan = self._find_subplan_for_target(target)
         if subplan is None:
             return SolverConstraint(
-                target_tables=target.node.tables,
+                target_relations=target.node.tables,
                 constraints=[atom] if atom else [],
-                alias_map=dict(self.alias_map),
             )
 
         inner_values = self._eval_inner_plan_values(subplan.inner)
@@ -357,18 +663,16 @@ class ConstraintGenerator:
 
         if not isinstance(outer_col, exp.Column):
             return SolverConstraint(
-                target_tables=target.node.tables,
+                target_relations=target.node.tables,
                 constraints=[atom] if atom else [],
-                alias_map=dict(self.alias_map),
             )
 
-        outer_table = self._resolve_table(outer_col, target.node.tables)
         meta = column_meta(outer_col)
         outer_col = outer_col.copy()
         if meta:
             outer_col.type = meta.get("domain")
 
-        if target.target_outcome == BranchType.IN_MATCH:
+        if target.bit == PlausibleBit.IN_MATCH:
             if inner_values:
                 literals = [
                     exp.Literal.number(v) if isinstance(v, (int, float))
@@ -390,25 +694,17 @@ class ConstraintGenerator:
                 constraint = exp.Is(this=outer_col.copy(), expression=exp.Not(this=exp.Null()))
 
         return SolverConstraint(
-            target_tables=target.node.tables,
+            target_relations=target.node.tables,
             constraints=[constraint],
-            alias_map=dict(self.alias_map),
         )
 
-    def _generate_distinct_constraint(self, target: CoverageTarget) -> SolverConstraint:
-        """Generate constraint for DISTINCT_UNIQUE or DISTINCT_DUPLICATE.
-
-        Uses row-indexed synthetic table names so the solver generates two rows.
-        DISTINCT_DUPLICATE: same projected values across rows.
-        DISTINCT_UNIQUE: different projected values across rows.
-        """
+    def _generate_distinct_constraint(self, target: PlausibleBranch) -> SolverConstraint:
         tables = target.node.tables
-        step = self._find_step(target.node.step_id)
+        step = target.node.step
         if step is None or not isinstance(step, Project):
             return SolverConstraint(
-                target_tables=tables,
+                target_relations=tables,
                 constraints=[exp.Literal.string("DISTINCT")],
-                alias_map=dict(self.alias_map),
             )
 
         proj_cols: List[exp.Column] = []
@@ -420,75 +716,52 @@ class ConstraintGenerator:
 
         if not proj_cols:
             return SolverConstraint(
-                target_tables=tables,
+                target_relations=tables,
                 constraints=[exp.Literal.string("DISTINCT")],
-                alias_map=dict(self.alias_map),
             )
-
-        # Resolve the first column's physical table to use as row-index prefix.
-        first_real = self._resolve_table(proj_cols[0], tables)
-        base = first_real if first_real else (tables[0] if tables else "")
-        row_tables = [f"{base}__0", f"{base}__1"]
-        row_alias_map = {row_tables[0]: base, row_tables[1]: base}
 
         constraints: List[exp.Expression] = []
         for col in proj_cols:
-            real_table = self._resolve_table(col, tables)
-            if not real_table:
+            col_id = self._column_id_for_expr(col, tables)
+            if col_id is None or col_id.relation is None:
                 continue
 
-            col_r0 = exp.Column(
-                this=col.this.copy(),
-                table=exp.to_identifier(f"{real_table}__0"),
-            )
-            col_r1 = exp.Column(
-                this=col.this.copy(),
-                table=exp.to_identifier(f"{real_table}__1"),
-            )
+            col_r0 = self._constraint_column(col_id, row_scope="r0")
+            col_r1 = self._constraint_column(col_id, row_scope="r1")
 
             meta = column_meta(col)
             if meta and "domain" in meta:
                 col_r0.type = meta["domain"]
                 col_r1.type = meta["domain"]
 
-            if target.target_outcome == BranchType.DISTINCT_DUPLICATE:
+            if target.bit in {PlausibleBit.DISTINCT_DUPLICATE, PlausibleBit.DUPLICATE}:
                 constraints.append(exp.EQ(this=col_r0, expression=col_r1))
             else:
                 constraints.append(exp.NEQ(this=col_r0, expression=col_r1))
 
         for col in proj_cols:
-            real_table = self._resolve_table(col, tables)
-            if not real_table:
+            col_id = self._column_id_for_expr(col, tables)
+            if col_id is None or col_id.relation is None:
                 continue
             for i in range(2):
-                col_ri = exp.Column(
-                    this=col.this.copy(),
-                    table=exp.to_identifier(f"{real_table}__{i}"),
-                )
+                col_ri = self._constraint_column(col_id, row_scope=f"r{i}")
                 meta = column_meta(col)
                 if meta and "domain" in meta:
                     col_ri.type = meta["domain"]
                 constraints.append(exp.Is(this=col_ri, expression=exp.Not(this=exp.Null())))
 
         return SolverConstraint(
-            target_tables=tuple(row_tables),
+            target_relations=tables,
             constraints=constraints,
-            alias_map=row_alias_map,
         )
 
-    def _generate_group_constraint(self, target: CoverageTarget) -> SolverConstraint:
-        """Generate constraint for GROUP_SINGLE or GROUP_MULTI.
-
-        Uses row-indexed synthetic table names (t1__0, t1__1) so the solver
-        generates two rows. Equality constraints ensure same/different GROUP BY keys.
-        """
+    def _generate_group_constraint(self, target: PlausibleBranch) -> SolverConstraint:
         tables = target.node.tables
-        step = self._find_step(target.node.step_id)
+        step = target.node.step
         if step is None or not isinstance(step, Aggregate) or not step.group:
             return SolverConstraint(
-                target_tables=tables,
+                target_relations=tables,
                 constraints=[exp.Literal.number(1)],
-                alias_map=dict(self.alias_map),
             )
 
         group_cols: List[exp.Column] = []
@@ -498,88 +771,124 @@ class ConstraintGenerator:
 
         if not group_cols:
             return SolverConstraint(
-                target_tables=tables,
+                target_relations=tables,
                 constraints=[exp.Literal.number(1)],
-                alias_map=dict(self.alias_map),
             )
-
-        # Resolve the first column's physical table to use as row-index prefix.
-        first_real = self._resolve_table(group_cols[0], tables)
-        base = first_real if first_real else (tables[0] if tables else "")
-        row_tables = [f"{base}__0", f"{base}__1"]
-        row_alias_map = {row_tables[0]: base, row_tables[1]: base}
 
         constraints: List[exp.Expression] = []
         for col in group_cols:
-            real_table = self._resolve_table(col, tables)
-            if not real_table:
+            col_id = self._column_id_for_expr(col, tables)
+            if col_id is None or col_id.relation is None:
                 continue
 
-            col_r0 = exp.Column(
-                this=col.this.copy(),
-                table=exp.to_identifier(f"{real_table}__0"),
-            )
-            col_r1 = exp.Column(
-                this=col.this.copy(),
-                table=exp.to_identifier(f"{real_table}__1"),
-            )
+            col_r0 = self._constraint_column(col_id, row_scope="r0")
+            col_r1 = self._constraint_column(col_id, row_scope="r1")
 
             meta = column_meta(col)
             if meta and "domain" in meta:
                 col_r0.type = meta["domain"]
                 col_r1.type = meta["domain"]
 
-            if target.target_outcome == BranchType.GROUP_MULTI:
+            if target.bit in {PlausibleBit.GROUP_MULTI, PlausibleBit.GROUP_SIZE}:
                 constraints.append(exp.EQ(this=col_r0, expression=col_r1))
             else:
                 constraints.append(exp.NEQ(this=col_r0, expression=col_r1))
 
         for col in group_cols:
-            real_table = self._resolve_table(col, tables)
-            if not real_table:
+            col_id = self._column_id_for_expr(col, tables)
+            if col_id is None or col_id.relation is None:
                 continue
             for i in range(2):
-                col_ri = exp.Column(
-                    this=col.this.copy(),
-                    table=exp.to_identifier(f"{real_table}__{i}"),
-                )
+                col_ri = self._constraint_column(col_id, row_scope=f"r{i}")
                 meta = column_meta(col)
                 if meta and "domain" in meta:
                     col_ri.type = meta["domain"]
                 constraints.append(exp.Is(this=col_ri, expression=exp.Not(this=exp.Null())))
 
         return SolverConstraint(
-            target_tables=tuple(row_tables),
+            target_relations=tables,
             constraints=constraints,
-            alias_map=row_alias_map,
         )
 
-    def _annotate_column_types(self, constraints: List[exp.Expression]) -> None:
-        """Set .type on Column nodes from planner-annotated column_meta.
+    def _constraint_column(
+        self,
+        column: ColumnId,
+        row_scope: str | None = None,
+    ) -> exp.Column:
+        col = _column_expr_from_id(column)
+        dtype = self._datatype_for_column_id(column)
+        if dtype is not None:
+            col.type = dtype
+        if column.relation is not None:
+            set_solver_var(
+                col,
+                SolverVar(
+                    column_id=column,
+                    relation_id=column.relation,
+                    row_scope=row_scope,
+                ),
+            )
+        return col
 
-        For original columns, column_meta provides the domain directly.
-        For synthetic row-indexed columns (e.g., t1__0.col_A), resolve the
-        real table name via alias_map and look up from instance schema.
-        """
-        from parseval.dtype import DataType
+    def _datatype_for_column_id(self, column: ColumnId):
+        lookup = column.source_column_id or column
+        if lookup.relation is None:
+            return None
+        try:
+            catalog_column = self.instance.catalog_column(
+                lookup.relation,
+                exp.to_identifier(lookup.name.raw, quoted=lookup.name.quoted),
+            )
+        except Exception:
+            table_name = _relation_table_name(lookup.relation)
+            type_sql = self.instance.tables.get(table_name, {}).get(lookup.name.normalized)
+            if type_sql is None:
+                return None
+            from parseval.dtype import DataType
 
+            try:
+                return DataType.build(type_sql)
+            except Exception:
+                return None
+        return catalog_column.datatype
+
+    def _annotate_solver_vars(
+        self,
+        constraints: List[exp.Expression],
+        tables: Tuple[RelationId, ...],
+    ) -> None:
+        """Set SolverVar metadata on Column nodes so the solver can assign values."""
         for expr in constraints:
             for col in expr.find_all(exp.Column):
-                if getattr(col, "type", None) is not None:
+                if solver_var(col) is not None:
                     continue
-                meta = column_meta(col)
-                if meta and "domain" in meta:
-                    col.type = meta["domain"]
+                col_id = self._column_id_for_expr(col, tables)
+                if col_id is None:
                     continue
-                table_name = col.table or ""
-                resolved = self.alias_map.resolve(table_name)
-                if resolved in self.instance.tables:
-                    col_type_str = self.instance.tables[resolved].get(col.name)
-                    if col_type_str:
-                        try:
-                            col.type = DataType.build(col_type_str)
-                        except Exception:
-                            pass
+                rel_id = col_id.relation
+                if rel_id is None and tables:
+                    rel_id = tables[0]
+                if rel_id is None:
+                    continue
+                sv = SolverVar(column_id=col_id, relation_id=rel_id)
+                set_solver_var(col, sv)
+
+    def _column_id_for_expr(
+        self,
+        col: exp.Column,
+        tables: Tuple[RelationId, ...],
+    ) -> ColumnId | None:
+        col_id = column_identity(col)
+        if col_id is not None:
+            return col_id
+        rel = self._resolve_relation(col, tables)
+        if rel is None:
+            return None
+        return column_id(
+            ColumnKind.SYNTHETIC,
+            identifier_name(col.name, dialect=self.dialect),
+            rel,
+        )
 
     def _eval_inner_plan_values(self, root: Step) -> set:
         """Evaluate an inner plan and return the set of projected column values."""
@@ -609,7 +918,8 @@ class ConstraintGenerator:
         if table_name not in self.instance.tables:
             return set()
 
-        rows = list(self.instance.get_rows(table_name))
+        from parseval.identity import table_relation as _tr4
+        rows = list(self.instance.get_rows(_tr4(table_name, dialect=self.dialect)))
         for filt in filters:
             if filt.condition is None:
                 continue
@@ -635,7 +945,6 @@ class ConstraintGenerator:
         return values
 
     def _generate_fresh_value(self, existing: set, meta: Optional[dict]) -> Any:
-        """Generate a fresh value not in the existing set, respecting column type."""
         from parseval.dtype import DataType
 
         if meta and "domain" in meta:
@@ -649,7 +958,6 @@ class ConstraintGenerator:
                     i += 1
                 return f"fresh_{i}"
 
-        # Fallback: try int, then string
         if existing and all(isinstance(v, int) for v in existing):
             return max(existing) + 1
         i = 1
@@ -658,18 +966,14 @@ class ConstraintGenerator:
         return f"fresh_{i}"
 
     def _find_subplan_for_target(self, target: CoverageTarget):
-        """Find the SubPlan step that corresponds to the target."""
         for step in self.plan.ordered_steps:
             if isinstance(step, SubPlan):
-                # Match by step_id or by anchor expression
                 if hasattr(step, 'anchor') and step.anchor is not None:
-                    # Check if the anchor matches the target's predicate
                     if step.anchor.sql() == target.node.predicate.sql():
                         return step
         return None
 
     def _find_inner_scan_table(self, subplan) -> str:
-        """Find the main table referenced in a SubPlan's inner plan."""
         stack = [subplan.inner]
         while stack:
             step = stack.pop()
@@ -678,29 +982,42 @@ class ConstraintGenerator:
             stack.extend(step.chain_dependencies)
         return ""
 
-    def _find_step(self, step_id: str) -> Optional[Step]:
-        for step in self.plan.ordered_steps:
-            if self.plan.annotation_for(step).step_id == step_id:
-                return step
+    def _resolve_relation(self, col: exp.Column, tables: Tuple[RelationId, ...]) -> RelationId | None:
+        """Resolve a column's table qualifier to a RelationId."""
+        if col.table:
+            table_name = normalize_name(col.table)
+            for rel in tables:
+                if _relation_matches_name(rel, table_name):
+                    return rel
+            if table_name in self.instance.tables:
+                return table_relation(table_name, dialect=self.dialect)
+        col_name = normalize_name(col.name)
+        for rel in tables:
+            name = _relation_table_name(rel)
+            if name in self.instance.tables and col_name in self.instance.tables[name]:
+                return rel
+        return tables[0] if tables else None
+
+    def _resolve_table_relation(
+        self,
+        table: exp.Table,
+        tables: Tuple[RelationId, ...],
+    ) -> RelationId | None:
+        table_name = normalize_name(table.name)
+        for rel in tables:
+            if _relation_matches_name(rel, table_name):
+                return rel
+        if table_name in self.instance.tables:
+            return table_relation(table_name, dialect=self.dialect)
         return None
 
-    def _resolve_table(self, col: exp.Column, tables: Tuple[str, ...]) -> str:
-        """Resolve a column's table qualifier to a physical table name."""
-        if col.table:
-            resolved = self.alias_map.resolve(col.table)
-            if resolved in self.instance.tables:
-                return resolved
-        col_name = normalize_name(col.name)
-        for t in tables:
-            resolved = self.alias_map.resolve(t)
-            if resolved in self.instance.tables and col_name in self.instance.tables[resolved]:
-                return resolved
-        return tables[0] if tables else ""
 
-    def _resolve_table_name(self, name: str) -> str:
-        """Resolve an alias or table name to the physical table name."""
-        resolved = self.alias_map.resolve(name)
-        return resolved if resolved in self.instance.tables else name
+ConstraintGenerator = PlausibleConstraintCompiler
 
 
-__all__ = ["ConstraintGenerator"]
+__all__ = [
+    "PlausibleBranch",
+    "PlausiblePath",
+    "PlausibleConstraintCompiler",
+    "ConstraintGenerator",
+]
