@@ -86,7 +86,7 @@ class BranchPath:
 class PathObservationKey:
     """Stable dedupe key for one row's outcome at one branch atom."""
 
-    node_key: Tuple[str, str]
+    node_key: Tuple[str, str, str]
     atom_id: int
     row_ids: Tuple[Any, ...]
 
@@ -271,8 +271,8 @@ class BranchTree:
     nodes: List[BranchNode] = field(default_factory=list)
     thresholds: CoverageThresholds = field(default_factory=CoverageThresholds)
     step_map: Dict[str, BranchNode] = field(default_factory=dict)
-    node_map: Dict[Tuple[str, str], BranchNode] = field(default_factory=dict)
-    row_index: Dict[Tuple[Any, ...], Set[Tuple[str, str]]] = field(default_factory=dict)
+    node_map: Dict[Tuple[str, str, str], BranchNode] = field(default_factory=dict)
+    row_index: Dict[Tuple[Any, ...], Set[Tuple[str, str, str]]] = field(default_factory=dict)
     observation_keys: Set[PathObservationKey] = field(default_factory=set)
     _uncovered_cache: Optional[List[CoverageTarget]] = field(
         default=None, repr=False
@@ -294,7 +294,7 @@ class BranchTree:
         join_facts: Tuple[JoinFact, ...] = (),
     ) -> BranchNode:
         """Find an existing node or create a new one."""
-        node_key = (step_id, predicate.sql())
+        node_key = (step_id, site, predicate.sql())
         existing = self.node_map.get(node_key)
         if existing is not None:
             return existing
@@ -321,7 +321,7 @@ class BranchTree:
         return node
 
     def record_observation(self, node: BranchNode, observation: AtomObservation) -> None:
-        node_key = (node.step_id, node.predicate_sql)
+        node_key = (node.step_id, node.site, node.predicate_sql)
         key = PathObservationKey(
             node_key=node_key,
             atom_id=observation.atom_id,
