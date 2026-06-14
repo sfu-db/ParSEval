@@ -51,7 +51,7 @@ class JoinFact:
     side: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PathPredicate:
     """A predicate required for a row to survive along a branch path."""
 
@@ -60,7 +60,7 @@ class PathPredicate:
     outcome: BranchType
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SubqueryPath:
     """Nested path for a subquery participating in an outer predicate."""
 
@@ -71,7 +71,7 @@ class SubqueryPath:
     predicate: Optional[exp.Expression] = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BranchPath:
     """Complete constraints needed for one target to survive toward the query root."""
 
@@ -86,9 +86,8 @@ class BranchPath:
 class PathObservationKey:
     """Stable dedupe key for one row's outcome at one branch atom."""
 
-    step_id: str
+    node_key: Tuple[str, str]
     atom_id: int
-    outcome: BranchType
     row_ids: Tuple[Any, ...]
 
 
@@ -272,7 +271,8 @@ class BranchTree:
     nodes: List[BranchNode] = field(default_factory=list)
     thresholds: CoverageThresholds = field(default_factory=CoverageThresholds)
     step_map: Dict[str, BranchNode] = field(default_factory=dict)
-    row_index: Dict[Tuple[Any, ...], Set[str]] = field(default_factory=dict)
+    node_map: Dict[Tuple[str, str], BranchNode] = field(default_factory=dict)
+    row_index: Dict[Tuple[Any, ...], Set[Tuple[str, str]]] = field(default_factory=dict)
     observation_keys: Set[PathObservationKey] = field(default_factory=set)
     _uncovered_cache: Optional[List[CoverageTarget]] = field(
         default=None, repr=False
@@ -294,8 +294,9 @@ class BranchTree:
         join_facts: Tuple[JoinFact, ...] = (),
     ) -> BranchNode:
         """Find an existing node or create a new one."""
-        existing = self.step_map.get(step_id)
-        if existing is not None and existing.predicate_sql == predicate.sql():
+        node_key = (step_id, predicate.sql())
+        existing = self.node_map.get(node_key)
+        if existing is not None:
             return existing
 
         node = BranchNode(
@@ -315,14 +316,15 @@ class BranchTree:
             parent.children.append(node)
 
         self.nodes.append(node)
-        self.step_map[step_id] = node
+        self.node_map[node_key] = node
+        self.step_map.setdefault(step_id, node)
         return node
 
     def record_observation(self, node: BranchNode, observation: AtomObservation) -> None:
+        node_key = (node.step_id, node.predicate_sql)
         key = PathObservationKey(
-            step_id=node.step_id,
+            node_key=node_key,
             atom_id=observation.atom_id,
-            outcome=observation.outcome,
             row_ids=observation.row_ids,
         )
         if observation.row_ids and key in self.observation_keys:
@@ -332,7 +334,7 @@ class BranchTree:
         node.record(observation)
         if observation.row_ids:
             entry = self.row_index.setdefault(observation.row_ids, set())
-            entry.add(node.step_id)
+            entry.add(node_key)
         self._cache_dirty = True
 
     @property
@@ -399,8 +401,8 @@ class BranchTree:
 
     def nodes_for_row(self, row_ids: Tuple[Any, ...]) -> List[BranchNode]:
         """All nodes that observed a given row."""
-        step_ids = self.row_index.get(row_ids, set())
-        return [self.step_map[sid] for sid in step_ids if sid in self.step_map]
+        node_keys = self.row_index.get(row_ids, set())
+        return [self.node_map[key] for key in node_keys if key in self.node_map]
 
     def row_path(self, row_ids: Tuple[Any, ...]) -> List[Tuple[BranchNode, Dict[int, BranchType]]]:
         """Full path a row took through the decision tree."""
