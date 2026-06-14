@@ -409,6 +409,49 @@ class BranchTree:
         nodes = self.nodes_for_row(row_ids)
         return [(node, node.row_outcomes(row_ids)) for node in nodes]
 
+    def path_for_target(self, target: CoverageTarget) -> BranchPath:
+        nodes: List[BranchNode] = []
+        current: Optional[BranchNode] = target.node
+        while current is not None:
+            nodes.append(current)
+            current = current.parent
+        nodes.reverse()
+
+        predicates: List[PathPredicate] = []
+        join_facts: List[JoinFact] = []
+        relations: List[RelationId] = []
+        seen_relations: Set[RelationId] = set()
+
+        for node in nodes:
+            for relation in node.tables:
+                if relation not in seen_relations:
+                    seen_relations.add(relation)
+                    relations.append(relation)
+            join_facts.extend(node.join_facts)
+            if node is target.node:
+                predicates.append(
+                    PathPredicate(
+                        node=node,
+                        expression=target.atom,
+                        outcome=target.target_outcome,
+                    )
+                )
+            elif node.site in {"filter", "having", "join_on"}:
+                predicates.append(
+                    PathPredicate(
+                        node=node,
+                        expression=node.predicate,
+                        outcome=BranchType.ATOM_TRUE,
+                    )
+                )
+
+        return BranchPath(
+            target=target,
+            predicates=tuple(predicates),
+            join_facts=tuple(join_facts),
+            relations=tuple(relations),
+        )
+
 
 # =============================================================================
 # Generation result
