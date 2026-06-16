@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Tuple, Optional, List, TYPE_CHECKING
 from itertools import product
 
@@ -22,6 +22,9 @@ class AggregateGroup:
     group_key: Tuple[Any, ...]
     source_row_ids: Tuple[Tuple[Any, ...], ...]
     aggregate_values: Mapping[Any, Any]
+    group_expressions: Mapping[ColumnId, exp.Expression] = field(default_factory=dict)
+    group_sources: Mapping[ColumnId, Tuple[ColumnId, ...]] = field(default_factory=dict)
+    group_key_values: Mapping[ColumnId, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,6 @@ class Row(exp.Expression):
                 source = resolved.source_column_id
                 if source is not None and source in columns:
                     return columns[source]
-            raise KeyError(key)
         normalized = normalize_name(self._key_name(key))
         for column_name, value in columns.items():
             if normalize_name(self._key_name(column_name)) == normalized:
@@ -414,18 +416,20 @@ def build_context_from_instance(instance: Instance) -> Context:
     tables = {}
     for table_name, columns in instance.tables.items():
         rows = instance.get_rows(table_name)
+        relation = instance.table_id(table_name)
         derived_columns = []
         datatypes = {}
         uniques = {}
         nullables = {}
-        for col in columns:
-            dtype = instance.get_column_type(table_name, col)
-            is_unique = instance.is_unique(table_name, col)
-            nullable = instance.nullable(table_name, col)
-            datatypes[col] = dtype
-            uniques[col] = is_unique
-            nullables[col] = nullable
-            derived_columns.append(col)
+        for col_name in columns:
+            col_id = instance._stored_column_id(relation, col_name)
+            dtype = instance.get_column_type(table_name, col_name)
+            is_unique = instance.is_unique(relation, col_id)
+            nullable = instance.nullable(relation, col_id)
+            datatypes[col_id] = dtype
+            uniques[col_id] = is_unique
+            nullables[col_id] = nullable
+            derived_columns.append(col_id)
         tables[table_name] = DerivedSchema(
             columns=derived_columns,
             rows=rows,

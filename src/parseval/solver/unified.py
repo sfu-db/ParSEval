@@ -22,6 +22,7 @@ assignments.
 
 from __future__ import annotations
 
+import calendar
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -78,28 +79,65 @@ class SolveResult:
 # =============================================================================
 
 
-def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
-    """Return the inner column of a year-extractor call, or None.
+def _literal_int(expr: exp.Expression | None) -> Optional[int]:
+    if not isinstance(expr, exp.Literal):
+        return None
+    try:
+        return int(str(expr.this))
+    except (TypeError, ValueError):
+        return None
 
-    Recognises:
-    * ``STRFTIME('%Y', col)`` (SQLite, with optional ``TsOrDs*`` wrap)
-    * ``YEAR(col)`` (MySQL/PostgreSQL, with optional ``TsOrDs*`` wrap)
-    * ``EXTRACT(YEAR FROM col)`` (standard SQL, PG, MySQL 8+)
-    """
+
+def _literal_text(expr: exp.Expression | None) -> Optional[str]:
+    if not isinstance(expr, exp.Literal):
+        return None
+    return str(expr.this)
+
+
+def _call_name(expr: exp.Expression) -> str:
+    if isinstance(expr, exp.Anonymous):
+        return (expr.name or "").upper()
+    if isinstance(expr, exp.Substring):
+        return "SUBSTR"
+    return expr.key.upper() if expr.key else ""
+
+
+def _call_args(expr: exp.Expression) -> List[exp.Expression]:
+    if isinstance(expr, exp.Substring):
+        args = [expr.this]
+        if expr.args.get("start") is not None:
+            args.append(expr.args["start"])
+        if expr.args.get("length") is not None:
+            args.append(expr.args["length"])
+        return args
+    return [
+        child for child in expr.iter_expressions()
+        if not isinstance(child, exp.DataType)
+    ]
+
+
+def _unwrap_temporal_column(expr: exp.Expression) -> Optional[exp.Column]:
+    if isinstance(expr, (exp.TsOrDsToTimestamp, exp.TsOrDsToDate)):
+        expr = expr.this
+    return expr if isinstance(expr, exp.Column) else None
+
+
+def _temporal_prefix_projection(expr: exp.Expression) -> Optional[Tuple[exp.Column, int]]:
+    """Return ``(column, ISO-prefix-length)`` for supported temporal projections."""
+    supported_formats = {
+        "%Y": 4,
+        "%Y-%m": 7,
+        "%Y-%m-%d": 10,
+    }
     if isinstance(expr, exp.TimeToStr):
-        if not isinstance(expr.args.get("format"), exp.Literal):
-            return None
-        if expr.args["format"].this != "%Y":
-            return None
-        inner = expr.this
-        if isinstance(inner, exp.TsOrDsToTimestamp):
-            inner = inner.this
-        return inner if isinstance(inner, exp.Column) else None
+        fmt = _literal_text(expr.args.get("format"))
+        col = _unwrap_temporal_column(expr.this)
+        if fmt in supported_formats and col is not None:
+            return col, supported_formats[fmt]
+        return None
     if isinstance(expr, exp.Year):
-        inner = expr.this
-        if isinstance(inner, exp.TsOrDsToDate):
-            inner = inner.this
-        return inner if isinstance(inner, exp.Column) else None
+        col = _unwrap_temporal_column(expr.this)
+        return (col, 4) if col is not None else None
     if isinstance(expr, exp.Extract):
         unit_node = expr.this
         unit_text = None
@@ -111,103 +149,154 @@ def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
             unit_text = unit_node.name.upper()
         if unit_text != "YEAR":
             return None
-        inner = expr.expression
-        return inner if isinstance(inner, exp.Column) else None
+        col = _unwrap_temporal_column(expr.expression)
+        return (col, 4) if col is not None else None
+
+    name = _call_name(expr)
+    if name in {"SUBSTR", "SUBSTRING"}:
+        args = _call_args(expr)
+        if len(args) < 3:
+            return None
+        col = _unwrap_temporal_column(args[0])
+        start = _literal_int(args[1])
+        length = _literal_int(args[2])
+        if col is not None and start == 1 and length in {4, 7, 10}:
+            return col, length
+        return None
+    if name in {"STRFTIME", "TIME_TO_STR"}:
+        args = _call_args(expr)
+        if len(args) < 2:
+            return None
+        if name == "STRFTIME":
+            fmt = _literal_text(args[0])
+            col = _unwrap_temporal_column(args[1])
+        else:
+            col = _unwrap_temporal_column(args[0])
+            fmt = _literal_text(args[1])
+        if fmt in supported_formats and col is not None:
+            return col, supported_formats[fmt]
     return None
 
 
-def _rewrite_year_extractor_predicates(constraint: SolverConstraint) -> None:
-    """Replace ``YEAR(col) op year`` with equivalent column bounds.
+def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
+    projection = _temporal_prefix_projection(expr)
+    if projection is None or projection[1] != 4:
+        return None
+    return projection[0]
 
-    Handles ``STRFTIME('%Y', col)``, ``YEAR(col)``, and
-    ``EXTRACT(YEAR FROM col)``. For DATE / TIMESTAMP columns the year
-    comparison is monotone, so the original predicate is equivalent to
-    ``col >= epoch(date(Y_lo, 1, 1)) AND col <= epoch(date(Y_hi, 12, 31))``.
-    This sidesteps Z3 having to invert the Hinnant year decomposition
-    (a deep non-linear integer formula that is intractable for the
-    default solver strategy within the 5s timeout).
+
+def _prefix_date_bounds(value: str, prefix_length: int):
+    from datetime import date as _date
+
+    try:
+        if prefix_length == 4 and len(value) == 4:
+            year = int(value)
+            return _date(year, 1, 1), _date(year, 12, 31)
+        if prefix_length == 7 and len(value) == 7 and value[4] == "-":
+            year = int(value[:4])
+            month = int(value[5:7])
+            last_day = calendar.monthrange(year, month)[1]
+            return _date(year, month, 1), _date(year, month, last_day)
+        if prefix_length == 10 and len(value) == 10 and value[4] == "-" and value[7] == "-":
+            year = int(value[:4])
+            month = int(value[5:7])
+            day = int(value[8:10])
+            exact = _date(year, month, day)
+            return exact, exact
+    except ValueError:
+        return None
+    return None
+
+
+def _is_temporal_column(col: exp.Column) -> Tuple[bool, bool]:
+    dtype = col_type(col) or DataType.build("TEXT")
+    is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(DataType.Type.DATE32)
+    is_datetime = dtype.is_type(
+        DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
+        DataType.Type.TIMESTAMP_MS, DataType.Type.TIMESTAMP_NS,
+        DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMPLTZ,
+        DataType.Type.DATETIME, DataType.Type.DATETIME64,
+    )
+    return is_date, is_datetime
+
+
+def _rewrite_year_extractor_predicates(constraint: SolverConstraint) -> None:
+    """Replace temporal string-prefix predicates with equivalent column bounds.
+
+    Handles year/month/day prefixes from ``SUBSTR`` and temporal formatting
+    calls. For DATE / TIMESTAMP columns these prefixes are monotone, so they
+    can be represented as direct epoch day/second ranges.
 
     Mutates ``constraint.constraints`` in place.
     """
-    from datetime import date as _date, datetime as _dt
+    from datetime import datetime as _dt
     from .smt_types import date_to_epoch_day, datetime_to_epoch_second
 
     rewritten: List[exp.Expression] = []
     for cexpr in constraint.constraints:
-        # Find every (year-extractor → comparison-node → column) pattern.
-        targets: List[Tuple[exp.Expression, exp.Column, int, Optional[int]]] = []
-        for kind in (exp.TimeToStr, exp.Year, exp.Extract):
-            for node in cexpr.find_all(kind):
-                col = _year_extractor_inner_column(node)
-                if col is None:
-                    continue
-                cmp_node = node
-                while cmp_node is not None and not isinstance(
-                    cmp_node, (exp.EQ, exp.GTE, exp.LTE, exp.Between)
-                ):
-                    cmp_node = cmp_node.parent
-                if cmp_node is None:
-                    continue
-                year_lits = [
-                    a for a in cmp_node.args.values()
-                    if isinstance(a, exp.Literal)
-                ]
-                years: List[int] = []
-                for lit in year_lits:
-                    raw = lit.this
-                    if not isinstance(raw, str):
-                        raw = str(raw)
-                    if len(raw) == 4 and raw.isdigit():
-                        years.append(int(raw))
-                if not years:
-                    continue
-                if isinstance(cmp_node, exp.EQ):
-                    lo_year, hi_year = years[0], years[0]
-                elif isinstance(cmp_node, exp.GTE):
-                    lo_year, hi_year = years[0], None
-                elif isinstance(cmp_node, exp.LTE):
-                    lo_year, hi_year = None, years[0]
-                else:
-                    lo_year, hi_year = min(years), max(years)
-                dtype = col_type(col) or DataType.build("TEXT")
-                is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
-                    DataType.Type.DATE32
-                )
-                is_datetime = dtype.is_type(
-                    DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
-                    DataType.Type.TIMESTAMP_MS, DataType.Type.TIMESTAMP_NS,
-                    DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMPLTZ,
-                    DataType.Type.DATETIME, DataType.Type.DATETIME64,
-                )
-                if not (is_date or is_datetime):
-                    continue
-                targets.append((cmp_node, col, lo_year, hi_year))
+        targets: List[Tuple[exp.Expression, exp.Column, Any, Any]] = []
+        for node in cexpr.walk():
+            projection = _temporal_prefix_projection(node)
+            if projection is None:
+                continue
+            col, prefix_length = projection
+            is_date, is_datetime = _is_temporal_column(col)
+            if not (is_date or is_datetime):
+                continue
+            cmp_node = node
+            while cmp_node is not None and not isinstance(
+                cmp_node, (exp.EQ, exp.GTE, exp.LTE, exp.Between)
+            ):
+                cmp_node = cmp_node.parent
+            if cmp_node is None:
+                continue
+            lo_value: Optional[str] = None
+            hi_value: Optional[str] = None
+            if isinstance(cmp_node, exp.EQ):
+                lo_value = hi_value = _literal_text(cmp_node.expression)
+            elif isinstance(cmp_node, exp.GTE):
+                lo_value = _literal_text(cmp_node.expression)
+            elif isinstance(cmp_node, exp.LTE):
+                hi_value = _literal_text(cmp_node.expression)
+            else:
+                lo_value = _literal_text(cmp_node.args.get("low"))
+                hi_value = _literal_text(cmp_node.args.get("high"))
+            lo_bounds = _prefix_date_bounds(lo_value, prefix_length) if lo_value else None
+            hi_bounds = _prefix_date_bounds(hi_value, prefix_length) if hi_value else None
+            if lo_value and lo_bounds is None:
+                continue
+            if hi_value and hi_bounds is None:
+                continue
+            lo_date = lo_bounds[0] if lo_bounds is not None else None
+            hi_date = hi_bounds[1] if hi_bounds is not None else None
+            if lo_date is None and hi_date is None:
+                continue
+            targets.append((cmp_node, col, lo_date, hi_date))
 
         if not targets:
             rewritten.append(cexpr)
             continue
 
         new_expr = cexpr.copy()
-        for old_node, col, lo_year, hi_year in targets:
-            dtype = col_type(col) or DataType.build("TEXT")
-            is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
-                DataType.Type.DATE32
-            )
+        for old_node, col, lo_date, hi_date in targets:
+            is_date, _is_datetime = _is_temporal_column(col)
             new_preds: List[exp.Expression] = []
-            if lo_year is not None:
+            if lo_date is not None:
                 if is_date:
-                    payload = date_to_epoch_day(_date(lo_year, 1, 1))
+                    payload = date_to_epoch_day(lo_date)
                 else:
-                    payload = datetime_to_epoch_second(_dt(lo_year, 1, 1))
+                    payload = datetime_to_epoch_second(
+                        _dt(lo_date.year, lo_date.month, lo_date.day)
+                    )
                 new_preds.append(exp.GTE(
                     this=col.copy(), expression=exp.Literal.number(payload),
                 ))
-            if hi_year is not None:
+            if hi_date is not None:
                 if is_date:
-                    payload = date_to_epoch_day(_date(hi_year, 12, 31))
+                    payload = date_to_epoch_day(hi_date)
                 else:
                     payload = datetime_to_epoch_second(
-                        _dt(hi_year, 12, 31, 23, 59, 59)
+                        _dt(hi_date.year, hi_date.month, hi_date.day, 23, 59, 59)
                     )
                 new_preds.append(exp.LTE(
                     this=col.copy(), expression=exp.Literal.number(payload),

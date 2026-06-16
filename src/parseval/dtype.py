@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Optional, Union
@@ -202,18 +203,24 @@ def parse_time(value: Any) -> Optional[dt_time]:
 def parse_datetime(value: Any) -> Optional[datetime]:
     """Parse a value into a datetime, or None if unparseable."""
     if isinstance(value, datetime):
-        return value.replace(microsecond=0)
+        return _normalize_datetime(value)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
-        # Strip trailing .0 that some databases emit (e.g., '2014-04-23T20:29:39.0')
-        cleaned = value.rstrip('0').rstrip('.') if '.' in value else value
-        for candidate in (cleaned.replace(" ", "T"), cleaned):
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        for candidate in (normalized.replace(" ", "T"), normalized):
             try:
-                return datetime.fromisoformat(candidate).replace(microsecond=0)
+                return _normalize_datetime(datetime.fromisoformat(candidate))
             except ValueError:
                 continue
     return None
+
+
+def _normalize_datetime(value: datetime) -> datetime:
+    value = value.replace(microsecond=0)
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def date_to_epoch_day(value: Any) -> int:
@@ -300,6 +307,73 @@ def infer_type_from_string(value: str) -> Any:
     if parsed is not None:
         return parsed
     return value
+
+
+_NUMERIC_LITERAL_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def infer_semantic_datatype_from_literal(value: Any) -> DataType | None:
+    """Infer semantic SQL type from a string literal used in a predicate."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if _NUMERIC_LITERAL_RE.match(text):
+        return DataType.build("REAL") if _numeric_literal_is_decimal(text) else DataType.build("INT")
+    temporal = _temporal_literal_semantic_datatype(text)
+    if temporal is not None:
+        return temporal
+    return None
+
+
+def merge_semantic_datatypes(datatypes: tuple[DataType, ...]) -> DataType | None:
+    """Merge compatible semantic datatype hints into one widened datatype."""
+    if not datatypes:
+        return None
+    families = {type_family(DataType.build(datatype)) for datatype in datatypes}
+    if families <= {TypeFamily.INTEGER}:
+        return DataType.build("INT")
+    if families <= {TypeFamily.INTEGER, TypeFamily.DECIMAL}:
+        return DataType.build("REAL")
+    if families <= {TypeFamily.DATE}:
+        return DataType.build("DATE")
+    if families <= {TypeFamily.DATE, TypeFamily.DATETIME}:
+        return DataType.build("DATETIME")
+    return None
+
+
+def semantic_cast_datatype(datatype: DataType) -> DataType | None:
+    """Return the normalized cast target used for semantic literal casts."""
+    family = type_family(DataType.build(datatype))
+    if family == TypeFamily.INTEGER:
+        return DataType.build("INT")
+    if family == TypeFamily.DECIMAL:
+        return DataType.build("REAL")
+    if family == TypeFamily.DATE:
+        return DataType.build("DATE")
+    if family == TypeFamily.DATETIME:
+        return DataType.build("DATETIME")
+    return None
+
+
+def _numeric_literal_is_decimal(value: str) -> bool:
+    return "." in value or "e" in value.lower()
+
+
+def _temporal_literal_semantic_datatype(value: str) -> DataType | None:
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    return (
+        DataType.build("DATETIME")
+        if _literal_has_time_component(value)
+        else DataType.build("DATE")
+    )
+
+
+def _literal_has_time_component(value: str) -> bool:
+    return bool(re.search(r"(?:\d{1,2}:\d{2}|[Tt]\d{1,2})", value))
 
 # # dd = exp.DataType.build("INT", dialect= 'sqlite', precision=10)
 

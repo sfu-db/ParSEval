@@ -37,6 +37,7 @@ from parseval.identity import (
 from parseval.plan import Plan, Step
 from parseval.plan.planner import Filter, Join, Aggregate, Project, Scan, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
+from parseval.dtype import DataType
 from parseval.helper import normalize_name
 from parseval.instance import Instance
 from parseval.solver import SolverConstraint
@@ -79,6 +80,7 @@ def _step_type_for_node(node: BranchNode) -> StepType:
         "join": StepType.JOIN,
         "join_on": StepType.JOIN,
         "project": StepType.PROJECT,
+        "scalar_subquery": StepType.FILTER,
         "subplan": StepType.FILTER,
     }
     return mapping.get(raw, StepType.ROOT)
@@ -228,6 +230,9 @@ class PlausibleConstraintCompiler:
         return self.compile(PlausibleBranch.from_coverage_target(target))
 
     def compile_path(self, path: BranchPath) -> SolverConstraint:
+        if path.target.node.site == "scalar_subquery":
+            return self._compile_scalar_subquery_path(path)
+
         constraints: List[exp.Expression] = []
         join_equalities: List[Tuple[ColumnId, ColumnId]] = []
         tables = path.relations or path.target.node.tables
@@ -245,19 +250,27 @@ class PlausibleConstraintCompiler:
         )
         join_equalities.extend(extra_join_equalities)
         self._annotate_solver_vars(constraints, tables)
+        lowered_joins = self._lower_join_equalities(join_equalities, tables)
+
+        # Populate variables dict with type info for join equality columns
+        # so the solver doesn't default them to TEXT.
+        variables: Dict[SolverVar, DataType] = {}
+        for left_sv, right_sv in lowered_joins:
+            for sv in (left_sv, right_sv):
+                if sv not in variables:
+                    dtype = self._datatype_for_column_id(sv.column_id)
+                    if dtype is not None:
+                        variables[sv] = dtype
+
         return SolverConstraint(
             target_relations=tables,
             constraints=constraints,
-            join_equalities=self._lower_join_equalities(join_equalities, tables),
+            join_equalities=lowered_joins,
+            variables=variables,
         )
 
     def compile(self, branch: PlausibleBranch) -> SolverConstraint:
-        atom = branch.atom
-        bit = branch.bit
         node = branch.node
-        tables = node.tables
-
-        step = node.step
 
         # --- Handle SubPlan branches ---
         if node.site == "exists":
@@ -280,167 +293,6 @@ class PlausibleConstraintCompiler:
         )
         return self.compile_path(_path_from_node_chain(target))
 
-        # --- Transform atom for target outcome ---
-        null_columns: List[exp.Column] = []
-        if bit in _POSITIVE_BITS:
-            atom_constraint = atom.copy()
-        elif bit in _NEGATIVE_BITS:
-            atom_constraint = negate_predicate(atom.copy())
-        elif bit in _NULL_BITS:
-            atom_constraint = atom.copy()
-            columns = list(atom.find_all(exp.Column))
-            for col in columns:
-                meta = column_meta(col)
-                if meta is not None and meta["nullable"]:
-                    null_columns.append(col)
-                    break
-                elif meta is None:
-                    rel = self._resolve_relation(col, tables)
-                    if rel and self.instance.nullable(rel, col.name):
-                        null_columns.append(col)
-                        break
-            else:
-                if columns:
-                    null_columns.append(columns[0])
-        else:
-            atom_constraint = atom.copy()
-
-        # --- Path predicates + JOIN equalities from cached hierarchy ---
-        path_predicates = list(node.path_predicates)
-        join_equalities = list(node.join_equalities)
-
-        # --- Database constraints from columns in the atom + path predicates ---
-        not_null_columns: List[ColumnId] = []
-        avoid_values: Dict[ColumnId, Set[Any]] = {}
-        foreign_keys: List[Tuple[ColumnId, RelationId, ColumnId]] = []
-
-        seen_cols: Set[ColumnId] = set()
-        all_exprs = [atom_constraint] + path_predicates
-        for expr in all_exprs:
-            for col in expr.find_all(exp.Column):
-                meta = column_meta(col)
-                if meta is None:
-                    continue
-                col_id = column_identity(col)
-                if col_id is None:
-                    rel = self._resolve_relation(col, tables)
-                    if rel is None:
-                        continue
-                    col_id = physical_column(col.name, rel, dialect=self.dialect)
-                if col_id in seen_cols:
-                    continue
-                seen_cols.add(col_id)
-
-                if not meta["nullable"]:
-                    not_null_columns.append(col_id)
-                if meta["unique"]:
-                    rel = col_id.relation
-                    if rel is None:
-                        continue
-                    existing = {
-                        sym.concrete
-                        for sym in self.instance.get_column_data(rel, col_id)
-                        if sym.concrete is not None
-                    }
-                    if existing:
-                        avoid_values[col_id] = existing
-
-        # Table-level constraints: NOT NULL, UNIQUE, FK, CHECK for all target tables.
-        for rel in tables:
-            table_name = _relation_table_name(rel)
-            if table_name not in self.instance.tables:
-                continue
-
-            schema = self.instance.tables[table_name]
-            for col_name in schema:
-                col_id = physical_column(col_name, rel, dialect=self.dialect)
-                if col_id in seen_cols:
-                    continue
-                seen_cols.add(col_id)
-
-                if not self.instance.nullable(rel, col_id):
-                    not_null_columns.append(col_id)
-
-                if self.instance.is_unique(rel, col_id):
-                    existing = {
-                        sym.concrete
-                        for sym in self.instance.get_column_data(rel, col_id)
-                        if sym.concrete is not None
-                    }
-                    if existing:
-                        avoid_values[col_id] = existing
-
-            for fk in self.instance.get_foreign_key(rel):
-                local_col = physical_column(fk.expressions[0].name, rel, dialect=self.dialect)
-                ref = fk.args.get("reference")
-                if ref is None:
-                    continue
-                ref_table_node = ref.find(exp.Table)
-                if ref_table_node is None:
-                    continue
-                ref_rel = self._resolve_table_relation(ref_table_node, tables)
-                ref_col = self.instance.resolve_fk_ref_column(fk)
-                if ref_rel is None or ref_col is None:
-                    continue
-                foreign_keys.append((
-                    local_col,
-                    ref_rel,
-                    physical_column(ref_col, ref_rel, dialect=self.dialect),
-                ))
-
-            for check_expr in self.instance.get_check_constraints(rel):
-                path_predicates.append(check_expr)
-
-        # Build unified constraints list: atom + path + DB constraints
-        constraints: List[exp.Expression] = [atom_constraint] + path_predicates
-        for col in null_columns:
-            constraints.append(exp.Is(this=col.copy(), expression=exp.Null()))
-        for col_id in not_null_columns:
-            constraints.append(exp.Is(
-                this=self._constraint_column(col_id),
-                expression=exp.Not(this=exp.Null()),
-            ))
-        for col_id, vals in avoid_values.items():
-            constraints.append(exp.Not(this=exp.In(
-                this=self._constraint_column(col_id),
-                expressions=[
-                    exp.Literal.number(v) if isinstance(v, (int, float))
-                    else exp.Literal.string(str(v))
-                    for v in vals
-                ],
-            )))
-
-        for local_col, ref_rel, ref_col in foreign_keys:
-            parent_vals = []
-            ref_table_name = _relation_table_name(ref_rel)
-            if ref_table_name in self.instance.tables:
-                for row in self.instance.get_rows(ref_rel):
-                    try:
-                        val = row[ref_col].concrete
-                    except KeyError:
-                        continue
-                    else:
-                        if val is not None:
-                            parent_vals.append(val)
-            if parent_vals:
-                literals = [
-                    exp.Literal.number(v) if isinstance(v, (int, float))
-                    else exp.Literal.string(str(v))
-                    for v in parent_vals
-                ]
-                constraints.append(exp.In(
-                    this=self._constraint_column(local_col),
-                    expressions=literals,
-                ))
-
-        self._annotate_solver_vars(constraints, tables)
-
-        return SolverConstraint(
-            target_relations=tables,
-            constraints=constraints,
-            join_equalities=self._lower_join_equalities(join_equalities, tables),
-        )
-
     def _constraints_for_path_predicate(self, predicate: PathPredicate) -> List[exp.Expression]:
         expression = predicate.expression.copy()
         if predicate.outcome in _POSITIVE_BITS:
@@ -462,6 +314,84 @@ class PlausibleConstraintCompiler:
         if predicate.outcome == PlausibleBit.JOIN_NO_MATCH:
             return [negate_predicate(expression)] if not _is_trivial_true(expression) else []
         return [expression]
+
+    def _compile_scalar_subquery_path(self, path: BranchPath) -> SolverConstraint:
+        atom = path.target.atom
+        if not isinstance(atom, exp.EQ):
+            return SolverConstraint(target_relations=path.relations, constraints=[])
+
+        left = atom.left
+        right = atom.right
+        outer_col = left if isinstance(left, exp.Column) else right if isinstance(right, exp.Column) else None
+        subquery = right if isinstance(right, exp.Subquery) else left if isinstance(left, exp.Subquery) else None
+        if outer_col is None or subquery is None:
+            return SolverConstraint(target_relations=path.relations, constraints=[])
+
+        outer_col_id = column_identity(outer_col)
+        if outer_col_id is None or outer_col_id.relation is None:
+            outer_rel = self._resolve_relation(outer_col, path.relations)
+            if outer_rel is None:
+                return SolverConstraint(target_relations=path.relations, constraints=[])
+            outer_col_id = physical_column(outer_col.name, outer_rel, dialect=self.dialect)
+
+        inner_projection = self._scalar_subquery_projection(subquery)
+        if inner_projection is None:
+            return SolverConstraint(target_relations=path.relations, constraints=[])
+        inner_col_id = column_identity(inner_projection)
+        if inner_col_id is None or inner_col_id.relation is None:
+            inner_tables = tuple(
+                table_relation(table.name, dialect=self.dialect)
+                for table in subquery.find_all(exp.Table)
+                if table.name in self.instance.tables
+            )
+            inner_rel = self._resolve_relation(inner_projection, inner_tables)
+            if inner_rel is None:
+                return SolverConstraint(target_relations=path.relations, constraints=[])
+            inner_col_id = physical_column(inner_projection.name, inner_rel, dialect=self.dialect)
+
+        constraints: List[exp.Expression] = [
+            exp.EQ(
+                this=self._constraint_column(outer_col_id),
+                expression=self._constraint_column(inner_col_id),
+            )
+        ]
+        join_equalities: List[Tuple[ColumnId, ColumnId]] = []
+        for predicate in path.predicates:
+            if predicate.node.site == "scalar_subquery":
+                continue
+            constraints.extend(self._constraints_for_path_predicate(predicate))
+        for fact in path.join_facts:
+            join_equalities.extend(fact.equalities)
+            if fact.predicate is not None and not _is_trivial_true(fact.predicate):
+                constraints.append(fact.predicate.copy())
+
+        relations = tuple(
+            dict.fromkeys(
+                rel
+                for rel in tuple(path.relations) + (outer_col_id.relation, inner_col_id.relation)
+                if rel is not None
+            )
+        )
+        constraints, extra_joins = self._apply_database_constraints(constraints, relations)
+        join_equalities.extend(extra_joins)
+        self._annotate_solver_vars(constraints, relations)
+        return SolverConstraint(
+            target_relations=relations,
+            constraints=constraints,
+            join_equalities=self._lower_join_equalities(join_equalities, relations),
+        )
+
+    def _scalar_subquery_projection(self, subquery: exp.Subquery) -> exp.Column | None:
+        inner = subquery.this
+        if isinstance(inner, exp.Select):
+            for projection in inner.expressions:
+                expr = projection.this if isinstance(projection, exp.Alias) else projection
+                if isinstance(expr, exp.Column):
+                    return expr
+                found = next(expr.find_all(exp.Column), None)
+                if found is not None:
+                    return found
+        return next(subquery.find_all(exp.Column), None)
 
     def _apply_database_constraints(
         self,
@@ -857,14 +787,27 @@ class PlausibleConstraintCompiler:
         constraints: List[exp.Expression],
         tables: Tuple[RelationId, ...],
     ) -> None:
-        """Set SolverVar metadata on Column nodes so the solver can assign values."""
+        """Set SolverVar metadata on Column nodes so the solver can assign values.
+
+        Also bridges the ``column_meta["domain"]`` → ``col.type`` gap: the
+        planner stores semantic types in ``column_meta`` but the solver reads
+        from ``col.type``.  Without this, path-predicate columns copied from
+        step expressions have ``col.type = None`` and the solver defaults to
+        TEXT, generating string values for INT columns.
+        """
         for expr in constraints:
             for col in expr.find_all(exp.Column):
                 if solver_var(col) is not None:
+                    # Even if SolverVar exists, ensure col.type is set.
+                    if col.type is None:
+                        self._set_type_from_metadata_or_catalog(col, tables)
                     continue
                 col_id = self._column_id_for_expr(col, tables)
                 if col_id is None:
                     continue
+                # Set col.type from column_meta or catalog lookup.
+                if col.type is None:
+                    self._set_type_from_col_id(col, col_id)
                 rel_id = col_id.relation
                 if rel_id is None and tables:
                     rel_id = tables[0]
@@ -872,6 +815,26 @@ class PlausibleConstraintCompiler:
                     continue
                 sv = SolverVar(column_id=col_id, relation_id=rel_id)
                 set_solver_var(col, sv)
+
+    def _set_type_from_metadata_or_catalog(
+        self,
+        col: exp.Column,
+        tables: Tuple[RelationId, ...],
+    ) -> None:
+        """Set ``col.type`` from ``column_meta["domain"]`` or catalog lookup."""
+        meta = column_meta(col)
+        if meta is not None and "domain" in meta:
+            col.type = meta["domain"]
+            return
+        col_id = self._column_id_for_expr(col, tables)
+        if col_id is not None:
+            self._set_type_from_col_id(col, col_id)
+
+    def _set_type_from_col_id(self, col: exp.Column, col_id: ColumnId) -> None:
+        """Set ``col.type`` from the catalog using a resolved ColumnId."""
+        dtype = self._datatype_for_column_id(col_id)
+        if dtype is not None:
+            col.type = dtype
 
     def _column_id_for_expr(
         self,

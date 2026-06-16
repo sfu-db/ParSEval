@@ -10,7 +10,12 @@ Public API::
 """
 
 from parseval.solver.unified import SolverConstraint
-from .constraints import ConstraintGenerator
+from .constraints import (
+    ConstraintGenerator,
+    PlausibleBranch,
+    PlausibleConstraintCompiler,
+    PlausiblePath,
+)
 from .engine import SymbolicEngine
 from .evaluator import PlanEvaluator, decompose_atoms
 from .infeasibility import is_infeasible
@@ -34,6 +39,9 @@ __all__ = [
     "CoverageThresholds",
     "GenerationResult",
     "PlanEvaluator",
+    "PlausibleBranch",
+    "PlausibleConstraintCompiler",
+    "PlausiblePath",
     "SolverConstraint",
     "SymbolicEngine",
     "decompose_atoms",

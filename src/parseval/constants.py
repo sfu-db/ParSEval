@@ -8,22 +8,46 @@ class PlausibleBit(IntEnum):
 
     FALSE = 0  # e.g., if condition is false
     TRUE = 1  # e.g., if condition is true
+    ATOM_FALSE = 0
+    ATOM_TRUE = 1
+    FILTER_FALSE = 0
+    FILTER_TRUE = 1
     JOIN_TRUE = 2  # e.g., threr exist tuple in both tables can join
+    JOIN_MATCH = 2
     JOIN_LEFT = 3  # e.g., there exist tuple in left table cannot join with right table,
+    JOIN_NO_MATCH = 3
     JOIN_RIGHT = 4  # e.g., there exist tuple in right table cannot join with left table
     NULL = 5  # e.g., column is null
+    ATOM_NULL = 5
+    FILTER_NULL = 5
     DUPLICATE = 6  # e.g., duplicate values exist
     MAX = 7  # e.g., number of max value
     MIN = 8  # e.g., number of  min value
     GROUP_COUNT = 9  # e.g., number of groups
     GROUP_SIZE = 10  # e.g., size of groups(count of rows in each group)
+    GROUP_SINGLE = 9
+    GROUP_MULTI = 10
     GROUP_NULL = 11
     GROUP_DUPLICATE = 12
     AGGREGATE_SIZE = 13
     HAVING_TRUE = 14  # e.g., having condition is true
+    HAVING_PASS = 14
     HAVING_FALSE = 15  # e.g., having condition is false
+    HAVING_FAIL = 15
     
     PROJECT = 16  # e.g., projection of a column
+    JOIN_NULL = 17
+    HAVING_NULL = 18
+    CASE_TAKEN = 19
+    CASE_ARM_TAKEN = 19
+    CASE_SKIPPED = 20
+    CASE_ARM_SKIPPED = 20
+    EXISTS_TRUE = 21
+    EXISTS_FALSE = 22
+    IN_MATCH = 23
+    IN_NO_MATCH = 24
+    DISTINCT_UNIQUE = 25
+    DISTINCT_DUPLICATE = 26
     
 
     @classmethod

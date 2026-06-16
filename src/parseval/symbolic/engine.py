@@ -24,10 +24,9 @@ from parseval.plan.planner import Aggregate, Join, Project
 from parseval.query import preprocess_sql
 from parseval.solver import Solver, SolverConstraint
 
-from .constraints import ConstraintGenerator
+from .constraints import PlausibleBranch, PlausibleConstraintCompiler
 from .evaluator import PlanEvaluator
 from .infeasibility import is_infeasible
-from .speculate import SpeculateConfig
 from .types import (
     BranchTree,
     BranchType,
@@ -66,7 +65,6 @@ class SymbolicEngine:
         self.plan = Plan(self.expr, self.instance)
         self.solver = solver or Solver(dialect=dialect)
         self.max_iterations = max_iterations
-        self.alias_map = self.plan.alias_map
         if max_rows_per_table is not None:
             self.max_rows_per_table = max_rows_per_table
         else:
@@ -75,39 +73,19 @@ class SymbolicEngine:
     def generate(
         self,
         thresholds: Optional[CoverageThresholds] = None,
-        config: Optional[SpeculateConfig] = None,
     ) -> GenerationResult:
-        """Run the generation loop until coverage is met or budget exhausted.
-
-        Args:
-            thresholds: CoverageThresholds for what constitutes "covered".
-                        If None, uses CoverageThresholds() (default thresholds).
-            config: SpeculateConfig for initial bulk generation.
-                    If None, derives from thresholds using SpeculateConfig.from_thresholds().
-
-        Flow:
-            Phase 0: Speculate bulk generation (positive + negative + null)
-            Phase 1: Evaluate coverage on current instance
-            Phase 2: Targeted gap-filling for uncovered branches
-        """
+        """Run the generation loop until coverage is met or budget exhausted."""
         thresholds = thresholds or CoverageThresholds()
-        config = config or SpeculateConfig.from_thresholds(thresholds)
         evaluator = PlanEvaluator(self.plan, self.instance, self.dialect)
-        constraint_gen = ConstraintGenerator(
-            self.plan, self.instance, self.dialect, self.alias_map
+        constraint_gen = PlausibleConstraintCompiler(
+            self.plan, self.instance, self.dialect
         )
 
         rows_before = self._total_rows()
 
-        # Phase 0: Speculate bulk generation.
-        from .speculate import speculate
-        speculate(
-            self.plan, self.instance, self.alias_map, self.dialect,
-            config=config,
-        )
-
-        # Phase 1: Initial evaluation.
-        tree = BranchTree(thresholds=thresholds)
+        # Phase 1: Build tree structure and run initial evaluation.
+        from .evaluator import build_branch_tree
+        tree = build_branch_tree(self.plan, self.instance, thresholds)
         tree = evaluator.evaluate(tree)
 
         # Phase 2: Targeted gap-filling.
@@ -116,7 +94,7 @@ class SymbolicEngine:
             if tree.fully_covered:
                 break
 
-            targets = tree.uncovered_targets
+            targets = tree.root_witness_targets or tree.uncovered_targets
             if not targets:
                 break
 
@@ -136,7 +114,7 @@ class SymbolicEngine:
                 continue
 
             # Generate complete constraints (including DB constraints).
-            constraint = constraint_gen.generate(target)
+            constraint = constraint_gen.compile(PlausibleBranch.from_coverage_target(target))
 
             # Solve and materialize.
             cp = self.instance.checkpoint()
@@ -186,31 +164,23 @@ class SymbolicEngine:
         return min(targets, key=key)
 
     def _solve_and_materialize(self, constraint: SolverConstraint) -> bool:
-        """Invoke the unified solver and materialize results into the instance.
+        """Invoke the unified solver and materialize results into the instance."""
+        from parseval.solver import SolverVar
 
-        The constraint should be complete (including DB constraints like
-        NOT NULL, UNIQUE, FK). The solver finds values satisfying everything
-        simultaneously — no post-hoc repair needed.
-
-        The solver returns assignments in flat format: {"table.col": value}.
-        This method transforms them to nested format: {"table": {"col": value}}
-        before calling create_row.
-        """
         result = self.solver.solve(constraint)
         if not result.sat:
             return False
 
-        # Transform flat assignments to nested format.
+        # Group assignments by table.
         rows_by_table: Dict[str, Dict[str, Any]] = {}
-        for variable_name, value in result.assignments.items():
-            if "." not in variable_name:
+        for var, value in result.assignments.items():
+            if not isinstance(var, SolverVar):
                 continue
-            table_key, col_name = variable_name.rsplit(".", 1)
-            # Resolve alias to physical table.
-            real_table = self.alias_map.get(table_key, table_key)
-            if real_table not in self.instance.tables:
+            table_name = var.relation_id.name.normalized if var.relation_id.name else None
+            col_name = var.column_id.name.normalized
+            if table_name is None or table_name not in self.instance.tables:
                 continue
-            rows_by_table.setdefault(real_table, {})[col_name] = value
+            rows_by_table.setdefault(table_name, {})[col_name] = value
 
         for table_name, row_values in rows_by_table.items():
             try:

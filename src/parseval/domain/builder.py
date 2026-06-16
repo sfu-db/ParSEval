@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from parseval.dtype import DataType
+from parseval.coercion import coerce_value, values_equivalent
+from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.identity import ColumnId, RelationId
-from .coercion import coerce_value, values_equivalent
 from .compiler import ConstraintCompiler
 from .exceptions import (
     ConstraintViolationError,
@@ -393,6 +393,10 @@ class DatabaseBuilder:
         if unique_pool_value is not _MISSING:
             return unique_pool_value
 
+        value_space_value = self._generate_from_value_space(column, plan)
+        if value_space_value is not _MISSING:
+            return value_space_value
+
         provider = self.registry.resolve(column)
         type_profile = self.registry.type_service.profile(column)
         max_retries = 10 if plan.residual_predicates else 1
@@ -409,6 +413,34 @@ class DatabaseBuilder:
             if self.validator.is_valid(plan, value):
                 return value
         return value
+
+    def _generate_from_value_space(self, column, plan: ColumnDomainPlan) -> Any:
+        if column.foreign_key or self._enforces_single_column_uniqueness(column):
+            return _MISSING
+        if column.semantic_tags:
+            return _MISSING
+        if plan.residual_predicates or plan.modulo_divisor is not None:
+            return _MISSING
+        if not self._has_value_space_constraints(plan):
+            return _MISSING
+        space = plan.to_value_space()
+        value = space.pick()
+        if value is None and not space.must_null:
+            return _MISSING
+        if self.validator.is_valid(plan, value):
+            return value
+        return _MISSING
+
+    def _has_value_space_constraints(self, plan: ColumnDomainPlan) -> bool:
+        family = type_family(plan.datatype)
+        return (
+            plan.allowed_values is not None
+            or plan.excluded_values
+            or plan.minimum is not None
+            or plan.maximum is not None
+            or (family == TypeFamily.TEXT and plan.maximum_length is not None)
+            or (family == TypeFamily.TEXT and plan.prefix is not None)
+        )
 
     def _generate_unique_allowed_value(self, column, plan: ColumnDomainPlan) -> Any:
         """Pick the first unused allowed value for unique columns with finite domains.
