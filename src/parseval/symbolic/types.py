@@ -261,6 +261,8 @@ class CoverageTarget:
 
     @property
     def atom(self) -> exp.Expression:
+        if self.atom_id < 0:
+            return self.node.predicate
         return self.node.atoms[self.atom_id]
 
 
@@ -337,6 +339,58 @@ class BranchTree:
             entry.add(node_key)
         self._cache_dirty = True
 
+    def _target_specs_for_node(self, node: BranchNode) -> List[Tuple[int, BranchType, int]]:
+        """Coverage targets for a node, including operator-level outcomes."""
+
+        specs: List[Tuple[int, BranchType, int]] = []
+
+        def add(atom_id: int, outcome: BranchType, threshold: int) -> None:
+            if threshold > 0:
+                specs.append((atom_id, outcome, threshold))
+
+        if node.site == "group":
+            add(0, BranchType.GROUP_SINGLE, self.thresholds.group_single)
+            add(0, BranchType.GROUP_MULTI, self.thresholds.group_multi)
+            return specs
+
+        if node.site == "distinct":
+            add(0, BranchType.DISTINCT_UNIQUE, self.thresholds.distinct_unique)
+            add(0, BranchType.DISTINCT_DUPLICATE, self.thresholds.distinct_duplicate)
+            return specs
+
+        if node.site == "exists":
+            add(0, BranchType.EXISTS_TRUE, self.thresholds.exists_true)
+            add(0, BranchType.EXISTS_FALSE, self.thresholds.exists_false)
+            return specs
+
+        if node.site == "in":
+            add(0, BranchType.IN_MATCH, self.thresholds.in_match)
+            add(0, BranchType.IN_NO_MATCH, self.thresholds.in_no_match)
+            return specs
+
+        for atom_id in range(len(node.atoms)):
+            add(atom_id, BranchType.ATOM_TRUE, self.thresholds.atom_true)
+            add(atom_id, BranchType.ATOM_FALSE, self.thresholds.atom_false)
+            add(atom_id, BranchType.ATOM_NULL, self.thresholds.atom_null)
+
+        if node.site == "filter":
+            add(-1, BranchType.FILTER_TRUE, self.thresholds.filter_true)
+            add(-1, BranchType.FILTER_FALSE, self.thresholds.filter_false)
+            add(-1, BranchType.FILTER_NULL, self.thresholds.filter_null)
+        elif node.site == "join_on":
+            add(-1, BranchType.JOIN_MATCH, self.thresholds.join_match)
+            add(-1, BranchType.JOIN_NO_MATCH, self.thresholds.join_no_match)
+            add(-1, BranchType.JOIN_NULL, self.thresholds.join_null)
+        elif node.site == "having":
+            add(-1, BranchType.HAVING_PASS, self.thresholds.having_pass)
+            add(-1, BranchType.HAVING_FAIL, self.thresholds.having_fail)
+            add(-1, BranchType.HAVING_NULL, self.thresholds.having_null)
+        elif node.site == "case_arm":
+            add(-1, BranchType.CASE_ARM_TAKEN, self.thresholds.case_arm_taken)
+            add(-1, BranchType.CASE_ARM_SKIPPED, self.thresholds.case_arm_skipped)
+
+        return specs
+
     @property
     def uncovered_targets(self) -> List[CoverageTarget]:
         """All atom-outcome pairs that haven't met their threshold."""
@@ -345,16 +399,12 @@ class BranchTree:
 
         targets: List[CoverageTarget] = []
         for node in self.nodes:
-            for atom_id in range(len(node.atoms)):
-                for outcome in (BranchType.ATOM_TRUE, BranchType.ATOM_FALSE, BranchType.ATOM_NULL):
-                    threshold = self.thresholds.threshold_for(outcome)
-                    if threshold <= 0:
-                        continue
-                    if node.is_infeasible(atom_id, outcome):
-                        continue
-                    if node.observation_count(atom_id, outcome) >= threshold:
-                        continue
-                    targets.append(CoverageTarget(node=node, atom_id=atom_id, target_outcome=outcome))
+            for atom_id, outcome, threshold in self._target_specs_for_node(node):
+                if node.is_infeasible(atom_id, outcome):
+                    continue
+                if node.observation_count(atom_id, outcome) >= threshold:
+                    continue
+                targets.append(CoverageTarget(node=node, atom_id=atom_id, target_outcome=outcome))
 
         self._uncovered_cache = targets
         self._cache_dirty = False
@@ -364,14 +414,10 @@ class BranchTree:
     def total_targets(self) -> int:
         count = 0
         for node in self.nodes:
-            for atom_id in range(len(node.atoms)):
-                for outcome in (BranchType.ATOM_TRUE, BranchType.ATOM_FALSE, BranchType.ATOM_NULL):
-                    threshold = self.thresholds.threshold_for(outcome)
-                    if threshold <= 0:
-                        continue
-                    if node.is_infeasible(atom_id, outcome):
-                        continue
-                    count += 1
+            for atom_id, outcome, _ in self._target_specs_for_node(node):
+                if node.is_infeasible(atom_id, outcome):
+                    continue
+                count += 1
         return count
 
     @property
@@ -451,6 +497,35 @@ class BranchTree:
             join_facts=tuple(join_facts),
             relations=tuple(relations),
         )
+
+    @property
+    def root_witness_targets(self) -> List[CoverageTarget]:
+        """Targets that exercise the full row path from root to a branch node.
+
+        These are preferred over ordinary atom-coverage targets so the engine
+        first generates rows that survive the entire plan path, then fills in
+        remaining edge-case atoms.  Only returns targets that are not yet
+        covered (observation count below threshold).
+        """
+        targets: List[CoverageTarget] = []
+        for node in self.nodes:
+            if node.site in {"filter", "join_on", "scalar_subquery", "having"}:
+                for atom_id in range(len(node.atoms)):
+                    threshold = self.thresholds.threshold_for(BranchType.ATOM_TRUE)
+                    if threshold <= 0:
+                        continue
+                    if node.is_infeasible(atom_id, BranchType.ATOM_TRUE):
+                        continue
+                    if node.observation_count(atom_id, BranchType.ATOM_TRUE) >= threshold:
+                        continue
+                    targets.append(
+                        CoverageTarget(
+                            node=node,
+                            atom_id=atom_id,
+                            target_outcome=BranchType.ATOM_TRUE,
+                        )
+                    )
+        return targets
 
 
 # =============================================================================

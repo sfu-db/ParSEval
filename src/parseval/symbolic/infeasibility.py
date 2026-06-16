@@ -42,13 +42,23 @@ def is_infeasible(
     if target_outcome == BranchType.ATOM_NULL:
         columns = list(atom.find_all(exp.Column))
         if columns:
+            def _table_for_col(col):
+                if col.table:
+                    return col.table
+                if node.tables:
+                    rel = node.tables[0]
+                    if isinstance(rel, str):
+                        return rel
+                    return rel.name.normalized if rel.name is not None else rel.display
+                return ""
+
             all_not_null = all(
                 not instance.nullable(
-                    col.table or (node.tables[0] if node.tables else ""),
+                    _table_for_col(col),
                     col.name,
                 )
                 for col in columns
-                if (col.table or (node.tables[0] if node.tables else "")) in instance.tables
+                if _table_for_col(col) in instance.tables
             )
             if all_not_null and columns:
                 return "All columns in atom are NOT NULL; atom cannot evaluate to NULL"

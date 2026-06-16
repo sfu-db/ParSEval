@@ -48,7 +48,6 @@ from __future__ import annotations
 import enum
 import heapq
 import math
-import re
 import typing as t
 from dataclasses import dataclass, field
 
@@ -58,7 +57,12 @@ from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from parseval.helper import normalize_name
-from parseval.dtype import DataType, parse_datetime
+from parseval.dtype import (
+    DataType,
+    infer_semantic_datatype_from_literal,
+    merge_semantic_datatypes,
+    semantic_cast_datatype,
+)
 from parseval.identity import (
     PARSEVAL_COLUMN_ID,
     PARSEVAL_SEMANTIC_DATATYPE,
@@ -1359,12 +1363,18 @@ def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
                 # Synthetic alias without source: resolve from group expression.
                 group_expr = inner_agg.group.get(col.name.normalized)
                 if group_expr is not None and isinstance(group_expr, exp.Column):
-                    group_cid = _resolve_group_source(group_expr, inner_agg, instance)
-                    if group_cid is not None:
+                    group_identity = _group_expression_identity(
+                        group_expr,
+                        inner_agg,
+                        instance,
+                    )
+                    if group_identity.single_lineage_source is not None:
                         resolved_columns.append(column_id(
-                            col.kind, group_cid.name, col.relation,
+                            col.kind,
+                            group_identity.single_lineage_source.name,
+                            col.relation,
                             scope_id=col.scope_id, ordinal=col.ordinal,
-                            source_column_id=group_cid,
+                            source_column_id=group_identity.single_lineage_source,
                         ))
                     else:
                         resolved_columns.append(col)
@@ -1452,7 +1462,7 @@ def _prepare_scan_identity(scan: "Scan", instance: t.Any) -> None:
         )
         scan.relation_id = rel_id
         table_key = instance._identity_key(source, is_table=True)
-        table_columns = (getattr(instance, "_ddl_columns", {}) or instance.tables).get(table_key, {})
+        table_columns = (instance._ddl_columns or instance.tables).get(table_key, {})
         scan.output_column_ids = tuple(
             _query_column_for_physical(
                 instance,
@@ -1479,7 +1489,7 @@ def _query_column_for_physical(
     ordinal: int,
     scope_id: str,
 ) -> ColumnId:
-    column_source = getattr(instance, "_column_sources", {}).get(
+    column_source = instance._column_sources.get(
         (instance._identity_key(table, is_table=True), column_key),
         column_key,
     )
@@ -1529,25 +1539,38 @@ def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[C
     return tuple(result)
 
 
-def _resolve_group_source(
-    expression: exp.Expression,
+@dataclass(frozen=True)
+class _GroupExpressionIdentity:
+    resolved_sources: t.Tuple[ColumnId, ...]
+    kind: ColumnKind
+    single_lineage_source: ColumnId | None
+
+
+def _iter_group_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
+    if isinstance(expression, exp.Column):
+        yield expression
+        return
+    if isinstance(expression, (exp.Subquery, exp.Exists)):
+        return
+    if isinstance(expression, exp.In) and isinstance(
+        expression.args.get("query"),
+        exp.Expression,
+    ):
+        return
+    for child in expression.args.values():
+        if isinstance(child, exp.Expression):
+            yield from _iter_group_scope_columns(child)
+        elif isinstance(child, list):
+            for item in child:
+                if isinstance(item, exp.Expression):
+                    yield from _iter_group_scope_columns(item)
+
+
+def _resolve_group_column_source(
+    col: exp.Column,
     step: "Step",
     instance: t.Any,
 ) -> "ColumnId | None":
-    """Resolve the source ColumnId for a GROUP BY expression.
-
-    Walks the dependency chain to find the step that owns the column,
-    since the Aggregate step can't resolve qualified columns directly.
-
-    For simple column references (GROUP BY col): returns the ColumnId.
-    For complex expressions (GROUP BY a + b): returns the ColumnId of the
-    first column found in the expression.
-    """
-    # Find the first column in the expression.
-    col = expression.find(exp.Column)
-    if col is None:
-        return None
-
     # Walk dependency chain to find a step that can resolve this column.
     visited: t.Set[int] = set()
 
@@ -1574,20 +1597,44 @@ def _resolve_group_source(
     return _try_resolve(step)
 
 
+def _group_expression_identity(
+    expression: exp.Expression,
+    step: "Step",
+    instance: t.Any,
+) -> _GroupExpressionIdentity:
+    """Resolve identity inputs for one GROUP BY expression."""
+    resolved_sources: t.List[ColumnId] = []
+    seen: t.Set[ColumnId] = set()
+    for col in _iter_group_scope_columns(expression):
+        source = _resolve_group_column_source(col, step, instance)
+        if source is None or source in seen:
+            continue
+        seen.add(source)
+        resolved_sources.append(source)
+
+    sources = tuple(resolved_sources)
+    return _GroupExpressionIdentity(
+        resolved_sources=sources,
+        kind=(
+            ColumnKind.PROJECTED
+            if isinstance(expression, exp.Column)
+            else ColumnKind.DERIVED
+        ),
+        single_lineage_source=sources[0] if len(sources) == 1 else None,
+    )
+
+
 def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tuple[ColumnId, ...]:
     result: t.List[ColumnId] = []
     dialect = getattr(instance, "dialect", None)
     aggregate_relation = _aggregate_output_relation(step, instance)
 
     for ordinal, (name, expression) in enumerate(step.group.items()):
-        # Resolve source column by walking the dependency chain.
-        # The Aggregate step can't resolve qualified columns (e.g., t1.col)
-        # because its visible columns come from the Scan which has no alias.
-        # Walk deps to find the step that owns the column.
-        source = _resolve_group_source(expression, step, instance)
+        identity = _group_expression_identity(expression, step, instance)
+        source = identity.single_lineage_source
         result.append(
             column_id(
-                ColumnKind.PROJECTED,
+                identity.kind,
                 identifier_name(name, dialect=dialect),
                 source.relation if source is not None else aggregate_relation,
                 scope_id=_scope_id_for(step),
@@ -1773,7 +1820,7 @@ def _enrich_identity_column(
 def _generation_metadata(step: "Step", instance: t.Any) -> t.Dict[str, t.Any]:
     metadata: t.Dict[str, t.Any] = {}
     if isinstance(step, Aggregate):
-        aggregation = _aggregation_metadata(step)
+        aggregation = _aggregation_metadata(step, instance)
         if aggregation["group_keys"] or aggregation["aggregate_outputs"]:
             metadata["aggregation"] = aggregation
     if isinstance(step, Having):
@@ -1785,12 +1832,26 @@ def _generation_metadata(step: "Step", instance: t.Any) -> t.Dict[str, t.Any]:
     return metadata
 
 
-def _aggregation_metadata(step: "Aggregate") -> t.Dict[str, t.Any]:
+def _aggregation_metadata(step: "Aggregate", instance: t.Any) -> t.Dict[str, t.Any]:
     group_keys = tuple(
         column
         for column in getattr(step, "output_column_ids", ())
         if column.name.normalized in set(step.group.keys())
     )
+    group_expressions = {
+        column: step.group[column.name.normalized]
+        for column in group_keys
+        if column.name.normalized in step.group
+    }
+    group_sources = {
+        column: _group_expression_identity(
+            step.group[column.name.normalized],
+            step,
+            instance,
+        ).resolved_sources
+        for column in group_keys
+        if column.name.normalized in step.group
+    }
     outputs: t.Dict[ColumnId, t.Dict[str, t.Any]] = {}
     for aggregation in step.aggregations:
         alias_name = aggregation.alias_or_name
@@ -1811,6 +1872,8 @@ def _aggregation_metadata(step: "Aggregate") -> t.Dict[str, t.Any]:
         }
     return {
         "group_keys": group_keys,
+        "group_expressions": group_expressions,
+        "group_sources": group_sources,
         "aggregate_outputs": outputs,
     }
 
@@ -2056,9 +2119,6 @@ def _is_planner_synthetic_operand(column: exp.Column) -> bool:
     return column.name.startswith("_a_")
 
 
-_NUMERIC_LITERAL_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
-
-
 def _infer_semantic_datatypes(
     expressions: t.Iterable[exp.Expression],
 ) -> t.Dict[ColumnId, DataType]:
@@ -2165,7 +2225,7 @@ def _collect_between_semantics(
         return
     low_type = _literal_semantic_datatype(node.args.get("low"))
     high_type = _literal_semantic_datatype(node.args.get("high"))
-    datatype = _merge_semantic_datatypes(
+    datatype = merge_semantic_datatypes(
         tuple(dtype for dtype in (low_type, high_type) if dtype is not None)
     )
     if datatype is not None:
@@ -2242,7 +2302,7 @@ def _literal_cast_datatype_for_expression(
     if isinstance(expression, exp.Cast):
         target = expression.args.get("to")
         return (
-            _semantic_cast_datatype(DataType.build(target))
+            semantic_cast_datatype(DataType.build(target))
             if isinstance(target, exp.DataType)
             else None
         )
@@ -2266,7 +2326,7 @@ def _literal_cast_datatype_for_column(
     datatype = semantic_datatypes.get(cid)
     if datatype is None:
         return None
-    return _semantic_cast_datatype(datatype)
+    return semantic_cast_datatype(datatype)
 
 
 def _single_semantic_column(expression: t.Any) -> exp.Column | None:
@@ -2282,50 +2342,10 @@ def _semantic_literal_cast(expression: t.Any, datatype: DataType) -> t.Any:
     return exp.Cast(this=expression.copy(), to=datatype.copy())
 
 
-def _semantic_cast_datatype(datatype: DataType) -> DataType | None:
-    family = _semantic_datatype_family(datatype)
-    if family == "integer":
-        return DataType.build("INT")
-    if family == "decimal":
-        return DataType.build("REAL")
-    if family == "date":
-        return DataType.build("DATE")
-    if family == "datetime":
-        return DataType.build("DATETIME")
-    return None
-
-
 def _literal_semantic_datatype(expression: t.Any) -> DataType | None:
     if not isinstance(expression, exp.Literal) or not expression.is_string:
         return None
-    value = str(expression.this).strip()
-    if not value:
-        return None
-    if _NUMERIC_LITERAL_RE.match(value):
-        return DataType.build("REAL") if _numeric_literal_is_decimal(value) else DataType.build("INT")
-    temporal = _temporal_literal_semantic_datatype(value)
-    if temporal is not None:
-        return temporal
-    return None
-
-
-def _numeric_literal_is_decimal(value: str) -> bool:
-    return "." in value or "e" in value.lower()
-
-
-def _temporal_literal_semantic_datatype(value: str) -> DataType | None:
-    parsed = parse_datetime(value)
-    if parsed is None:
-        return None
-    return (
-        DataType.build("DATETIME")
-        if _literal_has_time_component(value)
-        else DataType.build("DATE")
-    )
-
-
-def _literal_has_time_component(value: str) -> bool:
-    return bool(re.search(r"(?:\d{1,2}:\d{2}|[Tt]\d{1,2})", value))
+    return infer_semantic_datatype_from_literal(str(expression.this))
 
 
 def _temporal_function_semantic_datatype(node: exp.Expression) -> DataType | None:
@@ -2350,44 +2370,7 @@ def _resolve_semantic_datatype(
     selected = tuple(
         datatype for priority, datatype in candidates if priority == highest_priority
     )
-    return _merge_semantic_datatypes(selected)
-
-
-def _merge_semantic_datatypes(datatypes: t.Sequence[DataType]) -> DataType | None:
-    if not datatypes:
-        return None
-    families = {_semantic_datatype_family(datatype) for datatype in datatypes}
-    if families <= {"integer"}:
-        return DataType.build("INT")
-    if families <= {"integer", "decimal"}:
-        return DataType.build("REAL")
-    if families <= {"date"}:
-        return DataType.build("DATE")
-    if families <= {"date", "datetime"}:
-        return DataType.build("DATETIME")
-    return None
-
-
-def _semantic_datatype_family(datatype: DataType) -> str:
-    datatype = DataType.build(datatype)
-    if datatype.is_type(*DataType.INTEGER_TYPES):
-        return "integer"
-    if datatype.is_type(*DataType.REAL_TYPES):
-        return "decimal"
-    if datatype.is_type(DataType.Type.DATE, DataType.Type.DATE32):
-        return "date"
-    if datatype.is_type(
-        DataType.Type.DATETIME,
-        DataType.Type.DATETIME64,
-        DataType.Type.TIMESTAMP,
-        DataType.Type.TIMESTAMPLTZ,
-        DataType.Type.TIMESTAMPTZ,
-        DataType.Type.TIMESTAMP_MS,
-        DataType.Type.TIMESTAMP_NS,
-        DataType.Type.TIMESTAMP_S,
-    ):
-        return "datetime"
-    return datatype.sql().lower()
+    return merge_semantic_datatypes(selected)
 
 
 def _unique_column_ids(

@@ -137,3 +137,13 @@ def column_id(
 def column_identity(node: exp.Column) -> ColumnId | None:
     value: Any = node.meta.get(PARSEVAL_COLUMN_ID)
     return value if isinstance(value, ColumnId) else None
+
+
+def table_relation(name: str, dialect: str | None = None) -> RelationId:
+    """Create a TABLE RelationId from a raw name string."""
+    return relation_id(RelationKind.TABLE, identifier_name(name, dialect=dialect))
+
+
+def physical_column(name: str, relation: RelationId, dialect: str | None = None) -> ColumnId:
+    """Create a PHYSICAL ColumnId from a raw column name string."""
+    return column_id(ColumnKind.PHYSICAL, identifier_name(name, dialect=dialect), relation)

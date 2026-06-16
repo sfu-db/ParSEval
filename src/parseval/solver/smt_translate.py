@@ -108,6 +108,22 @@ def _zfill2(expr: z3.ExprRef, z3ctx: Optional[z3.Context] = None) -> z3.ExprRef:
     return z3.If(expr < 10, z3.Concat(z3.StringVal("0", ctx=z3ctx), z3.IntToStr(expr)), z3.IntToStr(expr))
 
 
+def _zfill4(expr: z3.ExprRef, z3ctx: Optional[z3.Context] = None) -> z3.ExprRef:
+    return z3.If(
+        expr < 10,
+        z3.Concat(z3.StringVal("000", ctx=z3ctx), z3.IntToStr(expr)),
+        z3.If(
+            expr < 100,
+            z3.Concat(z3.StringVal("00", ctx=z3ctx), z3.IntToStr(expr)),
+            z3.If(
+                expr < 1000,
+                z3.Concat(z3.StringVal("0", ctx=z3ctx), z3.IntToStr(expr)),
+                z3.IntToStr(expr),
+            ),
+        ),
+    )
+
+
 def like_to_z3(var: SMTValue, pattern: Union[SMTValue, str]) -> z3.BoolRef:
     """Translate a SQL LIKE expression into Z3 string constraints.
 
@@ -199,7 +215,10 @@ def _translate_substr(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``SUBSTR(s, start[, length])`` into Z3 ``SubString``."""
-    source = solver._as_value(args[0])
+    source = solver._coerce_value_to_type(
+        solver._as_value(args[0]),
+        DataType.build("TEXT"),
+    )
     start = solver._as_value(args[1])
     length = solver._as_value(args[2]) if len(args) > 2 else None
     result_type = normalize_dtype(DataType.build("TEXT"), solver.z3ctx)
@@ -219,7 +238,20 @@ def _translate_substr(
         )
         some = z3.And(_value_some(source), _value_some(start))
     else:
-        body = z3.SubString(raw_source, start_payload, _value_payload(length))
+        # Enforce that the source string is long enough for the SUBSTR to
+        # extract the requested number of characters. Without this, the solver
+        # may generate short strings that satisfy the constraint in Z3 but
+        # fail when evaluated by the database engine.
+        length_val = _value_payload(length)
+        min_len = z3.If(raw_start >= 1, raw_start, z3.IntVal(0, ctx=solver.z3ctx))
+        solver.add(
+            z3.Implies(
+                z3.And(_value_some(source), _value_some(start), _value_some(length)),
+                source_len >= min_len + length_val,
+            ),
+            track_vars=False,
+        )
+        body = z3.SubString(raw_source, start_payload, length_val)
         some = z3.And(_value_some(source), _value_some(start), _value_some(length))
     return SMTValue(z3.If(some, option_sort.Some(body), option_sort.NULL), result_type)
 
@@ -281,43 +313,100 @@ def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
     return y, m, d, hour, minute, second
 
 
+def _format_temporal_payload(
+    solver: SMTSolver, temporal: SMTValue, fmt_value: str
+) -> z3.ExprRef:
+    """Build a Z3 string for a concrete temporal format string."""
+    year, month, day, hour, minute, second = _ymd_hms_from_temporal(solver, temporal)
+    components = {
+        "Y": year,
+        "m": month,
+        "d": day,
+        "H": hour,
+        "M": minute,
+        "S": second,
+    }
+    renderers = {
+        "Y": lambda value: _zfill4(value, solver.z3ctx),
+        "m": lambda value: _zfill2(value, solver.z3ctx),
+        "d": lambda value: _zfill2(value, solver.z3ctx),
+        "H": lambda value: _zfill2(value, solver.z3ctx),
+        "M": lambda value: _zfill2(value, solver.z3ctx),
+        "S": lambda value: _zfill2(value, solver.z3ctx),
+    }
+    parts: List[z3.ExprRef] = []
+    i = 0
+    while i < len(fmt_value):
+        ch = fmt_value[i]
+        if ch == "%":
+            if i + 1 >= len(fmt_value):
+                raise UnsupportedSMTError(f"Unsupported STRFTIME format: {fmt_value}")
+            token = fmt_value[i + 1]
+            if token == "%":
+                parts.append(z3.StringVal("%", ctx=solver.z3ctx))
+            elif token in components:
+                component = components[token]
+                if component is None:
+                    raise UnsupportedSMTError(
+                        f"Unsupported STRFTIME token %{token} for {temporal.typeinfo.logical_name}"
+                    )
+                parts.append(renderers[token](component))
+            else:
+                raise UnsupportedSMTError(f"Unsupported STRFTIME token: %{token}")
+            i += 2
+            continue
+        literal_start = i
+        while i < len(fmt_value) and fmt_value[i] != "%":
+            i += 1
+        parts.append(z3.StringVal(fmt_value[literal_start:i], ctx=solver.z3ctx))
+    if not parts:
+        return z3.StringVal("", ctx=solver.z3ctx)
+    body = parts[0]
+    for part in parts[1:]:
+        body = z3.Concat(body, part)
+    return body
+
+
+def _default_temporal_format(family: str) -> str:
+    if family == "date":
+        return "%Y-%m-%d"
+    if family == "time":
+        return "%H:%M:%S"
+    return "%Y-%m-%d %H:%M:%S"
+
+
+def format_temporal_value(
+    solver: SMTSolver, temporal: SMTValue, fmt_value: Optional[str] = None
+) -> SMTValue:
+    """Format a temporal SMT value as SQL-facing TEXT."""
+    if temporal.typeinfo.family not in {"date", "time", "datetime", "timestamp"}:
+        raise UnsupportedSMTError(
+            f"Cannot format non-temporal value {temporal.typeinfo.logical_name}"
+        )
+    fmt = fmt_value if fmt_value is not None else _default_temporal_format(temporal.typeinfo.family)
+    body = _format_temporal_payload(solver, temporal, fmt)
+    result_type = normalize_dtype(DataType.build("TEXT"), solver.z3ctx)
+    option_sort = OptionTypeRegistry.get(result_type.payload_sort, solver.z3ctx)
+    return SMTValue(
+        z3.If(_value_some(temporal), option_sort.Some(body), option_sort.NULL),
+        result_type,
+    )
+
+
 def _translate_strftime(
     solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``STRFTIME(fmt, temporal)`` into Z3 string construction.
 
-    Supported format specifiers: ``%Y``, ``%m``, ``%d``, ``%Y-%m-%d``,
-    ``%H``, ``%M``, ``%S``.
+    Supports concrete format strings composed from ``%Y``, ``%m``, ``%d``,
+    ``%H``, ``%M``, ``%S``, ``%%``, and literal characters.
     """
     fmt = solver._as_value(args[0])
     temporal = solver._as_value(args[1])
     fmt_expr = z3.simplify(_value_payload(fmt))
     if not z3.is_string_value(fmt_expr):
         raise UnsupportedSMTError("STRFTIME requires a concrete format string")
-    fmt_value = fmt_expr.as_string()
-    year, month, day, hour, minute, second = _ymd_hms_from_temporal(solver, temporal)
-    if fmt_value == "%Y":
-        body = z3.IntToStr(year)
-    elif fmt_value == "%m":
-        body = _zfill2(month, solver.z3ctx)
-    elif fmt_value == "%d":
-        body = _zfill2(day, solver.z3ctx)
-    elif fmt_value == "%Y-%m-%d":
-        body = z3.Concat(
-            z3.IntToStr(year),
-            z3.StringVal("-"),
-            _zfill2(month, solver.z3ctx),
-            z3.StringVal("-"),
-            _zfill2(day, solver.z3ctx),
-        )
-    elif fmt_value == "%H":
-        body = _zfill2(hour, solver.z3ctx)
-    elif fmt_value == "%M":
-        body = _zfill2(minute, solver.z3ctx)
-    elif fmt_value == "%S":
-        body = _zfill2(second, solver.z3ctx)
-    else:
-        raise UnsupportedSMTError(f"Unsupported STRFTIME format: {fmt_value}")
+    body = _format_temporal_payload(solver, temporal, fmt_expr.as_string())
     result_type = normalize_dtype(DataType.build("TEXT"), solver.z3ctx)
     option_sort = OptionTypeRegistry.get(result_type.payload_sort, solver.z3ctx)
     return SMTValue(

@@ -276,6 +276,16 @@ class DomainSolver:
         if unknown_reasons:
             return DomainResult(status="unknown", reason=unknown_reasons[0])
 
+        # Pre-populate variables from constraint.variables so join equality
+        # columns get the correct type family instead of defaulting to TEXT.
+        from .types import CSPVariable as _CSPV
+        for sv, dtype in (constraint.variables or {}).items():
+            if sv not in all_variables:
+                all_variables[sv] = _CSPV(
+                    variable=sv,
+                    space=ValueSpace(family=type_family(dtype)),
+                )
+
         # Build equivalences from join equalities.
         join_constraints = self._build_equivalences(all_variables, join_equalities)
         all_constraints.extend(join_constraints)

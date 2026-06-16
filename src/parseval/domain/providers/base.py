@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 
-from ..coercion import coerce_reference_value
+from parseval.coercion import coerce_reference_value
 from ..spec import ColumnSpec
 from ..state import RowContext, SchemaRuntime
 from ..compiler import ColumnDomainPlan

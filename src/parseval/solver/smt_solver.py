@@ -47,6 +47,7 @@ from .smt_translate import (
     _value_payload,
     _coerce_pair,
     _null_value,
+    format_temporal_value,
     like_to_z3,
 )
 
@@ -443,7 +444,9 @@ class SMTSolver:
         if target_type.family == "int" and value.typeinfo.family == "real":
             return self._wrap_payload(z3.ToInt(raw), target_type.dtype)
         if target_type.family == "text":
-            if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"}:
+            if value.typeinfo.family in {"date", "time", "datetime", "timestamp"}:
+                return format_temporal_value(self, value)
+            if value.typeinfo.family == "int":
                 return self._wrap_payload(z3.IntToStr(raw), target_type.dtype)
             if value.typeinfo.family == "bool":
                 return self._wrap_payload(
@@ -695,7 +698,9 @@ class SMTSolver:
             if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "time":
                 return self._wrap_nullable_payload(value, raw % 86400, to_type.dtype)
         if to_type.family == "text":
-            converted = z3.IntToStr(raw) if value.typeinfo.family in {"int", "date", "time", "datetime", "timestamp"} else raw
+            if value.typeinfo.family in {"date", "time", "datetime", "timestamp"}:
+                return format_temporal_value(self, value)
+            converted = z3.IntToStr(raw) if value.typeinfo.family == "int" else raw
             return self._wrap_nullable_payload(value, converted, to_type.dtype)
         if to_type.family == "int" and value.typeinfo.family == "text":
             return self._wrap_nullable_payload(value, z3.StrToInt(raw), to_type.dtype)
@@ -772,9 +777,14 @@ class SMTSolver:
 
     def _translate_between(self, expression: exp.Expression) -> z3.BoolRef:
         """Translate ``value BETWEEN low AND high`` (inclusive range check)."""
+        value_expr = expression.this
+        low_expr = expression.args["low"]
+        high_expr = expression.args["high"]
         value = self._as_value(self._to_z3_expr(expression.this))
-        low = self._as_value(self._to_z3_expr(expression.args["low"]))
-        high = self._as_value(self._to_z3_expr(expression.args["high"]))
+        low = self._as_value(self._to_z3_expr(low_expr))
+        high = self._as_value(self._to_z3_expr(high_expr))
+        value, low = self._coerce_temporal_pair(value, low, value_expr, low_expr)
+        value, high = self._coerce_temporal_pair(value, high, value_expr, high_expr)
         if value.is_null_literal or low.is_null_literal or high.is_null_literal:
             return z3.BoolVal(False, ctx=self.z3ctx)
         raw_value = _value_payload(value)
@@ -1046,17 +1056,17 @@ class SMTSolver:
                 )
 
     def _ensure_temporal_bounds(self, expr: z3.ExprRef, typeinfo: SMTTypeInfo):
-        """Constrain temporal values to the range 1970-01-01 to 2030-01-01."""
+        """Constrain temporal values to the range 1900-01-01 to 2100-01-01."""
         opt = option_of(expr)
         value = unwrap_option(expr)
         if typeinfo.family == "date":
-            lower = date_to_epoch_day(date(1970, 1, 1))
-            upper = date_to_epoch_day(date(2030, 1, 1))
+            lower = date_to_epoch_day(date(1900, 1, 1))
+            upper = date_to_epoch_day(date(2100, 1, 1))
         elif typeinfo.family == "time":
             lower, upper = 0, 24 * 3600
         else:
-            lower = datetime_to_epoch_second(datetime(1970, 1, 1, 0, 0, 0))
-            upper = datetime_to_epoch_second(datetime(2030, 1, 1, 0, 0, 0))
+            lower = datetime_to_epoch_second(datetime(1900, 1, 1, 0, 0, 0))
+            upper = datetime_to_epoch_second(datetime(2100, 1, 1, 0, 0, 0))
         self.add(z3.Implies(opt.is_Some(expr), value > lower), track_vars=False)
         self.add(z3.Implies(opt.is_Some(expr), value < upper), track_vars=False)
 

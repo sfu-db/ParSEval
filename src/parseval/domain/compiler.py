@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, List, Optional, Tuple
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 
-from parseval.dtype import DataType
+from sqlglot import exp
+
+from parseval.dtype import DataType, type_family
+from parseval.value_space import ValueSpace
+
 from .constraints import (
     CheckConstraint,
     ContainsConstraint,
@@ -14,18 +20,14 @@ from .constraints import (
     RangeConstraint,
     SuffixConstraint,
 )
-
-from .spec import ColumnSpec
-from sqlglot import exp
-
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Tuple
 from .exceptions import ConstraintConflict, ConstraintViolationError
-import re
+from .spec import ColumnSpec
+
 
 @dataclass(frozen=True)
 class ColumnDomainPlan:
     """Normalized plan for generating and validating values for a single column."""
+    datatype: Any = field(default_factory=lambda: DataType.build("UNKNOWN"))
     nullable: bool = True
     unique: bool = False
     default: Any = None
@@ -63,6 +65,27 @@ class ColumnDomainPlan:
     def __post_init__(self):
         if self.pattern is not None and self._compiled_pattern is None:
             object.__setattr__(self, '_compiled_pattern', re.compile(self.pattern))
+
+    def to_value_space(self) -> ValueSpace:
+        """Convert this generation plan into the shared value-space core."""
+        space = ValueSpace(family=type_family(self.datatype))
+        return self._populate_value_space(space)
+
+    def _populate_value_space(self, space: ValueSpace) -> ValueSpace:
+        if self.allowed_values is not None:
+            space.allowed = set(self.allowed_values)
+        space.not_equals.update(self.excluded_values)
+        if self.minimum is not None:
+            space.narrow_min(self.minimum)
+        if self.maximum is not None:
+            space.narrow_max(self.maximum)
+        if not self.nullable:
+            space.not_null = True
+        if self.maximum_length is not None:
+            space.max_length = self.maximum_length
+        if self.prefix is not None and space.like_pattern is None:
+            space.like_pattern = f"{self.prefix}%"
+        return space
 
 
 class ConstraintCompiler:
@@ -249,6 +272,7 @@ class ConstraintCompiler:
                     residual_predicates.append(check.expression)
 
         return ColumnDomainPlan(
+            datatype=spec.datatype,
             nullable=nullable,
             unique=unique,
             default=default,

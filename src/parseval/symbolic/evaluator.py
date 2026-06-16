@@ -10,7 +10,6 @@ text round-tripping. The constraint generator operates on these directly.
 """
 
 from __future__ import annotations
-
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
@@ -55,7 +54,6 @@ from .types import (
     JoinFact,
 )
 
-
 # =============================================================================
 # Atom decomposition
 # =============================================================================
@@ -88,6 +86,25 @@ def decompose_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
             atoms.append(node)
 
     _walk(predicate)
+    return tuple(atoms)
+
+
+def scalar_subquery_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
+    atoms: List[exp.Expression] = []
+
+    def walk(node: exp.Expression) -> None:
+        if isinstance(node, exp.And):
+            walk(node.left)
+            walk(node.right)
+            return
+        if isinstance(node, exp.Or):
+            walk(node.left)
+            walk(node.right)
+            return
+        if node.find(exp.Subquery) or node.find(exp.Exists):
+            atoms.append(node)
+
+    walk(predicate)
     return tuple(atoms)
 
 
@@ -222,6 +239,7 @@ def _derived_variable(
     value: Any,
     row_ids: Tuple[Any, ...],
     relation_id: Optional[RelationId] = None,
+    column_id_override: Optional[ColumnId] = None,
 ) -> Variable:
     normalized = normalize_name(name)
     row_suffix = "_".join(str(row_id) for row_id in row_ids) or "scalar"
@@ -230,7 +248,10 @@ def _derived_variable(
         concrete=value,
         is_bound=True,
         is_null=value is None,
-        column_id=column_id(ColumnKind.DERIVED, identifier_name(normalized), relation_id),
+        column_id=(
+            column_id_override
+            or column_id(ColumnKind.DERIVED, identifier_name(normalized), relation_id)
+        ),
         rowid=row_ids,
         source="evaluator",
     )
@@ -309,6 +330,22 @@ def _step_relation_id(step: Step) -> Optional[RelationId]:
 def _aggregate_col_id(alias: str, relation_id: Optional[RelationId]) -> ColumnId:
     """Create a ColumnId for an aggregate output column."""
     return column_id(ColumnKind.AGGREGATE, identifier_name(alias), relation_id)
+
+
+def _output_column_by_name(step: Step, name: str) -> Optional[ColumnId]:
+    normalized = normalize_name(name)
+    for col_id in getattr(step, "output_column_ids", ()) or ():
+        if isinstance(col_id, ColumnId) and col_id.name.normalized == normalized:
+            return col_id
+    return None
+
+
+def _aggregate_output_col_id(
+    step: Aggregate,
+    alias: str,
+    relation_id: Optional[RelationId],
+) -> ColumnId:
+    return _output_column_by_name(step, alias) or _aggregate_col_id(alias, relation_id)
 
 
 # =============================================================================
@@ -479,6 +516,7 @@ class PlanEvaluator:
         predicate = step.condition
         atoms = decompose_atoms(predicate) if observe else ()
         node = None
+        scalar_nodes: List[Any] = []
         if observe:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
@@ -495,6 +533,21 @@ class PlanEvaluator:
                 path_predicates=path_preds,
                 join_equalities=join_eqs,
             )
+            for subquery_atom in scalar_subquery_atoms(predicate):
+                scalar_nodes.append(
+                    tree.get_or_create_node(
+                        step_id=f"{annotation.step_id}:scalar_subquery:{subquery_atom.sql()}",
+                        step_type="Filter",
+                        site="scalar_subquery",
+                        predicate=subquery_atom,
+                        atoms=(subquery_atom,),
+                        tables=_annotation_relation_ids(annotation),
+                        step_obj=step,
+                        parent=parent_node,
+                        path_predicates=path_preds,
+                        join_equalities=join_eqs,
+                    )
+                )
 
         passing_rows: List[Row] = []
         for _, table in ctx.tables.items():
@@ -540,6 +593,23 @@ class PlanEvaluator:
                             outcome=_classify_filter_outcome(predicate_value),
                             row_ids=_row_ids(row),
                             concrete_values=_concrete_values(predicate_for_row, env),
+                        ),
+                    )
+                for scalar_node in scalar_nodes:
+                    scalar_atom = scalar_node.atoms[0]
+                    scalar_for_row = self._resolve_subquery_predicates(
+                        scalar_atom,
+                        step.subplan_dependencies,
+                        row_bindings,
+                        env,
+                    )
+                    tree.record_observation(
+                        scalar_node,
+                        AtomObservation(
+                            atom_id=0,
+                            outcome=_classify_outcome(concrete(scalar_for_row, env)),
+                            row_ids=_row_ids(row),
+                            concrete_values=_concrete_values(scalar_for_row, env),
                         ),
                     )
                 # Full predicate for pass/fail.
@@ -752,6 +822,7 @@ class PlanEvaluator:
 
         for table_name, table in ctx.tables.items():
             groups: Dict[tuple, int] = {}
+            self._aggregation_metadata(step)
             if step.group:
                 for row in table.rows:
                     env = _env_from_row(row)
@@ -770,6 +841,7 @@ class PlanEvaluator:
                 relation_id = _step_relation_id(step)
                 for aggregate in step.aggregations:
                     alias = normalize_name(aggregate.alias_or_name)
+                    col_id = _aggregate_output_col_id(step, alias, relation_id)
                     value = self._aggregate_expression_value(
                         aggregate,
                         list(table.rows),
@@ -777,11 +849,12 @@ class PlanEvaluator:
                         operands=getattr(step, "operands", ()) or (),
                     )
                     aggregate_values[alias] = value
-                    columns[_aggregate_col_id(alias, relation_id)] = _derived_variable(
+                    columns[col_id] = _derived_variable(
                         alias,
                         value,
                         output_row_id,
                         relation_id,
+                        column_id_override=col_id,
                     )
                 output_rows = [Row(this=output_row_id, columns=columns)]
                 aggregate_groups = {
@@ -810,6 +883,12 @@ class PlanEvaluator:
             )
 
         return Context(tables={step.name: DerivedSchema(columns=self._aggregate_columns(step), rows=[])})
+
+    def _aggregation_metadata(self, step: Aggregate) -> Dict[str, Any]:
+        try:
+            return self.plan.annotation_for(step).metadata.get("aggregation", {})
+        except (KeyError, ValueError):
+            return {}
 
     def _eval_having(
         self,
@@ -1288,16 +1367,27 @@ class PlanEvaluator:
             key = tuple(concrete(expr, env) for expr in step.group.values())
             grouped.setdefault(key, []).append(row)
 
+        metadata = self._aggregation_metadata(step)
         relation_id = _step_relation_id(step)
+        group_expressions = metadata.get("group_expressions", {})
+        group_sources = metadata.get("group_sources", {})
         output_rows: List[Row] = []
         aggregate_groups: Dict[Tuple[Any, ...], AggregateGroup] = {}
         for group_index, (key, group_rows) in enumerate(grouped.items()):
             output_row_id = ("agg", step.name, group_index)
             source_row_ids = tuple(row.rowid for row in group_rows)
             columns: Dict[ColumnId, Any] = _retained_columns(group_rows[0])
+            group_key_values: Dict[ColumnId, Any] = {}
             for alias, value in zip(group_aliases, key):
-                col_id = _aggregate_col_id(alias, relation_id)
-                columns[col_id] = _derived_variable(alias, value, output_row_id, relation_id)
+                col_id = _aggregate_output_col_id(step, alias, relation_id)
+                group_key_values[col_id] = value
+                columns[col_id] = _derived_variable(
+                    alias,
+                    value,
+                    output_row_id,
+                    relation_id,
+                    column_id_override=col_id,
+                )
             aggregate_values: Dict[Any, Any] = {}
             for aggregate in step.aggregations:
                 alias = normalize_name(aggregate.alias_or_name)
@@ -1309,14 +1399,31 @@ class PlanEvaluator:
                     getattr(step, "operands", ()) or (),
                 )
                 aggregate_values[alias] = value
-                col_id = _aggregate_col_id(alias, relation_id)
-                columns[col_id] = _derived_variable(alias, value, output_row_id, relation_id)
+                col_id = _aggregate_output_col_id(step, alias, relation_id)
+                columns[col_id] = _derived_variable(
+                    alias,
+                    value,
+                    output_row_id,
+                    relation_id,
+                    column_id_override=col_id,
+                )
             output_rows.append(Row(this=output_row_id, columns=columns))
             aggregate_groups[output_row_id] = AggregateGroup(
                 output_row_id=output_row_id,
                 group_key=key,
                 source_row_ids=source_row_ids,
                 aggregate_values=aggregate_values,
+                group_expressions={
+                    col_id: group_expressions[col_id]
+                    for col_id in group_key_values
+                    if col_id in group_expressions
+                },
+                group_sources={
+                    col_id: group_sources[col_id]
+                    for col_id in group_key_values
+                    if col_id in group_sources
+                },
+                group_key_values=group_key_values,
             )
         return output_rows, aggregate_groups
 
@@ -1637,6 +1744,8 @@ def build_branch_tree(
         if isinstance(step, Filter) and step.condition is not None:
             atoms = decompose_atoms(step.condition)
             _add_node(step, "Filter", "filter", step.condition, atoms, tables)
+            for atom in scalar_subquery_atoms(step.condition):
+                _add_node(step, "Filter", "scalar_subquery", atom, (atom,), tables)
 
         elif isinstance(step, Join):
             for join_name, join_data in (step.joins or {}).items():
