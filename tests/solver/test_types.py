@@ -1,12 +1,11 @@
-"""Tests for solver shared types: ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate."""
+"""Tests for current solver value-space and datatype helpers."""
 import unittest
 
 from sqlglot import exp
 
 from parseval.dtype import DataType
 from parseval.solver.types import (
-    ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate, TypeFamily,
-    col_type, type_family,
+    ValueSpace, TypeFamily, col_type, type_family,
 )
 
 
@@ -117,43 +116,6 @@ class TestValueSpaceBoolean(unittest.TestCase):
         vs.narrow_neq(False)
         self.assertTrue(vs.is_empty())
         self.assertIsNone(vs.pick())
-
-
-class TestColumnPredicate(unittest.TestCase):
-    def test_basic_fields(self):
-        cp = ColumnPredicate(table="t1", column="age", op=">", value=18)
-        self.assertEqual(cp.table, "t1")
-        self.assertEqual(cp.column, "age")
-        self.assertEqual(cp.op, ">")
-        self.assertEqual(cp.value, 18)
-
-    def test_equality_op(self):
-        cp = ColumnPredicate(table="t1", column="name", op="=", value="alice")
-        self.assertEqual(cp.op, "=")
-        self.assertEqual(cp.value, "alice")
-
-
-class TestCSPVariable(unittest.TestCase):
-    def test_basic_fields(self):
-        vs = ValueSpace(family=TypeFamily.TEXT)
-        v = CSPVariable(name="t1.name", table="t1", column="name", space=vs)
-        self.assertEqual(v.name, "t1.name")
-        self.assertEqual(v.table, "t1")
-        self.assertEqual(v.column, "name")
-        self.assertIsNone(v.assigned)
-
-    def test_assigned_default(self):
-        vs = ValueSpace(family=TypeFamily.INTEGER)
-        v = CSPVariable(name="t1.age", table="t1", column="age", space=vs)
-        self.assertIsNone(v.assigned)
-
-
-class TestCSPConstraint(unittest.TestCase):
-    def test_basic_fields(self):
-        c = CSPConstraint(kind="eq", left="t1.id", right="t2.t1_id")
-        self.assertEqual(c.kind, "eq")
-        self.assertEqual(c.left, "t1.id")
-        self.assertEqual(c.right, "t2.t1_id")
 
 
 class TestColType(unittest.TestCase):
