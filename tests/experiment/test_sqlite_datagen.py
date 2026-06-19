@@ -4,6 +4,7 @@ import json
 import os
 import argparse
 import datetime
+import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -241,6 +242,64 @@ def test_bird_datagen_parallel_smoke():
     assert metrics["total_queries"] == 3
     assert [record["index"] for record in metrics["records"]] == [0, 1, 2]
     assert metrics["generated_rows"] > 0
+
+
+def test_toxicology_not_in_subquery_persists_non_null_atom_keys(tmp_path):
+    from parseval.main import instantiate_db
+
+    schema = """
+    CREATE TABLE atom (
+      atom_id TEXT NOT NULL PRIMARY KEY,
+      molecule_id TEXT,
+      element TEXT,
+      FOREIGN KEY (molecule_id) REFERENCES molecule(molecule_id)
+    );
+    CREATE TABLE bond (
+      bond_id TEXT NOT NULL PRIMARY KEY,
+      molecule_id TEXT,
+      bond_type TEXT,
+      FOREIGN KEY (molecule_id) REFERENCES molecule(molecule_id)
+    );
+    CREATE TABLE connected (
+      atom_id TEXT NOT NULL,
+      atom_id2 TEXT NOT NULL,
+      bond_id TEXT,
+      PRIMARY KEY (atom_id, atom_id2),
+      FOREIGN KEY (atom_id) REFERENCES atom(atom_id),
+      FOREIGN KEY (atom_id2) REFERENCES atom(atom_id),
+      FOREIGN KEY (bond_id) REFERENCES bond(bond_id)
+    );
+    CREATE TABLE molecule (
+      molecule_id TEXT NOT NULL PRIMARY KEY,
+      label TEXT
+    );
+    """
+    sql = """
+    SELECT DISTINCT T.element
+    FROM atom AS T
+    WHERE T.element NOT IN (
+      SELECT DISTINCT T1.element
+      FROM atom AS T1
+      INNER JOIN connected AS T2 ON T1.atom_id = T2.atom_id
+    )
+    """
+    database_path = tmp_path / "toxicology_247.sqlite"
+    result = instantiate_db(
+        sql,
+        schema,
+        f"sqlite:///{database_path}",
+        "sqlite",
+        db_id="toxicology_247",
+        max_iterations=10,
+        atom_null=0,
+        atom_dup=1,
+    )
+
+    assert result.success, result.error_msg
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute("SELECT atom_id FROM atom").fetchall()
+    assert rows
+    assert all(atom_id is not None for (atom_id,) in rows)
 
 
 if __name__ == "__main__":
