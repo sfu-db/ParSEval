@@ -71,6 +71,7 @@ from parseval.identity import (
     RelationId,
     RelationKind,
     column_id,
+    column_identity,
     identifier_name,
     relation_id,
 )
@@ -246,6 +247,27 @@ class Plan:
                 source_relations=_source_relations(step),
                 metadata=metadata,
             )
+        if self._instance is not None:
+            identity_steps = tuple(_all_identity_steps(self.root))
+            identity_index = _prepared_column_identity_index(identity_steps)
+            _stamp_missing_qualified_identities(
+                self.expression,
+                identity_index,
+                self._instance,
+                set_column_meta,
+            )
+            for step in identity_steps:
+                step_expressions = _step_expressions(step)
+                for expression in step_expressions:
+                    _stamp_missing_qualified_identities(
+                        expression,
+                        identity_index,
+                        self._instance,
+                        set_column_meta,
+                    )
+                annotation = annotations.get(id(step))
+                if annotation is not None:
+                    annotation.referenced_columns = _unique_column_ids(step_expressions)
         self._annotations = annotations
 
     def __repr__(self) -> str:
@@ -1323,6 +1345,67 @@ def _identity_order(root: "Step") -> t.List["Step"]:
 
     visit(root)
     return ordered
+
+
+def _all_identity_steps(root: "Step") -> t.Iterator["Step"]:
+    seen: t.Set[int] = set()
+
+    def visit(step: "Step") -> t.Iterator["Step"]:
+        if id(step) in seen:
+            return
+        seen.add(id(step))
+        yield step
+        if isinstance(step, SubPlan) and step.inner is not None:
+            yield from visit(step.inner)
+        for dependency in step.dependencies:
+            yield from visit(dependency)
+
+    yield from visit(root)
+
+
+def _prepared_column_identity_index(
+    steps: t.Iterable["Step"],
+) -> t.Dict[t.Tuple[str, str], t.Set[ColumnId]]:
+    index: t.Dict[t.Tuple[str, str], t.Set[ColumnId]] = {}
+    for step in steps:
+        if not isinstance(step, Scan) or step.relation_id is None:
+            continue
+        visible = step.relation_id.alias or step.relation_id.name
+        if visible is None:
+            continue
+        qualifier = visible.normalized.lower()
+        for column in getattr(step, "output_column_ids", ()):
+            key = (qualifier, column.name.normalized.lower())
+            index.setdefault(key, set()).add(column)
+    return index
+
+
+def _stamp_missing_qualified_identities(
+    expression: exp.Expression,
+    identity_index: t.Mapping[t.Tuple[str, str], t.Set[ColumnId]],
+    instance: t.Any,
+    set_column_meta: t.Callable,
+) -> None:
+    dialect = getattr(instance, "dialect", None)
+    for column in expression.find_all(exp.Column):
+        if column_identity(column) is not None or not column.table:
+            continue
+        key = (
+            identifier_name(column.table, dialect=dialect).normalized.lower(),
+            identifier_name(column.this, dialect=dialect).normalized.lower(),
+        )
+        candidates = identity_index.get(key, set())
+        if len(candidates) != 1:
+            continue
+        resolved_id = next(iter(candidates))
+        column.meta[PARSEVAL_COLUMN_ID] = resolved_id
+        _enrich_identity_column(
+            column,
+            resolved_id,
+            instance,
+            set_column_meta,
+            DataType,
+        )
 
 def _iter_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
     stack: t.List[exp.Expression] = [expression]
