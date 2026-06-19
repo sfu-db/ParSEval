@@ -14,11 +14,14 @@ Given an Instance and a SQL query, the engine:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlglot import exp
 
 from parseval.instance import Instance
+from parseval.identity import ColumnKind, RelationId
+from parseval.domain.exceptions import ConstraintConflict
 from parseval.plan import Plan
 from parseval.plan.planner import Aggregate, Join, Project
 from parseval.query import preprocess_sql
@@ -36,6 +39,49 @@ from .types import (
 )
 
 logger = logging.getLogger("parseval.engine")
+
+
+@dataclass(frozen=True)
+class _LogicalRowKey:
+    relation: RelationId
+    row_scope: str
+
+
+def _materialized_rows(
+    constraint: SolverConstraint,
+    assignments: Dict[Any, Any],
+) -> Dict[_LogicalRowKey, tuple[RelationId, Dict[str, Any]]]:
+    from parseval.solver import SolverVar
+
+    rows: Dict[_LogicalRowKey, tuple[RelationId, Dict[str, Any]]] = {}
+    for variable, value in assignments.items():
+        if not isinstance(variable, SolverVar):
+            continue
+        storage_relation = constraint.storage_relations.get(variable)
+        storage_column = variable.column_id.source_column_id or variable.column_id
+        if storage_relation is None or storage_column.kind is not ColumnKind.PHYSICAL:
+            raise ConstraintConflict(f"missing_physical_lineage:{variable.display}")
+        key = _LogicalRowKey(
+            relation=variable.relation_id,
+            row_scope=variable.row_scope or "r0",
+        )
+        existing = rows.get(key)
+        if existing is None:
+            values: Dict[str, Any] = {}
+            rows[key] = (storage_relation, values)
+        else:
+            existing_relation, values = existing
+            if existing_relation != storage_relation:
+                raise ConstraintConflict(
+                    f"conflicting_storage_relation:{variable.display}"
+                )
+        column_name = storage_column.name.normalized
+        if column_name in values and values[column_name] != value:
+            raise ConstraintConflict(
+                f"conflicting_materialized_assignment:{variable.display}"
+            )
+        values[column_name] = value
+    return rows
 
 
 class SymbolicEngine:
@@ -172,55 +218,34 @@ class SymbolicEngine:
 
     def _solve_and_materialize(self, constraint: SolverConstraint) -> bool:
         """Invoke the unified solver and materialize results into the instance."""
-        from parseval.solver import SolverVar
-
         result = self.solver.solve(constraint)
         if not result.sat:
             return False
 
-        # Group assignments by table and row scope so multi-row obligations
-        # materialize as distinct physical rows.
-        rows_by_table: Dict[tuple[Any, str], Dict[str, Any]] = {}
-        for var, value in result.assignments.items():
-            if not isinstance(var, SolverVar):
-                continue
-            storage_relation = constraint.storage_relations.get(var)
-            storage_column = var.column_id.source_column_id or var.column_id
-            if storage_relation is None:
-                source_relation = storage_column.relation
-                if source_relation is not None and source_relation.name is not None:
-                    storage_relation = source_relation
-                else:
-                    storage_relation = var.relation_id
-            if storage_relation.name is None:
-                continue
-            try:
-                self.instance._table_key_for_storage(storage_relation)
-            except Exception:
-                continue
-            col_name = storage_column.name.normalized
-            row_scope = var.row_scope or "r0"
-            rows_by_table.setdefault((storage_relation, row_scope), {})[col_name] = value
+        try:
+            materialized = _materialized_rows(constraint, result.assignments)
+        except ConstraintConflict:
+            return False
 
-        relations = []
+        storage_relations = []
         seen_relations = set()
-        for relation, _row_scope in rows_by_table:
-            if relation in seen_relations:
+        for storage_relation, _row_values in materialized.values():
+            if storage_relation in seen_relations:
                 continue
-            seen_relations.add(relation)
-            relations.append(relation)
+            seen_relations.add(storage_relation)
+            storage_relations.append(storage_relation)
         ordered_relations = self.instance._creation_order(
-            {relation: {} for relation in relations}
+            {relation: {} for relation in storage_relations}
         )
-        for relation in ordered_relations:
-            scoped_rows = [
-                (row_scope, row_values)
-                for (row_relation, row_scope), row_values in rows_by_table.items()
-                if row_relation == relation
+        for storage_relation in ordered_relations:
+            logical_rows = [
+                row_values
+                for row_storage_relation, row_values in materialized.values()
+                if row_storage_relation == storage_relation
             ]
-            for _row_scope, row_values in scoped_rows:
+            for row_values in logical_rows:
                 try:
-                    self.instance.create_row(relation, values=row_values)
+                    self.instance.create_row(storage_relation, values=row_values)
                 except Exception:
                     return False
         return True

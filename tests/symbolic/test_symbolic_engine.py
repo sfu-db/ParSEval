@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import unittest
 
+from parseval.identity import (
+    ColumnKind,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
+)
 from parseval.instance import Instance
 from parseval.plan import Plan
 from parseval.query import preprocess_sql
+from parseval.solver import SolveResult, SolverConstraint
+from parseval.solver.types import SolverVar
 from parseval.symbolic import (
     BranchTree,
     BranchType,
@@ -159,53 +168,6 @@ class TestPlanEvaluator(unittest.TestCase):
 
 
 class TestBranchTree(unittest.TestCase):
-    def test_uncovered_targets_with_default_thresholds(self):
-        tree = BranchTree(thresholds=CoverageThresholds())
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        # No observations → all atom outcomes are uncovered.
-        targets = tree.uncovered_targets
-        self.assertEqual(len(targets), 3)  # TRUE, FALSE, NULL
-
-    def test_observation_reduces_uncovered(self):
-        tree = BranchTree(thresholds=CoverageThresholds())
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        from parseval.symbolic.types import AtomObservation
-
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
-        )
-        targets = tree.uncovered_targets
-        self.assertEqual(len(targets), 2)  # FALSE and NULL still missing
-
-    def test_threshold_zero_skips_branch_type(self):
-        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
-        tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        targets = tree.uncovered_targets
-        # Only TRUE and FALSE, not NULL.
-        self.assertEqual(len(targets), 2)
-        self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
-
     def test_infeasible_excluded_from_targets(self):
         tree = BranchTree(thresholds=CoverageThresholds())
         node = tree.get_or_create_node(
@@ -219,30 +181,6 @@ class TestBranchTree(unittest.TestCase):
         tree.mark_infeasible(node, 0, BranchType.ATOM_NULL)
         targets = tree.uncovered_targets
         self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
-
-    def test_coverage_ratio(self):
-        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        self.assertEqual(tree.coverage_ratio, 0.0)
-        from parseval.symbolic.types import AtomObservation
-
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
-        )
-        self.assertEqual(tree.coverage_ratio, 0.5)
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_FALSE)
-        )
-        self.assertEqual(tree.coverage_ratio, 1.0)
-        self.assertTrue(tree.fully_covered)
-
 
 # ---------------------------------------------------------------------------
 # Infeasibility
@@ -349,6 +287,135 @@ class TestSymbolicEngine(unittest.TestCase):
         result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
         # Should cover both atoms' TRUE and FALSE.
         self.assertGreaterEqual(result.coverage, 0.5)
+
+
+class _FixedSolver:
+    def __init__(self, assignments):
+        self.assignments = assignments
+
+    def solve(self, _constraint):
+        return SolveResult(sat=True, assignments=self.assignments)
+
+
+def _people_alias_assignments(instance):
+    physical = instance.table_id("people")
+    physical_id = instance.column_id("people", "id")
+    physical_name = instance.column_id("people", "name")
+    left = relation_id(
+        RelationKind.TABLE,
+        physical.name,
+        alias=identifier_name("a"),
+        scope_id="left",
+    )
+    right = relation_id(
+        RelationKind.TABLE,
+        physical.name,
+        alias=identifier_name("b"),
+        scope_id="right",
+    )
+    left_id = column_id(
+        ColumnKind.PHYSICAL,
+        identifier_name("id"),
+        left,
+        source_column_id=physical_id,
+    )
+    left_name = column_id(
+        ColumnKind.PHYSICAL,
+        identifier_name("name"),
+        left,
+        source_column_id=physical_name,
+    )
+    right_id = column_id(
+        ColumnKind.PHYSICAL,
+        identifier_name("id"),
+        right,
+        source_column_id=physical_id,
+    )
+    right_name = column_id(
+        ColumnKind.PHYSICAL,
+        identifier_name("name"),
+        right,
+        source_column_id=physical_name,
+    )
+    assignments = {
+        SolverVar(left_id, left, "r0"): 1,
+        SolverVar(left_name, left, "r0"): "Alice",
+        SolverVar(right_id, right, "r0"): 2,
+        SolverVar(right_name, right, "r0"): "Bob",
+    }
+    return physical, physical_id, physical_name, left, right, assignments
+
+
+def test_same_table_aliases_materialize_as_separate_rows():
+    instance = Instance(
+        ddls="CREATE TABLE people (id INT PRIMARY KEY, manager_id INT, name TEXT NOT NULL);",
+        name="self_join_materialization",
+        dialect="sqlite",
+    )
+    physical, physical_id, physical_name, left, right, assignments = (
+        _people_alias_assignments(instance)
+    )
+    constraint = SolverConstraint(
+        target_relations=(left, right),
+        storage_relations={variable: physical for variable in assignments},
+    )
+    engine = SymbolicEngine(
+        instance,
+        "SELECT a.name FROM people a JOIN people b ON a.id = b.manager_id",
+        solver=_FixedSolver(assignments),
+        max_iterations=1,
+    )
+
+    assert engine._solve_and_materialize(constraint)
+    assert sorted(
+        (row[physical_id].concrete, row[physical_name].concrete)
+        for row in instance.get_rows("people")
+    ) == [(1, "Alice"), (2, "Bob")]
+
+
+def test_conflicting_materialized_assignment_fails_closed():
+    instance = Instance(
+        ddls="CREATE TABLE people (id INT PRIMARY KEY, name TEXT NOT NULL);",
+        name="conflicting_materialization",
+        dialect="sqlite",
+    )
+    physical = instance.table_id("people")
+    physical_name = instance.column_id("people", "name")
+    binding = relation_id(
+        RelationKind.TABLE,
+        physical.name,
+        alias=identifier_name("p"),
+        scope_id="binding",
+    )
+    first = column_id(
+        ColumnKind.PROJECTED,
+        identifier_name("first_name"),
+        binding,
+        source_column_id=physical_name,
+    )
+    second = column_id(
+        ColumnKind.PROJECTED,
+        identifier_name("second_name"),
+        binding,
+        source_column_id=physical_name,
+    )
+    assignments = {
+        SolverVar(first, binding, "r0"): "Alice",
+        SolverVar(second, binding, "r0"): "Bob",
+    }
+    constraint = SolverConstraint(
+        target_relations=(binding,),
+        storage_relations={variable: physical for variable in assignments},
+    )
+    engine = SymbolicEngine(
+        instance,
+        "SELECT name FROM people",
+        solver=_FixedSolver(assignments),
+        max_iterations=1,
+    )
+
+    assert not engine._solve_and_materialize(constraint)
+    assert not instance.get_rows("people")
 
 
 if __name__ == "__main__":

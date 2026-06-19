@@ -25,6 +25,7 @@ from sqlglot import exp, parse_one
 
 from parseval.dtype import DataType
 from parseval.identity import (
+    ColumnId,
     ColumnKind,
     RelationKind,
     column_id,
@@ -60,14 +61,50 @@ def _variable(name: str = "x", type=INT) -> Variable:
 
 
 def _predicate(sql: str) -> exp.Expression:
+    from parseval.identity import PARSEVAL_COLUMN_ID
     where = parse_one(f"SELECT * FROM t WHERE {sql}").find(exp.Where)
     assert where is not None
-    return where.this
+    node = where.this
+    for col in node.find_all(exp.Column):
+        col_id = _col_id(col.name, col.table if col.table else None)
+        col.meta[PARSEVAL_COLUMN_ID] = col_id
+    return node
 
 
 def _value(sql: str) -> exp.Expression:
+    from parseval.identity import PARSEVAL_COLUMN_ID
     select = parse_one(f"SELECT {sql} AS v FROM t")
-    return select.expressions[0].this
+    node = select.expressions[0].this
+    # Annotate any Column nodes with ColumnId metadata
+    for col in node.find_all(exp.Column):
+        col_id = _col_id(col.name, col.table if col.table else None)
+        col.meta[PARSEVAL_COLUMN_ID] = col_id
+    return node
+
+
+def _col_id(name: str, table: str | None = None) -> ColumnId:
+    """Create a ColumnId for testing."""
+    from parseval.identity import identifier_name, relation_id, RelationKind
+    rel = relation_id(RelationKind.SYNTHETIC, identifier_name(table)) if table else None
+    return column_id(ColumnKind.SYNTHETIC, identifier_name(name), rel)
+
+
+def _env(bindings: dict) -> Environment:
+    """Create an Environment from {name: value} dicts for testing."""
+    col_bindings = {}
+    for key, value in bindings.items():
+        if isinstance(key, ColumnId):
+            col_bindings[key] = value
+        elif isinstance(key, str):
+            col_bindings[_col_id(key)] = value
+    return Environment(col_bindings)
+
+
+def _annotate_col(col: exp.Expression, col_id: ColumnId) -> exp.Expression:
+    """Set PARSEVAL_COLUMN_ID metadata on an exp.Column for testing."""
+    from parseval.identity import PARSEVAL_COLUMN_ID
+    col.meta[PARSEVAL_COLUMN_ID] = col_id
+    return col
 
 
 # ---------------------------------------------------------------------------
@@ -205,48 +242,56 @@ class TestConstCoercion(unittest.TestCase):
 
 
 class TestEnvironment(unittest.TestCase):
-    def test_resolve_by_bare_name(self):
-        env = Environment({"x": 5})
-        self.assertEqual(env.resolve(_value("x")), 5)
-
-    def test_resolve_with_table_qualification(self):
-        env = Environment({"t.x": 7})
-        col = _predicate("t.x = 1").this
-        self.assertEqual(env.resolve(col), 7)
-
-    def test_bare_name_fallback_when_qualified_column_unbound(self):
-        env = Environment({"x": 5})
-        col = _predicate("t.x = 1").this
+    def test_resolve_by_column_id(self):
+        x_id = _col_id("x")
+        env = _env({x_id: 5})
+        col = _annotate_col(_value("x"), x_id)
         self.assertEqual(env.resolve(col), 5)
 
+    def test_resolve_with_table_qualification(self):
+        x_id = _col_id("x", "t")
+        env = _env({x_id: 7})
+        col = _annotate_col(_predicate("t.x = 1").this, x_id)
+        self.assertEqual(env.resolve(col), 7)
+
     def test_outer_scope_chain(self):
-        outer = Environment({"y": 100})
-        inner = outer.extend({"x": 10})
-        self.assertEqual(inner.resolve(_value("x")), 10)
-        self.assertEqual(inner.resolve(_value("y")), 100)
+        y_id = _col_id("y")
+        x_id = _col_id("x")
+        outer = _env({y_id: 100})
+        inner = outer.extend({x_id: 10})
+        self.assertEqual(inner.resolve(_annotate_col(_value("x"), x_id)), 10)
+        self.assertEqual(inner.resolve(_annotate_col(_value("y"), y_id)), 100)
 
     def test_inner_shadowing(self):
-        outer = Environment({"x": 100})
-        inner = outer.extend({"x": 1})
-        self.assertEqual(inner.resolve(_value("x")), 1)
+        x_id = _col_id("x")
+        outer = _env({x_id: 100})
+        inner = outer.extend({x_id: 1})
+        self.assertEqual(inner.resolve(_annotate_col(_value("x"), x_id)), 1)
 
     def test_unresolved_returns_none(self):
-        env = Environment({"x": 5})
-        self.assertIsNone(env.resolve(_value("y")))
+        x_id = _col_id("x")
+        env = _env({x_id: 5})
+        y_col = _annotate_col(_value("y"), _col_id("y"))
+        self.assertIsNone(env.resolve(y_col))
 
     def test_contains(self):
-        outer = Environment({"y": 1})
-        inner = outer.extend({"x": 2})
-        self.assertTrue(inner.contains(_value("x")))
-        self.assertTrue(inner.contains(_value("y")))
-        self.assertFalse(inner.contains(_value("z")))
+        y_id = _col_id("y")
+        x_id = _col_id("x")
+        outer = _env({y_id: 1})
+        inner = outer.extend({x_id: 2})
+        self.assertTrue(inner.contains(_annotate_col(_value("x"), x_id)))
+        self.assertTrue(inner.contains(_annotate_col(_value("y"), y_id)))
+        z_col = _annotate_col(_value("z"), _col_id("z"))
+        self.assertFalse(inner.contains(z_col))
 
     def test_bind_mutates_this_scope_only(self):
-        outer = Environment({"y": 1})
+        y_id = _col_id("y")
+        z_id = _col_id("z")
+        outer = _env({y_id: 1})
         inner = outer.extend({})
-        inner.bind("z", 3)
-        self.assertEqual(inner.resolve(_value("z")), 3)
-        self.assertFalse(outer.contains(_value("z")))
+        inner.bind(z_id, 3)
+        self.assertEqual(inner.resolve(_annotate_col(_value("z"), z_id)), 3)
+        self.assertFalse(outer.contains(_annotate_col(_value("z"), z_id)))
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +317,7 @@ class TestConcreteLiterals(unittest.TestCase):
         self.assertFalse(concrete(_value("FALSE")))
 
     def test_column_resolution(self):
-        env = Environment({"x": 42})
+        env = _env({"x": 42})
         self.assertEqual(concrete(_value("x"), env), 42)
 
     def test_column_unresolved_is_none(self):
@@ -307,11 +352,11 @@ class TestConcreteArithmetic(unittest.TestCase):
         self.assertEqual(concrete(_value("-5")), -5)
 
     def test_add_propagates_null_from_column(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertIsNone(concrete(_value("x + 1"), env))
 
     def test_add_with_column(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertEqual(concrete(_value("x + 3"), env), 8)
 
 
@@ -335,16 +380,16 @@ class TestConcreteComparisons(unittest.TestCase):
         self.assertTrue(concrete(_predicate("3 <= 3")))
 
     def test_null_propagation_through_comparison(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertIsNone(concrete(_predicate("x > 5"), env))
         self.assertIsNone(concrete(_predicate("x = 5"), env))
 
     def test_numeric_string_coercion(self):
-        env = Environment({"x": "42"})
+        env = _env({"x": "42"})
         self.assertTrue(concrete(_predicate("x = 42"), env))
 
     def test_incomparable_values_return_none(self):
-        env = Environment({"x": "abc"})
+        env = _env({"x": "abc"})
         self.assertIsNone(concrete(_predicate("x > 5"), env))
 
 
@@ -380,7 +425,7 @@ class TestThreeValuedLogic(unittest.TestCase):
         self.assertIsNone(tvl_not(None))
 
     def test_concrete_honors_tvl_for_logical_connectives(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         # TRUE OR NULL = TRUE — an important 3VL case
         self.assertTrue(concrete(_predicate("1 = 1 OR x > 0"), env))
         # FALSE AND NULL = FALSE
@@ -396,31 +441,31 @@ class TestThreeValuedLogic(unittest.TestCase):
 
 class TestNullChecks(unittest.TestCase):
     def test_is_null_true(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertTrue(concrete(_predicate("x IS NULL"), env))
 
     def test_is_null_false_when_bound(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertFalse(concrete(_predicate("x IS NULL"), env))
 
     def test_is_not_null_true_when_bound(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertTrue(concrete(_predicate("x IS NOT NULL"), env))
 
     def test_is_not_null_false_when_null(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertFalse(concrete(_predicate("x IS NOT NULL"), env))
 
     def test_constructed_is_not_null_true_when_bound(self):
         col = _value("x")
         pred = exp.Is(this=col, expression=exp.Not(this=exp.Null()))
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertTrue(concrete(pred, env))
 
     def test_constructed_is_not_null_false_when_null(self):
         col = _value("x")
         pred = exp.Is(this=col, expression=exp.Not(this=exp.Null()))
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertFalse(concrete(pred, env))
 
 
@@ -431,33 +476,33 @@ class TestNullChecks(unittest.TestCase):
 
 class TestConditional(unittest.TestCase):
     def test_case_when_simple(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         value = concrete(_value("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END"), env)
         self.assertEqual(value, "pos")
 
     def test_case_when_multiple_arms(self):
-        env = Environment({"x": 0})
+        env = _env({"x": 0})
         sql = "CASE WHEN x > 0 THEN 'pos' WHEN x < 0 THEN 'neg' ELSE 'zero' END"
         self.assertEqual(concrete(_value(sql), env), "zero")
 
     def test_case_falls_through_to_null_without_default(self):
-        env = Environment({"x": -1})
+        env = _env({"x": -1})
         self.assertIsNone(concrete(_value("CASE WHEN x > 0 THEN 'pos' END"), env))
 
     def test_coalesce_first_non_null(self):
-        env = Environment({"x": None, "y": 7})
+        env = _env({"x": None, "y": 7})
         self.assertEqual(concrete(_value("COALESCE(x, y, 99)"), env), 7)
 
     def test_coalesce_all_null(self):
-        env = Environment({"x": None, "y": None})
+        env = _env({"x": None, "y": None})
         self.assertIsNone(concrete(_value("COALESCE(x, y)"), env))
 
     def test_nullif_matching(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertIsNone(concrete(_value("NULLIF(x, 5)"), env))
 
     def test_nullif_not_matching(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertEqual(concrete(_value("NULLIF(x, 7)"), env), 5)
 
 
@@ -468,29 +513,29 @@ class TestConditional(unittest.TestCase):
 
 class TestMembership(unittest.TestCase):
     def test_between_inclusive(self):
-        env = Environment({"x": 5})
+        env = _env({"x": 5})
         self.assertTrue(concrete(_predicate("x BETWEEN 1 AND 10"), env))
         self.assertTrue(concrete(_predicate("x BETWEEN 5 AND 5"), env))
         self.assertFalse(concrete(_predicate("x BETWEEN 6 AND 10"), env))
 
     def test_between_null_value_is_null(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertIsNone(concrete(_predicate("x BETWEEN 1 AND 10"), env))
 
     def test_in_list_match(self):
-        env = Environment({"x": 2})
+        env = _env({"x": 2})
         self.assertTrue(concrete(_predicate("x IN (1, 2, 3)"), env))
 
     def test_in_list_no_match(self):
-        env = Environment({"x": 99})
+        env = _env({"x": 99})
         self.assertFalse(concrete(_predicate("x IN (1, 2, 3)"), env))
 
     def test_in_null_value(self):
-        env = Environment({"x": None})
+        env = _env({"x": None})
         self.assertIsNone(concrete(_predicate("x IN (1, 2, 3)"), env))
 
     def test_in_with_null_candidate_and_no_match_yields_null(self):
-        env = Environment({"x": 99})
+        env = _env({"x": 99})
         self.assertIsNone(concrete(_predicate("x IN (1, 2, NULL)"), env))
 
 
@@ -501,29 +546,29 @@ class TestMembership(unittest.TestCase):
 
 class TestStrings(unittest.TestCase):
     def test_concat(self):
-        env = Environment({"a": "hello", "b": "world"})
+        env = _env({"a": "hello", "b": "world"})
         self.assertEqual(concrete(_value("CONCAT(a, ' ', b)"), env), "hello world")
 
     def test_substring(self):
-        env = Environment({"s": "abcdef"})
+        env = _env({"s": "abcdef"})
         self.assertEqual(concrete(_value("SUBSTRING(s, 2, 3)"), env), "bcd")
 
     def test_length(self):
-        env = Environment({"s": "abc"})
+        env = _env({"s": "abc"})
         self.assertEqual(concrete(_value("LENGTH(s)"), env), 3)
 
     def test_upper_lower(self):
-        env = Environment({"s": "AbC"})
+        env = _env({"s": "AbC"})
         self.assertEqual(concrete(_value("UPPER(s)"), env), "ABC")
         self.assertEqual(concrete(_value("LOWER(s)"), env), "abc")
 
     def test_like_percent_wildcard(self):
-        env = Environment({"s": "hello"})
+        env = _env({"s": "hello"})
         self.assertTrue(concrete(_predicate("s LIKE 'he%'"), env))
         self.assertFalse(concrete(_predicate("s LIKE 'wo%'"), env))
 
     def test_like_null_propagation(self):
-        env = Environment({"s": None})
+        env = _env({"s": None})
         self.assertIsNone(concrete(_predicate("s LIKE 'a%'"), env))
 
 
@@ -552,28 +597,28 @@ class TestNegatePredicate(unittest.TestCase):
     def test_negates_is_null_to_is_not_null(self):
         col = _value("x")
         negated = negate_predicate(exp.Is(this=col, expression=exp.Null()))
-        self.assertTrue(concrete(negated, Environment({"x": 5})))
-        self.assertFalse(concrete(negated, Environment({"x": None})))
+        self.assertTrue(concrete(negated, _env({"x": 5})))
+        self.assertFalse(concrete(negated, _env({"x": None})))
 
     def test_negates_is_not_null_to_is_null(self):
         col = _value("x")
         negated = negate_predicate(
             exp.Is(this=col, expression=exp.Not(this=exp.Null()))
         )
-        self.assertTrue(concrete(negated, Environment({"x": None})))
-        self.assertFalse(concrete(negated, Environment({"x": 5})))
+        self.assertTrue(concrete(negated, _env({"x": None})))
+        self.assertFalse(concrete(negated, _env({"x": 5})))
 
     def test_negates_parsed_is_not_null_to_is_null(self):
         negated = negate_predicate(_predicate("x IS NOT NULL"))
-        self.assertTrue(concrete(negated, Environment({"x": None})))
-        self.assertFalse(concrete(negated, Environment({"x": 5})))
+        self.assertTrue(concrete(negated, _env({"x": None})))
+        self.assertFalse(concrete(negated, _env({"x": 5})))
 
     def test_negates_general_predicate(self):
         pred = _predicate("x > 5")
         negated = negate_predicate(pred)
         # should be some form of NOT, even after simplify — sqlglot may
         # rewrite "NOT x > 5" → "x <= 5"
-        env = Environment({"x": 4})
+        env = _env({"x": 4})
         self.assertTrue(concrete(negated, env))
 
 
@@ -590,8 +635,8 @@ class TestITE(unittest.TestCase):
             true_branch=Const(this="pos", type=TEXT),
             false_branch=Const(this="neg", type=TEXT),
         )
-        self.assertEqual(concrete(node, Environment({"x": 5})), "pos")
-        self.assertEqual(concrete(node, Environment({"x": -1})), "neg")
+        self.assertEqual(concrete(node, _env({"x": 5})), "pos")
+        self.assertEqual(concrete(node, _env({"x": -1})), "neg")
 
     def test_ite_null_condition_returns_null(self):
         col = _value("x")
@@ -600,7 +645,7 @@ class TestITE(unittest.TestCase):
             true_branch=Const(this="pos", type=TEXT),
             false_branch=Const(this="neg", type=TEXT),
         )
-        self.assertIsNone(concrete(node, Environment({"x": None})))
+        self.assertIsNone(concrete(node, _env({"x": None})))
 
 
 # ---------------------------------------------------------------------------
@@ -610,18 +655,18 @@ class TestITE(unittest.TestCase):
 
 class TestRealisticExpressions(unittest.TestCase):
     def test_filter_with_and_or_null(self):
-        env = Environment({"a": 3, "b": None})
+        env = _env({"a": 3, "b": None})
         # (a > 0 AND b IS NULL) OR a = 10
         pred = _predicate("(a > 0 AND b IS NULL) OR a = 10")
         self.assertTrue(concrete(pred, env))
 
     def test_case_with_column_arithmetic(self):
-        env = Environment({"a": 5, "b": 3})
+        env = _env({"a": 5, "b": 3})
         sql = "CASE WHEN a > b THEN a - b WHEN a = b THEN 0 ELSE b - a END"
         self.assertEqual(concrete(_value(sql), env), 2)
 
     def test_coalesce_chain_with_nulls(self):
-        env = Environment({"a": None, "b": None, "c": 42})
+        env = _env({"a": None, "b": None, "c": 42})
         self.assertEqual(concrete(_value("COALESCE(a, b, c, 99)"), env), 42)
 
     def test_variable_embedded_in_expression(self):
