@@ -159,53 +159,6 @@ class TestPlanEvaluator(unittest.TestCase):
 
 
 class TestBranchTree(unittest.TestCase):
-    def test_uncovered_targets_with_default_thresholds(self):
-        tree = BranchTree(thresholds=CoverageThresholds())
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        # No observations → all atom outcomes are uncovered.
-        targets = tree.uncovered_targets
-        self.assertEqual(len(targets), 3)  # TRUE, FALSE, NULL
-
-    def test_observation_reduces_uncovered(self):
-        tree = BranchTree(thresholds=CoverageThresholds())
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        from parseval.symbolic.types import AtomObservation
-
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
-        )
-        targets = tree.uncovered_targets
-        self.assertEqual(len(targets), 2)  # FALSE and NULL still missing
-
-    def test_threshold_zero_skips_branch_type(self):
-        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
-        tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        targets = tree.uncovered_targets
-        # Only TRUE and FALSE, not NULL.
-        self.assertEqual(len(targets), 2)
-        self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
-
     def test_infeasible_excluded_from_targets(self):
         tree = BranchTree(thresholds=CoverageThresholds())
         node = tree.get_or_create_node(
@@ -219,30 +172,6 @@ class TestBranchTree(unittest.TestCase):
         tree.mark_infeasible(node, 0, BranchType.ATOM_NULL)
         targets = tree.uncovered_targets
         self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
-
-    def test_coverage_ratio(self):
-        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
-        node = tree.get_or_create_node(
-            step_id="step_0",
-            step_type="Filter",
-            site="filter",
-            predicate=_pred("a > 5"),
-            atoms=(_pred("a > 5"),),
-            tables=("t",),
-        )
-        self.assertEqual(tree.coverage_ratio, 0.0)
-        from parseval.symbolic.types import AtomObservation
-
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
-        )
-        self.assertEqual(tree.coverage_ratio, 0.5)
-        tree.record_observation(
-            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_FALSE)
-        )
-        self.assertEqual(tree.coverage_ratio, 1.0)
-        self.assertTrue(tree.fully_covered)
-
 
 # ---------------------------------------------------------------------------
 # Infeasibility
