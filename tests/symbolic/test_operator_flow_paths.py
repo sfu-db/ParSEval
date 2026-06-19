@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
+from parseval.identity import ColumnKind
 from parseval.instance import Instance
 from parseval.plan import Plan
 from parseval.query import preprocess_sql
 from parseval.solver import Solver
+from parseval.solver.types import solver_var
 from parseval.symbolic.constraints import ConstraintGenerator
 from parseval.symbolic.evaluator import build_branch_tree
 from parseval.symbolic.types import BranchTree, BranchType
-from sqlglot import parse_one
+from sqlglot import exp, parse_one
 
 
 JOIN_SCHEMA = """
@@ -163,3 +167,72 @@ def test_branch_tree_keeps_distinct_sites_for_same_step_predicate():
 
     assert first is not second
     assert len(tree.nodes) == 2
+
+
+def test_nested_alias_solver_vars_keep_distinct_bindings_and_storage():
+    schema = """
+    CREATE TABLE atom (atom_id TEXT PRIMARY KEY, element TEXT);
+    CREATE TABLE connected (
+      atom_id TEXT NOT NULL,
+      atom_id2 TEXT NOT NULL,
+      PRIMARY KEY (atom_id, atom_id2),
+      FOREIGN KEY (atom_id) REFERENCES atom(atom_id)
+    );
+    """
+    sql = """
+    SELECT DISTINCT T.element
+    FROM atom AS T
+    WHERE T.element NOT IN (
+      SELECT DISTINCT T1.element
+      FROM atom AS T1
+      INNER JOIN connected AS T2 ON T1.atom_id = T2.atom_id
+    )
+    """
+    instance, _plan, _tree, _target, constraint = _compile_uncovered(
+        sql, schema, site="filter"
+    )
+    vars_by_qualifier = {}
+    for expression in constraint.constraints:
+        for column in expression.find_all(exp.Column):
+            variable = solver_var(column)
+            assert variable is not None
+            vars_by_qualifier.setdefault(column.table.lower(), set()).add(variable)
+
+    assert {var.relation_id.display.lower() for var in vars_by_qualifier["t1"]} == {"t1"}
+    assert {var.relation_id.display.lower() for var in vars_by_qualifier["t2"]} == {"t2"}
+    assert all(
+        var.column_id.kind is not ColumnKind.SYNTHETIC
+        for var in vars_by_qualifier["t1"]
+    )
+    assert all(
+        var.column_id.kind is not ColumnKind.SYNTHETIC
+        for var in vars_by_qualifier["t2"]
+    )
+    assert {
+        constraint.storage_relations[var].name.normalized
+        for var in vars_by_qualifier["t1"]
+    } == {"atom"}
+    assert {
+        constraint.storage_relations[var].name.normalized
+        for var in vars_by_qualifier["t2"]
+    } == {"connected"}
+
+
+def test_unresolved_qualified_constraint_column_fails_closed():
+    instance = Instance(
+        ddls="CREATE TABLE atom (atom_id TEXT PRIMARY KEY);",
+        name="unresolved_constraint",
+        dialect="sqlite",
+    )
+    plan = Plan(
+        preprocess_sql("SELECT atom_id FROM atom", instance, dialect="sqlite"),
+        instance,
+    )
+    column = exp.column("atom_id", table="missing_alias")
+    predicate = exp.EQ(this=column, expression=exp.Literal.string("x"))
+
+    with pytest.raises(ValueError, match="unresolved_scoped_column"):
+        ConstraintGenerator(plan, instance)._annotate_solver_vars(
+            [predicate],
+            (instance.table_id("atom"),),
+        )
