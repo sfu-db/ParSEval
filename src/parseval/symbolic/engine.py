@@ -24,7 +24,7 @@ from parseval.plan.planner import Aggregate, Join, Project
 from parseval.query import preprocess_sql
 from parseval.solver import Solver, SolverConstraint
 
-from .constraints import PlausibleBranch, PlausibleConstraintCompiler
+from .constraints import PlausibleBranch, ConstraintGenerator
 from .evaluator import PlanEvaluator
 from .infeasibility import is_infeasible
 from .types import (
@@ -77,7 +77,7 @@ class SymbolicEngine:
         """Run the generation loop until coverage is met or budget exhausted."""
         thresholds = thresholds or CoverageThresholds()
         evaluator = PlanEvaluator(self.plan, self.instance, self.dialect)
-        constraint_gen = PlausibleConstraintCompiler(
+        constraint_gen = ConstraintGenerator(
             self.plan, self.instance, self.dialect
         )
 
@@ -148,7 +148,14 @@ class SymbolicEngine:
         2. ATOM_NULL (3VL edge cases)
         3. Filter sites before Join before Having before Case
         """
-        site_priority = {"filter": 0, "join_on": 1, "having": 2, "case_arm": 3, "group": 4}
+        site_priority = {
+            "root_result": -1,
+            "filter": 0,
+            "join_on": 1,
+            "having": 2,
+            "case_arm": 3,
+            "group": 4,
+        }
         outcome_priority = {
             BranchType.ATOM_TRUE: 0,
             BranchType.ATOM_FALSE: 1,
@@ -171,22 +178,51 @@ class SymbolicEngine:
         if not result.sat:
             return False
 
-        # Group assignments by table.
-        rows_by_table: Dict[str, Dict[str, Any]] = {}
+        # Group assignments by table and row scope so multi-row obligations
+        # materialize as distinct physical rows.
+        rows_by_table: Dict[tuple[Any, str], Dict[str, Any]] = {}
         for var, value in result.assignments.items():
             if not isinstance(var, SolverVar):
                 continue
-            table_name = var.relation_id.name.normalized if var.relation_id.name else None
-            col_name = var.column_id.name.normalized
-            if table_name is None or table_name not in self.instance.tables:
+            storage_relation = constraint.storage_relations.get(var)
+            storage_column = var.column_id.source_column_id or var.column_id
+            if storage_relation is None:
+                source_relation = storage_column.relation
+                if source_relation is not None and source_relation.name is not None:
+                    storage_relation = source_relation
+                else:
+                    storage_relation = var.relation_id
+            if storage_relation.name is None:
                 continue
-            rows_by_table.setdefault(table_name, {})[col_name] = value
-
-        for table_name, row_values in rows_by_table.items():
             try:
-                self.instance.create_row(table_name, values=row_values)
+                self.instance._table_key_for_storage(storage_relation)
             except Exception:
-                return False
+                continue
+            col_name = storage_column.name.normalized
+            row_scope = var.row_scope or "r0"
+            rows_by_table.setdefault((storage_relation, row_scope), {})[col_name] = value
+
+        relations = []
+        seen_relations = set()
+        for relation, _row_scope in rows_by_table:
+            if relation in seen_relations:
+                continue
+            seen_relations.add(relation)
+            relations.append(relation)
+        ordered_relations = self.instance._creation_order(
+            {relation: {} for relation in relations}
+        )
+        for relation in ordered_relations:
+            scoped_rows = [
+                (row_scope, row_values)
+                for (row_relation, row_scope), row_values in rows_by_table.items()
+                if row_relation == relation
+            ]
+            for _row_scope, row_values in scoped_rows:
+                try:
+                    self.instance.create_row(relation, values=row_values)
+                except Exception:
+                    return False
         return True
 
     def _total_rows(self) -> int:

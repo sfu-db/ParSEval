@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from functools import cached_property
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 import random
 
@@ -18,6 +19,7 @@ from sqlglot.schema import (
 
 from parseval.domain import DatabaseBuilder
 from parseval.domain.exceptions import ForeignKeyResolutionError, UniqueConflictError
+from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.identity import (
     CatalogColumn,
     ColumnId,
@@ -799,6 +801,59 @@ class Catalog(MappingSchema):
             (self._resolve_declared_table_key(table_name), OrderedDict(columns))
             for table_name, columns in mappings.items()
         )
+        normalized_table_sources = {}
+        normalized_column_sources = {}
+        normalized_primary_keys: Dict[str, list] = {}
+        normalized_foreign_keys: Dict[str, list] = {}
+        normalized_unique_constraints: Dict[str, list] = {}
+        normalized_table_constraints: Dict[str, Dict[str, set]] = {}
+        for table_name, columns in mappings.items():
+            table_key = self._resolve_declared_table_key(table_name)
+            if table_name in self._table_sources:
+                normalized_table_sources[table_key] = self._table_sources[table_name]
+            normalized_primary_keys.setdefault(table_key, []).extend(
+                primary_keys.get(table_name, [])
+            )
+            normalized_foreign_keys.setdefault(table_key, []).extend(
+                foreign_keys.get(table_name, [])
+            )
+            normalized_unique_constraints.setdefault(table_key, []).extend(
+                unique_constraints.get(table_name, [])
+            )
+            for column_name in columns:
+                column_key = self._resolve_declared_column_key(table_key, column_name)
+                source = self._column_sources.get((table_name, column_name))
+                if source is not None:
+                    normalized_column_sources[(table_key, column_key)] = source
+                constraints = table_constraints.get(table_name, {}).get(column_name)
+                if constraints:
+                    normalized_table_constraints.setdefault(table_key, {}).setdefault(
+                        column_key,
+                        set(),
+                    ).update(constraints)
+        for table_name, pks in primary_keys.items():
+            table_key = self._resolve_declared_table_key(table_name)
+            normalized_primary_keys.setdefault(table_key, []).extend(pks)
+        for table_name, fks in foreign_keys.items():
+            table_key = self._resolve_declared_table_key(table_name)
+            normalized_foreign_keys.setdefault(table_key, []).extend(fks)
+        for table_name, uniques in unique_constraints.items():
+            table_key = self._resolve_declared_table_key(table_name)
+            normalized_unique_constraints.setdefault(table_key, []).extend(uniques)
+        for table_name, columns in table_constraints.items():
+            table_key = self._resolve_declared_table_key(table_name)
+            for column_name, constraints in columns.items():
+                column_key = self._resolve_declared_column_key(table_key, column_name)
+                normalized_table_constraints.setdefault(table_key, {}).setdefault(
+                    column_key,
+                    set(),
+                ).update(constraints)
+        self._table_sources = normalized_table_sources
+        self._column_sources = normalized_column_sources
+        primary_keys = normalized_primary_keys
+        foreign_keys = normalized_foreign_keys
+        unique_constraints = normalized_unique_constraints
+        table_constraints = normalized_table_constraints
         normalized_dependency: Dict[str, int] = {}
         for table_name, dependency_count in dependency.items():
             table_key = self._resolve_declared_table_key(table_name)
@@ -811,9 +866,9 @@ class Catalog(MappingSchema):
         # Order tables so that FK dependencies are built after their targets.
         sorted_table = OrderedDict(
             {
-                table_name: mappings[table_name]
+                table_name: self._ddl_columns[table_name]
                 for table_name in sorted(
-                    mappings,
+                    self._ddl_columns,
                     key=lambda key: dependency.get(key, 0),
                     reverse=True,
                 )
@@ -822,14 +877,14 @@ class Catalog(MappingSchema):
         for table_name, table_columns in sorted_table.items():
             table_source = self._table_sources.get(table_name, table_name)
             self.add_table(table_name, table_columns, dialect=dialect)
-            self.add_primary_key(table_source, primary_keys.get(table_name, []))
-            self.add_foreign_key(table_source, foreign_keys.get(table_name, []))
+            self.add_primary_key(table_name, primary_keys.get(table_name, []))
+            self.add_foreign_key(table_name, foreign_keys.get(table_name, []))
             for unique_columns in unique_constraints.get(table_name, []):
-                self.add_unique_constraint(table_source, list(unique_columns))
+                self.add_unique_constraint(table_name, list(unique_columns))
             for column in table_columns:
                 if column in table_constraints.get(table_name, {}):
                     self.add_constraint(
-                        table_source,
+                        table_name,
                         self._column_sources.get((table_name, column), column),
                         table_constraints[table_name][column],
                     )
@@ -1372,12 +1427,87 @@ class Instance(Catalog):
                 if fk.target_table_id == relation:
                     row_values[target_col] = target_value
 
+        locked_columns = set(concretes)
+        self._freshen_single_unique_defaults(
+            relation,
+            row_values,
+            locked_columns=locked_columns,
+        )
+        self._freshen_composite_defaults(
+            relation,
+            row_values,
+            locked_columns=locked_columns,
+        )
         row = self.place_row(relation, row_values)
         self.builder.runtime.remember_row(
             self._table_key_for_storage(relation),
             self._row_value_dict(row),
         )
         return tuple_index
+
+    def _freshen_single_unique_defaults(
+        self,
+        relation: RelationId,
+        row_values: Dict[ColumnId, Any],
+        locked_columns: Set[ColumnId],
+    ) -> None:
+        for column_name in self._table_columns_for_storage(relation):
+            column = self._stored_column_id(relation, column_name)
+            if not self.is_unique(relation, column):
+                continue
+            value = row_values.get(column)
+            if value is None:
+                continue
+            used_values = {
+                symbol.concrete
+                for symbol in self.get_column_data(relation, column)
+                if symbol.concrete is not None
+            }
+            if value not in used_values:
+                continue
+            if column in locked_columns:
+                raise UniqueConflictError(
+                    f"Duplicate value {value!r} for unique column {column.display}"
+                )
+            attempt = 1
+            while value in used_values:
+                value = self._next_default_value(value, attempt)
+                attempt += 1
+            row_values[column] = value
+
+    def _freshen_composite_defaults(
+        self,
+        relation: RelationId,
+        row_values: Dict[ColumnId, Any],
+        locked_columns: Set[ColumnId],
+    ) -> None:
+        for columns in self._constraint_groups(relation):
+            candidates = [column for column in columns if column not in locked_columns]
+            if not candidates:
+                continue
+            attempt = 1
+            while self._composite_tuple_exists(relation, columns, row_values):
+                column = candidates[-1]
+                row_values[column] = self._next_default_value(
+                    row_values.get(column),
+                    attempt,
+                )
+                attempt += 1
+
+    def _composite_tuple_exists(
+        self,
+        relation: RelationId,
+        columns: Tuple[ColumnId, ...],
+        values: Mapping[ColumnId, Any],
+    ) -> bool:
+        target = tuple(values.get(column) for column in columns)
+        if any(value is None for value in target):
+            return False
+        for existing_row in self.get_rows(relation):
+            existing = tuple(existing_row[column].concrete for column in columns)
+            if existing == target:
+                return True
+        return False
 
     def _ensure_bootstrapping_value(
         self,
@@ -1442,18 +1572,33 @@ class Instance(Catalog):
             return value + 1
         if isinstance(value, float):
             return value + 1.0
+        if isinstance(value, datetime):
+            return value + timedelta(days=attempt)
+        if isinstance(value, date):
+            return value + timedelta(days=attempt)
+        if isinstance(value, time):
+            seconds = (value.hour * 3600 + value.minute * 60 + value.second + attempt) % 86400
+            hour, rem = divmod(seconds, 3600)
+            minute, second = divmod(rem, 60)
+            return time(hour, minute, second)
         return f"{value}_{attempt}"
 
     @staticmethod
     def _default_for_type(datatype: str) -> Any:
         """Return a sensible default value for a SQL type string."""
-        upper = datatype.upper()
-        if any(t in upper for t in ("INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT")):
+        family = type_family(DataType.build(datatype))
+        if family == TypeFamily.INTEGER:
             return 1
-        if any(t in upper for t in ("REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL")):
+        if family == TypeFamily.DECIMAL:
             return 1.0
-        if "BOOL" in upper:
+        if family == TypeFamily.BOOLEAN:
             return 0
+        if family == TypeFamily.DATE:
+            return date(2024, 6, 15)
+        if family == TypeFamily.DATETIME:
+            return datetime(2024, 6, 15, 0, 0, 0)
+        if family == TypeFamily.TIME:
+            return time(0, 0, 0)
         return "value"
 
     def _bootstrap_reference_rows(

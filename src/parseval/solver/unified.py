@@ -54,12 +54,14 @@ class SolverConstraint:
         constraints: All constraint expressions (comparisons, IS NULL, etc.).
         join_equalities: Cross-variable equalities that the solver enforces.
         variables: Optional explicit datatype map for solver variables.
+        storage_relations: Physical storage relation for alias-scoped variables.
     """
 
     target_relations: Tuple[RelationId, ...]
     constraints: List[exp.Expression] = field(default_factory=list)
     join_equalities: List[Tuple[SolverVar, SolverVar]] = field(default_factory=list)
     variables: Dict[SolverVar, DataType] = field(default_factory=dict)
+    storage_relations: Dict[SolverVar, RelationId] = field(default_factory=dict)
 
 
 @dataclass
@@ -557,6 +559,11 @@ class Solver:
                 constraints=grouped_exprs.get(key, []),
                 join_equalities=grouped_joins.get(key, []),
                 variables=component_types,
+                storage_relations={
+                    variable: relation
+                    for variable, relation in constraint.storage_relations.items()
+                    if variable in component_vars
+                },
             ))
         return components
 

@@ -97,18 +97,11 @@ class Row(exp.Expression):
         columns = self.column_values
         if key in columns:
             return columns[key]
-        if isinstance(key, ColumnId):
-            source = key.source_column_id
-            if source is not None and source in columns:
-                return columns[source]
         if isinstance(key, exp.Column):
             resolved = key.meta.get(PARSEVAL_COLUMN_ID)
             if isinstance(resolved, ColumnId):
                 if resolved in columns:
                     return columns[resolved]
-                source = resolved.source_column_id
-                if source is not None and source in columns:
-                    return columns[source]
         normalized = normalize_name(self._key_name(key))
         for column_name, value in columns.items():
             if normalize_name(self._key_name(column_name)) == normalized:
@@ -334,7 +327,7 @@ class Context:
     """
 
     def __init__(
-        self, tables: Dict[str, DerivedSchema], external: Optional[Context] = None
+        self, tables: Dict[Any, DerivedSchema], external: Optional[Context] = None
     ) -> None:
         """
         Args
@@ -396,7 +389,7 @@ class Context:
                 reader = table[i]
             yield reader, self
 
-    def table_iter(self, table: str) -> TableIter:
+    def table_iter(self, table: Any) -> TableIter:
         return iter(self.tables[table])
 
     def set_mask(self, rowid) -> None:

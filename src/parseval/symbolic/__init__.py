@@ -13,7 +13,7 @@ from parseval.solver.unified import SolverConstraint
 from .constraints import (
     ConstraintGenerator,
     PlausibleBranch,
-    PlausibleConstraintCompiler,
+    ConstraintGenerator,
     PlausiblePath,
 )
 from .engine import SymbolicEngine
@@ -27,6 +27,7 @@ from .types import (
     CoverageTarget,
     CoverageThresholds,
     GenerationResult,
+    OperatorObligation,
 )
 
 __all__ = [
@@ -38,9 +39,10 @@ __all__ = [
     "CoverageTarget",
     "CoverageThresholds",
     "GenerationResult",
+    "OperatorObligation",
     "PlanEvaluator",
     "PlausibleBranch",
-    "PlausibleConstraintCompiler",
+    "ConstraintGenerator",
     "PlausiblePath",
     "SolverConstraint",
     "SymbolicEngine",

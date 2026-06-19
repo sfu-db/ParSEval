@@ -71,6 +71,21 @@ class SubqueryPath:
     predicate: Optional[exp.Expression] = None
 
 
+@dataclass(frozen=True)
+class OperatorObligation:
+    """An operator-level requirement for a generated witness row."""
+
+    kind: str
+    step_id: str
+    site: str
+    relation: Optional[RelationId] = None
+    storage_relation: Optional[RelationId] = None
+    columns: Tuple[ColumnId, ...] = ()
+    row_scope: Optional[str] = None
+    row_count: int = 1
+    expression: Optional[exp.Expression] = None
+
+
 @dataclass(frozen=True, eq=False)
 class BranchPath:
     """Complete constraints needed for one target to survive toward the query root."""
@@ -79,6 +94,7 @@ class BranchPath:
     predicates: Tuple[PathPredicate, ...] = ()
     join_facts: Tuple[JoinFact, ...] = ()
     subqueries: Tuple[SubqueryPath, ...] = ()
+    obligations: Tuple[OperatorObligation, ...] = ()
     relations: Tuple[RelationId, ...] = ()
 
 
@@ -126,6 +142,7 @@ class BranchNode:
     path_predicates: Tuple[exp.Expression, ...] = ()
     join_equalities: Tuple[Tuple[ColumnId, ColumnId], ...] = ()
     join_facts: Tuple[JoinFact, ...] = ()
+    obligations: Tuple[OperatorObligation, ...] = ()
 
     # Dict-based observation storage: atom_id -> {row_ids -> outcome}
     observations: Dict[int, Dict[Tuple[Any, ...], BranchType]] = field(
@@ -294,6 +311,7 @@ class BranchTree:
         path_predicates: Tuple[exp.Expression, ...] = (),
         join_equalities: Tuple[Tuple[ColumnId, ColumnId], ...] = (),
         join_facts: Tuple[JoinFact, ...] = (),
+        obligations: Tuple[OperatorObligation, ...] = (),
     ) -> BranchNode:
         """Find an existing node or create a new one."""
         node_key = (step_id, site, predicate.sql())
@@ -313,6 +331,7 @@ class BranchTree:
             path_predicates=path_predicates,
             join_equalities=join_equalities,
             join_facts=join_facts,
+            obligations=obligations,
         )
         if parent is not None:
             parent.children.append(node)
@@ -356,6 +375,10 @@ class BranchTree:
         if node.site == "distinct":
             add(0, BranchType.DISTINCT_UNIQUE, self.thresholds.distinct_unique)
             add(0, BranchType.DISTINCT_DUPLICATE, self.thresholds.distinct_duplicate)
+            return specs
+
+        if node.site == "root_result":
+            add(0, BranchType.ATOM_TRUE, 1)
             return specs
 
         if node.site == "exists":
@@ -465,6 +488,7 @@ class BranchTree:
 
         predicates: List[PathPredicate] = []
         join_facts: List[JoinFact] = []
+        obligations: List[OperatorObligation] = []
         relations: List[RelationId] = []
         seen_relations: Set[RelationId] = set()
 
@@ -474,6 +498,7 @@ class BranchTree:
                     seen_relations.add(relation)
                     relations.append(relation)
             join_facts.extend(node.join_facts)
+            obligations.extend(node.obligations)
             if node is target.node:
                 predicates.append(
                     PathPredicate(
@@ -495,6 +520,7 @@ class BranchTree:
             target=target,
             predicates=tuple(predicates),
             join_facts=tuple(join_facts),
+            obligations=tuple(obligations),
             relations=tuple(relations),
         )
 
@@ -509,6 +535,18 @@ class BranchTree:
         """
         targets: List[CoverageTarget] = []
         for node in self.nodes:
+            if node.site == "root_result":
+                if node.is_infeasible(0, BranchType.ATOM_TRUE):
+                    continue
+                if node.observation_count(0, BranchType.ATOM_TRUE) < 1:
+                    targets.append(
+                        CoverageTarget(
+                            node=node,
+                            atom_id=0,
+                            target_outcome=BranchType.ATOM_TRUE,
+                        )
+                    )
+                continue
             if node.site in {"filter", "join_on", "scalar_subquery", "having"}:
                 for atom_id in range(len(node.atoms)):
                     threshold = self.thresholds.threshold_for(BranchType.ATOM_TRUE)
@@ -564,6 +602,7 @@ __all__ = [
     "CoverageThresholds",
     "GenerationResult",
     "JoinFact",
+    "OperatorObligation",
     "PathObservationKey",
     "PathPredicate",
     "SubqueryPath",
