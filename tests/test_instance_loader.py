@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from parseval.instance import Instance
-from parseval.domain.exceptions import UniqueConflictError
+from parseval.domain.exceptions import ConstraintViolationError, UniqueConflictError
 
 
 SCHEMA = """
@@ -18,6 +18,17 @@ CREATE TABLE users (
 
 
 class InstanceLoaderTests(unittest.TestCase):
+    def test_create_row_rejects_explicit_null_for_non_nullable_column(self):
+        instance = Instance(ddls=SCHEMA, name="nonnull_case", dialect="sqlite")
+
+        with self.assertRaisesRegex(
+            ConstraintViolationError,
+            "explicit_null_for_non_nullable_column:users.id",
+        ):
+            instance.create_row("users", {"id": None, "name": "Alice"})
+
+        self.assertEqual(instance.get_rows("users"), [])
+
     def test_to_db_materializes_snapshot_into_sqlite(self):
         instance = Instance(ddls=SCHEMA, name="loader_case", dialect="sqlite")
         instance.create_row("users", {"id": 1, "name": "Alice"})

@@ -18,7 +18,11 @@ from sqlglot.schema import (
 )
 
 from parseval.domain import DatabaseBuilder
-from parseval.domain.exceptions import ForeignKeyResolutionError, UniqueConflictError
+from parseval.domain.exceptions import (
+    ConstraintViolationError,
+    ForeignKeyResolutionError,
+    UniqueConflictError,
+)
 from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.identity import (
     CatalogColumn,
@@ -1247,6 +1251,12 @@ class Instance(Catalog):
     ) -> RowCreationResult:
         relation = self._resolve_relation_for_storage(table)
         values_by_id = self._normalize_row_values_by_id(relation, values or {})
+        for column, value in values_by_id.items():
+            if value is None and not self.nullable(relation, column):
+                raise ConstraintViolationError(
+                    "explicit_null_for_non_nullable_column:"
+                    f"{relation.display}.{column.name.normalized}"
+                )
         provided_columns = set(values_by_id)
         new_tuples: Dict[RelationId, List[Row]] = defaultdict(list)
         positions: Dict[RelationId, int] = {}
