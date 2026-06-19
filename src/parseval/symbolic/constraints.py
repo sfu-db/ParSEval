@@ -75,6 +75,10 @@ _NULL_BITS = {
 }
 
 
+class UnresolvedScopedColumnError(ValueError):
+    """A qualified constraint column has no planner-provided identity."""
+
+
 def _step_type_for_node(node: BranchNode) -> StepType:
     raw = (node.step_type or node.site or "").lower()
     mapping = {
@@ -686,6 +690,11 @@ class ConstraintGenerator:
         return storage
 
     def _storage_relation_for_column_id(self, column: ColumnId) -> RelationId | None:
+        if (
+            column.source_column_id is None
+            and column.kind in {ColumnKind.SYNTHETIC, ColumnKind.DERIVED}
+        ):
+            return None
         source = column.source_column_id or column
         relation = source.relation or column.relation
         if relation is None or relation.name is None:
@@ -1325,6 +1334,10 @@ class ConstraintGenerator:
         col_id = column_identity(col)
         if col_id is not None:
             return col_id
+        if col.table:
+            raise UnresolvedScopedColumnError(
+                f"unresolved_scoped_column:{col.sql(dialect=self.dialect)}"
+            )
         rel = self._resolve_relation(col, tables)
         if rel is None:
             return None
