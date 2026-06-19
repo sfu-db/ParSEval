@@ -193,6 +193,7 @@ AGENTS.md
 tmp/
 legacy/
 .agents
+.worktrees/
 
 results/
 .claude/
