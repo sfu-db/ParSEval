@@ -22,6 +22,7 @@ from parseval.identity import (
     column_id,
     column_identity,
     identifier_name,
+    physical_column,
 )
 from parseval.plan import Plan, Step
 from parseval.plan.planner import (
@@ -52,6 +53,7 @@ from .types import (
     BranchTree,
     BranchType,
     JoinFact,
+    OperatorObligation,
 )
 
 # =============================================================================
@@ -257,8 +259,95 @@ def _derived_variable(
     )
 
 
-def _retained_columns(row: Row) -> Dict[ColumnId, Any]:
-    return dict(row.items())
+def _copy_variable_for_column(
+    column_id: ColumnId,
+    symbol: Any,
+    row_ids: Tuple[Any, ...],
+) -> Variable:
+    value = _symbol_value(symbol)
+    kwargs: Dict[str, Any] = {
+        "this": f"{column_id.display}_{'_'.join(str(row_id) for row_id in row_ids) or 'row'}",
+        "concrete": value,
+        "is_bound": getattr(symbol, "is_bound", True),
+        "is_null": getattr(symbol, "is_null", value is None),
+        "column_id": column_id,
+        "relation_id": column_id.relation,
+        "rowid": row_ids,
+        "source": getattr(symbol, "source", None) or "evaluator",
+    }
+    for key in ("type", "nullable", "unique", "domain"):
+        if hasattr(symbol, "args") and key in symbol.args:
+            kwargs[key] = symbol.args[key]
+    return Variable(**kwargs)
+
+
+def _source_symbol(row: Row, column_id: ColumnId) -> Any:
+    columns = row.column_values
+    current: Optional[ColumnId] = column_id
+    while current is not None:
+        if current in columns:
+            return columns[current]
+        current = current.source_column_id
+    target_lineage = _column_lineage(column_id)
+    for row_column, symbol in columns.items():
+        if not isinstance(row_column, ColumnId):
+            continue
+        row_lineage = _column_lineage(row_column)
+        if any(
+            _lineage_columns_match(target_column, source_column)
+            for target_column in target_lineage
+            for source_column in row_lineage
+        ):
+            return symbol
+    return row[column_id]
+
+
+def _column_lineage(column_id: ColumnId) -> Tuple[ColumnId, ...]:
+    columns: List[ColumnId] = []
+    current: Optional[ColumnId] = column_id
+    while current is not None:
+        columns.append(current)
+        current = current.source_column_id
+    return tuple(columns)
+
+
+def _lineage_columns_match(left: ColumnId, right: ColumnId) -> bool:
+    if left == right:
+        return True
+    return _relation_identity_key(left.relation) == _relation_identity_key(
+        right.relation
+    ) and _column_name_key(left) == _column_name_key(right)
+
+
+def _relation_identity_key(relation: Optional[RelationId]) -> Tuple[Any, ...]:
+    if relation is None:
+        return ()
+    return (
+        relation.kind,
+        relation.catalog.normalized if relation.catalog is not None else None,
+        relation.db.normalized if relation.db is not None else None,
+        relation.name.normalized if relation.name is not None else None,
+    )
+
+
+def _column_name_key(column_id: ColumnId) -> str:
+    return "".join(
+        char
+        for char in normalize_name(column_id.name.normalized).casefold()
+        if char.isalnum()
+    )
+
+
+def _materialize_column_from_row(
+    column_id: ColumnId,
+    row: Row,
+    row_ids: Optional[Tuple[Any, ...]] = None,
+) -> Any:
+    return _copy_variable_for_column(
+        column_id,
+        _source_symbol(row, column_id),
+        row.rowid if row_ids is None else row_ids,
+    )
 
 
 def _case_arm_condition(case_expr: exp.Case, arm_pred: exp.Expression) -> exp.Expression:
@@ -367,6 +456,9 @@ class PlanEvaluator:
         if getattr(self.plan, "_instance", None) is not instance:
             self.plan._instance = instance
             self.plan._annotations = None
+        # Strict runtime lookup requires planner identities to be prepared
+        # before the first context is built or any expression is evaluated.
+        self.plan.annotations
 
     def evaluate(self, tree: Optional[BranchTree] = None) -> BranchTree:
         if tree is None:
@@ -378,7 +470,27 @@ class PlanEvaluator:
         if tree is None:
             tree = BranchTree()
         ctx = build_context_from_instance(self.instance)
-        return self._walk(self.plan.root, ctx, tree)
+        output = self._walk(self.plan.root, ctx, tree)
+        self._record_root_result(output, tree)
+        return output
+
+    def _record_root_result(self, output: Context, tree: BranchTree) -> None:
+        root_node = next((node for node in tree.nodes if node.site == "root_result"), None)
+        if root_node is None:
+            return
+        rows: List[Row] = []
+        for table in output.tables.values():
+            rows.extend(table.rows)
+        if not rows:
+            return
+        tree.record_observation(
+            root_node,
+            AtomObservation(
+                atom_id=0,
+                outcome=BranchType.ATOM_TRUE,
+                row_ids=_row_ids(rows[0]),
+            ),
+        )
 
     def _evaluate_subtree(
         self,
@@ -490,16 +602,53 @@ class PlanEvaluator:
         return input_ctx
 
     def _eval_scan(self, step: Scan, ctx: Context) -> Context:
+        output_key = step.relation_id or step.name
         if step.source is None or not isinstance(step.source, exp.Table):
             table_name = step.name
             if table_name in ctx.tables:
-                return Context(tables={step.name: ctx.tables[table_name]})
-            return Context(tables={step.name: DerivedSchema(columns=(), rows=[])})
+                table = ctx.tables[table_name]
+                output_columns = tuple(getattr(step, "output_column_ids", ()) or table.columns)
+                return Context(
+                    tables={
+                        output_key: DerivedSchema(
+                            columns=output_columns,
+                            rows=[
+                                Row(
+                                    this=row.rowid,
+                                    columns={
+                                        column: _materialize_column_from_row(column, row)
+                                        for column in output_columns
+                                    },
+                                )
+                                for row in table.rows
+                            ],
+                        )
+                    }
+                )
+            return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
 
         table_name = step.source.name
         if table_name not in ctx.tables:
-            return Context(tables={step.name: DerivedSchema(columns=(), rows=[])})
-        return Context(tables={step.name: ctx.tables[table_name]})
+            return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
+        table = ctx.tables[table_name]
+        output_columns = tuple(getattr(step, "output_column_ids", ()) or table.columns)
+        return Context(
+            tables={
+                output_key: DerivedSchema(
+                    columns=output_columns,
+                    rows=[
+                        Row(
+                            this=row.rowid,
+                            columns={
+                                column: _materialize_column_from_row(column, row)
+                                for column in output_columns
+                            },
+                        )
+                        for row in table.rows
+                    ],
+                )
+            }
+        )
 
     def _eval_filter(
         self,
@@ -637,6 +786,7 @@ class PlanEvaluator:
         observe: bool = True,
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
     ) -> Context:
+        input_ctx = ctx
         for join_name, join_data in (step.joins or {}).items():
             condition = join_data.get("condition")
             if condition is None or not isinstance(condition, exp.Expression):
@@ -668,9 +818,13 @@ class PlanEvaluator:
                     join_facts=own_join_facts,
                 )
 
-            source_name = step.source_name or step.name
-            source_table = ctx.tables.get(source_name)
-            join_table = ctx.tables.get(join_name)
+            source_relation = step.source_relation
+            source_table = (
+                ctx.tables.get(source_relation)
+                if source_relation is not None
+                else None
+            )
+            join_table = input_ctx.tables.get(join_name)
             if source_table is None or join_table is None:
                 continue
 
@@ -783,7 +937,7 @@ class PlanEvaluator:
             )
             ctx = Context(
                 tables={
-                    step.name: DerivedSchema(columns=columns, rows=joined_rows),
+                    (source_relation or step.name): DerivedSchema(columns=columns, rows=joined_rows),
                 }
             )
 
@@ -839,6 +993,7 @@ class PlanEvaluator:
                 aggregate_values: Dict[Any, Any] = {}
                 columns = {}
                 relation_id = _step_relation_id(step)
+                output_columns = self._aggregate_columns(step)
                 for aggregate in step.aggregations:
                     alias = normalize_name(aggregate.alias_or_name)
                     col_id = _aggregate_output_col_id(step, alias, relation_id)
@@ -856,6 +1011,27 @@ class PlanEvaluator:
                         relation_id,
                         column_id_override=col_id,
                     )
+                if table.rows:
+                    source_row = table.rows[0]
+                    for col_id in output_columns:
+                        if col_id in columns:
+                            continue
+                        columns[col_id] = _materialize_column_from_row(
+                            col_id,
+                            source_row,
+                            output_row_id,
+                        )
+                else:
+                    for col_id in output_columns:
+                        if col_id in columns:
+                            continue
+                        columns[col_id] = _derived_variable(
+                            col_id.name.normalized,
+                            None,
+                            output_row_id,
+                            col_id.relation,
+                            column_id_override=col_id,
+                        )
                 output_rows = [Row(this=output_row_id, columns=columns)]
                 aggregate_groups = {
                     output_row_id: AggregateGroup(
@@ -875,7 +1051,7 @@ class PlanEvaluator:
             return Context(
                 tables={
                     step.name: DerivedSchema(
-                        columns=tuple(output_rows[0].columns) if output_rows else self._aggregate_columns(step),
+                        columns=self._aggregate_columns(step),
                         rows=output_rows,
                         aggregate_groups=aggregate_groups,
                     )
@@ -1116,9 +1292,8 @@ class PlanEvaluator:
                     distinct_rows.append(row)
                 rows = distinct_rows
 
-            columns = tuple(rows[0].columns) if rows else visible_columns
             output[step.name] = DerivedSchema(
-                columns=columns,
+                columns=visible_columns,
                 rows=rows,
                 datatypes=table.datatypes,
                 nullables=table.nullables,
@@ -1175,8 +1350,6 @@ class PlanEvaluator:
                         break
                 col_id = column_id(ColumnKind.PROJECTED, identifier_name(name), relation_id)
             values[col_id] = self._projection_value(expr, row, env, col_id)
-        for cid, symbol in _retained_columns(row).items():
-            values.setdefault(cid, symbol)
         return values
 
     def _projected_key(self, row: Row, visible_columns: Tuple[ColumnId, ...]) -> Tuple[Any, ...]:
@@ -1376,7 +1549,7 @@ class PlanEvaluator:
         for group_index, (key, group_rows) in enumerate(grouped.items()):
             output_row_id = ("agg", step.name, group_index)
             source_row_ids = tuple(row.rowid for row in group_rows)
-            columns: Dict[ColumnId, Any] = _retained_columns(group_rows[0])
+            columns: Dict[ColumnId, Any] = {}
             group_key_values: Dict[ColumnId, Any] = {}
             for alias, value in zip(group_aliases, key):
                 col_id = _aggregate_output_col_id(step, alias, relation_id)
@@ -1406,6 +1579,14 @@ class PlanEvaluator:
                     output_row_id,
                     relation_id,
                     column_id_override=col_id,
+                )
+            for col_id in self._aggregate_columns(step):
+                if col_id in columns:
+                    continue
+                columns[col_id] = _materialize_column_from_row(
+                    col_id,
+                    group_rows[0],
+                    output_row_id,
                 )
             output_rows.append(Row(this=output_row_id, columns=columns))
             aggregate_groups[output_row_id] = AggregateGroup(
@@ -1670,6 +1851,35 @@ def build_branch_tree(
 
     # Index: step_id → BranchNode for parent lookup.
     step_nodes: Dict[str, Any] = {}
+    scan_columns_by_relation: Dict[RelationId, Tuple[ColumnId, ...]] = {}
+    storage_by_relation: Dict[RelationId, RelationId] = {}
+
+    def _storage_table_key(relation: RelationId) -> str | None:
+        try:
+            return instance._table_key_for_storage(relation)
+        except Exception:
+            return None
+
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+    for step in plan.ordered_steps:
+        if not isinstance(step, Scan) or getattr(step, "relation_id", None) is None:
+            continue
+        output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
+        scan_columns_by_relation[step.relation_id] = output_columns
+        storage_relation = None
+        for column in output_columns:
+            source = column.source_column_id or column
+            if source.relation is not None and source.relation.name is not None:
+                if _storage_table_key(source.relation) in instance.tables:
+                    storage_relation = source.relation
+                    break
+        if storage_relation is None and step.relation_id.name is not None:
+            if _storage_table_key(step.relation_id) in instance.tables:
+                storage_relation = step.relation_id
+        if storage_relation is not None:
+            storage_by_relation[step.relation_id] = storage_relation
 
     def _find_parent(step: Step) -> Optional[Any]:
         """Find the nearest upstream step that has a BranchNode."""
@@ -1705,6 +1915,127 @@ def build_branch_tree(
             walk(dep, False)
         return tuple(predicates), tuple(join_eqs)
 
+    def _scan_obligations(
+        step_id: str,
+        tables: Tuple[RelationId, ...],
+        row_count: int = 1,
+        keyed_only: bool = False,
+    ) -> Tuple[OperatorObligation, ...]:
+        obligations: List[OperatorObligation] = []
+        for relation in tables:
+            storage_relation = storage_by_relation.get(relation)
+            table_name = _storage_table_key(storage_relation or relation)
+            if table_name is None or table_name not in instance.tables:
+                continue
+            columns = scan_columns_by_relation.get(relation, ())
+            if not columns:
+                columns = tuple(
+                    physical_column(column_name, relation, dialect=getattr(instance, "dialect", None))
+                    for column_name in instance.tables[table_name]
+                )
+            if keyed_only:
+                def key_name(value: Any) -> str:
+                    return str(getattr(value, "name", value)).lower()
+
+                key_names = {
+                    key_name(key)
+                    for key in instance.primary_keys.get(table_name, ())
+                }
+                for unique_columns in instance.unique_constraints.get(table_name, ()):
+                    key_names.update(key_name(key) for key in unique_columns)
+                columns = tuple(
+                    column for column in columns
+                    if column.name.normalized.lower() in key_names
+                )
+                if not columns:
+                    continue
+            obligations.append(
+                OperatorObligation(
+                    kind="scan_exists",
+                    step_id=step_id,
+                    site="scan",
+                    relation=relation,
+                    storage_relation=storage_relation,
+                    columns=columns,
+                    row_count=row_count,
+                )
+            )
+        return tuple(obligations)
+
+    def _lineage_relations(step: Step) -> Tuple[RelationId, ...]:
+        relations: List[RelationId] = []
+        seen: set[RelationId] = set()
+
+        def add_relation(relation: RelationId | None) -> None:
+            if relation is None:
+                return
+            for alias_relation, storage_relation in storage_by_relation.items():
+                if storage_relation == relation and alias_relation not in seen:
+                    seen.add(alias_relation)
+                    relations.append(alias_relation)
+                    return
+            if relation not in seen:
+                seen.add(relation)
+                relations.append(relation)
+
+        def add_column(column: ColumnId) -> None:
+            source = column.source_column_id or column
+            add_relation(source.relation or column.relation)
+
+        def walk_step(s: Step, visited: set[int]) -> None:
+            if id(s) in visited:
+                return
+            visited.add(id(s))
+            for expr_value in (
+                getattr(s, "condition", None),
+                *tuple(getattr(s, "projections", ()) or ()),
+                *tuple(getattr(s, "order", ()) or ()),
+                *tuple((getattr(s, "group", {}) or {}).values()),
+                *tuple(getattr(s, "aggregations", ()) or ()),
+            ):
+                if not isinstance(expr_value, exp.Expression):
+                    continue
+                for col in expr_value.find_all(exp.Column):
+                    col_id = column_identity(col)
+                    if col_id is not None:
+                        add_column(col_id)
+            if isinstance(s, Join):
+                for join_data in (s.joins or {}).values():
+                    for expr_value in (
+                        *tuple(join_data.get("source_key", ()) or ()),
+                        *tuple(join_data.get("join_key", ()) or ()),
+                        join_data.get("condition"),
+                    ):
+                        if not isinstance(expr_value, exp.Expression):
+                            continue
+                        for col in expr_value.find_all(exp.Column):
+                            col_id = column_identity(col)
+                            if col_id is not None:
+                                add_column(col_id)
+            for dep in s.chain_dependencies:
+                walk_step(dep, visited)
+
+        for column in tuple(getattr(step, "output_column_ids", ()) or ()):
+            add_column(column)
+        walk_step(step, set())
+        return tuple(relations)
+
+    def _canonical_relations(relations: Tuple[RelationId, ...]) -> Tuple[RelationId, ...]:
+        canonical: List[RelationId] = []
+        seen: set[RelationId] = set()
+        for relation in relations:
+            mapped = relation
+            if relation not in storage_by_relation:
+                for alias_relation, storage_relation in storage_by_relation.items():
+                    if storage_relation == relation:
+                        mapped = alias_relation
+                        break
+            if mapped in seen:
+                continue
+            seen.add(mapped)
+            canonical.append(mapped)
+        return tuple(canonical)
+
     def _add_node(
         step: Step,
         step_type: str,
@@ -1734,8 +2065,38 @@ def build_branch_tree(
             path_predicates=path_preds,
             join_equalities=tuple(join_eqs) + own_join_equalities,
             join_facts=join_facts,
+            obligations=_scan_obligations(annotation.step_id, tables, keyed_only=True),
         )
-        step_nodes[annotation.step_id] = node
+        step_nodes.setdefault(annotation.step_id, node)
+
+    def _root_required_row_count(root: Step) -> int:
+        max_root_rows = 20
+        if isinstance(root, Limit):
+            offset = max(int(getattr(root, "offset", 0) or 0), 0)
+            limit = getattr(root, "limit", 1)
+            limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
+            return min(max(offset + limit_value, 1), max_root_rows)
+        return 1
+
+    def _root_obligations(root: Step) -> Tuple[OperatorObligation, ...]:
+        annotation = plan.annotation_for(root)
+        row_count = _root_required_row_count(root)
+        root_relations = _canonical_relations(
+            annotation.source_relations + _lineage_relations(root)
+        )
+        obligations: List[OperatorObligation] = [
+            OperatorObligation(
+                kind="root_result",
+                step_id=annotation.step_id,
+                site="root_result",
+                row_count=row_count,
+            )
+        ]
+        return tuple(obligations) + _scan_obligations(
+            annotation.step_id,
+            root_relations,
+            row_count=row_count,
+        )
 
     for step in plan.ordered_steps:
         annotation = plan.annotation_for(step)
@@ -1785,6 +2146,23 @@ def build_branch_tree(
                 _add_node(step, "SubPlan", "exists", step.anchor, (step.anchor,), ())
             elif step.kind is SubPlanKind.IN:
                 _add_node(step, "SubPlan", "in", step.anchor, (step.anchor,), ())
+
+    root_annotation = plan.annotation_for(plan.root)
+    root_obligations = _root_obligations(plan.root)
+    if root_obligations:
+        tree.get_or_create_node(
+            step_id=f"{root_annotation.step_id}:root_result",
+            step_type=type(plan.root).__name__,
+            site="root_result",
+            predicate=exp.true(),
+            atoms=(exp.true(),),
+            tables=_canonical_relations(
+                root_annotation.source_relations + _lineage_relations(plan.root)
+            ),
+            step_obj=plan.root,
+            parent=_find_parent(plan.root),
+            obligations=root_obligations,
+        )
 
     return tree
 

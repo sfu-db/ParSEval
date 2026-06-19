@@ -363,14 +363,9 @@ class Environment:
         self._outer: Optional[Environment] = outer
 
     def _resolve_by_id(self, col_id: ColumnId) -> Any:
-        """Direct ColumnId lookup with source_column_id chain fallback."""
+        """Direct ColumnId lookup."""
         if col_id in self._bindings:
             return self._bindings[col_id]
-        source = col_id.source_column_id
-        while source is not None:
-            if source in self._bindings:
-                return self._bindings[source]
-            source = source.source_column_id
         return _MISSING
 
     def resolve(self, column: Union[exp.Column, ColumnId]) -> Any:

@@ -384,6 +384,33 @@ class Step:
 
             return bool(agg_funcs)
 
+        def _aggregate_alias_for_having(agg_func: exp.AggFunc) -> str:
+            agg_name = _aggregate_function_name(agg_func)
+            agg_argument = _aggregate_argument_id(agg_func)
+            for aggregation in aggregations:
+                existing = _direct_aggregate_function(aggregation)
+                if (
+                    existing is not None
+                    and _aggregate_function_name(existing) == agg_name
+                    and _aggregate_argument_id(existing) == agg_argument
+                ):
+                    alias_name = aggregation.alias_or_name
+                    if alias_name:
+                        return alias_name
+
+            base_name = agg_name
+            existing_aliases = {
+                normalize_name(aggregation.alias_or_name)
+                for aggregation in aggregations
+                if aggregation.alias_or_name
+            }
+            alias_name = base_name
+            suffix = 1
+            while normalize_name(alias_name) in existing_aliases:
+                alias_name = f"{base_name}_{suffix}"
+                suffix += 1
+            return alias_name
+
         def set_ops_and_aggs(agg_step: "Aggregate") -> None:
             agg_step.operands = tuple(
                 alias(operand, alias_) for operand, alias_ in operands.items()
@@ -419,12 +446,15 @@ class Step:
             aggregate.source = step.name
 
             if having:
-                if extract_agg_operands(
-                    exp.alias_(having.this, "_h", quoted=True)
-                ):
-                    aggregate.condition = exp.column("_h", step.name, quoted=True)
-                else:
-                    aggregate.condition = having.this
+                aggregate.condition = having.this
+                for agg_func in _iter_outer_agg_funcs(having.this):
+                    alias_name = _aggregate_alias_for_having(agg_func)
+                    alias_expr = exp.alias_(agg_func.copy(), alias_name, quoted=True)
+                    if alias_expr not in aggregations:
+                        aggregations.add(alias_expr)
+                    agg_func.replace(
+                        exp.column(alias_name, step.name, quoted=True)
+                    )
 
             set_ops_and_aggs(aggregate)
 
@@ -783,9 +813,7 @@ class Aggregate(Step):
 class Having(Step):
     """Applies a ``HAVING`` predicate on the output of an :class:`Aggregate`.
 
-    The condition expression may reference aggregate-output columns (such as
-    the synthetic ``_h`` alias that :meth:`Step.from_expression` creates when
-    the ``HAVING`` clause itself contains aggregate functions) or
+    The condition expression may reference aggregate-output columns or
     ``GROUP BY`` column aliases (``_g0``, ``_g1``, ...).
     """
 
@@ -1407,10 +1435,61 @@ def _prepare_step_identity(step: "Step", instance: t.Any) -> None:
     elif isinstance(step, Project):
         step.output_column_ids = _build_project_output_columns(step, instance)
     else:
+        if isinstance(step, Join):
+            _prepare_join_identity(step, instance)
         output_columns: t.List[ColumnId] = []
         for dep in step.chain_dependencies:
             output_columns.extend(getattr(dep, "output_column_ids", ()))
         step.output_column_ids = tuple(output_columns)
+
+
+def _prepare_join_identity(step: "Join", instance: t.Any) -> None:
+    dialect = getattr(instance, "dialect", None)
+    scans = [
+        dep
+        for dep in step.chain_dependencies
+        if isinstance(dep, Scan) and dep.relation_id is not None
+    ]
+
+    source_name = getattr(step, "source_name", None) or step.name
+    source_scan = next(
+        (
+            scan
+            for scan in scans
+            if source_name and _relation_matches(scan.relation_id, source_name, dialect)
+        ),
+        None,
+    )
+    if source_scan is not None:
+        step.source_relation = source_scan.relation_id
+
+    rewritten_joins: t.Dict[RelationId, t.Dict[str, t.Any]] = {}
+    for join_relation, join_data in step.joins.items():
+        scan = next(
+            (
+                candidate
+                for candidate in scans
+                if _same_relation_identity(candidate.relation_id, join_relation, dialect)
+            ),
+            None,
+        )
+        rewritten_joins[scan.relation_id if scan is not None else join_relation] = join_data
+    step.joins = rewritten_joins
+
+
+def _same_relation_identity(
+    candidate: RelationId | None,
+    expected: RelationId | None,
+    dialect: str | None,
+) -> bool:
+    if candidate is None or expected is None:
+        return False
+    qualifiers = []
+    if expected.alias is not None:
+        qualifiers.append(expected.alias.raw)
+    if expected.name is not None:
+        qualifiers.append(expected.name.raw)
+    return any(_relation_matches(candidate, qualifier, dialect) for qualifier in qualifiers)
 
 
 def _prepare_scan_identity(scan: "Scan", instance: t.Any) -> None:
@@ -1667,9 +1746,13 @@ def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tup
     # Include all non-aggregated columns from input tables as pass-through columns.
     # This handles MySQL-style GROUP BY where non-aggregated columns are allowed
     # (they are functionally dependent on the GROUP BY keys).
-    seen_normalized = {column.name.normalized for column in result}
+    seen_column_keys = {
+        (column.relation, column.name.normalized)
+        for column in result
+    }
     for visible_col in _visible_columns(step):
-        if visible_col.name.normalized in seen_normalized:
+        column_key = (visible_col.relation, visible_col.name.normalized)
+        if column_key in seen_column_keys:
             continue
         result.append(
             column_id(
@@ -1681,7 +1764,7 @@ def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any) -> t.Tup
                 source_column_id=visible_col,
             )
         )
-        seen_normalized.add(visible_col.name.normalized)
+        seen_column_keys.add(column_key)
 
     return tuple(result)
 
@@ -1885,13 +1968,28 @@ def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
     )
     if aggregate is None or step.condition is None:
         return ()
-    aliases = _condition_column_names(step.condition)
+    aggregate_aliases = {
+        normalize_name(aggregation.alias_or_name): _direct_aggregate_function(aggregation)
+        for aggregation in aggregate.aggregations
+        if isinstance(aggregation, exp.Alias)
+        and aggregation.alias_or_name
+        and _direct_aggregate_function(aggregation) is not None
+    }
     constraints: t.List[t.Dict[str, t.Any]] = []
-    for aggregation in aggregate.aggregations:
-        alias_name = aggregation.alias_or_name
-        if alias_name not in aliases or not isinstance(aggregation, exp.Alias):
+    for comparison in step.condition.walk():
+        if not isinstance(comparison, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
             continue
-        constraint = _aggregate_comparison_constraint(aggregation.this)
+        rewritten = comparison.copy()
+        matched = False
+        for column in rewritten.find_all(exp.Column):
+            aggregate_function = aggregate_aliases.get(normalize_name(column.name))
+            if aggregate_function is None:
+                continue
+            column.replace(aggregate_function.copy())
+            matched = True
+        if not matched:
+            continue
+        constraint = _aggregate_comparison_constraint(rewritten)
         if constraint is not None:
             constraints.append(constraint)
     return tuple(constraints)

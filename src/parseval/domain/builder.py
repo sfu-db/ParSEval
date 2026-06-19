@@ -231,9 +231,6 @@ class DatabaseBuilder:
     def _coerce_for_column(self, column, value):
         """Coerce a concrete value to match a column's declared datatype.
 
-        For SQLite temporal columns, string values are preserved as-is
-        (SQLite stores dates as TEXT).
-
         Args:
             column: The target ColumnSpec.
             value: The value to coerce.
@@ -245,9 +242,6 @@ class DatabaseBuilder:
             TypeCoercionError: If the value cannot be converted.
         """
         try:
-            # For SQLite, preserve string values for temporal columns (SQLite stores as TEXT).
-            if column.dialect == "sqlite" and isinstance(value, str) and column.datatype and column.datatype.is_type(*DataType.TEMPORAL_TYPES):
-                return value
             return coerce_value(value, column.datatype, dialect=column.dialect)
         except Exception as exc:
             raise TypeCoercionError(
