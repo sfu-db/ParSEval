@@ -317,6 +317,13 @@ class ConstraintGenerator:
         return self.compile_path(_path_from_node_chain(target))
 
     def _constraints_for_path_predicate(self, predicate: PathPredicate) -> List[exp.Expression]:
+        if predicate.node.site == "project_output":
+            return self._project_output_constraints(predicate)
+        if predicate.node.site == "aggregate_output":
+            return self._aggregate_output_constraints(predicate)
+        if predicate.node.site == "aggregate_distinct_input":
+            return self._aggregate_distinct_input_constraints(predicate)
+
         expression = predicate.expression.copy()
         if predicate.outcome in _POSITIVE_BITS:
             if predicate.node.site == "filter":
@@ -337,6 +344,106 @@ class ConstraintGenerator:
         if predicate.outcome == PlausibleBit.JOIN_NO_MATCH:
             return [negate_predicate(expression)] if not _is_trivial_true(expression) else []
         return [expression]
+
+    def _project_output_constraints(
+        self,
+        predicate: PathPredicate,
+    ) -> List[exp.Expression]:
+        expression = predicate.expression
+        if isinstance(expression, exp.Alias):
+            expression = expression.this
+        scoped = self._scoped_expression(expression, predicate.node.tables, "r0")
+        if predicate.outcome == PlausibleBit.PROJECT_NULL:
+            return [exp.Is(this=scoped, expression=exp.Null())]
+        return [exp.Is(this=scoped, expression=exp.Not(this=exp.Null()))]
+
+    def _aggregate_output_constraints(
+        self,
+        predicate: PathPredicate,
+    ) -> List[exp.Expression]:
+        function = next(predicate.expression.find_all(exp.AggFunc), None)
+        if function is None:
+            return []
+        if isinstance(function, exp.Count):
+            return []
+
+        argument = function.this
+        if isinstance(argument, exp.Distinct):
+            if not argument.expressions:
+                return []
+            argument = argument.expressions[0]
+        if argument is None or isinstance(argument, exp.Star):
+            return []
+
+        scoped = self._scoped_expression(argument, predicate.node.tables, "r0")
+        if predicate.outcome == PlausibleBit.AGGREGATE_NULL:
+            return [exp.Is(this=scoped, expression=exp.Null())]
+        return [exp.Is(this=scoped, expression=exp.Not(this=exp.Null()))]
+
+    def _aggregate_distinct_input_constraints(
+        self,
+        predicate: PathPredicate,
+    ) -> List[exp.Expression]:
+        left = self._scoped_expression(
+            predicate.expression,
+            predicate.node.tables,
+            "r0",
+        )
+        if predicate.outcome == PlausibleBit.AGG_DISTINCT_NULL_IGNORED:
+            return [exp.Is(this=left, expression=exp.Null())]
+
+        right = self._scoped_expression(
+            predicate.expression,
+            predicate.node.tables,
+            "r1",
+        )
+        comparison_type = (
+            exp.EQ
+            if predicate.outcome == PlausibleBit.AGG_DISTINCT_DUPLICATE_ELIMINATED
+            else exp.NEQ
+        )
+        constraints: List[exp.Expression] = [
+            comparison_type(this=left.copy(), expression=right.copy()),
+            exp.Is(this=left, expression=exp.Not(this=exp.Null())),
+            exp.Is(this=right, expression=exp.Not(this=exp.Null())),
+        ]
+
+        step = predicate.node.step
+        if isinstance(step, Aggregate):
+            for group_expression in step.group.values():
+                constraints.append(
+                    exp.EQ(
+                        this=self._scoped_expression(
+                            group_expression,
+                            predicate.node.tables,
+                            "r0",
+                        ),
+                        expression=self._scoped_expression(
+                            group_expression,
+                            predicate.node.tables,
+                            "r1",
+                        ),
+                    )
+                )
+        return constraints
+
+    def _scoped_expression(
+        self,
+        expression: exp.Expression,
+        tables: Tuple[RelationId, ...],
+        row_scope: str,
+    ) -> exp.Expression:
+        def scope(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Column):
+                return node
+            col_id = column_identity(node)
+            if col_id is None:
+                raise UnresolvedScopedColumnError(
+                    f'unresolved_scoped_column:{node.sql()}'
+                )
+            return self._constraint_column(col_id, row_scope=row_scope)
+
+        return expression.copy().transform(scope)
 
     def _positive_predicate_constraints(self, expression: exp.Expression) -> List[exp.Expression]:
         constraints: List[exp.Expression] = []
@@ -530,23 +637,22 @@ class ConstraintGenerator:
         row_scope: str | None = None,
         relations: Tuple[RelationId, ...] = (),
     ) -> List[exp.Expression]:
-        inner = subquery.this
-        if not isinstance(inner, exp.Select):
+        subplan = self._find_subplan_for_subquery(subquery)
+        if subplan is None or subplan.inner is None:
             return []
+        inner_expressions: List[exp.Expression] = []
+        for step in self._iter_steps_with_subplans(subplan.inner):
+            if isinstance(step, Join):
+                for join_data in step.joins.values():
+                    condition = join_data.get("condition")
+                    if isinstance(condition, exp.Expression):
+                        inner_expressions.append(condition)
+            elif isinstance(step, Filter) and isinstance(step.condition, exp.Expression):
+                inner_expressions.append(step.condition)
+
         constraints: List[exp.Expression] = []
-        for join in inner.find_all(exp.Join):
-            on_expr = join.args.get("on")
-            if isinstance(on_expr, exp.Expression):
-                for conjunct in self._split_conjuncts(on_expr):
-                    if conjunct.find(exp.Subquery):
-                        continue
-                    copied = conjunct.copy()
-                    if row_scope is not None:
-                        self._scope_expression_columns(copied, row_scope, relations)
-                    constraints.append(copied)
-        where = inner.args.get("where")
-        if where is not None and isinstance(where.this, exp.Expression):
-            for conjunct in self._split_conjuncts(where.this):
+        for expression in inner_expressions:
+            for conjunct in self._split_conjuncts(expression):
                 if conjunct.find(exp.Subquery):
                     continue
                 copied = conjunct.copy()
@@ -1277,7 +1383,7 @@ class ConstraintGenerator:
                         set_solver_var(col, scoped_var)
                     # Even if SolverVar exists, ensure col.type is set.
                     if col.type is None:
-                        self._set_type_from_metadata_or_catalog(col, tables)
+                        self._set_type_from_col_id(col, existing_var.column_id)
                     continue
                 col_id = self._column_id_for_expr(col, tables)
                 if col_id is None:
