@@ -396,13 +396,13 @@ class Step:
         # --- extract SELECT-list projections, aggregate operands, aggregations --------
         projections: t.List[exp.Expression] = []
         operands: t.Dict[exp.Expression, str] = {}
-        aggregations: t.Set[exp.Expression] = set()
+        aggregations: t.List[exp.Expression] = []
         next_operand_name = name_sequence("_a_")
 
         def extract_agg_operands(expr: exp.Expression) -> bool:
             agg_funcs = tuple(_iter_outer_agg_funcs(expr))
-            if agg_funcs:
-                aggregations.add(expr)
+            if agg_funcs and expr not in aggregations:
+                aggregations.append(expr)
 
             for agg in agg_funcs:
                 for operand in agg.unnest_operands():
@@ -482,7 +482,7 @@ class Step:
                     alias_name = _aggregate_alias_for_having(agg_func)
                     alias_expr = exp.alias_(agg_func.copy(), alias_name, quoted=True)
                     if alias_expr not in aggregations:
-                        aggregations.add(alias_expr)
+                        aggregations.append(alias_expr)
                     agg_func.replace(
                         exp.column(alias_name, step.name, quoted=True)
                     )

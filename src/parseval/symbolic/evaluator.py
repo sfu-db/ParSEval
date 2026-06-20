@@ -437,6 +437,28 @@ def _aggregate_output_col_id(
     return _output_column_by_name(step, alias) or _aggregate_col_id(alias, relation_id)
 
 
+def _aggregate_coverage_expressions(step: Aggregate) -> Tuple[exp.Expression, ...]:
+    operands = {
+        normalize_name(operand.alias_or_name): (
+            operand.this if isinstance(operand, exp.Alias) else operand
+        )
+        for operand in (getattr(step, "operands", ()) or ())
+        if operand.alias_or_name
+    }
+
+    def expand(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Column) and not node.table:
+            operand = operands.get(normalize_name(node.name))
+            if operand is not None:
+                return operand.copy()
+        return node
+
+    return tuple(
+        aggregation.copy().transform(expand)
+        for aggregation in step.aggregations
+    )
+
+
 # =============================================================================
 # PlanEvaluator
 # =============================================================================
@@ -2119,12 +2141,52 @@ def build_branch_tree(
             if step.group or step.aggregations:
                 group_pred = exp.Literal.number(1)
                 _add_node(step, "Aggregate", "group", group_pred, (group_pred,), tables)
+            if step.aggregations:
+                aggregate_expressions = _aggregate_coverage_expressions(step)
+                _add_node(
+                    step,
+                    "Aggregate",
+                    "aggregate_output",
+                    exp.Literal.string("AGGREGATE_OUTPUT"),
+                    aggregate_expressions,
+                    tables,
+                )
+                distinct_arguments = tuple(
+                    argument.expressions[0]
+                    for aggregation in aggregate_expressions
+                    for function in aggregation.find_all(exp.AggFunc)
+                    for argument in (function.this,)
+                    if isinstance(argument, exp.Distinct) and argument.expressions
+                )
+                if distinct_arguments:
+                    _add_node(
+                        step,
+                        "Aggregate",
+                        "aggregate_distinct_input",
+                        exp.Literal.string("AGGREGATE_DISTINCT_INPUT"),
+                        distinct_arguments,
+                        tables,
+                    )
 
         elif isinstance(step, Having) and step.condition is not None:
             atoms = decompose_atoms(step.condition)
             _add_node(step, "Having", "having", step.condition, atoms, tables)
 
         elif isinstance(step, Project):
+            project_expressions = tuple(
+                projection
+                for projection in step.projections
+                if isinstance(projection, exp.Expression)
+            )
+            if project_expressions:
+                _add_node(
+                    step,
+                    "Project",
+                    "project_output",
+                    exp.Literal.string("PROJECT_OUTPUT"),
+                    project_expressions,
+                    tables,
+                )
             for projection in step.projections:
                 if not isinstance(projection, exp.Expression):
                     continue
