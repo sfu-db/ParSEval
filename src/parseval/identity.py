@@ -45,6 +45,11 @@ class RelationId:
         visible = self.alias or self.name
         return visible.display if visible is not None else self.kind.value
 
+    @property
+    def binding_display(self) -> str:
+        visible = self.display
+        return f"{visible}@{self.scope_id}" if self.scope_id else visible
+
 
 class ColumnKind(Enum):
     PHYSICAL = "physical"

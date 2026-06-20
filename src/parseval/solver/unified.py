@@ -578,7 +578,7 @@ class Solver:
     def _smt_name(self, index: int, variable: SolverVar) -> str:
         return (
             f"sv_{index}_"
-            f"{variable.relation_id.display}_"
+            f"{variable.relation_id.binding_display}_"
             f"{variable.column_id.name.normalized}"
         ).replace(".", "_").replace("#", "_")
 

@@ -39,7 +39,7 @@ class SolverVar:
     @property
     def display(self) -> str:
         scope = f"#{self.row_scope}" if self.row_scope else ""
-        return f"{self.relation_id.display}.{self.column_id.name.display}{scope}"
+        return f"{self.relation_id.binding_display}.{self.column_id.name.display}{scope}"
 
 
 def set_solver_var(column: exp.Column, variable: SolverVar) -> exp.Column:
