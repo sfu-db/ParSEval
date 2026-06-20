@@ -39,6 +39,17 @@ def test_relation_id_distinguishes_self_join_aliases():
     assert rel_a.name == rel_b.name
 
 
+def test_relation_binding_display_distinguishes_reused_visible_names():
+    table = identifier_name("races")
+    outer = relation_id(RelationKind.TABLE, table, scope_id="outer")
+    inner = relation_id(RelationKind.TABLE, table, scope_id="inner")
+
+    assert outer.display == inner.display == "races"
+    assert outer.binding_display == "races@outer"
+    assert inner.binding_display == "races@inner"
+    assert outer.binding_display != inner.binding_display
+
+
 def test_column_id_links_query_column_to_physical_source():
     physical_table = relation_id(RelationKind.TABLE, identifier_name("users"))
     physical = column_id(ColumnKind.PHYSICAL, identifier_name("id"), physical_table)

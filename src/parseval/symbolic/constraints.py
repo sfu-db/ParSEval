@@ -155,15 +155,6 @@ def _relation_table_name(rel: RelationId) -> str:
     return rel.name.normalized if rel.name is not None else rel.display
 
 
-def _relation_matches_name(rel: RelationId, name: str) -> bool:
-    candidates = []
-    if rel.name is not None:
-        candidates.append(rel.name.normalized)
-    if rel.alias is not None:
-        candidates.append(rel.alias.normalized)
-    return normalize_name(name) in candidates
-
-
 def _column_expr_from_id(column: ColumnId) -> exp.Column:
     relation = column.relation
     table_name = ""
@@ -1468,33 +1459,42 @@ class ConstraintGenerator:
         return ""
 
     def _resolve_relation(self, col: exp.Column, tables: Tuple[RelationId, ...]) -> RelationId | None:
-        """Resolve a column's table qualifier to a RelationId."""
+        """Resolve a column from planner or solver identity.
+
+        Only unqualified synthetic/schema expressions may use catalog shape as
+        a fallback. Qualified query columns must already carry scoped identity.
+        """
+        col_id = column_identity(col)
+        if col_id is not None and col_id.relation is not None:
+            return col_id.relation
+        variable = solver_var(col)
+        if variable is not None:
+            return variable.relation_id
         if col.table:
-            table_name = normalize_name(col.table)
-            for rel in tables:
-                if _relation_matches_name(rel, table_name):
-                    return rel
-            if table_name in self.instance.tables:
-                return table_relation(table_name, dialect=self.dialect)
+            raise UnresolvedScopedColumnError(
+                f"unresolved_scoped_column:{col.sql(dialect=self.dialect)}"
+            )
         col_name = normalize_name(col.name)
+        candidates: List[RelationId] = []
         for rel in tables:
             name = _relation_table_name(rel)
             if name in self.instance.tables and col_name in self.instance.tables[name]:
-                return rel
-        return tables[0] if tables else None
+                candidates.append(rel)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def _resolve_table_relation(
         self,
         table: exp.Table,
         tables: Tuple[RelationId, ...],
     ) -> RelationId | None:
+        del tables
         table_name = normalize_name(table.name)
-        for rel in tables:
-            if _relation_matches_name(rel, table_name):
-                return rel
-        if table_name in self.instance.tables:
-            return table_relation(table_name, dialect=self.dialect)
-        return None
+        try:
+            return self.instance.table_id(table_name)
+        except Exception:
+            return None
 
 
 

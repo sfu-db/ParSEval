@@ -1420,6 +1420,11 @@ def _iter_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
             node.args.get("query"),
             exp.Expression,
         ):
+            # Unlike EXISTS and scalar Subquery nodes, IN stores an outer-scope
+            # operand and its inner query on the same AST node. Traverse only
+            # the operand here; the inner plan resolves the query separately.
+            if isinstance(node.this, exp.Expression):
+                stack.append(node.this)
             continue
         for child in node.args.values():
             if isinstance(child, exp.Expression):
@@ -2612,6 +2617,10 @@ def _step_expressions(step: "Step") -> t.Tuple[exp.Expression, ...]:
         aggregations = getattr(step, "aggregations", None) or []
         expressions.extend(
             agg for agg in aggregations if isinstance(agg, exp.Expression)
+        )
+        operands = getattr(step, "operands", None) or ()
+        expressions.extend(
+            operand for operand in operands if isinstance(operand, exp.Expression)
         )
 
     if isinstance(step, SubPlan):
