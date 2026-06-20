@@ -236,6 +236,13 @@ class CoverageThresholds:
     group_multi: int = 1
     distinct_unique: int = 0
     distinct_duplicate: int = 0
+    project_null: int = 1
+    project_non_null: int = 1
+    aggregate_null: int = 1
+    aggregate_non_null: int = 1
+    aggregate_distinct_null_ignored: int = 1
+    aggregate_distinct_duplicate_eliminated: int = 1
+    aggregate_distinct_multiple_retained: int = 1
     atom_dup: int = 1
 
     def threshold_for(self, branch_type: BranchType) -> int:
@@ -259,6 +266,13 @@ class CoverageThresholds:
             BranchType.GROUP_MULTI: self.group_multi,
             BranchType.DISTINCT_UNIQUE: self.distinct_unique,
             BranchType.DISTINCT_DUPLICATE: self.distinct_duplicate,
+            BranchType.PROJECT_NULL: self.project_null,
+            BranchType.PROJECT_NON_NULL: self.project_non_null,
+            BranchType.AGGREGATE_NULL: self.aggregate_null,
+            BranchType.AGGREGATE_NON_NULL: self.aggregate_non_null,
+            BranchType.AGG_DISTINCT_NULL_IGNORED: self.aggregate_distinct_null_ignored,
+            BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED: self.aggregate_distinct_duplicate_eliminated,
+            BranchType.AGG_DISTINCT_MULTIPLE_RETAINED: self.aggregate_distinct_multiple_retained,
         }
         return thresholds.get(branch_type, 0)
 
@@ -375,6 +389,39 @@ class BranchTree:
         if node.site == "distinct":
             add(0, BranchType.DISTINCT_UNIQUE, self.thresholds.distinct_unique)
             add(0, BranchType.DISTINCT_DUPLICATE, self.thresholds.distinct_duplicate)
+            return specs
+
+        if node.site == "project_output":
+            for atom_id in range(len(node.atoms)):
+                add(atom_id, BranchType.PROJECT_NULL, self.thresholds.project_null)
+                add(atom_id, BranchType.PROJECT_NON_NULL, self.thresholds.project_non_null)
+            return specs
+
+        if node.site == "aggregate_output":
+            for atom_id, atom in enumerate(node.atoms):
+                expression = atom.this if isinstance(atom, exp.Alias) else atom
+                if not isinstance(expression, exp.Count):
+                    add(atom_id, BranchType.AGGREGATE_NULL, self.thresholds.aggregate_null)
+                add(atom_id, BranchType.AGGREGATE_NON_NULL, self.thresholds.aggregate_non_null)
+            return specs
+
+        if node.site == "aggregate_distinct_input":
+            for atom_id in range(len(node.atoms)):
+                add(
+                    atom_id,
+                    BranchType.AGG_DISTINCT_NULL_IGNORED,
+                    self.thresholds.aggregate_distinct_null_ignored,
+                )
+                add(
+                    atom_id,
+                    BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED,
+                    self.thresholds.aggregate_distinct_duplicate_eliminated,
+                )
+                add(
+                    atom_id,
+                    BranchType.AGG_DISTINCT_MULTIPLE_RETAINED,
+                    self.thresholds.aggregate_distinct_multiple_retained,
+                )
             return specs
 
         if node.site == "root_result":

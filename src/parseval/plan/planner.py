@@ -200,6 +200,25 @@ class Plan:
                         step.output_column_ids = tuple(
                             getattr(inner, "output_column_ids", ())
                         )
+                        inner_expression = _subplan_scope_expression(step)
+                        if inner_expression is not None:
+                            for col in _iter_scope_columns(inner_expression):
+                                resolved_id = _resolve_scope_column_id(
+                                    col,
+                                    inner,
+                                    self._instance,
+                                    allow_unresolved=True,
+                                )
+                                if resolved_id is None:
+                                    continue
+                                col.meta[PARSEVAL_COLUMN_ID] = resolved_id
+                                _enrich_identity_column(
+                                    col,
+                                    resolved_id,
+                                    self._instance,
+                                    set_column_meta,
+                                    DataType,
+                                )
                 else:
                     resolve_exprs = exprs
                 # For SubPlan correlation columns, resolve against the
@@ -224,6 +243,17 @@ class Plan:
                             continue
                         col.meta[PARSEVAL_COLUMN_ID] = resolved_id
                         _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
+                if isinstance(step, SubPlan) and step.inner is not None:
+                    inner_expression = _subplan_scope_expression(step)
+                    if inner_expression is not None:
+                        for col in _iter_scope_columns(inner_expression):
+                            if col.table and col.name and column_identity(col) is None:
+                                _resolve_scope_column_id(
+                                    col,
+                                    step.inner,
+                                    self._instance,
+                                    allow_unresolved=False,
+                                )
                 if isinstance(step, Project):
                     step.output_column_ids = _build_project_output_columns(
                         step,
@@ -247,27 +277,6 @@ class Plan:
                 source_relations=_source_relations(step),
                 metadata=metadata,
             )
-        if self._instance is not None:
-            identity_steps = tuple(_all_identity_steps(self.root))
-            identity_index = _prepared_column_identity_index(identity_steps)
-            _stamp_missing_qualified_identities(
-                self.expression,
-                identity_index,
-                self._instance,
-                set_column_meta,
-            )
-            for step in identity_steps:
-                step_expressions = _step_expressions(step)
-                for expression in step_expressions:
-                    _stamp_missing_qualified_identities(
-                        expression,
-                        identity_index,
-                        self._instance,
-                        set_column_meta,
-                    )
-                annotation = annotations.get(id(step))
-                if annotation is not None:
-                    annotation.referenced_columns = _unique_column_ids(step_expressions)
         self._annotations = annotations
 
     def __repr__(self) -> str:
@@ -387,13 +396,13 @@ class Step:
         # --- extract SELECT-list projections, aggregate operands, aggregations --------
         projections: t.List[exp.Expression] = []
         operands: t.Dict[exp.Expression, str] = {}
-        aggregations: t.Set[exp.Expression] = set()
+        aggregations: t.List[exp.Expression] = []
         next_operand_name = name_sequence("_a_")
 
         def extract_agg_operands(expr: exp.Expression) -> bool:
             agg_funcs = tuple(_iter_outer_agg_funcs(expr))
-            if agg_funcs:
-                aggregations.add(expr)
+            if agg_funcs and expr not in aggregations:
+                aggregations.append(expr)
 
             for agg in agg_funcs:
                 for operand in agg.unnest_operands():
@@ -473,7 +482,7 @@ class Step:
                     alias_name = _aggregate_alias_for_having(agg_func)
                     alias_expr = exp.alias_(agg_func.copy(), alias_name, quoted=True)
                     if alias_expr not in aggregations:
-                        aggregations.add(alias_expr)
+                        aggregations.append(alias_expr)
                     agg_func.replace(
                         exp.column(alias_name, step.name, quoted=True)
                     )
@@ -1188,25 +1197,6 @@ def _attach_subplans(
 # ---------------------------------------------------------------------------
 
 
-def _scope_local_base_tables(scope: Scope) -> t.Set[str]:
-    names: t.Set[str] = set()
-    for table in scope.expression.find_all(exp.Table):
-        names.add(normalize_name(table.name))
-    return names
-
-
-def _parent_alias_base_tables(scope: Scope) -> t.Dict[str, str]:
-    if scope.parent is None:
-        return {}
-    alias_to_table: t.Dict[str, str] = {}
-    for source in scope.parent.expression.find_all(exp.Table):
-        alias_name = source.alias_or_name
-        if not alias_name:
-            continue
-        alias_to_table[normalize_name(alias_name)] = normalize_name(source.name)
-    return alias_to_table
-
-
 def _projection_column_keys(scope: Scope) -> t.Set[t.Tuple[str, str]]:
     if not isinstance(scope.expression, exp.Select):
         return set()
@@ -1248,8 +1238,6 @@ def correlation_columns(scope: Scope) -> t.Tuple[exp.Column, ...]:
     if not external_columns or scope.parent is None:
         return ()
 
-    local_base_tables = _scope_local_base_tables(scope)
-    parent_alias_to_base = _parent_alias_base_tables(scope)
     projection_keys = _projection_column_keys(scope)
     non_projection_keys = _non_projection_column_keys(scope)
 
@@ -1266,9 +1254,6 @@ def correlation_columns(scope: Scope) -> t.Tuple[exp.Column, ...]:
         if not table_name:
             surviving.append(column)
             seen.add(key)
-            continue
-        parent_base = parent_alias_to_base.get(table_name)
-        if parent_base is not None and parent_base in local_base_tables:
             continue
         surviving.append(column)
         seen.add(key)
@@ -1305,6 +1290,61 @@ def _build_correlation_map(
     for scope in traverse_scope(expression):
         result[id(scope.expression)] = correlation_columns(scope)
     return result
+
+
+def _subplan_scope_expression(step: "SubPlan") -> exp.Expression | None:
+    anchor = step.anchor
+    if isinstance(anchor, exp.In):
+        inner = anchor.args.get("query")
+    elif isinstance(anchor, (exp.Exists, exp.Subquery, exp.CTE)):
+        inner = anchor.this
+    else:
+        inner = None
+    if isinstance(inner, exp.Subquery):
+        inner = inner.this
+    return inner if isinstance(inner, exp.Expression) else None
+
+
+def _resolve_scope_column_id(
+    col: exp.Column,
+    root: "Step",
+    instance: t.Any,
+    *,
+    allow_unresolved: bool,
+) -> ColumnId | None:
+    dialect = getattr(instance, "dialect", None)
+    name = identifier_name(col.this, dialect=dialect)
+    candidates: t.List[ColumnId] = []
+    seen_steps: t.Set[int] = set()
+    stack: t.List[Step] = [root]
+    while stack:
+        step = stack.pop()
+        if id(step) in seen_steps:
+            continue
+        seen_steps.add(id(step))
+        if isinstance(step, Scan):
+            candidates.extend(
+                candidate
+                for candidate in getattr(step, "output_column_ids", ())
+                if _column_matches_name(candidate, name)
+            )
+        stack.extend(step.chain_dependencies)
+    if col.table:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if _column_matches_qualifier(candidate, col.table, dialect)
+        ]
+    unique = tuple(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique[0]
+    if allow_unresolved:
+        return None
+    if not unique and col.table:
+        raise ValueError(f"Unresolved column qualifier: {col.sql()}")
+    if not unique:
+        raise ValueError(f"Unresolved column: {col.sql()}")
+    raise ValueError(f"Ambiguous column: {col.sql()}")
 
 
 @dataclass
@@ -1346,66 +1386,6 @@ def _identity_order(root: "Step") -> t.List["Step"]:
     visit(root)
     return ordered
 
-
-def _all_identity_steps(root: "Step") -> t.Iterator["Step"]:
-    seen: t.Set[int] = set()
-
-    def visit(step: "Step") -> t.Iterator["Step"]:
-        if id(step) in seen:
-            return
-        seen.add(id(step))
-        yield step
-        if isinstance(step, SubPlan) and step.inner is not None:
-            yield from visit(step.inner)
-        for dependency in step.dependencies:
-            yield from visit(dependency)
-
-    yield from visit(root)
-
-
-def _prepared_column_identity_index(
-    steps: t.Iterable["Step"],
-) -> t.Dict[t.Tuple[str, str], t.Set[ColumnId]]:
-    index: t.Dict[t.Tuple[str, str], t.Set[ColumnId]] = {}
-    for step in steps:
-        if not isinstance(step, Scan) or step.relation_id is None:
-            continue
-        visible = step.relation_id.alias or step.relation_id.name
-        if visible is None:
-            continue
-        qualifier = visible.normalized.lower()
-        for column in getattr(step, "output_column_ids", ()):
-            key = (qualifier, column.name.normalized.lower())
-            index.setdefault(key, set()).add(column)
-    return index
-
-
-def _stamp_missing_qualified_identities(
-    expression: exp.Expression,
-    identity_index: t.Mapping[t.Tuple[str, str], t.Set[ColumnId]],
-    instance: t.Any,
-    set_column_meta: t.Callable,
-) -> None:
-    dialect = getattr(instance, "dialect", None)
-    for column in expression.find_all(exp.Column):
-        if column_identity(column) is not None or not column.table:
-            continue
-        key = (
-            identifier_name(column.table, dialect=dialect).normalized.lower(),
-            identifier_name(column.this, dialect=dialect).normalized.lower(),
-        )
-        candidates = identity_index.get(key, set())
-        if len(candidates) != 1:
-            continue
-        resolved_id = next(iter(candidates))
-        column.meta[PARSEVAL_COLUMN_ID] = resolved_id
-        _enrich_identity_column(
-            column,
-            resolved_id,
-            instance,
-            set_column_meta,
-            DataType,
-        )
 
 def _iter_scope_columns(expression: exp.Expression) -> t.Iterator[exp.Column]:
     stack: t.List[exp.Expression] = [expression]
@@ -1685,7 +1665,11 @@ def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[C
             projection_columns = list(_iter_scope_columns(projection))
             if len(projection_columns) == 1:
                 source = projection_columns[0].meta.get(PARSEVAL_COLUMN_ID)
-        if isinstance(source, ColumnId) and alias_name == source.name.raw:
+        if (
+            isinstance(source, ColumnId)
+            and alias_name == source.name.raw
+            and source not in result
+        ):
             result.append(source)
             continue
         relation = source.relation if isinstance(source, ColumnId) else None
