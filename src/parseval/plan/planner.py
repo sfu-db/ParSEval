@@ -1665,7 +1665,11 @@ def _build_project_output_columns(step: "Project", instance: t.Any) -> t.Tuple[C
             projection_columns = list(_iter_scope_columns(projection))
             if len(projection_columns) == 1:
                 source = projection_columns[0].meta.get(PARSEVAL_COLUMN_ID)
-        if isinstance(source, ColumnId) and alias_name == source.name.raw:
+        if (
+            isinstance(source, ColumnId)
+            and alias_name == source.name.raw
+            and source not in result
+        ):
             result.append(source)
             continue
         relation = source.relation if isinstance(source, ColumnId) else None

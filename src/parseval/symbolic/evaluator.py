@@ -977,6 +977,8 @@ class PlanEvaluator:
             return ctx
 
         node = None
+        aggregate_node = None
+        distinct_input_node = None
         if observe:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
@@ -995,6 +997,40 @@ class PlanEvaluator:
                 path_predicates=path_preds,
                 join_equalities=join_eqs,
             )
+            aggregate_expressions = _aggregate_coverage_expressions(step)
+            if aggregate_expressions:
+                aggregate_node = tree.get_or_create_node(
+                    step_id=annotation.step_id,
+                    step_type="Aggregate",
+                    site="aggregate_output",
+                    predicate=exp.Literal.string("AGGREGATE_OUTPUT"),
+                    atoms=aggregate_expressions,
+                    tables=_annotation_relation_ids(annotation),
+                    step_obj=step,
+                    parent=parent_node,
+                    path_predicates=path_preds,
+                    join_equalities=join_eqs,
+                )
+                distinct_arguments = tuple(
+                    argument.expressions[0]
+                    for aggregation in aggregate_expressions
+                    for function in aggregation.find_all(exp.AggFunc)
+                    for argument in (function.this,)
+                    if isinstance(argument, exp.Distinct) and argument.expressions
+                )
+                if distinct_arguments:
+                    distinct_input_node = tree.get_or_create_node(
+                        step_id=annotation.step_id,
+                        step_type="Aggregate",
+                        site="aggregate_distinct_input",
+                        predicate=exp.Literal.string("AGGREGATE_DISTINCT_INPUT"),
+                        atoms=distinct_arguments,
+                        tables=_annotation_relation_ids(annotation),
+                        step_obj=step,
+                        parent=parent_node,
+                        path_predicates=path_preds,
+                        join_equalities=join_eqs,
+                    )
 
         for table_name, table in ctx.tables.items():
             groups: Dict[tuple, int] = {}
@@ -1069,6 +1105,55 @@ class PlanEvaluator:
                 for count in groups.values():
                     outcome = BranchType.GROUP_SINGLE if count == 1 else BranchType.GROUP_MULTI
                     tree.record_observation(node, AtomObservation(atom_id=0, outcome=outcome))
+
+            if aggregate_node is not None:
+                rows_by_id = {_row_ids(row): row for row in table.rows}
+                for output_row_id, group in aggregate_groups.items():
+                    for atom_id, aggregation in enumerate(step.aggregations):
+                        alias = normalize_name(aggregation.alias_or_name)
+                        value = group.aggregate_values.get(alias)
+                        tree.record_observation(
+                            aggregate_node,
+                            AtomObservation(
+                                atom_id=atom_id,
+                                outcome=(
+                                    BranchType.AGGREGATE_NULL
+                                    if value is None
+                                    else BranchType.AGGREGATE_NON_NULL
+                                ),
+                                row_ids=output_row_id,
+                            ),
+                        )
+                    if distinct_input_node is not None:
+                        source_rows = [
+                            rows_by_id[row_id]
+                            for row_id in group.source_row_ids
+                            if row_id in rows_by_id
+                        ]
+                        for atom_id, argument in enumerate(distinct_input_node.atoms):
+                            raw_values = [
+                                concrete(argument, _env_from_row(row))
+                                for row in source_rows
+                            ]
+                            non_null = [value for value in raw_values if value is not None]
+                            outcomes = []
+                            if len(non_null) < len(raw_values):
+                                outcomes.append(BranchType.AGG_DISTINCT_NULL_IGNORED)
+                            if len(non_null) != len(set(non_null)):
+                                outcomes.append(
+                                    BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED
+                                )
+                            if len(set(non_null)) >= 2:
+                                outcomes.append(BranchType.AGG_DISTINCT_MULTIPLE_RETAINED)
+                            for outcome in outcomes:
+                                tree.record_observation(
+                                    distinct_input_node,
+                                    AtomObservation(
+                                        atom_id=atom_id,
+                                        outcome=outcome,
+                                        row_ids=(*output_row_id, outcome.name),
+                                    ),
+                                )
 
             return Context(
                 tables={
@@ -1170,6 +1255,46 @@ class PlanEvaluator:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
             path_preds, join_eqs = self._collect_upstream(step)
+            project_expressions = tuple(
+                projection
+                for projection in step.projections
+                if isinstance(projection, exp.Expression)
+            )
+            project_node = None
+            if project_expressions:
+                project_node = tree.get_or_create_node(
+                    step_id=annotation.step_id,
+                    step_type="Project",
+                    site="project_output",
+                    predicate=exp.Literal.string("PROJECT_OUTPUT"),
+                    atoms=project_expressions,
+                    tables=_annotation_relation_ids(annotation),
+                    step_obj=step,
+                    parent=parent_node,
+                    path_predicates=path_preds,
+                    join_equalities=join_eqs,
+                )
+                for table_name, table in ctx.tables.items():
+                    output_ids = self._projected_columns(step, table.columns)
+                    for row in table.rows:
+                        projected = self._projected_values(step, row, table_name)
+                        for atom_id, output_id in enumerate(output_ids):
+                            if atom_id >= len(project_expressions):
+                                break
+                            value = _symbol_value(projected.get(output_id))
+                            tree.record_observation(
+                                project_node,
+                                AtomObservation(
+                                    atom_id=atom_id,
+                                    outcome=(
+                                        BranchType.PROJECT_NULL
+                                        if value is None
+                                        else BranchType.PROJECT_NON_NULL
+                                    ),
+                                    row_ids=_row_ids(row),
+                                    concrete_values=((output_id, value),),
+                                ),
+                            )
             for projection in step.projections:
                 if not isinstance(projection, exp.Expression):
                     continue
@@ -1663,17 +1788,12 @@ class PlanEvaluator:
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
         operands: Tuple[exp.Expression, ...] = (),
     ) -> Any:
-        operand_rows: List[Dict[str, Any]] = []
-        operand_expr_by_alias: Dict[str, exp.Expression] = {}
-        for row in rows:
-            source_env = _env_from_row(row, outer_bindings)
-            operand_values: Dict[str, Any] = {}
-            for operand in operands:
-                alias = normalize_name(operand.alias_or_name)
-                operand_expr = operand.this if isinstance(operand, exp.Alias) else operand
-                operand_expr_by_alias[alias] = operand_expr
-                operand_values[alias] = concrete(operand_expr, source_env)
-            operand_rows.append(operand_values)
+        operand_expr_by_alias = {
+            normalize_name(operand.alias_or_name): (
+                operand.this if isinstance(operand, exp.Alias) else operand
+            )
+            for operand in operands
+        }
 
         aggregate_expr = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
         aggregate_types = (exp.Count, exp.Avg, exp.Sum, exp.Min, exp.Max)
@@ -1683,7 +1803,6 @@ class PlanEvaluator:
                 rows,
                 table_name,
                 outer_bindings,
-                operand_rows,
                 operand_expr_by_alias,
             )
 
@@ -1695,7 +1814,6 @@ class PlanEvaluator:
                 rows,
                 table_name,
                 outer_bindings,
-                operand_rows,
                 operand_expr_by_alias,
             )
             return exp.convert(value)
@@ -1711,7 +1829,6 @@ class PlanEvaluator:
         rows: List[Row],
         table_name: str,
         outer_bindings: Optional[Dict[ColumnId, Any]],
-        operand_rows: List[Dict[str, Any]],
         operand_expr_by_alias: Dict[str, exp.Expression],
     ) -> Any:
         arg = aggregate_expr.this
@@ -1723,17 +1840,27 @@ class PlanEvaluator:
                 if isinstance(operand_expr, exp.Star):
                     return len(rows)
 
-        if operand_rows and any(operand_values for operand_values in operand_rows):
-            values = [
-                concrete(arg, Environment(operand_values))
-                for operand_values in operand_rows
-            ]
+        resolved_arg = arg
+        if isinstance(arg, exp.Column):
+            resolved_arg = operand_expr_by_alias.get(normalize_name(arg.name), arg)
+        is_distinct = isinstance(resolved_arg, exp.Distinct)
+        if is_distinct:
+            if not resolved_arg.expressions:
+                raw_values = []
+            else:
+                value_expression = resolved_arg.expressions[0]
+                raw_values = [
+                    concrete(value_expression, _env_from_row(row, outer_bindings))
+                    for row in rows
+                ]
         else:
-            values = [
-                concrete(arg, _env_from_row(row, outer_bindings))
+            raw_values = [
+                concrete(resolved_arg, _env_from_row(row, outer_bindings))
                 for row in rows
             ]
-        non_null_values = [value for value in values if value is not None]
+        non_null_values = [value for value in raw_values if value is not None]
+        if is_distinct:
+            non_null_values = list(dict.fromkeys(non_null_values))
 
         if isinstance(aggregate_expr, exp.Count):
             return len(non_null_values)
