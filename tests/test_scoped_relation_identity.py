@@ -147,3 +147,29 @@ def test_foreign_key_resolution_returns_physical_relation():
 
     assert resolved == instance.table_id("parent")
     assert resolved != scoped_parent
+
+
+def test_inner_alias_cannot_resolve_from_shadowed_outer_alias():
+    instance = Instance(
+        """
+        CREATE TABLE users (id INT, user_name TEXT);
+        CREATE TABLE orders (id INT);
+        """,
+        name="shadowed_alias",
+        dialect="sqlite",
+    )
+    plan = Plan(
+        sqlglot.parse_one(
+            """
+            SELECT X.id FROM users AS X
+            WHERE EXISTS (
+              SELECT 1 FROM orders AS X WHERE X.user_name = 'invalid'
+            )
+            """,
+            read="sqlite",
+        ),
+        instance,
+    )
+
+    with pytest.raises(ValueError, match="Unresolved column qualifier: X.user_name"):
+        plan.annotation_for(plan.root)

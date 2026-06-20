@@ -530,23 +530,22 @@ class ConstraintGenerator:
         row_scope: str | None = None,
         relations: Tuple[RelationId, ...] = (),
     ) -> List[exp.Expression]:
-        inner = subquery.this
-        if not isinstance(inner, exp.Select):
+        subplan = self._find_subplan_for_subquery(subquery)
+        if subplan is None or subplan.inner is None:
             return []
+        inner_expressions: List[exp.Expression] = []
+        for step in self._iter_steps_with_subplans(subplan.inner):
+            if isinstance(step, Join):
+                for join_data in step.joins.values():
+                    condition = join_data.get("condition")
+                    if isinstance(condition, exp.Expression):
+                        inner_expressions.append(condition)
+            elif isinstance(step, Filter) and isinstance(step.condition, exp.Expression):
+                inner_expressions.append(step.condition)
+
         constraints: List[exp.Expression] = []
-        for join in inner.find_all(exp.Join):
-            on_expr = join.args.get("on")
-            if isinstance(on_expr, exp.Expression):
-                for conjunct in self._split_conjuncts(on_expr):
-                    if conjunct.find(exp.Subquery):
-                        continue
-                    copied = conjunct.copy()
-                    if row_scope is not None:
-                        self._scope_expression_columns(copied, row_scope, relations)
-                    constraints.append(copied)
-        where = inner.args.get("where")
-        if where is not None and isinstance(where.this, exp.Expression):
-            for conjunct in self._split_conjuncts(where.this):
+        for expression in inner_expressions:
+            for conjunct in self._split_conjuncts(expression):
                 if conjunct.find(exp.Subquery):
                     continue
                 copied = conjunct.copy()
