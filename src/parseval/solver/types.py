@@ -22,7 +22,7 @@ from parseval.dtype import (
     type_family,
 )
 from parseval.identity import ColumnId, RelationId
-from parseval.value_space import ValueSpace
+from parseval.domain.value_space import ValueSpace
 
 
 PARSEVAL_SOLVER_VAR = "parseval_solver_var"

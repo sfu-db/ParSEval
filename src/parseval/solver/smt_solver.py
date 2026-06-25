@@ -962,11 +962,10 @@ class SMTSolver:
         if isinstance(condition, exp.Column):
             # Check caller's context first
             if effective_ctx is not None:
-                from parseval.helper import normalize_name
                 col_key = (
-                    f"{normalize_name(condition.table)}.{normalize_name(condition.name)}"
+                    f"{condition.table}.{condition.name}"
                     if condition.table
-                    else normalize_name(condition.name)
+                    else condition.name
                 )
                 if col_key in effective_ctx:
                     raw = effective_ctx[col_key]

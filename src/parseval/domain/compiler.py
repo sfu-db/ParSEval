@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable, List, Optional, Tuple
 from sqlglot import exp
 
 from parseval.dtype import DataType, type_family
-from parseval.value_space import ValueSpace
+from .value_space import ValueSpace
 
 from .constraints import (
     CheckConstraint,

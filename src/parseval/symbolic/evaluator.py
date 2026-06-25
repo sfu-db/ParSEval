@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.helper import normalize_name
 from parseval.identity import (
     ColumnId,
     ColumnKind,
@@ -243,7 +242,7 @@ def _derived_variable(
     relation_id: Optional[RelationId] = None,
     column_id_override: Optional[ColumnId] = None,
 ) -> Variable:
-    normalized = normalize_name(name)
+    normalized = name
     row_suffix = "_".join(str(row_id) for row_id in row_ids) or "scalar"
     return Variable(
         this=f"derived_{normalized}_{row_suffix}",
@@ -333,7 +332,7 @@ def _relation_identity_key(relation: Optional[RelationId]) -> Tuple[Any, ...]:
 def _column_name_key(column_id: ColumnId) -> str:
     return "".join(
         char
-        for char in normalize_name(column_id.name.normalized).casefold()
+        for char in column_id.name.normalized.casefold()
         if char.isalnum()
     )
 
@@ -422,7 +421,7 @@ def _aggregate_col_id(alias: str, relation_id: Optional[RelationId]) -> ColumnId
 
 
 def _output_column_by_name(step: Step, name: str) -> Optional[ColumnId]:
-    normalized = normalize_name(name)
+    normalized = name
     for col_id in getattr(step, "output_column_ids", ()) or ():
         if isinstance(col_id, ColumnId) and col_id.name.normalized == normalized:
             return col_id
@@ -439,7 +438,7 @@ def _aggregate_output_col_id(
 
 def _aggregate_coverage_expressions(step: Aggregate) -> Tuple[exp.Expression, ...]:
     operands = {
-        normalize_name(operand.alias_or_name): (
+        operand.alias_or_name: (
             operand.this if isinstance(operand, exp.Alias) else operand
         )
         for operand in (getattr(step, "operands", ()) or ())
@@ -448,7 +447,7 @@ def _aggregate_coverage_expressions(step: Aggregate) -> Tuple[exp.Expression, ..
 
     def expand(node: exp.Expression) -> exp.Expression:
         if isinstance(node, exp.Column) and not node.table:
-            operand = operands.get(normalize_name(node.name))
+            operand = operands.get(node.name)
             if operand is not None:
                 return operand.copy()
         return node
@@ -626,6 +625,34 @@ class PlanEvaluator:
     def _eval_scan(self, step: Scan, ctx: Context) -> Context:
         output_key = step.relation_id or step.name
         if step.source is None or not isinstance(step.source, exp.Table):
+            # For subquery scans, evaluate the SubPlan's inner plan.
+            subplans = step.subplan_dependencies
+            if subplans:
+                subplan = subplans[0]
+                inner_ctx = self._evaluate_subtree(subplan.inner)
+                inner_rows = []
+                for _name, table in inner_ctx.tables.items():
+                    inner_rows.extend(table.rows)
+                output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
+                if not output_columns and inner_rows:
+                    output_columns = tuple(inner_rows[0].columns)
+                return Context(
+                    tables={
+                        output_key: DerivedSchema(
+                            columns=output_columns,
+                            rows=[
+                                Row(
+                                    this=row.rowid,
+                                    columns={
+                                        column: _materialize_column_from_row(column, row)
+                                        for column in output_columns
+                                    },
+                                )
+                                for row in inner_rows
+                            ],
+                        )
+                    }
+                )
             table_name = step.name
             if table_name in ctx.tables:
                 table = ctx.tables[table_name]
@@ -1053,7 +1080,7 @@ class PlanEvaluator:
                 relation_id = _step_relation_id(step)
                 output_columns = self._aggregate_columns(step)
                 for aggregate in step.aggregations:
-                    alias = normalize_name(aggregate.alias_or_name)
+                    alias = aggregate.alias_or_name
                     col_id = _aggregate_output_col_id(step, alias, relation_id)
                     value = self._aggregate_expression_value(
                         aggregate,
@@ -1110,7 +1137,7 @@ class PlanEvaluator:
                 rows_by_id = {_row_ids(row): row for row in table.rows}
                 for output_row_id, group in aggregate_groups.items():
                     for atom_id, aggregation in enumerate(step.aggregations):
-                        alias = normalize_name(aggregation.alias_or_name)
+                        alias = aggregation.alias_or_name
                         value = group.aggregate_values.get(alias)
                         tree.record_observation(
                             aggregate_node,
@@ -1469,7 +1496,7 @@ class PlanEvaluator:
             if self._is_star_projection(projection):
                 columns.extend(input_columns)
             else:
-                name = normalize_name(projection.alias_or_name or projection.sql(dialect=self.dialect))
+                name = projection.alias_or_name or projection.sql(dialect=self.dialect)
                 relation_id = None
                 for col in input_columns:
                     if isinstance(col, ColumnId) and col.relation is not None:
@@ -1489,7 +1516,7 @@ class PlanEvaluator:
             expr = projection.this if isinstance(projection, exp.Alias) else projection
             col_id = output_ids[proj_index] if output_ids and proj_index < len(output_ids) else None
             if col_id is None:
-                name = normalize_name(projection.alias_or_name or projection.sql(dialect=self.dialect))
+                name = projection.alias_or_name or projection.sql(dialect=self.dialect)
                 relation_id = None
                 for col in row.columns:
                     if isinstance(col, ColumnId) and col.relation is not None:
@@ -1509,7 +1536,7 @@ class PlanEvaluator:
         return _derived_variable(col_id.name.normalized, value, _row_ids(row), col_id.relation)
 
     def _projection_name(self, projection: exp.Expression) -> str:
-        return normalize_name(projection.alias_or_name or projection.sql(dialect=self.dialect))
+        return projection.alias_or_name or projection.sql(dialect=self.dialect)
 
     def _is_star_projection(self, projection: exp.Expression) -> bool:
         if isinstance(projection, exp.Star):
@@ -1710,7 +1737,7 @@ class PlanEvaluator:
                 )
             aggregate_values: Dict[Any, Any] = {}
             for aggregate in step.aggregations:
-                alias = normalize_name(aggregate.alias_or_name)
+                alias = aggregate.alias_or_name
                 value = self._aggregate_expression_value(
                     aggregate,
                     group_rows,
@@ -1764,7 +1791,7 @@ class PlanEvaluator:
         for alias in step.group:
             cols.append(_aggregate_col_id(alias, relation_id))
         for aggregate in step.aggregations:
-            cols.append(_aggregate_col_id(normalize_name(aggregate.alias_or_name), relation_id))
+            cols.append(_aggregate_col_id(aggregate.alias_or_name, relation_id))
         return tuple(cols)
 
     def _sort_key_value(
@@ -1789,7 +1816,7 @@ class PlanEvaluator:
         operands: Tuple[exp.Expression, ...] = (),
     ) -> Any:
         operand_expr_by_alias = {
-            normalize_name(operand.alias_or_name): (
+            operand.alias_or_name: (
                 operand.this if isinstance(operand, exp.Alias) else operand
             )
             for operand in operands
@@ -1836,13 +1863,13 @@ class PlanEvaluator:
             if isinstance(arg, exp.Star):
                 return len(rows)
             if isinstance(arg, exp.Column):
-                operand_expr = operand_expr_by_alias.get(normalize_name(arg.name))
+                operand_expr = operand_expr_by_alias.get(arg.name)
                 if isinstance(operand_expr, exp.Star):
                     return len(rows)
 
         resolved_arg = arg
         if isinstance(arg, exp.Column):
-            resolved_arg = operand_expr_by_alias.get(normalize_name(arg.name), arg)
+            resolved_arg = operand_expr_by_alias.get(arg.name, arg)
         is_distinct = isinstance(resolved_arg, exp.Distinct)
         if is_distinct:
             if not resolved_arg.expressions:

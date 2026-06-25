@@ -56,7 +56,6 @@ from sqlglot.helper import name_sequence
 from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from parseval.helper import normalize_name
 from parseval.dtype import (
     DataType,
     infer_semantic_datatype_from_literal,
@@ -162,108 +161,119 @@ class Plan:
         annotations: t.Dict[int, "StepAnnotations"] = {}
         for index, step in enumerate(self.ordered_steps):
             exprs = _step_expressions(step)
-            if self._instance is not None:
-                _prepare_step_identity(step, self._instance)
-                # SubPlan inner plans live in a separate scope — recurse
-                # through all inner steps (not just the root, since the
-                # correlated condition is typically on a Filter dependency).
-                if isinstance(step, SubPlan):
-                    resolve_exprs = tuple(
-                        col for col in (getattr(step, "correlation", None) or ())
-                        if isinstance(col, exp.Expression)
-                    )
-                    inner = step.inner
-                    if inner is not None:
-                        inner_steps = _identity_order(inner)
-                        for inner_step in inner_steps:
-                            _prepare_step_identity(inner_step, self._instance)
-                            for inner_expr in _step_expressions(inner_step):
-                                for col in _iter_scope_columns(inner_expr):
-                                    resolved_id = _resolve_column_id(
-                                        col,
-                                        inner_step,
-                                        self._instance,
-                                        allow_unresolved=True,
-                                    )
-                                    if resolved_id is None:
-                                        continue
-                                    col.meta[PARSEVAL_COLUMN_ID] = resolved_id
-                                    _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
-                            if isinstance(inner_step, Project):
-                                inner_step.output_column_ids = _build_project_output_columns(
-                                    inner_step,
-                                    self._instance,
-                                )
-                                # Propagate updated output_column_ids to downstream
-                                # steps (Limit, Sort) that copy from Project.
-                                _propagate_output_columns(inner_step)
-                        step.output_column_ids = tuple(
-                            getattr(inner, "output_column_ids", ())
-                        )
-                        inner_expression = _subplan_scope_expression(step)
-                        if inner_expression is not None:
-                            for col in _iter_scope_columns(inner_expression):
-                                resolved_id = _resolve_scope_column_id(
+            _prepare_step_identity(step, self._instance)
+            # SubPlan inner plans live in a separate scope — recurse
+            # through all inner steps (not just the root, since the
+            # correlated condition is typically on a Filter dependency).
+            if isinstance(step, SubPlan):
+                resolve_exprs = tuple(
+                    col for col in (getattr(step, "correlation", None) or ())
+                    if isinstance(col, exp.Expression)
+                )
+                inner = step.inner
+                if inner is not None:
+                    inner_steps = _identity_order(inner)
+                    for inner_step in inner_steps:
+                        _prepare_step_identity(inner_step, self._instance)
+                        for inner_expr in _step_expressions(inner_step):
+                            for col in _iter_scope_columns(inner_expr):
+                                resolved_id = _resolve_column_id(
                                     col,
-                                    inner,
+                                    inner_step,
                                     self._instance,
                                     allow_unresolved=True,
                                 )
                                 if resolved_id is None:
                                     continue
                                 col.meta[PARSEVAL_COLUMN_ID] = resolved_id
-                                _enrich_identity_column(
-                                    col,
-                                    resolved_id,
-                                    self._instance,
-                                    set_column_meta,
-                                    DataType,
-                                )
-                else:
-                    resolve_exprs = exprs
-                # For SubPlan correlation columns, resolve against the
-                # consumer (outer step) which has visible columns.
-                resolve_target = step
-                if isinstance(step, SubPlan) and step.consumer is not None:
-                    _prepare_step_identity(step.consumer, self._instance)
-                    resolve_target = step.consumer
-                for expr in resolve_exprs:
-                    for col in _iter_scope_columns(expr):
-                        allow_unresolved = isinstance(step, SubPlan) or (
-                            isinstance(step, Aggregate)
-                            and _is_planner_synthetic_operand(col)
-                        )
-                        resolved_id = _resolve_column_id(
-                            col,
-                            resolve_target,
-                            self._instance,
-                            allow_unresolved=allow_unresolved,
-                        )
-                        if resolved_id is None:
-                            continue
-                        col.meta[PARSEVAL_COLUMN_ID] = resolved_id
-                        _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
-                if isinstance(step, SubPlan) and step.inner is not None:
+                                _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
+                        if isinstance(inner_step, Project):
+                            inner_step.output_column_ids = _build_project_output_columns(
+                                inner_step,
+                                self._instance,
+                            )
+                            # Propagate updated output_column_ids to downstream
+                            # steps (Limit, Sort) that copy from Project.
+                            _propagate_output_columns(inner_step)
+                    step.output_column_ids = tuple(
+                        getattr(inner, "output_column_ids", ())
+                    )
                     inner_expression = _subplan_scope_expression(step)
                     if inner_expression is not None:
                         for col in _iter_scope_columns(inner_expression):
-                            if col.table and col.name and column_identity(col) is None:
-                                _resolve_scope_column_id(
-                                    col,
-                                    step.inner,
-                                    self._instance,
-                                    allow_unresolved=False,
-                                )
-                if isinstance(step, Project):
-                    step.output_column_ids = _build_project_output_columns(
-                        step,
-                        self._instance,
-                    )
-                semantic_datatypes = _infer_semantic_datatypes(exprs)
-                metadata = _generation_metadata(step, self._instance)
+                            resolved_id = _resolve_scope_column_id(
+                                col,
+                                inner,
+                                self._instance,
+                                allow_unresolved=True,
+                            )
+                            if resolved_id is None:
+                                continue
+                            col.meta[PARSEVAL_COLUMN_ID] = resolved_id
+                            _enrich_identity_column(
+                                col,
+                                resolved_id,
+                                self._instance,
+                                set_column_meta,
+                                DataType,
+                            )
             else:
-                semantic_datatypes = {}
-                metadata = {}
+                resolve_exprs = exprs
+            # For SubPlan correlation columns, resolve against the
+            # consumer (outer step) which has visible columns.
+            resolve_target = step
+            if isinstance(step, SubPlan) and step.consumer is not None:
+                _prepare_step_identity(step.consumer, self._instance)
+                resolve_target = step.consumer
+            for expr in resolve_exprs:
+                for col in _iter_scope_columns(expr):
+                    allow_unresolved = isinstance(step, SubPlan) or (
+                        isinstance(step, Aggregate)
+                        and _is_synthetic_operand_name(col.name)
+                    )
+                    resolved_id = _resolve_column_id(
+                        col,
+                        resolve_target,
+                        self._instance,
+                        allow_unresolved=allow_unresolved,
+                    )
+                    if resolved_id is None:
+                        continue
+                    col.meta[PARSEVAL_COLUMN_ID] = resolved_id
+                    _enrich_identity_column(col, resolved_id, self._instance, set_column_meta, DataType)
+            if isinstance(step, SubPlan) and step.inner is not None and not isinstance(step.inner, SetOperation):
+                inner_expression = _subplan_scope_expression(step)
+                if inner_expression is not None:
+                    for col in _iter_scope_columns(inner_expression):
+                        if col.table and col.name and column_identity(col) is None and not _is_synthetic_operand_name(col.name):
+                            _resolve_scope_column_id(
+                                col,
+                                step.inner,
+                                self._instance,
+                                allow_unresolved=False,
+                            )
+            if isinstance(step, Project):
+                step.output_column_ids = _build_project_output_columns(
+                    step,
+                    self._instance,
+                )
+            # Enrich operand columns inside aggregations so they carry
+            # type metadata for downstream constraint generation.
+            if isinstance(step, Aggregate):
+                for operand in step.operands:
+                    if not isinstance(operand, exp.Alias) or not operand.alias:
+                        continue
+                    for agg in step.aggregations:
+                        for col in agg.find_all(exp.Column):
+                            if col.name == operand.alias:
+                                cid = col.meta.get(PARSEVAL_COLUMN_ID)
+                                if isinstance(cid, ColumnId):
+                                    _enrich_identity_column(
+                                        col, cid, self._instance,
+                                        set_column_meta, DataType,
+                                    )
+            semantic_datatypes = _infer_semantic_datatypes(exprs)
+            metadata = _generation_metadata(step, self._instance)
             if semantic_datatypes:
                 metadata["semantic_datatypes"] = semantic_datatypes
 
@@ -431,13 +441,13 @@ class Step:
 
             base_name = agg_name
             existing_aliases = {
-                normalize_name(aggregation.alias_or_name)
+                aggregation.alias_or_name
                 for aggregation in aggregations
                 if aggregation.alias_or_name
             }
             alias_name = base_name
             suffix = 1
-            while normalize_name(alias_name) in existing_aliases:
+            while alias_name in existing_aliases:
                 alias_name = f"{base_name}_{suffix}"
                 suffix += 1
             return alias_name
@@ -1203,7 +1213,7 @@ def _projection_column_keys(scope: Scope) -> t.Set[t.Tuple[str, str]]:
     keys: t.Set[t.Tuple[str, str]] = set()
     for projection in scope.expression.expressions:
         for column in projection.find_all(exp.Column):
-            keys.add((normalize_name(column.table or ""), normalize_name(column.name)))
+            keys.add((column.table or "", column.name))
     return keys
 
 
@@ -1219,7 +1229,7 @@ def _non_projection_column_keys(scope: Scope) -> t.Set[t.Tuple[str, str]]:
             if not isinstance(item, exp.Expression):
                 continue
             for column in item.find_all(exp.Column):
-                keys.add((normalize_name(column.table or ""), normalize_name(column.name)))
+                keys.add((column.table or "", column.name))
     return keys
 
 
@@ -1247,8 +1257,8 @@ def correlation_columns(scope: Scope) -> t.Tuple[exp.Column, ...]:
         key = column.sql()
         if key in seen:
             continue
-        table_name = normalize_name(column.table) if column.table else None
-        column_key = (normalize_name(column.table or ""), normalize_name(column.name))
+        table_name = column.table if column.table else None
+        column_key = (column.table or "", column.name)
         if column_key in projection_keys and column_key not in non_projection_keys:
             continue
         if not table_name:
@@ -1328,6 +1338,25 @@ def _resolve_scope_column_id(
                 for candidate in getattr(step, "output_column_ids", ())
                 if _column_matches_name(candidate, name)
             )
+        elif isinstance(step, Aggregate):
+            # Resolve synthetic operand aliases (_a_0, _o_0, etc.) from operands.
+            if _is_synthetic_operand_name(name.normalized):
+                for operand in step.operands:
+                    if not isinstance(operand, exp.Alias) or not operand.alias:
+                        continue
+                    if identifier_name(operand.alias, dialect=dialect).normalized != name.normalized:
+                        continue
+                    source = _first_resolved_column_id(operand.this, step, instance)
+                    candidates.append(
+                        column_id(
+                            ColumnKind.SYNTHETIC,
+                            name,
+                            source.relation if source is not None else _aggregate_output_relation(step, instance),
+                            scope_id=_scope_id_for(step),
+                            ordinal=len(candidates),
+                            source_column_id=source,
+                        )
+                    )
         stack.extend(step.chain_dependencies)
     if col.table:
         candidates = [
@@ -1883,11 +1912,11 @@ def _visible_columns(step: "Step") -> t.Tuple[ColumnId, ...]:
 def _relation_matches(relation: RelationId | None, qualifier: str, dialect: str | None) -> bool:
     if relation is None:
         return False
-    key = identifier_name(qualifier, dialect=dialect).normalized.lower()
+    key = identifier_name(qualifier, dialect=dialect).normalized
     return (
-        relation.alias is not None and relation.alias.normalized.lower() == key
+        relation.alias is not None and relation.alias.normalized == key
     ) or (
-        relation.name is not None and relation.name.normalized.lower() == key
+        relation.name is not None and relation.name.normalized == key
     )
 
 
@@ -1957,19 +1986,24 @@ def _enrich_identity_column(
     DataType: t.Any,
 ) -> None:
     source = resolved_id.source_column_id
-    if source is None or source.relation is None or source.relation.name is None:
+    for _ in range(10):
+        if source is None or source.relation is None or source.relation.name is None or source.name is None:
+            return
+        try:
+            catalog_column = instance.catalog_column(source.relation, exp.to_identifier(source.name.raw))
+        except (KeyError, ValueError):
+            source = source.source_column_id
+            continue
+        dtype = DataType.build(catalog_column.datatype)
+        meta = {
+            "table": source.relation.name.normalized,
+            "nullable": catalog_column.nullable,
+            "unique": catalog_column.unique,
+            "domain": dtype,
+        }
+        set_column_meta(col, meta)
+        col.type = dtype
         return
-    try:
-        catalog_column = instance.catalog_column(source.relation, exp.to_identifier(source.name.raw))
-    except Exception:
-        return
-    meta = {
-        "table": source.relation.name.normalized,
-        "nullable": catalog_column.nullable,
-        "unique": catalog_column.unique,
-        "domain": DataType.build(catalog_column.datatype),
-    }
-    set_column_meta(col, meta)
 
 
 def _generation_metadata(step: "Step", instance: t.Any) -> t.Dict[str, t.Any]:
@@ -2041,7 +2075,7 @@ def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
     if aggregate is None or step.condition is None:
         return ()
     aggregate_aliases = {
-        normalize_name(aggregation.alias_or_name): _direct_aggregate_function(aggregation)
+        aggregation.alias_or_name: _direct_aggregate_function(aggregation)
         for aggregation in aggregate.aggregations
         if isinstance(aggregation, exp.Alias)
         and aggregation.alias_or_name
@@ -2054,7 +2088,7 @@ def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
         rewritten = comparison.copy()
         matched = False
         for column in rewritten.find_all(exp.Column):
-            aggregate_function = aggregate_aliases.get(normalize_name(column.name))
+            aggregate_function = aggregate_aliases.get(column.name)
             if aggregate_function is None:
                 continue
             column.replace(aggregate_function.copy())
@@ -2138,7 +2172,7 @@ def _aggregate_function_name(expression: exp.AggFunc) -> str:
 
 def _aggregate_argument_id(expression: exp.AggFunc) -> ColumnId | None:
     for column in _iter_scope_columns(expression):
-        if _is_planner_synthetic_operand(column):
+        if _is_synthetic_operand_name(column.name):
             continue
         cid = column.meta.get(PARSEVAL_COLUMN_ID)
         if isinstance(cid, ColumnId):
@@ -2161,7 +2195,7 @@ def _aggregate_semantic_datatype(expression: exp.AggFunc) -> DataType:
 
 def _aggregate_argument_datatype(expression: exp.AggFunc) -> DataType | None:
     for column in _iter_scope_columns(expression):
-        if _is_planner_synthetic_operand(column):
+        if _is_synthetic_operand_name(column.name):
             continue
         meta = column.args.get("_parseval_meta")
         if meta is None:
@@ -2285,8 +2319,8 @@ def _resolve_outer_column_id(
     return _resolve_column_id(column, consumer, instance, allow_unresolved=True)
 
 
-def _is_planner_synthetic_operand(column: exp.Column) -> bool:
-    return column.name.startswith("_a_")
+def _is_synthetic_operand_name(name: str) -> bool:
+    return name.startswith("_a_") or name.startswith("_o_")
 
 
 def _infer_semantic_datatypes(
@@ -2321,6 +2355,10 @@ def _infer_semantic_datatypes(
                 _collect_range_comparison_semantics(node, add)
                 continue
 
+            if isinstance(node, (exp.EQ, exp.NEQ)):
+                _collect_equality_comparison_semantics(node, add)
+                continue
+
             if isinstance(node, exp.Between):
                 _collect_between_semantics(node, add)
 
@@ -2331,12 +2369,27 @@ def _infer_semantic_datatypes(
             semantic_datatypes[cid] = datatype
 
     if semantic_datatypes:
+        from parseval.plan.rex import set_column_meta
         for expression in expression_tuple:
             for column in _iter_scope_columns(expression):
                 cid = column.meta.get(PARSEVAL_COLUMN_ID)
                 if isinstance(cid, ColumnId) and cid in semantic_datatypes:
-                    column.meta[PARSEVAL_SEMANTIC_DATATYPE] = semantic_datatypes[cid]
-        _wrap_semantic_literal_casts(expression_tuple, semantic_datatypes)
+                    semantic_dt = semantic_datatypes[cid]
+                    column.meta[PARSEVAL_SEMANTIC_DATATYPE] = semantic_dt
+                    # Only override col.type when the catalog type is TEXT
+                    # but the semantic type is temporal.  For TEXT columns
+                    # the solver must generate strings (the DB stores text),
+                    # so we keep col.type=TEXT and let the semantic type
+                    # inform boundary value generation and analysis instead.
+                    existing_meta = column.args.get("_parseval_meta")
+                    if existing_meta is not None:
+                        meta = dict(existing_meta)
+                        meta["domain"] = semantic_dt
+                        set_column_meta(column, meta)
+        # Don't wrap literals in CAST — the solver's _coerce_temporal_pair
+        # already handles temporal coercion.  CAST wrapping causes the solver
+        # to generate datetime objects that serialize differently than the
+        # original literal format in SQLite.
 
     return semantic_datatypes
 
@@ -2400,6 +2453,22 @@ def _collect_between_semantics(
     )
     if datatype is not None:
         add(column, datatype, 1)
+
+
+def _collect_equality_comparison_semantics(
+    node: exp.Expression,
+    add: t.Callable[[exp.Column, DataType, int], None],
+) -> None:
+    left_column = _single_scope_column(node.left)
+    right_column = _single_scope_column(node.right)
+    if left_column is not None and right_column is None:
+        datatype = _literal_semantic_datatype(node.right)
+        if datatype is not None:
+            add(left_column, datatype, 1)
+    elif right_column is not None and left_column is None:
+        datatype = _literal_semantic_datatype(node.left)
+        if datatype is not None:
+            add(right_column, datatype, 1)
 
 
 def _single_scope_column(expression: t.Any) -> exp.Column | None:

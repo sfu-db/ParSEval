@@ -100,7 +100,14 @@ def identifier_name(value: exp.Identifier | str, dialect: str | None = None) -> 
     else:
         raw = str(value)
         quoted = False
-    normalized = raw if quoted else raw.lower()
+    # Use dialect-aware normalization via sqlglot's Dialect.normalize_identifier.
+    # This handles dialect-specific rules (e.g., SQLite lowercases even quoted identifiers).
+    if dialect:
+        from sqlglot.dialects.dialect import Dialect
+        dialect_obj = Dialect.get_or_raise(dialect)
+        normalized = dialect_obj.normalize_identifier(exp.to_identifier(raw, quoted=quoted)).name
+    else:
+        normalized = raw.lower()
     return IdentifierName(raw=raw, normalized=normalized, quoted=quoted, dialect=dialect)
 
 
@@ -142,6 +149,32 @@ def column_id(
 def column_identity(node: exp.Column) -> ColumnId | None:
     value: Any = node.meta.get(PARSEVAL_COLUMN_ID)
     return value if isinstance(value, ColumnId) else None
+
+
+def iter_scope_columns(expression: exp.Expression):
+    """Yield columns from one SQL scope without entering subqueries."""
+    stack = [expression]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Column):
+            yield node
+            continue
+        if isinstance(node, (exp.Subquery, exp.Exists)):
+            continue
+        if isinstance(node, exp.In) and isinstance(
+            node.args.get("query"),
+            exp.Expression,
+        ):
+            if isinstance(node.this, exp.Expression):
+                stack.append(node.this)
+            continue
+        for child in node.args.values():
+            if isinstance(child, exp.Expression):
+                stack.append(child)
+            elif isinstance(child, list):
+                stack.extend(
+                    item for item in child if isinstance(item, exp.Expression)
+                )
 
 
 def table_relation(name: str, dialect: str | None = None) -> RelationId:

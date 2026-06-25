@@ -5,7 +5,6 @@ from itertools import product
 
 from sqlglot import exp
 
-from parseval.helper import normalize_name
 from parseval.identity import PARSEVAL_COLUMN_ID, ColumnId
 
 if TYPE_CHECKING:
@@ -102,9 +101,9 @@ class Row(exp.Expression):
             if isinstance(resolved, ColumnId):
                 if resolved in columns:
                     return columns[resolved]
-        normalized = normalize_name(self._key_name(key))
+        normalized = self._key_name(key)
         for column_name, value in columns.items():
-            if normalize_name(self._key_name(column_name)) == normalized:
+            if self._key_name(column_name) == normalized:
                 return value
         raise KeyError(key)
 
