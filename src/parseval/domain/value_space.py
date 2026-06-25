@@ -98,8 +98,8 @@ class ValueSpace:
         return None
 
     def _pick_numeric(self) -> Any:
-        lo = self.min_val if self.min_val is not None else 1
-        hi = self.max_val if self.max_val is not None else lo + 100
+        lo = self.min_val if self.min_val is not None else min(self.max_val - 100, 1) if self.max_val is not None else 1
+        hi = self.max_val if self.max_val is not None else max(self.min_val + 100, lo + 100) if self.min_val is not None else lo + 100
         if lo > hi:
             return None
         if self.family == TypeFamily.INTEGER:

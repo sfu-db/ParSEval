@@ -38,7 +38,6 @@ from parseval.plan import Plan, Step
 from parseval.plan.planner import Filter, Join, Aggregate, Project, Scan, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
 from parseval.dtype import DataType
-from parseval.helper import normalize_name
 from parseval.instance import Instance
 from parseval.solver import SolverConstraint
 from parseval.solver.types import SolverVar, set_solver_var, solver_var
@@ -573,7 +572,7 @@ class ConstraintGenerator:
 
         def add(value: Any) -> None:
             raw = getattr(value, "name", value)
-            normalized = normalize_name(raw)
+            normalized = raw
             if normalized not in names:
                 names.append(normalized)
 
@@ -607,7 +606,7 @@ class ConstraintGenerator:
                 ),
             )
             if col.type is None:
-                self._set_type_from_col_id(col, col_id)
+                self._set_type_from_catalog(col, col_id)
 
     def _scalar_subquery_value_expression(
         self,
@@ -1368,11 +1367,10 @@ class ConstraintGenerator:
     ) -> None:
         """Set SolverVar metadata on Column nodes so the solver can assign values.
 
-        Also bridges the ``column_meta["domain"]`` → ``col.type`` gap: the
-        planner stores semantic types in ``column_meta`` but the solver reads
-        from ``col.type``.  Without this, path-predicate columns copied from
-        step expressions have ``col.type = None`` and the solver defaults to
-        TEXT, generating string values for INT columns.
+        The planner sets ``col.type`` during enrichment, so most columns
+        already have their type.  For newly constructed columns (IS NOT NULL,
+        unique avoidance) that weren't in step expressions, fall back to
+        catalog lookup.
         """
         for expr in constraints:
             for col in expr.find_all(exp.Column):
@@ -1381,16 +1379,14 @@ class ConstraintGenerator:
                     scoped_var = self._with_join_scope(existing_var, row_scope_by_relation)
                     if scoped_var is not existing_var:
                         set_solver_var(col, scoped_var)
-                    # Even if SolverVar exists, ensure col.type is set.
                     if col.type is None:
-                        self._set_type_from_col_id(col, existing_var.column_id)
+                        self._set_type_from_catalog(col, existing_var.column_id)
                     continue
                 col_id = self._column_id_for_expr(col, tables)
                 if col_id is None:
                     continue
-                # Set col.type from column_meta or catalog lookup.
                 if col.type is None:
-                    self._set_type_from_col_id(col, col_id)
+                    self._set_type_from_catalog(col, col_id)
                 rel_id = col_id.relation
                 if rel_id is None and tables:
                     rel_id = tables[0]
@@ -1403,21 +1399,7 @@ class ConstraintGenerator:
                 )
                 set_solver_var(col, sv)
 
-    def _set_type_from_metadata_or_catalog(
-        self,
-        col: exp.Column,
-        tables: Tuple[RelationId, ...],
-    ) -> None:
-        """Set ``col.type`` from ``column_meta["domain"]`` or catalog lookup."""
-        meta = column_meta(col)
-        if meta is not None and "domain" in meta:
-            col.type = meta["domain"]
-            return
-        col_id = self._column_id_for_expr(col, tables)
-        if col_id is not None:
-            self._set_type_from_col_id(col, col_id)
-
-    def _set_type_from_col_id(self, col: exp.Column, col_id: ColumnId) -> None:
+    def _set_type_from_catalog(self, col: exp.Column, col_id: ColumnId) -> None:
         """Set ``col.type`` from the catalog using a resolved ColumnId."""
         dtype = self._datatype_for_column_id(col_id)
         if dtype is not None:
@@ -1580,7 +1562,7 @@ class ConstraintGenerator:
             raise UnresolvedScopedColumnError(
                 f"unresolved_scoped_column:{col.sql(dialect=self.dialect)}"
             )
-        col_name = normalize_name(col.name)
+        col_name = col.name
         candidates: List[RelationId] = []
         for rel in tables:
             name = _relation_table_name(rel)
@@ -1596,7 +1578,7 @@ class ConstraintGenerator:
         tables: Tuple[RelationId, ...],
     ) -> RelationId | None:
         del tables
-        table_name = normalize_name(table.name)
+        table_name = table.name
         try:
             return self.instance.table_id(table_name)
         except Exception:

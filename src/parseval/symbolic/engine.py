@@ -29,7 +29,6 @@ from parseval.solver import Solver, SolverConstraint
 
 from .constraints import PlausibleBranch, ConstraintGenerator
 from .evaluator import PlanEvaluator
-from .infeasibility import is_infeasible
 from .types import (
     BranchTree,
     BranchType,
@@ -150,14 +149,6 @@ class SymbolicEngine:
 
             # Process one target per iteration.
             target = self._prioritize(targets)
-
-            # Quick infeasibility check.
-            reason = is_infeasible(
-                target.node, target.atom_id, target.target_outcome, self.instance
-            )
-            if reason is not None:
-                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
-                continue
 
             # Generate complete constraints (including DB constraints).
             constraint = constraint_gen.compile(PlausibleBranch.from_coverage_target(target))

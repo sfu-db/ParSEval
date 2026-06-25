@@ -208,6 +208,10 @@ def parse_datetime(value: Any) -> Optional[datetime]:
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
         normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        # Strip single-digit fractional seconds (.0, .1, etc.) that Python 3.10
+        # rejects.  Multi-digit fractions (.000) are valid ISO-8601.
+        if re.search(r"\.\d{1}$", normalized):
+            normalized = normalized[:-2]
         for candidate in (normalized.replace(" ", "T"), normalized):
             try:
                 return _normalize_datetime(datetime.fromisoformat(candidate))

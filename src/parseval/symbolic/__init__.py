@@ -18,7 +18,6 @@ from .constraints import (
 )
 from .engine import SymbolicEngine
 from .evaluator import PlanEvaluator, decompose_atoms
-from .infeasibility import is_infeasible
 from .types import (
     AtomObservation,
     BranchNode,
@@ -47,5 +46,4 @@ __all__ = [
     "SolverConstraint",
     "SymbolicEngine",
     "decompose_atoms",
-    "is_infeasible",
 ]

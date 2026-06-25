@@ -34,7 +34,6 @@ from parseval.identity import (
     identifier_name,
     relation_id,
 )
-# from parseval.helper import normalize_name
 from parseval.plan.rex import Row, Symbol, Variable
 from parseval.states import raise_exception
 

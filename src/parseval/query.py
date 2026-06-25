@@ -161,12 +161,10 @@ def preprocess_sql(
     try:
         parsed = qualify.qualify(parsed, schema=mappingschema, dialect=dialect)
     except Exception:
-        parsed = qualify.qualify(
-            parsed,
-            schema=mappingschema,
-            dialect=dialect,
-            validate_qualify_columns=False,
-        )
+        # Schema-based qualification fails for CTE columns (not in physical
+        # schema) and other constructs.  Qualify without schema — sqlglot
+        # still resolves table aliases from FROM clauses.
+        parsed = qualify.qualify(parsed, dialect=dialect)
     parsed = annotate_types.annotate_types(parsed, schema=mappingschema)
     return parsed
 
