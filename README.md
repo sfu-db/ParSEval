@@ -27,7 +27,7 @@ print(result.success, result.generation.rows_generated)
 ### Disprove Query Equivalence
 
 ```python
-from parseval import disprove, Semantics
+from parseval import disprove
 
 result = disprove(
     sql1="SELECT name FROM users WHERE age > 25",
@@ -35,46 +35,64 @@ result = disprove(
     schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
     connection_string="sqlite:////tmp/test.db",
     dialect="sqlite",
-    semantics=Semantics.BAG,  # or Semantics.SET
+    semantics="bag",  # or Semantics.SET
 )
 print(result.verdict)  # Verdict.EQ or Verdict.NEQ
 ```
 
-### Supported Dialects
+### Coverage Thresholds
 
-- `sqlite` — full support
-- `mysql` — supported via DBManager
-- `postgres` — supported via DBManager
+Control how many rows are generated per branch type. Set a threshold to `0` to skip that branch type entirely. Higher values generate more rows but improve coverage.
+
+```python
+result = instantiate_db(
+    sql="SELECT name FROM users WHERE age > 25",
+    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    connection_string="sqlite:////tmp/test.db",
+    dialect="sqlite",
+    atom_null=2,           # Generate 2 rows where WHERE evaluates to NULL
+    atom_false=1,          # Generate 1 row where WHERE is FALSE
+    project_null=1,        # Generate 1 row where SELECT output is NULL
+    distinct_duplicate=1,  # Generate 1 duplicate row for DISTINCT elimination
+    distinct_unique=1,     # Generate 1 unique row for DISTINCT
+)
+```
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `atom_null` | Rows where a WHERE/ON predicate evaluates to NULL | 1 |
+| `atom_false` | Rows where a WHERE/ON predicate is FALSE | 1 |
+| `atom_dup` | Rows that trigger duplicate detection | 1 |
+| `project_null` | Rows where a projected column is NULL | 1 |
+| `distinct_duplicate` | Duplicate rows eliminated by DISTINCT | 1 |
+| `distinct_unique` | Unique rows retained by DISTINCT | 1 |
+| `max_iterations` | Max iterations for the symbolic engine | 10 |
+
+### Connection Strings
+
+```python
+# SQLite
+connection_string="sqlite:////tmp/test.db"
+
+# MySQL
+connection_string="mysql+pymysql://user:password@localhost:3306/mydb"
+
+# PostgreSQL
+connection_string="postgresql://user:password@localhost:5432/mydb"
+```
 
 ## File Structure
 
 ```
 src/parseval/
 ├── main.py              # Public API: instantiate_db, disprove
-├── symbolic/
-│   ├── engine.py        # SymbolicEngine — orchestrates generation
-│   ├── speculate.py     # Speculative data generation (Propagator + Resolver)
-│   ├── evaluator.py     # Branch coverage evaluation
-│   ├── uexpr.py         # UExprToConstraint — Z3-based constraint solver
-│   ├── constraints.py   # Coverage gap → solver constraint translation
-│   └── types.py         # BranchType, CoverageTarget, BranchTree
-├── solver/
-│   ├── unified.py       # Tiered solver (Trivial → Heuristic → CSP → SMT)
-│   ├── smt.py           # Z3 SMT solver with SQL-to-Z3 translation
-│   ├── lowering.py      # Predicate lowering (SQL → column constraints)
-│   └── value_space.py   # CSP domain narrowing
-├── plan/
-│   ├── planner.py       # Query plan builder (Scan, Join, Filter, etc.)
-│   ├── rex.py           # Concrete expression evaluation + Symbol types
-│   └── context.py       # Row/Environment for plan evaluation
-├── instance/
-│   ├── core.py          # Instance — in-memory row management
-│   ├── io.py            # Persistence (to_db)
-│   └── loader.py        # SQLAlchemy-based DB writer
-├── domain/              # Type-aware value generation
-├── db_manager.py        # Multi-backend connection management
-├── logger.py            # Configurable logging
-└── states.py            # Result types (Verdict, DisproveResult, etc.)
+├── disprover.py         # Query equivalence disproval
+├── states.py            # Result types (Verdict, DisproveResult, etc.)
+├── symbolic/            # Coverage-driven data generation engine
+├── solver/              # Constraint satisfaction (CSP + SMT/Z3)
+├── plan/                # Query plan analysis
+├── instance/            # In-memory row management and persistence
+└── domain/              # Type-aware value generation
 ```
 
 ## Running Experiments
