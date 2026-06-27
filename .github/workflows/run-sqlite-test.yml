@@ -29,13 +29,16 @@ jobs:
           uv pip install -e .
 
       - name: Run SQLite experiment
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           source .venv/bin/activate
-          python tests/experiment/test_sqlite.py \
+          python -u tests/experiment/test_sqlite.py \
             --schema_fp data/sqlite/schema.json \
             --gold_fp data/sqlite/dev.json \
             --preds_fp data/sqlite/dail.txt \
-            --output_dir results
+            --output_dir results \
             --workers 32
 
       - name: Upload results as artifact
@@ -43,7 +46,6 @@ jobs:
         with:
           name: sqlite-experiment-results
           path: results/
-
       # - name: Commit results to repo
       #   run: |
       #     git config user.name "github-actions[bot]"
