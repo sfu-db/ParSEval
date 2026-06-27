@@ -23,11 +23,12 @@ def test_identifier_name_normalizes_unquoted_names():
     assert ident.dialect == "sqlite"
 
 
-def test_identifier_name_preserves_quoted_names():
+def test_identifier_name_normalizes_by_dialect():
     node = exp.Identifier(this="User", quoted=True)
     ident = identifier_name(node, dialect="sqlite")
     assert ident.raw == "User"
-    assert ident.normalized == "User"
+    # SQLite normalizes identifiers to lowercase even when quoted.
+    assert ident.normalized == "user"
     assert ident.quoted is True
 
 

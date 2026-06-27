@@ -31,10 +31,15 @@ class ValueSpace:
         if self.equals is not None:
             if self.equals in self.not_equals:
                 return True
-            if self.min_val is not None and self.equals < self.min_val:
-                return True
-            if self.max_val is not None and self.equals > self.max_val:
-                return True
+            try:
+                if self.min_val is not None and self.equals < self.min_val:
+                    return True
+                if self.max_val is not None and self.equals > self.max_val:
+                    return True
+            except TypeError:
+                # Incomparable types (e.g. str vs float) — cannot determine
+                # emptiness from range bounds alone.
+                pass
             if self.allowed is not None and self.equals not in self.allowed:
                 return True
             if self.like_pattern is not None and not _matches_like(
@@ -43,8 +48,11 @@ class ValueSpace:
                 return True
             return False
         if self.min_val is not None and self.max_val is not None:
-            if self.min_val > self.max_val:
-                return True
+            try:
+                if self.min_val > self.max_val:
+                    return True
+            except TypeError:
+                pass
         if self.allowed is not None:
             valid = self.allowed - self.not_equals
             if self.like_pattern is not None:
@@ -105,16 +113,32 @@ class ValueSpace:
         if self.family == TypeFamily.INTEGER:
             lo = int(lo)
             hi = int(hi)
-            mid = (lo + hi) // 2
-            for offset in range(hi - lo + 1):
-                for try_val in (mid + offset, mid - offset):
+            candidates = []
+            if self.min_val is not None:
+                candidates.append(lo)
+            if self.max_val is not None and hi != lo:
+                candidates.append(hi)
+            if not candidates:
+                candidates.append(lo)
+            for candidate in candidates:
+                if lo <= candidate <= hi and candidate not in self.not_equals:
+                    return candidate
+            base = candidates[0]
+            for offset in range(1, hi - lo + 1):
+                for try_val in (base + offset, base - offset):
                     if lo <= try_val <= hi and try_val not in self.not_equals:
                         return try_val
         else:
-            mid = (lo + hi) / 2
-            for try_val in (mid, lo, hi):
-                if try_val not in self.not_equals:
-                    return try_val
+            candidates = []
+            if self.min_val is not None:
+                candidates.append(self.min_val)
+            if self.max_val is not None and self.max_val != self.min_val:
+                candidates.append(self.max_val)
+            if not candidates:
+                candidates = [lo, hi]
+            for candidate in candidates:
+                if candidate not in self.not_equals:
+                    return candidate
         return None
 
     def _pick_text(self) -> Optional[str]:
@@ -181,27 +205,46 @@ class ValueSpace:
                 if self.max_val is not None and isinstance(self.max_val, (int, float))
                 else lo + 365
             )
-            mid = (lo + hi) // 2
-            try:
-                return date(1970, 1, 1) + timedelta(days=mid)
-            except (ValueError, OverflowError):
-                pass
-        if self.min_val is not None:
-            if isinstance(self.min_val, datetime):
-                return self.min_val
-            if isinstance(self.min_val, date):
-                return self.min_val
-            if isinstance(self.min_val, dt_time):
-                return self.min_val
-            if isinstance(self.min_val, str):
+            candidates = [lo]
+            if hi != lo:
+                candidates.append(hi)
+            for candidate in candidates:
                 try:
-                    return date.fromisoformat(self.min_val[:10])
+                    val = date(1970, 1, 1) + timedelta(days=candidate)
+                    if val not in self.not_equals:
+                        return val
+                except (ValueError, OverflowError):
+                    continue
+            for offset in range(1, hi - lo + 1):
+                for try_days in (candidates[0] + offset, candidates[0] - offset):
+                    try:
+                        val = date(1970, 1, 1) + timedelta(days=try_days)
+                        if val not in self.not_equals:
+                            return val
+                    except (ValueError, OverflowError):
+                        continue
+        candidates = []
+        if self.min_val is not None:
+            candidates.append(self.min_val)
+        if self.max_val is not None and self.max_val != self.min_val:
+            candidates.append(self.max_val)
+        for candidate in candidates:
+            if isinstance(candidate, datetime):
+                if candidate not in self.not_equals:
+                    return candidate
+            elif isinstance(candidate, date):
+                if candidate not in self.not_equals:
+                    return candidate
+            elif isinstance(candidate, dt_time):
+                if candidate not in self.not_equals:
+                    return candidate
+            elif isinstance(candidate, str):
+                try:
+                    val = date.fromisoformat(candidate[:10])
+                    if val not in self.not_equals:
+                        return val
                 except (ValueError, IndexError):
                     pass
-        if self.max_val is not None and isinstance(self.max_val, dt_time):
-            return self.max_val
-        if self.max_val is not None and isinstance(self.max_val, date):
-            return self.max_val
         return date(2024, 6, 15)
 
     def _has_temporal_bound(self) -> bool:

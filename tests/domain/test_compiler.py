@@ -11,7 +11,8 @@ from parseval.domain.constraints import (
 )
 
 from parseval.domain.exceptions import ConstraintConflict
-from parseval.dtype import DataType
+from parseval.dtype import DataType, TypeFamily
+from parseval.domain.value_space import ValueSpace
 
 class TestCompiler(unittest.TestCase):
     def setUp(self):
@@ -99,6 +100,24 @@ class TestCompiler(unittest.TestCase):
         )
         plan = self.compiler.compile(spec)
         self.assertEqual(plan.allowed_values, (first, second))
+
+    def test_compile_plan_exports_shared_value_space(self):
+        spec = ColumnSpec(
+            table="t",
+            column="score",
+            datatype=DataType.build("INT"),
+            nullable=False,
+            checks=(RangeConstraint(minimum=10, maximum=20),),
+        )
+
+        plan = self.compiler.compile(spec)
+        space = plan.to_value_space()
+
+        self.assertIsInstance(space, ValueSpace)
+        self.assertEqual(space.family, TypeFamily.INTEGER)
+        self.assertTrue(space.not_null)
+        self.assertEqual(space.min_val, 10)
+        self.assertEqual(space.max_val, 20)
 
 def test_intersect_preserving_order_method():
     """_intersect_preserving_order must be a method on ConstraintCompiler."""

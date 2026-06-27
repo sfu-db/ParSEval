@@ -6,7 +6,7 @@ from parseval.query import preprocess_sql
 from parseval.solver.types import solver_var
 from parseval.symbolic.constraints import ConstraintGenerator
 from parseval.symbolic.engine import SymbolicEngine
-from parseval.symbolic.evaluator import build_branch_tree
+from parseval.symbolic.branch_tree import build_branch_tree
 from parseval.symbolic.types import BranchType
 
 
@@ -24,7 +24,7 @@ def _compile(sql: str, site: str, outcome: BranchType, atom_id: int = 0):
         and target.atom_id == atom_id
         and target.target_outcome == outcome
     )
-    return ConstraintGenerator(plan, instance).generate(target)
+    return ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
 
 
 def _assert_physical_storage(constraint):

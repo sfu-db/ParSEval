@@ -1,19 +1,18 @@
-"""ParSEval logging — configurable, structured execution tracking.
+"""ParSEval logging — configurable execution tracking.
 
 Usage::
 
-    from parseval.logger import get_logger, configure
+    from parseval.logger import configure, log
 
-    # Configure once at startup
+    # Optional: configure once at startup
     configure(level="INFO", log_file="parseval.log")
 
-    # Get loggers by component
-    log = get_logger("engine")
-    log.info("Generation started", extra={"sql": sql, "dialect": "sqlite"})
+    # Use the module-level logger
+    log.info("Generation started")
 
-    # Or use the module-level convenience
-    from parseval.logger import log
-    log.info("ParSEval initialized")
+    # Or get one directly
+    import logging
+    logging.getLogger("parseval").info("hello")
 """
 
 import logging
@@ -25,21 +24,14 @@ from typing import Optional
 _FORMAT = "[%(asctime)s] %(levelname)s [%(name)s]: %(message)s"
 _FORMAT_VERBOSE = "[%(asctime)s] %(levelname)s [%(name)s] [%(filename)s:%(lineno)d]: %(message)s"
 
-# Root logger name for all ParSEval loggers
 ROOT = "parseval"
 
-# Sub-logger names
-COMPONENTS = {
-    "engine": "Symbolic engine execution",
-    "solver": "SMT/CSP solver invocations",
-    "speculate": "Speculative data generation",
-    "plan": "Query plan construction",
-    "instance": "Instance row management",
-    "db": "Database operations (dump/execute)",
-    "coverage": "Branch coverage tracking",
-}
-
-_configured = False
+# Default: WARNING to stderr so users see problems but not noise.
+_root = logging.getLogger(ROOT)
+_root.setLevel(logging.WARNING)
+_root.propagate = False
+if not _root.handlers:
+    _root.addHandler(logging.StreamHandler(sys.stderr))
 
 
 def configure(
@@ -62,56 +54,29 @@ def configure(
     quiet : bool
         If True, suppress all output below WARNING.
     """
-    global _configured
-
-    root = logging.getLogger(ROOT)
-    root.handlers.clear()
-    root.propagate = False
+    _root.handlers.clear()
 
     if quiet:
         log_level = logging.WARNING
     else:
         log_level = getattr(logging, level.upper(), logging.INFO)
 
-    root.setLevel(log_level)
+    _root.setLevel(log_level)
 
     fmt = _FORMAT_VERBOSE if verbose else _FORMAT
     formatter = logging.Formatter(fmt)
 
-    # Console handler
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(log_level)
     console.setFormatter(formatter)
-    root.addHandler(console)
+    _root.addHandler(console)
 
-    # File handler (if specified)
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file)
-        fh.setLevel(logging.DEBUG)  # File always gets everything
+        fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(_FORMAT_VERBOSE))
-        root.addHandler(fh)
-
-    _configured = True
+        _root.addHandler(fh)
 
 
-def get_logger(component: str = "") -> logging.Logger:
-    """Get a ParSEval logger for a specific component.
-
-    Parameters
-    ----------
-    component : str
-        Component name (e.g. "engine", "solver", "db").
-        Empty string returns the root parseval logger.
-    """
-    if not _configured:
-        # Auto-configure with defaults on first use
-        configure(level="WARNING")
-
-    if component:
-        return logging.getLogger(f"{ROOT}.{component}")
-    return logging.getLogger(ROOT)
-
-
-# Module-level convenience logger
 log = logging.getLogger(ROOT)

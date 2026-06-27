@@ -9,7 +9,7 @@ dependency-free and testable in isolation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Set, Tuple
 
 from sqlglot import exp
 
@@ -58,6 +58,7 @@ class PathPredicate:
     node: "BranchNode"
     expression: exp.Expression
     outcome: BranchType
+    obligation: Optional["CoverageObligation"] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -86,6 +87,16 @@ class OperatorObligation:
     expression: Optional[exp.Expression] = None
 
 
+@dataclass(frozen=True)
+class CoverageObligation:
+    """One planner/runtime coverage requirement attached to a BranchNode."""
+
+    metric: str
+    atom_id: int
+    expression: exp.Expression
+    outcomes: Tuple[BranchType, ...]
+
+
 @dataclass(frozen=True, eq=False)
 class BranchPath:
     """Complete constraints needed for one target to survive toward the query root."""
@@ -95,6 +106,7 @@ class BranchPath:
     join_facts: Tuple[JoinFact, ...] = ()
     subqueries: Tuple[SubqueryPath, ...] = ()
     obligations: Tuple[OperatorObligation, ...] = ()
+    coverage_obligations: Tuple[CoverageObligation, ...] = ()
     relations: Tuple[RelationId, ...] = ()
 
 
@@ -132,8 +144,16 @@ class BranchNode:
     atoms: Tuple[exp.Expression, ...]  # decomposed atomic predicates (live AST)
     tables: Tuple[RelationId, ...] = ()
     infeasible: Set[Tuple[int, BranchType]] = field(default_factory=set)
+    infeasible_atom_outcomes: Set[Tuple[Tuple[int, BranchType], ...]] = field(
+        default_factory=set
+    )
+    discovery: Literal["planned", "runtime"] = "planned"
+    origin: Optional[str] = None
 
-    # Plan hierarchy
+    # Cached planner metadata (set during Phase 1 tree construction)
+    annotation_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Plan hierarchy and runtime parentage
     step: Optional[Any] = None  # direct reference to plan Step object
     parent: Optional[BranchNode] = None
     children: List[BranchNode] = field(default_factory=list)
@@ -142,7 +162,9 @@ class BranchNode:
     path_predicates: Tuple[exp.Expression, ...] = ()
     join_equalities: Tuple[Tuple[ColumnId, ColumnId], ...] = ()
     join_facts: Tuple[JoinFact, ...] = ()
+    subqueries: Tuple[SubqueryPath, ...] = ()
     obligations: Tuple[OperatorObligation, ...] = ()
+    coverage_obligations: Tuple[CoverageObligation, ...] = ()
 
     # Dict-based observation storage: atom_id -> {row_ids -> outcome}
     observations: Dict[int, Dict[Tuple[Any, ...], BranchType]] = field(
@@ -184,6 +206,18 @@ class BranchNode:
 
     def mark_infeasible(self, atom_id: int, outcome: BranchType) -> None:
         self.infeasible.add((atom_id, outcome))
+
+    def is_atom_outcomes_infeasible(
+        self,
+        atom_outcomes: Tuple[Tuple[int, BranchType], ...],
+    ) -> bool:
+        return tuple(atom_outcomes) in self.infeasible_atom_outcomes
+
+    def mark_atom_outcomes_infeasible(
+        self,
+        atom_outcomes: Tuple[Tuple[int, BranchType], ...],
+    ) -> None:
+        self.infeasible_atom_outcomes.add(tuple(atom_outcomes))
 
     def row_outcomes(self, row_ids: Tuple[Any, ...]) -> Dict[int, BranchType]:
         """Outcomes for a specific row across all atoms."""
@@ -243,6 +277,7 @@ class CoverageThresholds:
     aggregate_distinct_null_ignored: int = 1
     aggregate_distinct_duplicate_eliminated: int = 1
     aggregate_distinct_multiple_retained: int = 1
+    aggregate_duplicate: int = 1
     atom_dup: int = 1
 
     def threshold_for(self, branch_type: BranchType) -> int:
@@ -252,6 +287,8 @@ class CoverageThresholds:
             BranchType.ATOM_NULL: self.atom_null,
             BranchType.JOIN_MATCH: self.join_match,
             BranchType.JOIN_NO_MATCH: self.join_no_match,
+            BranchType.JOIN_LEFT: self.join_no_match,
+            BranchType.JOIN_RIGHT: self.join_no_match,
             BranchType.JOIN_NULL: self.join_null,
             BranchType.HAVING_PASS: self.having_pass,
             BranchType.HAVING_FAIL: self.having_fail,
@@ -273,6 +310,7 @@ class CoverageThresholds:
             BranchType.AGG_DISTINCT_NULL_IGNORED: self.aggregate_distinct_null_ignored,
             BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED: self.aggregate_distinct_duplicate_eliminated,
             BranchType.AGG_DISTINCT_MULTIPLE_RETAINED: self.aggregate_distinct_multiple_retained,
+            BranchType.DUPLICATE: self.aggregate_duplicate,
         }
         return thresholds.get(branch_type, 0)
 
@@ -289,9 +327,15 @@ class CoverageTarget:
     node: BranchNode
     atom_id: int  # index into node.atoms
     target_outcome: BranchType
+    atom_outcomes: Tuple[Tuple[int, BranchType], ...] = ()
+    obligation: Optional[CoverageObligation] = None
 
     @property
     def atom(self) -> exp.Expression:
+        if self.obligation is not None:
+            return self.obligation.expression
+        if self.atom_outcomes:
+            return self.node.predicate
         if self.atom_id < 0:
             return self.node.predicate
         return self.node.atoms[self.atom_id]
@@ -325,13 +369,22 @@ class BranchTree:
         path_predicates: Tuple[exp.Expression, ...] = (),
         join_equalities: Tuple[Tuple[ColumnId, ColumnId], ...] = (),
         join_facts: Tuple[JoinFact, ...] = (),
+        subqueries: Tuple[SubqueryPath, ...] = (),
         obligations: Tuple[OperatorObligation, ...] = (),
+        coverage_obligations: Tuple[CoverageObligation, ...] = (),
+        annotation_metadata: Optional[Dict[str, Any]] = None,
+        discovery: Literal["planned", "runtime"] = "planned",
+        origin: Optional[str] = None,
     ) -> BranchNode:
         """Find an existing node or create a new one."""
         node_key = (step_id, site, predicate.sql())
         existing = self.node_map.get(node_key)
         if existing is not None:
             return existing
+        if not coverage_obligations:
+            from .branch_tree import coverage_obligations_for_site
+
+            coverage_obligations = coverage_obligations_for_site(site, atoms)
 
         node = BranchNode(
             step_id=step_id,
@@ -340,12 +393,17 @@ class BranchTree:
             predicate=predicate,
             atoms=atoms,
             tables=tables,
+            discovery=discovery,
+            origin=origin,
+            annotation_metadata=annotation_metadata or {},
             step=step_obj,
             parent=parent,
             path_predicates=path_predicates,
             join_equalities=join_equalities,
             join_facts=join_facts,
+            subqueries=subqueries,
             obligations=obligations,
+            coverage_obligations=coverage_obligations,
         )
         if parent is not None:
             parent.children.append(node)
@@ -380,6 +438,19 @@ class BranchTree:
         def add(atom_id: int, outcome: BranchType, threshold: int) -> None:
             if threshold > 0:
                 specs.append((atom_id, outcome, threshold))
+
+        if node.coverage_obligations:
+            for obligation in node.coverage_obligations:
+                for outcome in obligation.outcomes:
+                    threshold = self.thresholds.threshold_for(outcome)
+                    if node.site == "root_result" and outcome == BranchType.ATOM_TRUE:
+                        threshold = max(threshold, 1)
+                    add(
+                        obligation.atom_id,
+                        outcome,
+                        threshold,
+                    )
+            return specs
 
         if node.site == "group":
             add(0, BranchType.GROUP_SINGLE, self.thresholds.group_single)
@@ -443,56 +514,26 @@ class BranchTree:
             add(atom_id, BranchType.ATOM_FALSE, self.thresholds.atom_false)
             add(atom_id, BranchType.ATOM_NULL, self.thresholds.atom_null)
 
-        if node.site == "filter":
-            add(-1, BranchType.FILTER_TRUE, self.thresholds.filter_true)
-            add(-1, BranchType.FILTER_FALSE, self.thresholds.filter_false)
-            add(-1, BranchType.FILTER_NULL, self.thresholds.filter_null)
-        elif node.site == "join_on":
-            add(-1, BranchType.JOIN_MATCH, self.thresholds.join_match)
-            add(-1, BranchType.JOIN_NO_MATCH, self.thresholds.join_no_match)
-            add(-1, BranchType.JOIN_NULL, self.thresholds.join_null)
-        elif node.site == "having":
-            add(-1, BranchType.HAVING_PASS, self.thresholds.having_pass)
-            add(-1, BranchType.HAVING_FAIL, self.thresholds.having_fail)
-            add(-1, BranchType.HAVING_NULL, self.thresholds.having_null)
-        elif node.site == "case_arm":
-            add(-1, BranchType.CASE_ARM_TAKEN, self.thresholds.case_arm_taken)
-            add(-1, BranchType.CASE_ARM_SKIPPED, self.thresholds.case_arm_skipped)
-
         return specs
 
     @property
     def uncovered_targets(self) -> List[CoverageTarget]:
         """All atom-outcome pairs that haven't met their threshold."""
-        if not self._cache_dirty and self._uncovered_cache is not None:
-            return self._uncovered_cache
+        from .branch_tree import CoverageAnalyzer
 
-        targets: List[CoverageTarget] = []
-        for node in self.nodes:
-            for atom_id, outcome, threshold in self._target_specs_for_node(node):
-                if node.is_infeasible(atom_id, outcome):
-                    continue
-                if node.observation_count(atom_id, outcome) >= threshold:
-                    continue
-                targets.append(CoverageTarget(node=node, atom_id=atom_id, target_outcome=outcome))
-
-        self._uncovered_cache = targets
-        self._cache_dirty = False
-        return targets
+        return CoverageAnalyzer(self).uncovered_targets
 
     @property
     def total_targets(self) -> int:
-        count = 0
-        for node in self.nodes:
-            for atom_id, outcome, _ in self._target_specs_for_node(node):
-                if node.is_infeasible(atom_id, outcome):
-                    continue
-                count += 1
-        return count
+        from .branch_tree import CoverageAnalyzer
+
+        return CoverageAnalyzer(self).total_targets
 
     @property
     def covered_count(self) -> int:
-        return self.total_targets - len(self.uncovered_targets)
+        from .branch_tree import CoverageAnalyzer
+
+        return CoverageAnalyzer(self).covered_count
 
     @property
     def coverage_ratio(self) -> float:
@@ -503,10 +544,19 @@ class BranchTree:
 
     @property
     def fully_covered(self) -> bool:
-        return len(self.uncovered_targets) == 0
+        from .branch_tree import CoverageAnalyzer
+
+        return CoverageAnalyzer(self).fully_covered
 
     def mark_infeasible(self, node: BranchNode, atom_id: int, outcome: BranchType) -> None:
         node.mark_infeasible(atom_id, outcome)
+        self._cache_dirty = True
+
+    def mark_target_infeasible(self, target: CoverageTarget) -> None:
+        if target.atom_outcomes:
+            target.node.mark_atom_outcomes_infeasible(target.atom_outcomes)
+        else:
+            target.node.mark_infeasible(target.atom_id, target.target_outcome)
         self._cache_dirty = True
 
     # -- Row-level trace queries --
@@ -526,50 +576,9 @@ class BranchTree:
         return [(node, node.row_outcomes(row_ids)) for node in nodes]
 
     def path_for_target(self, target: CoverageTarget) -> BranchPath:
-        nodes: List[BranchNode] = []
-        current: Optional[BranchNode] = target.node
-        while current is not None:
-            nodes.append(current)
-            current = current.parent
-        nodes.reverse()
+        from .branch_tree import BranchPathBuilder
 
-        predicates: List[PathPredicate] = []
-        join_facts: List[JoinFact] = []
-        obligations: List[OperatorObligation] = []
-        relations: List[RelationId] = []
-        seen_relations: Set[RelationId] = set()
-
-        for node in nodes:
-            for relation in node.tables:
-                if relation not in seen_relations:
-                    seen_relations.add(relation)
-                    relations.append(relation)
-            join_facts.extend(node.join_facts)
-            obligations.extend(node.obligations)
-            if node is target.node:
-                predicates.append(
-                    PathPredicate(
-                        node=node,
-                        expression=target.atom,
-                        outcome=target.target_outcome,
-                    )
-                )
-            elif node.site in {"filter", "having", "join_on"}:
-                predicates.append(
-                    PathPredicate(
-                        node=node,
-                        expression=node.predicate,
-                        outcome=BranchType.ATOM_TRUE,
-                    )
-                )
-
-        return BranchPath(
-            target=target,
-            predicates=tuple(predicates),
-            join_facts=tuple(join_facts),
-            obligations=tuple(obligations),
-            relations=tuple(relations),
-        )
+        return BranchPathBuilder().path_for_target(target)
 
     @property
     def root_witness_targets(self) -> List[CoverageTarget]:
@@ -580,37 +589,9 @@ class BranchTree:
         remaining edge-case atoms.  Only returns targets that are not yet
         covered (observation count below threshold).
         """
-        targets: List[CoverageTarget] = []
-        for node in self.nodes:
-            if node.site == "root_result":
-                if node.is_infeasible(0, BranchType.ATOM_TRUE):
-                    continue
-                if node.observation_count(0, BranchType.ATOM_TRUE) < 1:
-                    targets.append(
-                        CoverageTarget(
-                            node=node,
-                            atom_id=0,
-                            target_outcome=BranchType.ATOM_TRUE,
-                        )
-                    )
-                continue
-            if node.site in {"filter", "join_on", "scalar_subquery", "having"}:
-                for atom_id in range(len(node.atoms)):
-                    threshold = self.thresholds.threshold_for(BranchType.ATOM_TRUE)
-                    if threshold <= 0:
-                        continue
-                    if node.is_infeasible(atom_id, BranchType.ATOM_TRUE):
-                        continue
-                    if node.observation_count(atom_id, BranchType.ATOM_TRUE) >= threshold:
-                        continue
-                    targets.append(
-                        CoverageTarget(
-                            node=node,
-                            atom_id=atom_id,
-                            target_outcome=BranchType.ATOM_TRUE,
-                        )
-                    )
-        return targets
+        from .branch_tree import CoverageAnalyzer
+
+        return CoverageAnalyzer(self).root_witness_targets
 
 
 # =============================================================================
@@ -646,6 +627,7 @@ __all__ = [
     "BranchTree",
     "BranchType",
     "CoverageTarget",
+    "CoverageObligation",
     "CoverageThresholds",
     "GenerationResult",
     "JoinFact",

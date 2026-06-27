@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import uuid
 
-from parseval.domain.coercion import coerce_reference_value, coerce_value, values_equivalent
+from parseval.coercion import coerce_reference_value, coerce_value, values_equivalent
 from parseval.domain.spec import ColumnSpec
 from parseval.dtype import DataType, TypeFamily, TypeProfile, TypeService
 

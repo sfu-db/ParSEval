@@ -40,10 +40,7 @@ def test_column_ast_is_stamped_with_resolved_identity():
 
 def test_nested_join_columns_keep_alias_scope_and_physical_lineage():
     ddl = """
-    CREATE TABLE atom (
-      atom_id TEXT PRIMARY KEY,
-      element TEXT
-    );
+    CREATE TABLE atom (atom_id TEXT PRIMARY KEY, element TEXT);
     CREATE TABLE connected (
       atom_id TEXT NOT NULL,
       atom_id2 TEXT NOT NULL,
@@ -53,20 +50,16 @@ def test_nested_join_columns_keep_alias_scope_and_physical_lineage():
     """
     plan = _plan(
         """
-        SELECT DISTINCT T.element
-        FROM atom AS T
+        SELECT DISTINCT T.element FROM atom AS T
         WHERE T.element NOT IN (
-          SELECT DISTINCT T1.element
-          FROM atom AS T1
+          SELECT DISTINCT T1.element FROM atom AS T1
           INNER JOIN connected AS T2 ON T1.atom_id = T2.atom_id
         )
         """,
         ddl,
     )
-
     for step in plan.ordered_steps:
         plan.annotation_for(step)
-
     columns = {
         (column.table.lower(), column.name.lower()): column_identity(column)
         for column in plan.expression.find_all(exp.Column)
@@ -74,7 +67,6 @@ def test_nested_join_columns_keep_alias_scope_and_physical_lineage():
     outer = columns[("t", "element")]
     inner_atom = columns[("t1", "atom_id")]
     inner_connected = columns[("t2", "atom_id")]
-
     assert outer is not None
     assert inner_atom is not None
     assert inner_connected is not None
@@ -91,8 +83,7 @@ def test_reused_alias_text_is_distinguished_by_query_scope():
     """
     plan = _plan(
         """
-        SELECT X.element
-        FROM atom AS X
+        SELECT X.element FROM atom AS X
         WHERE EXISTS (
           SELECT 1 FROM connected AS X WHERE X.atom_id IS NOT NULL
         )
@@ -101,7 +92,6 @@ def test_reused_alias_text_is_distinguished_by_query_scope():
     )
     for step in plan.ordered_steps:
         plan.annotation_for(step)
-
     outer = next(
         column_identity(column)
         for column in plan.expression.find_all(exp.Column)
@@ -112,13 +102,177 @@ def test_reused_alias_text_is_distinguished_by_query_scope():
         for column in plan.expression.find_all(exp.Column)
         if column.name.lower() == "atom_id"
     )
-
     assert outer is not None
     assert inner is not None
     assert outer.relation != inner.relation
     assert outer.relation.scope_id != inner.relation.scope_id
     assert (outer.source_column_id or outer).relation.name.normalized == "atom"
     assert (inner.source_column_id or inner).relation.name.normalized == "connected"
+
+
+def test_repeated_derived_tables_keep_local_join_alias_scope():
+    ddl = """
+    CREATE TABLE atom (atom_id TEXT, element TEXT, molecule_id TEXT);
+    CREATE TABLE molecule (molecule_id TEXT, label TEXT);
+    """
+    plan = _plan(
+        """
+        SELECT COUNT(T.atom_id)
+        FROM (
+          SELECT T1.atom_id, T1.element, T1.molecule_id, T2.label
+          FROM atom AS T1
+          INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id
+          WHERE T2.molecule_id = 'TR006'
+        ) AS T
+        UNION ALL
+        SELECT T3.label
+        FROM (
+          SELECT T1.atom_id, T1.element, T1.molecule_id, T2.label
+          FROM atom AS T1
+          INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id
+          WHERE T2.molecule_id = 'TR006'
+        ) AS T3
+        """,
+        ddl,
+    )
+
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+
+def test_cte_join_subquery_reused_aliases_keep_local_scope():
+    ddl = """
+    CREATE TABLE results (raceId INT, FastestLapTime TEXT);
+    CREATE TABLE races (raceId INT, circuitId INT);
+    CREATE TABLE circuits (circuitId INT, country TEXT);
+    """
+    plan = _plan(
+        """
+        WITH fastest_lap_times AS (
+          SELECT T1.raceId, T1.FastestLapTime AS time_in_seconds
+          FROM results AS T1
+          WHERE T1.FastestLapTime IS NOT NULL
+        )
+        SELECT T1.FastestLapTime
+        FROM results AS T1
+        INNER JOIN races AS T2 ON T1.raceId = T2.raceId
+        INNER JOIN circuits AS T3 ON T2.circuitId = T3.circuitId
+        INNER JOIN (
+          SELECT MIN(fastest_lap_times.time_in_seconds) AS min_time_in_seconds
+          FROM fastest_lap_times
+          INNER JOIN races AS T2 ON fastest_lap_times.raceId = T2.raceId
+          INNER JOIN circuits AS T3 ON T2.circuitId = T3.circuitId
+          WHERE T3.country = 'Italy'
+        ) AS T4 ON T1.FastestLapTime = T4.min_time_in_seconds
+        """,
+        ddl,
+    )
+
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+
+def test_in_subquery_reuses_table_name_with_distinct_internal_bindings():
+    plan = _plan(
+        """
+        SELECT name
+        FROM races
+        WHERE year = 2017
+          AND name NOT IN (
+            SELECT name FROM races WHERE year = 2000
+          )
+        """,
+        "CREATE TABLE races (raceId INT PRIMARY KEY, year INT, name TEXT);",
+    )
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+    in_expression = plan.expression.find(exp.In)
+    assert in_expression is not None
+    outer = column_identity(in_expression.this)
+    query = in_expression.args["query"]
+    inner_column = next(
+        column
+        for column in query.find_all(exp.Column)
+        if column.name.lower() == "name"
+    )
+    inner = column_identity(inner_column)
+
+    assert outer is not None
+    assert inner is not None
+    assert outer.relation != inner.relation
+    assert outer.relation.binding_display != inner.relation.binding_display
+    assert (outer.source_column_id or outer).relation.name.normalized == "races"
+    assert (inner.source_column_id or inner).relation.name.normalized == "races"
+
+
+def test_scalar_subquery_reuses_table_with_distinct_internal_bindings():
+    plan = _plan(
+        """
+        SELECT r.name FROM races AS r
+        WHERE r.year = (SELECT MAX(i.year) FROM races AS i)
+        """,
+        "CREATE TABLE races (raceId INT PRIMARY KEY, year INT, name TEXT);",
+    )
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+    columns = {
+        (column.table.lower(), column.name.lower()): column_identity(column)
+        for column in plan.expression.find_all(exp.Column)
+    }
+    outer = columns[("r", "year")]
+    inner = columns[("i", "year")]
+
+    assert outer is not None
+    assert inner is not None
+    assert outer.relation.binding_display != inner.relation.binding_display
+    assert (outer.source_column_id or outer).relation.name.normalized == "races"
+    assert (inner.source_column_id or inner).relation.name.normalized == "races"
+
+
+def test_correlated_column_keeps_outer_binding_identity():
+    plan = _plan(
+        """
+        SELECT r.name FROM races AS r
+        WHERE EXISTS (
+          SELECT 1 FROM races AS i WHERE i.year < r.year
+        )
+        """,
+        "CREATE TABLE races (raceId INT PRIMARY KEY, year INT, name TEXT);",
+    )
+    for step in plan.ordered_steps:
+        plan.annotation_for(step)
+
+    columns = list(plan.expression.find_all(exp.Column))
+    outer_name = column_identity(
+        next(column for column in columns if column.sql() == "r.name")
+    )
+    outer_correlation = column_identity(
+        next(column for column in columns if column.sql() == "r.year")
+    )
+    inner = column_identity(
+        next(column for column in columns if column.sql() == "i.year")
+    )
+
+    assert outer_name is not None
+    assert outer_correlation is not None
+    assert inner is not None
+    assert outer_name.relation == outer_correlation.relation
+    assert outer_correlation.relation.binding_display != inner.relation.binding_display
+    assert (outer_correlation.source_column_id or outer_correlation).relation.name.normalized == "races"
+    assert (inner.source_column_id or inner).relation.name.normalized == "races"
+
+
+def test_missing_column_sources_breaks_instance_contract():
+    ddl = "CREATE TABLE users (id INT PRIMARY KEY);"
+    instance = Instance(ddl, name="db", dialect="sqlite")
+    del instance._column_sources
+    with pytest.raises(AttributeError, match="_column_sources"):
+        Plan(
+            sqlglot.parse_one("SELECT u.id FROM users AS u", read="sqlite"),
+            instance=instance,
+        )
 
 
 def test_plan_exposes_aliases_through_relation_identity_not_alias_map():

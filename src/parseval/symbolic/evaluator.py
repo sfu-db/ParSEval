@@ -41,73 +41,36 @@ from parseval.plan.context import (
     AggregateGroup,
     Context,
     DerivedSchema,
+    RangeReader,
     Row,
+    RowReader,
     build_context_from_instance,
 )
 from parseval.plan.rex import Const, Environment, Variable, concrete, column_meta
 from parseval.instance import Instance
 
+from .branch_tree import (
+    BranchCoverageRecorder,
+    BranchTreeBuilder,
+    _aggregate_coverage_expressions,
+    _case_arm_condition,
+    _join_facts_for_step,
+    _subquery_paths_for_atom,
+    decompose_atoms,
+    project_coverage_expressions,
+    project_coverage_items,
+    scalar_subquery_atoms,
+)
 from .types import (
     AtomObservation,
     BranchTree,
     BranchType,
     JoinFact,
     OperatorObligation,
+    SubqueryPath,
 )
 
-# =============================================================================
-# Atom decomposition
-# =============================================================================
-
-
-def decompose_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
-    """Break a compound predicate into its atomic sub-predicates.
-
-    Atoms are the leaves of the AND/OR/NOT tree. We do NOT descend into
-    subqueries (those are handled as SubPlan branches), and we skip atoms
-    that contain subqueries since they can't be concretely evaluated.
-    """
-    atoms: List[exp.Expression] = []
-
-    def _walk(node: exp.Expression) -> None:
-        if isinstance(node, exp.And):
-            _walk(node.left)
-            _walk(node.right)
-        elif isinstance(node, exp.Or):
-            _walk(node.left)
-            _walk(node.right)
-        elif isinstance(node, exp.Not):
-            _walk(node.this)
-        elif isinstance(node, exp.Paren):
-            _walk(node.this)
-        else:
-            # Skip atoms containing subqueries — they need SubPlan evaluation.
-            if node.find(exp.Subquery) or node.find(exp.Exists):
-                return
-            atoms.append(node)
-
-    _walk(predicate)
-    return tuple(atoms)
-
-
-def scalar_subquery_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
-    atoms: List[exp.Expression] = []
-
-    def walk(node: exp.Expression) -> None:
-        if isinstance(node, exp.And):
-            walk(node.left)
-            walk(node.right)
-            return
-        if isinstance(node, exp.Or):
-            walk(node.left)
-            walk(node.right)
-            return
-        if node.find(exp.Subquery) or node.find(exp.Exists):
-            atoms.append(node)
-
-    walk(predicate)
-    return tuple(atoms)
-
+_SUBPLAN_ANCHOR_ID = "parseval_subplan_anchor_id"
 
 def _classify_outcome(value: Any) -> BranchType:
     """Map a Python evaluation result to an atom-level BranchType."""
@@ -194,45 +157,6 @@ def _symbol_value(sym: Any) -> Any:
 
 def _annotation_relation_ids(annotation) -> Tuple[RelationId, ...]:
     return tuple(getattr(annotation, "source_relations", ()))
-
-
-def _join_facts_for_step(plan: Plan, step: Step) -> Tuple[JoinFact, ...]:
-    if not isinstance(step, Join):
-        return ()
-
-    facts: List[JoinFact] = []
-    referenced = list(plan.annotation_for(step).referenced_columns)
-    ref_index = 0
-    for join_rel, join_data in (step.joins or {}).items():
-        equalities: List[Tuple[ColumnId, ColumnId]] = []
-        source_keys = tuple(join_data.get("source_key", ()))
-        join_keys = tuple(join_data.get("join_key", ()))
-        for source_key, join_key in zip(source_keys, join_keys):
-            source_id = column_identity(source_key) if isinstance(source_key, exp.Column) else None
-            join_id = column_identity(join_key) if isinstance(join_key, exp.Column) else None
-            if (source_id is None or join_id is None) and ref_index + 1 < len(referenced):
-                source_id = referenced[ref_index]
-                join_id = referenced[ref_index + 1]
-            if source_id is not None and join_id is not None:
-                equalities.append((source_id, join_id))
-            ref_index += 2
-
-        source_relation = equalities[0][0].relation if equalities else None
-        target_relation = join_rel if isinstance(join_rel, RelationId) else None
-        if source_relation is None or target_relation is None:
-            continue
-        facts.append(
-            JoinFact(
-                source_relation=source_relation,
-                target_relation=target_relation,
-                equalities=tuple(equalities),
-                predicate=join_data.get("condition")
-                if isinstance(join_data.get("condition"), exp.Expression)
-                else None,
-                side=str(join_data.get("side") or "").lower(),
-            )
-        )
-    return tuple(facts)
 
 
 def _derived_variable(
@@ -349,37 +273,44 @@ def _materialize_column_from_row(
     )
 
 
-def _case_arm_condition(case_expr: exp.Case, arm_pred: exp.Expression) -> exp.Expression:
-    if isinstance(case_expr.this, exp.Expression):
-        return exp.EQ(this=case_expr.this.copy(), expression=arm_pred.copy())
-    return arm_pred
+def _outer_environment(outer_bindings: Optional[Any] = None) -> Optional[Environment]:
+    if outer_bindings is None:
+        return None
+    if isinstance(outer_bindings, Environment):
+        return outer_bindings
+    return Environment(outer_bindings)
 
 
-def _row_bindings(row: Row) -> Dict[ColumnId, Any]:
-    """Build ColumnId-keyed bindings from a row."""
-    return {col_id: _symbol_value(symbol) for col_id, symbol in row.items()}
+def _reader_for_row(row: Row) -> RowReader:
+    reader = RowReader(row.columns)
+    reader.row = row
+    return reader
 
 
 def _env_from_row(
     row: Row,
-    outer_bindings: Optional[Dict[ColumnId, Any]] = None,
+    outer_bindings: Optional[Any] = None,
 ) -> Environment:
-    """Build an Environment from a single row."""
-    bindings: Dict[ColumnId, Any] = dict(outer_bindings) if outer_bindings else {}
-    bindings.update(_row_bindings(row))
-    return Environment(bindings)
+    """Build a reader-backed Environment from a single row."""
+    return Environment.from_readers(
+        {"row": _reader_for_row(row)},
+        outer=_outer_environment(outer_bindings),
+    )
 
 
 def _env_from_join(
     source_row: Row,
     join_row: Row,
-    outer_bindings: Optional[Dict[ColumnId, Any]] = None,
+    outer_bindings: Optional[Any] = None,
 ) -> Environment:
-    """Build an Environment from two joined rows."""
-    bindings: Dict[ColumnId, Any] = dict(outer_bindings) if outer_bindings else {}
-    bindings.update(_row_bindings(source_row))
-    bindings.update(_row_bindings(join_row))
-    return Environment(bindings)
+    """Build a reader-backed Environment from two joined rows."""
+    return Environment.from_readers(
+        {
+            "source": _reader_for_row(source_row),
+            "join": _reader_for_row(join_row),
+        },
+        outer=_outer_environment(outer_bindings),
+    )
 
 
 def _joined_row(source_row: Row, join_row: Row) -> Row:
@@ -436,28 +367,6 @@ def _aggregate_output_col_id(
     return _output_column_by_name(step, alias) or _aggregate_col_id(alias, relation_id)
 
 
-def _aggregate_coverage_expressions(step: Aggregate) -> Tuple[exp.Expression, ...]:
-    operands = {
-        operand.alias_or_name: (
-            operand.this if isinstance(operand, exp.Alias) else operand
-        )
-        for operand in (getattr(step, "operands", ()) or ())
-        if operand.alias_or_name
-    }
-
-    def expand(node: exp.Expression) -> exp.Expression:
-        if isinstance(node, exp.Column) and not node.table:
-            operand = operands.get(node.name)
-            if operand is not None:
-                return operand.copy()
-        return node
-
-    return tuple(
-        aggregation.copy().transform(expand)
-        for aggregation in step.aggregations
-    )
-
-
 # =============================================================================
 # PlanEvaluator
 # =============================================================================
@@ -480,20 +389,34 @@ class PlanEvaluator:
         # Strict runtime lookup requires planner identities to be prepared
         # before the first context is built or any expression is evaluated.
         self.plan.annotations
+        self._uncorrelated_scalar_cache: Dict[int, Any] = {}
+        self._coverage_recorder: Optional[BranchCoverageRecorder] = None
 
     def evaluate(self, tree: Optional[BranchTree] = None) -> BranchTree:
         if tree is None:
-            tree = BranchTree()
+            tree = BranchTreeBuilder(self.plan, self.instance).build()
         self.evaluate_context(tree)
         return tree
 
     def evaluate_context(self, tree: Optional[BranchTree] = None) -> Context:
         if tree is None:
-            tree = BranchTree()
+            tree = BranchTreeBuilder(self.plan, self.instance).build()
+        self._coverage_recorder = BranchCoverageRecorder(tree)
+        self._uncorrelated_scalar_cache = {}
         ctx = build_context_from_instance(self.instance)
         output = self._walk(self.plan.root, ctx, tree)
         self._record_root_result(output, tree)
         return output
+
+    def _runtime_node(self, **kwargs: Any):
+        if self._coverage_recorder is None:
+            raise RuntimeError("coverage_recorder_not_initialized")
+        return self._coverage_recorder.runtime_node(**kwargs)
+
+    def _observe(self, node, observation: AtomObservation) -> None:
+        if self._coverage_recorder is None:
+            raise RuntimeError("coverage_recorder_not_initialized")
+        self._coverage_recorder.observe(node, observation)
 
     def _record_root_result(self, output: Context, tree: BranchTree) -> None:
         root_node = next((node for node in tree.nodes if node.site == "root_result"), None)
@@ -504,7 +427,7 @@ class PlanEvaluator:
             rows.extend(table.rows)
         if not rows:
             return
-        tree.record_observation(
+        self._observe(
             root_node,
             AtomObservation(
                 atom_id=0,
@@ -719,7 +642,7 @@ class PlanEvaluator:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
             path_preds, join_eqs = self._collect_upstream(step)
-            node = tree.get_or_create_node(
+            node = self._runtime_node(
                 step_id=annotation.step_id,
                 step_type="Filter",
                 site="filter",
@@ -731,50 +654,74 @@ class PlanEvaluator:
                 path_predicates=path_preds,
                 join_equalities=join_eqs,
             )
-            for subquery_atom in scalar_subquery_atoms(predicate):
-                scalar_nodes.append(
-                    tree.get_or_create_node(
-                        step_id=f"{annotation.step_id}:scalar_subquery:{subquery_atom.sql()}",
-                        step_type="Filter",
-                        site="scalar_subquery",
-                        predicate=subquery_atom,
-                        atoms=(subquery_atom,),
-                        tables=_annotation_relation_ids(annotation),
-                        step_obj=step,
-                        parent=parent_node,
-                        path_predicates=path_preds,
-                        join_equalities=join_eqs,
-                    )
+            node.subqueries = tuple(
+                subquery
+                for atom in scalar_subquery_atoms(predicate)
+                for subquery in _subquery_paths_for_atom(
+                    node,
+                    atom,
+                    step.subplan_dependencies,
                 )
+            )
+            for subquery_atom in scalar_subquery_atoms(predicate):
+                scalar_node = self._runtime_node(
+                    step_id=f"{annotation.step_id}:scalar_subquery:{subquery_atom.sql()}",
+                    step_type="Filter",
+                    site="scalar_subquery",
+                    predicate=subquery_atom,
+                    atoms=(subquery_atom,),
+                    tables=_annotation_relation_ids(annotation),
+                    step_obj=step,
+                    parent=parent_node,
+                    path_predicates=path_preds,
+                    join_equalities=join_eqs,
+                )
+                scalar_node.subqueries = _subquery_paths_for_atom(
+                    scalar_node,
+                    subquery_atom,
+                    step.subplan_dependencies,
+                )
+                scalar_nodes.append(scalar_node)
 
         passing_rows: List[Row] = []
+        has_subplans = bool(step.subplan_dependencies)
         for _, table in ctx.tables.items():
+            reader = RowReader(table.columns)
             for row in table.rows:
-                row_bindings = _row_bindings(row)
-                if outer_bindings:
-                    row_bindings.update(outer_bindings)
-                env = Environment(row_bindings)
-                predicate_for_row = self._resolve_subquery_predicates(
-                    predicate,
-                    step.subplan_dependencies,
-                    row_bindings,
-                    env,
+                reader.row = row
+                env = Environment.from_readers(
+                    {"row": reader},
+                    outer=_outer_environment(outer_bindings),
+                )
+                predicate_for_row = (
+                    self._resolve_subquery_predicates(
+                        predicate,
+                        step.subplan_dependencies,
+                        env,
+                        env,
+                    )
+                    if has_subplans
+                    else predicate
                 )
                 predicate_value = concrete(predicate_for_row, env)
                 # Record per-atom observations.
                 for atom_id, atom in enumerate(atoms):
-                    atom_for_row = self._resolve_subquery_predicates(
-                        atom,
-                        step.subplan_dependencies,
-                        row_bindings,
-                        env,
+                    atom_for_row = (
+                        self._resolve_subquery_predicates(
+                            atom,
+                            step.subplan_dependencies,
+                            env,
+                            env,
+                        )
+                        if has_subplans
+                        else atom
                     )
                     outcome = _try_early_classify(atom)
                     if outcome is None:
                         value = concrete(atom_for_row, env)
                         outcome = _classify_outcome(value)
                     if node is not None:
-                        tree.record_observation(
+                        self._observe(
                             node,
                             AtomObservation(
                                 atom_id=atom_id,
@@ -784,7 +731,7 @@ class PlanEvaluator:
                             ),
                         )
                 if node is not None:
-                    tree.record_observation(
+                    self._observe(
                         node,
                         AtomObservation(
                             atom_id=-1,
@@ -798,10 +745,10 @@ class PlanEvaluator:
                     scalar_for_row = self._resolve_subquery_predicates(
                         scalar_atom,
                         step.subplan_dependencies,
-                        row_bindings,
+                        env,
                         env,
                     )
-                    tree.record_observation(
+                    self._observe(
                         scalar_node,
                         AtomObservation(
                             atom_id=0,
@@ -853,7 +800,7 @@ class PlanEvaluator:
                     for fact in own_join_facts
                     for equality in fact.equalities
                 )
-                node = tree.get_or_create_node(
+                node = self._runtime_node(
                     step_id=annotation.step_id,
                     step_type="Join",
                     site="join_on",
@@ -880,6 +827,37 @@ class PlanEvaluator:
             side = str(join_data.get("side") or "").lower()
             preserves_source = side in {"left", "full"}
             preserves_join = side in {"right", "full"}
+            source_reader_cache: Dict[int, RowReader] = {}
+            join_reader_cache: Dict[int, RowReader] = {}
+
+            def cached_reader(row: Row, cache: Dict[int, RowReader]) -> RowReader:
+                key = id(row)
+                reader = cache.get(key)
+                if reader is None:
+                    reader = _reader_for_row(row)
+                    cache[key] = reader
+                return reader
+
+            def env_for_source(row: Row) -> Environment:
+                return Environment.from_readers(
+                    {"source": cached_reader(row, source_reader_cache)},
+                    outer=_outer_environment(outer_bindings),
+                )
+
+            def env_for_join_row(row: Row) -> Environment:
+                return Environment.from_readers(
+                    {"join": cached_reader(row, join_reader_cache)},
+                    outer=_outer_environment(outer_bindings),
+                )
+
+            def env_for_pair(source_row: Row, join_row: Row) -> Environment:
+                return Environment.from_readers(
+                    {
+                        "source": cached_reader(source_row, source_reader_cache),
+                        "join": cached_reader(join_row, join_reader_cache),
+                    },
+                    outer=_outer_environment(outer_bindings),
+                )
 
             def join_key_values(env: Environment) -> Tuple[Tuple[ColumnId, Any], ...]:
                 return tuple(
@@ -894,11 +872,11 @@ class PlanEvaluator:
             def record_preserved_row(row: Row, env: Environment) -> None:
                 if node is None:
                     return
-                tree.record_observation(
+                self._observe(
                     node,
                     AtomObservation(
                         atom_id=-1,
-                        outcome=BranchType.JOIN_NO_MATCH,
+                        outcome=BranchType.JOIN_MATCH,
                         row_ids=_row_ids(row),
                         concrete_values=join_key_values(env),
                     ),
@@ -927,7 +905,7 @@ class PlanEvaluator:
                     if atom_outcome is None:
                         value = concrete(atom, env)
                         atom_outcome = _classify_outcome(value)
-                    tree.record_observation(
+                    self._observe(
                         node,
                         AtomObservation(
                             atom_id=atom_id,
@@ -936,22 +914,69 @@ class PlanEvaluator:
                             concrete_values=_concrete_values(atom, env),
                         ),
                     )
-                tree.record_observation(
+                branch_atom_id = {
+                    BranchType.JOIN_MATCH: -1,
+                    BranchType.JOIN_NULL: -4,
+                }.get(outcome)
+                if branch_atom_id is not None:
+                    self._observe(
+                        node,
+                        AtomObservation(
+                            atom_id=branch_atom_id,
+                            outcome=outcome,
+                            row_ids=row_ids,
+                            concrete_values=join_key_values(env),
+                        ),
+                    )
+
+            joined_rows: List[Row] = []
+            matched_join_rows: set[int] = set()
+            source_keys = tuple(join_data.get("source_key", ()) or ())
+            join_keys = tuple(join_data.get("join_key", ()) or ())
+            use_key_buckets = bool(source_keys and join_keys and len(source_keys) == len(join_keys))
+            key_buckets: Dict[Tuple[Any, ...], List[Tuple[int, Row]]] = {}
+            if use_key_buckets:
+                for join_index, join_row in enumerate(join_table.rows):
+                    join_env = env_for_join_row(join_row)
+                    key = tuple(concrete(key_expr, join_env) for key_expr in join_keys)
+                    key_buckets.setdefault(key, []).append((join_index, join_row))
+
+            def candidate_rows(source_row: Row) -> List[Tuple[int, Row]]:
+                if not use_key_buckets:
+                    return list(enumerate(join_table.rows))
+                source_env = env_for_source(source_row)
+                source_key = tuple(concrete(key_expr, source_env) for key_expr in source_keys)
+                return key_buckets.get(source_key, [])
+
+            def record_source_gap(source_row: Row, outcome: BranchType) -> None:
+                if node is None:
+                    return
+                null_right = _null_join_row(join_table, _row_ids(source_row))
+                env = env_for_pair(source_row, null_right)
+                self._observe(
                     node,
                     AtomObservation(
-                        atom_id=-1,
+                        atom_id=-4 if outcome == BranchType.JOIN_NULL else -2,
                         outcome=outcome,
-                        row_ids=row_ids,
+                        row_ids=_row_ids(source_row),
                         concrete_values=join_key_values(env),
                     ),
                 )
 
-            joined_rows: List[Row] = []
-            matched_join_rows: set[int] = set()
             for source_row in source_table.rows:
                 source_matched = False
-                for join_index, join_row in enumerate(join_table.rows):
-                    env = _env_from_join(source_row, join_row, outer_bindings)
+                candidates = candidate_rows(source_row)
+                if use_key_buckets and not candidates:
+                    source_env = env_for_source(source_row)
+                    source_key = tuple(concrete(key_expr, source_env) for key_expr in source_keys)
+                    record_source_gap(
+                        source_row,
+                        BranchType.JOIN_NULL
+                        if any(value is None for value in source_key)
+                        else BranchType.JOIN_LEFT,
+                    )
+                for join_index, join_row in candidates:
+                    env = env_for_pair(source_row, join_row)
                     joined_row_ids = _row_ids(source_row) + _row_ids(join_row)
                     keys_match, condition_matches, join_outcome = evaluate_join_pair(env)
                     record_join_pair(env, joined_row_ids, join_outcome)
@@ -966,7 +991,7 @@ class PlanEvaluator:
                     joined_rows.append(preserved)
                     record_preserved_row(
                         preserved,
-                        _env_from_join(source_row, null_right, outer_bindings),
+                        env_for_pair(source_row, null_right),
                     )
 
             if preserves_join:
@@ -978,7 +1003,27 @@ class PlanEvaluator:
                     joined_rows.append(preserved)
                     record_preserved_row(
                         preserved,
-                        _env_from_join(null_source, join_row, outer_bindings),
+                        env_for_pair(null_source, join_row),
+                    )
+            elif node is not None:
+                for join_index, join_row in enumerate(join_table.rows):
+                    if join_index in matched_join_rows:
+                        continue
+                    null_source = _null_join_row(source_table, _row_ids(join_row))
+                    env = env_for_pair(null_source, join_row)
+                    join_key = tuple(concrete(key_expr, env_for_join_row(join_row)) for key_expr in join_keys)
+                    self._observe(
+                        node,
+                        AtomObservation(
+                            atom_id=-4 if any(value is None for value in join_key) else -3,
+                            outcome=(
+                                BranchType.JOIN_NULL
+                                if any(value is None for value in join_key)
+                                else BranchType.JOIN_RIGHT
+                            ),
+                            row_ids=_row_ids(join_row),
+                            concrete_values=join_key_values(env),
+                        ),
                     )
 
             columns = tuple(joined_rows[0].columns) if joined_rows else (
@@ -1005,28 +1050,31 @@ class PlanEvaluator:
 
         node = None
         aggregate_node = None
+        aggregate_input_node = None
         distinct_input_node = None
         if observe:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
             path_preds, join_eqs = self._collect_upstream(step)
             # Use a synthetic "group_cardinality" atom for group-size branches.
-            group_pred = exp.Literal.number(1)  # placeholder expression
-            node = tree.get_or_create_node(
+            group_pred = exp.Literal.string("GROUP_SIZE")
+            group_count_pred = exp.Literal.string("GROUP_COUNT")
+            node = self._runtime_node(
                 step_id=annotation.step_id,
                 step_type="Aggregate",
                 site="group",
                 predicate=group_pred,
-                atoms=(group_pred,),
+                atoms=(group_pred, group_count_pred),
                 tables=_annotation_relation_ids(annotation),
                 step_obj=step,
                 parent=parent_node,
                 path_predicates=path_preds,
                 join_equalities=join_eqs,
+                annotation_metadata=annotation.metadata,
             )
             aggregate_expressions = _aggregate_coverage_expressions(step)
             if aggregate_expressions:
-                aggregate_node = tree.get_or_create_node(
+                aggregate_node = self._runtime_node(
                     step_id=annotation.step_id,
                     step_type="Aggregate",
                     site="aggregate_output",
@@ -1037,7 +1085,30 @@ class PlanEvaluator:
                     parent=parent_node,
                     path_predicates=path_preds,
                     join_equalities=join_eqs,
+                    annotation_metadata=annotation.metadata,
                 )
+                aggregate_inputs = tuple(
+                    argument
+                    for aggregation in aggregate_expressions
+                    for function in aggregation.find_all(exp.AggFunc)
+                    for argument in (function.this,)
+                    if argument is not None
+                    and not isinstance(argument, (exp.Star, exp.Distinct))
+                )
+                if aggregate_inputs:
+                    aggregate_input_node = self._runtime_node(
+                        step_id=annotation.step_id,
+                        step_type="Aggregate",
+                        site="aggregate_input",
+                        predicate=exp.Literal.string("AGGREGATE_INPUT"),
+                        atoms=aggregate_inputs,
+                        tables=_annotation_relation_ids(annotation),
+                        step_obj=step,
+                        parent=parent_node,
+                        path_predicates=path_preds,
+                        join_equalities=join_eqs,
+                        annotation_metadata=annotation.metadata,
+                    )
                 distinct_arguments = tuple(
                     argument.expressions[0]
                     for aggregation in aggregate_expressions
@@ -1046,7 +1117,7 @@ class PlanEvaluator:
                     if isinstance(argument, exp.Distinct) and argument.expressions
                 )
                 if distinct_arguments:
-                    distinct_input_node = tree.get_or_create_node(
+                    distinct_input_node = self._runtime_node(
                         step_id=annotation.step_id,
                         step_type="Aggregate",
                         site="aggregate_distinct_input",
@@ -1057,6 +1128,7 @@ class PlanEvaluator:
                         parent=parent_node,
                         path_predicates=path_preds,
                         join_equalities=join_eqs,
+                        annotation_metadata=annotation.metadata,
                     )
 
         for table_name, table in ctx.tables.items():
@@ -1070,23 +1142,31 @@ class PlanEvaluator:
                 output_rows, aggregate_groups = self._grouped_aggregate_rows(
                     step,
                     list(table.rows),
+                    table.columns,
                     table_name,
                 )
             else:
-                source_row_ids = tuple(row.rowid for row in table.rows)
+                all_rows = list(table.rows)
+                source_row_ids = tuple(row.rowid for row in all_rows)
+                group_schema = DerivedSchema(columns=table.columns, rows=all_rows)
+                group_schema.range_reader.range = range(0, len(all_rows))
+
                 output_row_id = ("agg", step.name, "global")
                 aggregate_values: Dict[Any, Any] = {}
                 columns = {}
                 relation_id = _step_relation_id(step)
                 output_columns = self._aggregate_columns(step)
+                subplans = getattr(step, "subplan_dependencies", ()) or ()
                 for aggregate in step.aggregations:
                     alias = aggregate.alias_or_name
                     col_id = _aggregate_output_col_id(step, alias, relation_id)
                     value = self._aggregate_expression_value(
                         aggregate,
-                        list(table.rows),
+                        group_schema.range_reader,
+                        all_rows,
                         table_name,
                         operands=getattr(step, "operands", ()) or (),
+                        subplans=subplans,
                     )
                     aggregate_values[alias] = value
                     columns[col_id] = _derived_variable(
@@ -1096,8 +1176,8 @@ class PlanEvaluator:
                         relation_id,
                         column_id_override=col_id,
                     )
-                if table.rows:
-                    source_row = table.rows[0]
+                if all_rows:
+                    source_row = all_rows[0]
                     for col_id in output_columns:
                         if col_id in columns:
                             continue
@@ -1126,12 +1206,24 @@ class PlanEvaluator:
                         aggregate_values=aggregate_values,
                     )
                 }
-                groups[((),)] = len(table.rows)
+                groups[((),)] = len(all_rows)
 
             if node is not None:
+                group_count = len(groups)
+                self._observe(
+                    node,
+                    AtomObservation(
+                        atom_id=1,
+                        outcome=(
+                            BranchType.GROUP_SINGLE
+                            if group_count == 1
+                            else BranchType.GROUP_MULTI
+                        ),
+                    ),
+                )
                 for count in groups.values():
                     outcome = BranchType.GROUP_SINGLE if count == 1 else BranchType.GROUP_MULTI
-                    tree.record_observation(node, AtomObservation(atom_id=0, outcome=outcome))
+                    self._observe(node, AtomObservation(atom_id=0, outcome=outcome))
 
             if aggregate_node is not None:
                 rows_by_id = {_row_ids(row): row for row in table.rows}
@@ -1139,7 +1231,7 @@ class PlanEvaluator:
                     for atom_id, aggregation in enumerate(step.aggregations):
                         alias = aggregation.alias_or_name
                         value = group.aggregate_values.get(alias)
-                        tree.record_observation(
+                        self._observe(
                             aggregate_node,
                             AtomObservation(
                                 atom_id=atom_id,
@@ -1151,6 +1243,36 @@ class PlanEvaluator:
                                 row_ids=output_row_id,
                             ),
                         )
+                    if aggregate_input_node is not None:
+                        source_rows = [
+                            rows_by_id[row_id]
+                            for row_id in group.source_row_ids
+                            if row_id in rows_by_id
+                        ]
+                        for atom_id, argument in enumerate(aggregate_input_node.atoms):
+                            values = [
+                                concrete(argument, _env_from_row(row))
+                                for row in source_rows
+                            ]
+                            if any(value is None for value in values):
+                                self._observe(
+                                    aggregate_input_node,
+                                    AtomObservation(
+                                        atom_id=atom_id,
+                                        outcome=BranchType.AGGREGATE_NULL,
+                                        row_ids=(*output_row_id, "null", atom_id),
+                                    ),
+                                )
+                            non_null = [value for value in values if value is not None]
+                            if len(non_null) != len(set(non_null)):
+                                self._observe(
+                                    aggregate_input_node,
+                                    AtomObservation(
+                                        atom_id=atom_id,
+                                        outcome=BranchType.DUPLICATE,
+                                        row_ids=(*output_row_id, "duplicate", atom_id),
+                                    ),
+                                )
                     if distinct_input_node is not None:
                         source_rows = [
                             rows_by_id[row_id]
@@ -1173,7 +1295,7 @@ class PlanEvaluator:
                             if len(set(non_null)) >= 2:
                                 outcomes.append(BranchType.AGG_DISTINCT_MULTIPLE_RETAINED)
                             for outcome in outcomes:
-                                tree.record_observation(
+                                self._observe(
                                     distinct_input_node,
                                     AtomObservation(
                                         atom_id=atom_id,
@@ -1218,7 +1340,7 @@ class PlanEvaluator:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
             path_preds, join_eqs = self._collect_upstream(step)
-            node = tree.get_or_create_node(
+            node = self._runtime_node(
                 step_id=annotation.step_id,
                 step_type="Having",
                 site="having",
@@ -1244,7 +1366,7 @@ class PlanEvaluator:
                         value = concrete(atom, env)
                         outcome = _classify_outcome(value)
                     if node is not None:
-                        tree.record_observation(
+                        self._observe(
                             node,
                             AtomObservation(
                                 atom_id=atom_id,
@@ -1254,7 +1376,7 @@ class PlanEvaluator:
                             ),
                         )
                 if node is not None:
-                    tree.record_observation(
+                    self._observe(
                         node,
                         AtomObservation(
                             atom_id=-1,
@@ -1282,14 +1404,13 @@ class PlanEvaluator:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
             path_preds, join_eqs = self._collect_upstream(step)
+            project_items = project_coverage_items(step)
             project_expressions = tuple(
-                projection
-                for projection in step.projections
-                if isinstance(projection, exp.Expression)
+                projection for _index, projection in project_items
             )
             project_node = None
             if project_expressions:
-                project_node = tree.get_or_create_node(
+                project_node = self._runtime_node(
                     step_id=annotation.step_id,
                     step_type="Project",
                     site="project_output",
@@ -1305,11 +1426,12 @@ class PlanEvaluator:
                     output_ids = self._projected_columns(step, table.columns)
                     for row in table.rows:
                         projected = self._projected_values(step, row, table_name)
-                        for atom_id, output_id in enumerate(output_ids):
-                            if atom_id >= len(project_expressions):
+                        for atom_id, (projection_index, _projection) in enumerate(project_items):
+                            if projection_index >= len(output_ids):
                                 break
+                            output_id = output_ids[projection_index]
                             value = _symbol_value(projected.get(output_id))
-                            tree.record_observation(
+                            self._observe(
                                 project_node,
                                 AtomObservation(
                                     atom_id=atom_id,
@@ -1327,15 +1449,14 @@ class PlanEvaluator:
                     continue
                 for case_expr in projection.find_all(exp.Case):
                     ifs = case_expr.args.get("ifs") or []
-                    for arm_index, arm in enumerate(ifs):
-                        del arm_index
+                    for arm in ifs:
                         raw_arm_pred = arm.args.get("this")
                         if not isinstance(raw_arm_pred, exp.Expression):
                             continue
                         arm_pred = _case_arm_condition(case_expr, raw_arm_pred)
 
                         atoms = decompose_atoms(arm_pred)
-                        node = tree.get_or_create_node(
+                        node = self._runtime_node(
                             step_id=annotation.step_id,
                             step_type="Project",
                             site="case_arm",
@@ -1357,7 +1478,7 @@ class PlanEvaluator:
                                     if outcome is None:
                                         value = concrete(atom, env)
                                         outcome = _classify_outcome(value)
-                                    tree.record_observation(
+                                    self._observe(
                                         node,
                                         AtomObservation(
                                             atom_id=atom_id,
@@ -1366,7 +1487,7 @@ class PlanEvaluator:
                                             concrete_values=_concrete_values(atom, env),
                                         ),
                                     )
-                                tree.record_observation(
+                                self._observe(
                                     node,
                                     AtomObservation(
                                         atom_id=-1,
@@ -1382,7 +1503,7 @@ class PlanEvaluator:
 
             # Track DISTINCT
             if step.distinct:
-                distinct_node = tree.get_or_create_node(
+                distinct_node = self._runtime_node(
                     step_id=annotation.step_id,
                     step_type="Project",
                     site="distinct",
@@ -1413,7 +1534,7 @@ class PlanEvaluator:
                         break
 
                 outcome = BranchType.DISTINCT_DUPLICATE if has_duplicates else BranchType.DISTINCT_UNIQUE
-                tree.record_observation(distinct_node, AtomObservation(atom_id=0, outcome=outcome))
+                self._observe(distinct_node, AtomObservation(atom_id=0, outcome=outcome))
 
         return self._materialize_project(step, ctx)
 
@@ -1434,8 +1555,7 @@ class PlanEvaluator:
 
     def _eval_limit(self, step: Limit, ctx: Context) -> Context:
         output: Dict[str, DerivedSchema] = {}
-        for table_name, table in ctx.tables.items():
-            del table_name
+        for _table_name, table in ctx.tables.items():
             offset = max(int(getattr(step, "offset", 0) or 0), 0)
             if step.limit == float("inf"):
                 rows = list(table.rows)[offset:]
@@ -1490,20 +1610,7 @@ class PlanEvaluator:
         output_ids = getattr(step, "output_column_ids", None)
         if output_ids and len(output_ids) == len(step.projections):
             return output_ids
-        # Fallback: build from input columns
-        columns: List[ColumnId] = []
-        for projection in step.projections:
-            if self._is_star_projection(projection):
-                columns.extend(input_columns)
-            else:
-                name = projection.alias_or_name or projection.sql(dialect=self.dialect)
-                relation_id = None
-                for col in input_columns:
-                    if isinstance(col, ColumnId) and col.relation is not None:
-                        relation_id = col.relation
-                        break
-                columns.append(column_id(ColumnKind.PROJECTED, identifier_name(name), relation_id))
-        return tuple(columns)
+        raise ValueError(f"missing_project_output_column_ids:{step.name}")
 
     def _projected_values(self, step: Project, row: Row, table_name: str) -> Dict[ColumnId, Any]:
         values: Dict[ColumnId, Any] = {}
@@ -1560,7 +1667,7 @@ class PlanEvaluator:
 
         parent_node = self._find_upstream_branch_node(step, tree)
         path_preds, join_eqs = self._collect_upstream(step)
-        node = tree.get_or_create_node(
+        node = self._runtime_node(
             step_id=step_id,
             step_type="SubPlan",
             site="exists",
@@ -1577,16 +1684,16 @@ class PlanEvaluator:
         for table_name, table in ctx.tables.items():
             for row in table.rows:
                 observed_outer_row = True
-                outer_bindings = _row_bindings(row)
-                has_rows = self._inner_plan_has_rows(step.inner, outer_bindings)
+                env = _env_from_row(row)
+                has_rows = self._inner_plan_has_rows(step.inner, env)
                 outcome = BranchType.EXISTS_TRUE if has_rows else BranchType.EXISTS_FALSE
-                tree.record_observation(
+                self._observe(
                     node,
                     AtomObservation(
                         atom_id=0,
                         outcome=outcome,
                         row_ids=_row_ids(row),
-                        concrete_values=_concrete_values(step.anchor, _env_from_row(row)),
+                        concrete_values=_concrete_values(step.anchor, env),
                     ),
                 )
 
@@ -1595,7 +1702,7 @@ class PlanEvaluator:
             # in the outer plan's annotation map, so we cannot use _walk).
             has_rows = self._inner_plan_has_rows(step.inner)
             outcome = BranchType.EXISTS_TRUE if has_rows else BranchType.EXISTS_FALSE
-            tree.record_observation(node, AtomObservation(atom_id=0, outcome=outcome))
+            self._observe(node, AtomObservation(atom_id=0, outcome=outcome))
 
         return ctx  # SubPlan doesn't transform the outer context
 
@@ -1613,16 +1720,23 @@ class PlanEvaluator:
         ):
             return predicate
 
-        scalar_values: Dict[str, Any] = {}
-        predicate_values: Dict[str, bool] = {}
-        outer_env = env or Environment(outer_bindings)
+        scalar_values: Dict[int, Any] = {}
+        predicate_values: Dict[int, bool] = {}
+        outer_env = env or _outer_environment(outer_bindings) or Environment()
         for subplan in subplans:
-            key = subplan.anchor.sql(dialect=self.dialect)
+            key = id(subplan)
+            subplan.anchor.meta[_SUBPLAN_ANCHOR_ID] = key
             if subplan.kind is SubPlanKind.SCALAR:
-                scalar_values[key] = self._scalar_subquery_value(
-                    subplan,
-                    outer_bindings,
-                )
+                if not subplan.correlated and key in self._uncorrelated_scalar_cache:
+                    scalar_values[key] = self._uncorrelated_scalar_cache[key]
+                else:
+                    scalar_value = self._scalar_subquery_value(
+                        subplan,
+                        outer_bindings,
+                    )
+                    if not subplan.correlated:
+                        self._uncorrelated_scalar_cache[key] = scalar_value
+                    scalar_values[key] = scalar_value
             elif subplan.kind is SubPlanKind.EXISTS:
                 predicate_values[key] = self._inner_plan_has_rows(subplan.inner, outer_bindings)
             elif subplan.kind is SubPlanKind.IN and isinstance(subplan.anchor, exp.In):
@@ -1633,7 +1747,7 @@ class PlanEvaluator:
             return predicate
 
         def replace_subquery(node: exp.Expression):
-            key = node.sql(dialect=self.dialect)
+            key = node.meta.get(_SUBPLAN_ANCHOR_ID)
             if isinstance(node, exp.Subquery) and key in scalar_values:
                 return exp.convert(scalar_values[key])
             if isinstance(node, (exp.Exists, exp.In)) and key in predicate_values:
@@ -1704,6 +1818,7 @@ class PlanEvaluator:
         self,
         step: Aggregate,
         rows: List[Row],
+        source_columns: Tuple[Any, ...],
         table_name: str,
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
     ) -> Tuple[List[Row], Dict[Tuple[Any, ...], AggregateGroup]]:
@@ -1721,6 +1836,9 @@ class PlanEvaluator:
         output_rows: List[Row] = []
         aggregate_groups: Dict[Tuple[Any, ...], AggregateGroup] = {}
         for group_index, (key, group_rows) in enumerate(grouped.items()):
+            group_schema = DerivedSchema(columns=source_columns, rows=group_rows)
+            group_schema.range_reader.range = range(0, len(group_rows))
+
             output_row_id = ("agg", step.name, group_index)
             source_row_ids = tuple(row.rowid for row in group_rows)
             columns: Dict[ColumnId, Any] = {}
@@ -1736,14 +1854,17 @@ class PlanEvaluator:
                     column_id_override=col_id,
                 )
             aggregate_values: Dict[Any, Any] = {}
+            subplans = getattr(step, "subplan_dependencies", ()) or ()
             for aggregate in step.aggregations:
                 alias = aggregate.alias_or_name
                 value = self._aggregate_expression_value(
                     aggregate,
+                    group_schema.range_reader,
                     group_rows,
                     table_name,
                     outer_bindings,
                     getattr(step, "operands", ()) or (),
+                    subplans=subplans,
                 )
                 aggregate_values[alias] = value
                 col_id = _aggregate_output_col_id(step, alias, relation_id)
@@ -1810,10 +1931,12 @@ class PlanEvaluator:
     def _aggregate_expression_value(
         self,
         aggregate: exp.Expression,
+        range_reader: RangeReader,
         rows: List[Row],
         table_name: str,
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
         operands: Tuple[exp.Expression, ...] = (),
+        subplans: Tuple[Any, ...] = (),
     ) -> Any:
         operand_expr_by_alias = {
             operand.alias_or_name: (
@@ -1827,6 +1950,7 @@ class PlanEvaluator:
         if isinstance(aggregate_expr, aggregate_types):
             return self._aggregate_function_value(
                 aggregate_expr,
+                range_reader,
                 rows,
                 table_name,
                 outer_bindings,
@@ -1838,6 +1962,7 @@ class PlanEvaluator:
                 return node
             value = self._aggregate_function_value(
                 node,
+                range_reader,
                 rows,
                 table_name,
                 outer_bindings,
@@ -1846,6 +1971,12 @@ class PlanEvaluator:
             return exp.convert(value)
 
         resolved = aggregate_expr.copy().transform(replace_aggregate)
+        # Resolve any scalar subqueries embedded in the aggregate expression
+        # (e.g. COUNT(x) / (SELECT COUNT(y) FROM t)).
+        if subplans and resolved.find(exp.Subquery):
+            resolved = self._resolve_subquery_predicates(
+                resolved, subplans, outer_bindings or {},
+            )
         if rows:
             return concrete(resolved, _env_from_row(rows[0], outer_bindings))
         return concrete(resolved, Environment())
@@ -1853,6 +1984,7 @@ class PlanEvaluator:
     def _aggregate_function_value(
         self,
         aggregate_expr: exp.Expression,
+        range_reader: RangeReader,
         rows: List[Row],
         table_name: str,
         outer_bindings: Optional[Dict[ColumnId, Any]],
@@ -1871,15 +2003,22 @@ class PlanEvaluator:
         if isinstance(arg, exp.Column):
             resolved_arg = operand_expr_by_alias.get(arg.name, arg)
         is_distinct = isinstance(resolved_arg, exp.Distinct)
+
+        # Use RangeReader for simple column references; fall back to per-row
+        # concrete() for complex expressions.
         if is_distinct:
-            if not resolved_arg.expressions:
-                raw_values = []
-            else:
-                value_expression = resolved_arg.expressions[0]
+            inner = resolved_arg.expressions[0] if resolved_arg.expressions else None
+            if inner is not None and isinstance(inner, exp.Column):
+                raw_values = [_symbol_value(v) for v in range_reader[inner]]
+            elif inner is not None:
                 raw_values = [
-                    concrete(value_expression, _env_from_row(row, outer_bindings))
+                    concrete(inner, _env_from_row(row, outer_bindings))
                     for row in rows
                 ]
+            else:
+                raw_values = []
+        elif isinstance(resolved_arg, exp.Column):
+            raw_values = [_symbol_value(v) for v in range_reader[resolved_arg]]
         else:
             raw_values = [
                 concrete(resolved_arg, _env_from_row(row, outer_bindings))
@@ -1894,14 +2033,12 @@ class PlanEvaluator:
         if not non_null_values:
             return None
         if isinstance(aggregate_expr, exp.Avg):
-            # Filter to numeric values only (handle TEXT columns with numeric content)
             numeric = [v for v in non_null_values if isinstance(v, (int, float))]
             return sum(numeric) / len(numeric) if numeric else None
         if isinstance(aggregate_expr, exp.Sum):
             numeric = [v for v in non_null_values if isinstance(v, (int, float))]
             return sum(numeric) if numeric else None
         if isinstance(aggregate_expr, exp.Min):
-            # Try numeric comparison first, then string comparison
             try:
                 return min(non_null_values)
             except TypeError:
@@ -1964,7 +2101,7 @@ class PlanEvaluator:
 
         parent_node = self._find_upstream_branch_node(step, tree)
         path_preds, join_eqs = self._collect_upstream(step)
-        node = tree.get_or_create_node(
+        node = self._runtime_node(
             step_id=step_id,
             step_type="SubPlan",
             site="in",
@@ -1983,13 +2120,12 @@ class PlanEvaluator:
             if isinstance(outer_col, exp.Column):
                 for table_name, table in ctx.tables.items():
                     for row in table.rows:
-                        outer_bindings = _row_bindings(row)
-                        inner_values = self._inner_plan_values(step.inner, outer_bindings)
                         env = _env_from_row(row)
+                        inner_values = self._inner_plan_values(step.inner, env)
                         outer_val = _symbol_value(row[outer_col])
 
                         outcome = BranchType.IN_MATCH if outer_val in inner_values else BranchType.IN_NO_MATCH
-                        tree.record_observation(
+                        self._observe(
                             node,
                             AtomObservation(
                                 atom_id=0,
@@ -2002,385 +2138,4 @@ class PlanEvaluator:
         return ctx
 
 
-def build_branch_tree(
-    plan: Plan,
-    instance: Instance,
-    thresholds: Optional[Any] = None,
-) -> BranchTree:
-    """Build a BranchTree hierarchy from a Plan without running evaluation.
-
-    Constructs the full tree structure — nodes, parent/child links, cached
-    path_predicates and join_equalities — but no observations. The evaluator
-    populates observations by calling ``tree.record_observation`` during
-    evaluation.
-    """
-    from .types import BranchTree, CoverageThresholds
-
-    tree = BranchTree(
-        thresholds=thresholds or CoverageThresholds(),
-    )
-
-    # Ensure plan annotations are computed (needed for step_id, tables).
-    if getattr(plan, "_instance", None) is not instance:
-        plan._instance = instance
-        plan._annotations = None
-
-    # Index: step_id → BranchNode for parent lookup.
-    step_nodes: Dict[str, Any] = {}
-    scan_columns_by_relation: Dict[RelationId, Tuple[ColumnId, ...]] = {}
-    storage_by_relation: Dict[RelationId, RelationId] = {}
-
-    def _storage_table_key(relation: RelationId) -> str | None:
-        try:
-            return instance._table_key_for_storage(relation)
-        except Exception:
-            return None
-
-    for step in plan.ordered_steps:
-        plan.annotation_for(step)
-
-    for step in plan.ordered_steps:
-        if not isinstance(step, Scan) or getattr(step, "relation_id", None) is None:
-            continue
-        output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
-        scan_columns_by_relation[step.relation_id] = output_columns
-        storage_relation = None
-        for column in output_columns:
-            source = column.source_column_id or column
-            if source.relation is not None and source.relation.name is not None:
-                if _storage_table_key(source.relation) in instance.tables:
-                    storage_relation = source.relation
-                    break
-        if storage_relation is None and step.relation_id.name is not None:
-            if _storage_table_key(step.relation_id) in instance.tables:
-                storage_relation = step.relation_id
-        if storage_relation is not None:
-            storage_by_relation[step.relation_id] = storage_relation
-
-    def _find_parent(step: Step) -> Optional[Any]:
-        """Find the nearest upstream step that has a BranchNode."""
-        for dep in step.chain_dependencies:
-            ann = plan.annotation_for(dep)
-            if ann.step_id in step_nodes:
-                return step_nodes[ann.step_id]
-            parent = _find_parent(dep)
-            if parent is not None:
-                return parent
-        return None
-
-    def _collect_upstream(step: Step) -> Tuple[Tuple[Any, ...], Tuple[Tuple[ColumnId, ColumnId], ...]]:
-        predicates: List[Any] = []
-        join_eqs: List[Tuple[ColumnId, ColumnId]] = []
-        visited: set = set()
-
-        def walk(s: Step, is_target: bool) -> None:
-            if id(s) in visited:
-                return
-            visited.add(id(s))
-            if not is_target:
-                cond = getattr(s, "condition", None)
-                if isinstance(cond, exp.Expression):
-                    predicates.append(cond)
-            if isinstance(s, Join):
-                for fact in _join_facts_for_step(plan, s):
-                    join_eqs.extend(fact.equalities)
-            for dep in s.chain_dependencies:
-                walk(dep, False)
-
-        for dep in step.chain_dependencies:
-            walk(dep, False)
-        return tuple(predicates), tuple(join_eqs)
-
-    def _scan_obligations(
-        step_id: str,
-        tables: Tuple[RelationId, ...],
-        row_count: int = 1,
-        keyed_only: bool = False,
-    ) -> Tuple[OperatorObligation, ...]:
-        obligations: List[OperatorObligation] = []
-        for relation in tables:
-            storage_relation = storage_by_relation.get(relation)
-            table_name = _storage_table_key(storage_relation or relation)
-            if table_name is None or table_name not in instance.tables:
-                continue
-            columns = scan_columns_by_relation.get(relation, ())
-            if not columns:
-                columns = tuple(
-                    physical_column(column_name, relation, dialect=getattr(instance, "dialect", None))
-                    for column_name in instance.tables[table_name]
-                )
-            if keyed_only:
-                def key_name(value: Any) -> str:
-                    return str(getattr(value, "name", value)).lower()
-
-                key_names = {
-                    key_name(key)
-                    for key in instance.primary_keys.get(table_name, ())
-                }
-                for unique_columns in instance.unique_constraints.get(table_name, ()):
-                    key_names.update(key_name(key) for key in unique_columns)
-                columns = tuple(
-                    column for column in columns
-                    if column.name.normalized.lower() in key_names
-                )
-                if not columns:
-                    continue
-            obligations.append(
-                OperatorObligation(
-                    kind="scan_exists",
-                    step_id=step_id,
-                    site="scan",
-                    relation=relation,
-                    storage_relation=storage_relation,
-                    columns=columns,
-                    row_count=row_count,
-                )
-            )
-        return tuple(obligations)
-
-    def _lineage_relations(step: Step) -> Tuple[RelationId, ...]:
-        relations: List[RelationId] = []
-        seen: set[RelationId] = set()
-
-        def add_relation(relation: RelationId | None) -> None:
-            if relation is None:
-                return
-            for alias_relation, storage_relation in storage_by_relation.items():
-                if storage_relation == relation and alias_relation not in seen:
-                    seen.add(alias_relation)
-                    relations.append(alias_relation)
-                    return
-            if relation not in seen:
-                seen.add(relation)
-                relations.append(relation)
-
-        def add_column(column: ColumnId) -> None:
-            source = column.source_column_id or column
-            add_relation(source.relation or column.relation)
-
-        def walk_step(s: Step, visited: set[int]) -> None:
-            if id(s) in visited:
-                return
-            visited.add(id(s))
-            for expr_value in (
-                getattr(s, "condition", None),
-                *tuple(getattr(s, "projections", ()) or ()),
-                *tuple(getattr(s, "order", ()) or ()),
-                *tuple((getattr(s, "group", {}) or {}).values()),
-                *tuple(getattr(s, "aggregations", ()) or ()),
-            ):
-                if not isinstance(expr_value, exp.Expression):
-                    continue
-                for col in expr_value.find_all(exp.Column):
-                    col_id = column_identity(col)
-                    if col_id is not None:
-                        add_column(col_id)
-            if isinstance(s, Join):
-                for join_data in (s.joins or {}).values():
-                    for expr_value in (
-                        *tuple(join_data.get("source_key", ()) or ()),
-                        *tuple(join_data.get("join_key", ()) or ()),
-                        join_data.get("condition"),
-                    ):
-                        if not isinstance(expr_value, exp.Expression):
-                            continue
-                        for col in expr_value.find_all(exp.Column):
-                            col_id = column_identity(col)
-                            if col_id is not None:
-                                add_column(col_id)
-            for dep in s.chain_dependencies:
-                walk_step(dep, visited)
-
-        for column in tuple(getattr(step, "output_column_ids", ()) or ()):
-            add_column(column)
-        walk_step(step, set())
-        return tuple(relations)
-
-    def _canonical_relations(relations: Tuple[RelationId, ...]) -> Tuple[RelationId, ...]:
-        canonical: List[RelationId] = []
-        seen: set[RelationId] = set()
-        for relation in relations:
-            mapped = relation
-            if relation not in storage_by_relation:
-                for alias_relation, storage_relation in storage_by_relation.items():
-                    if storage_relation == relation:
-                        mapped = alias_relation
-                        break
-            if mapped in seen:
-                continue
-            seen.add(mapped)
-            canonical.append(mapped)
-        return tuple(canonical)
-
-    def _add_node(
-        step: Step,
-        step_type: str,
-        site: str,
-        predicate: exp.Expression,
-        atoms: Tuple[exp.Expression, ...],
-        tables: Tuple[RelationId, ...],
-    ) -> None:
-        annotation = plan.annotation_for(step)
-        parent_node = _find_parent(step)
-        path_preds, join_eqs = _collect_upstream(step)
-        join_facts = _join_facts_for_step(plan, step) if isinstance(step, Join) else ()
-        own_join_equalities = tuple(
-            equality
-            for fact in join_facts
-            for equality in fact.equalities
-        )
-        node = tree.get_or_create_node(
-            step_id=annotation.step_id,
-            step_type=step_type,
-            site=site,
-            predicate=predicate,
-            atoms=atoms,
-            tables=tables,
-            step_obj=step,
-            parent=parent_node,
-            path_predicates=path_preds,
-            join_equalities=tuple(join_eqs) + own_join_equalities,
-            join_facts=join_facts,
-            obligations=_scan_obligations(annotation.step_id, tables, keyed_only=True),
-        )
-        step_nodes.setdefault(annotation.step_id, node)
-
-    def _root_required_row_count(root: Step) -> int:
-        max_root_rows = 20
-        if isinstance(root, Limit):
-            offset = max(int(getattr(root, "offset", 0) or 0), 0)
-            limit = getattr(root, "limit", 1)
-            limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
-            return min(max(offset + limit_value, 1), max_root_rows)
-        return 1
-
-    def _root_obligations(root: Step) -> Tuple[OperatorObligation, ...]:
-        annotation = plan.annotation_for(root)
-        row_count = _root_required_row_count(root)
-        root_relations = _canonical_relations(
-            annotation.source_relations + _lineage_relations(root)
-        )
-        obligations: List[OperatorObligation] = [
-            OperatorObligation(
-                kind="root_result",
-                step_id=annotation.step_id,
-                site="root_result",
-                row_count=row_count,
-            )
-        ]
-        return tuple(obligations) + _scan_obligations(
-            annotation.step_id,
-            root_relations,
-            row_count=row_count,
-        )
-
-    for step in plan.ordered_steps:
-        annotation = plan.annotation_for(step)
-        tables = annotation.source_relations
-
-        if isinstance(step, Filter) and step.condition is not None:
-            atoms = decompose_atoms(step.condition)
-            _add_node(step, "Filter", "filter", step.condition, atoms, tables)
-            for atom in scalar_subquery_atoms(step.condition):
-                _add_node(step, "Filter", "scalar_subquery", atom, (atom,), tables)
-
-        elif isinstance(step, Join):
-            for join_name, join_data in (step.joins or {}).items():
-                condition = join_data.get("condition")
-                if condition is not None and isinstance(condition, exp.Expression):
-                    atoms = decompose_atoms(condition)
-                    _add_node(step, "Join", "join_on", condition, atoms, tables)
-
-        elif isinstance(step, Aggregate):
-            if step.group or step.aggregations:
-                group_pred = exp.Literal.number(1)
-                _add_node(step, "Aggregate", "group", group_pred, (group_pred,), tables)
-            if step.aggregations:
-                aggregate_expressions = _aggregate_coverage_expressions(step)
-                _add_node(
-                    step,
-                    "Aggregate",
-                    "aggregate_output",
-                    exp.Literal.string("AGGREGATE_OUTPUT"),
-                    aggregate_expressions,
-                    tables,
-                )
-                distinct_arguments = tuple(
-                    argument.expressions[0]
-                    for aggregation in aggregate_expressions
-                    for function in aggregation.find_all(exp.AggFunc)
-                    for argument in (function.this,)
-                    if isinstance(argument, exp.Distinct) and argument.expressions
-                )
-                if distinct_arguments:
-                    _add_node(
-                        step,
-                        "Aggregate",
-                        "aggregate_distinct_input",
-                        exp.Literal.string("AGGREGATE_DISTINCT_INPUT"),
-                        distinct_arguments,
-                        tables,
-                    )
-
-        elif isinstance(step, Having) and step.condition is not None:
-            atoms = decompose_atoms(step.condition)
-            _add_node(step, "Having", "having", step.condition, atoms, tables)
-
-        elif isinstance(step, Project):
-            project_expressions = tuple(
-                projection
-                for projection in step.projections
-                if isinstance(projection, exp.Expression)
-            )
-            if project_expressions:
-                _add_node(
-                    step,
-                    "Project",
-                    "project_output",
-                    exp.Literal.string("PROJECT_OUTPUT"),
-                    project_expressions,
-                    tables,
-                )
-            for projection in step.projections:
-                if not isinstance(projection, exp.Expression):
-                    continue
-                for case_expr in projection.find_all(exp.Case):
-                    ifs = case_expr.args.get("ifs") or []
-                    for arm in ifs:
-                        raw_arm_pred = arm.args.get("this")
-                        if not isinstance(raw_arm_pred, exp.Expression):
-                            continue
-                        arm_pred = _case_arm_condition(case_expr, raw_arm_pred)
-                        atoms = decompose_atoms(arm_pred)
-                        _add_node(step, "Project", "case_arm", arm_pred, atoms, tables)
-            if step.distinct:
-                dist_pred = exp.Literal.string("DISTINCT")
-                _add_node(step, "Project", "distinct", dist_pred, (dist_pred,), tables)
-
-        elif isinstance(step, SubPlan):
-            if step.kind is SubPlanKind.EXISTS:
-                _add_node(step, "SubPlan", "exists", step.anchor, (step.anchor,), ())
-            elif step.kind is SubPlanKind.IN:
-                _add_node(step, "SubPlan", "in", step.anchor, (step.anchor,), ())
-
-    root_annotation = plan.annotation_for(plan.root)
-    root_obligations = _root_obligations(plan.root)
-    if root_obligations:
-        tree.get_or_create_node(
-            step_id=f"{root_annotation.step_id}:root_result",
-            step_type=type(plan.root).__name__,
-            site="root_result",
-            predicate=exp.true(),
-            atoms=(exp.true(),),
-            tables=_canonical_relations(
-                root_annotation.source_relations + _lineage_relations(plan.root)
-            ),
-            step_obj=plan.root,
-            parent=_find_parent(plan.root),
-            obligations=root_obligations,
-        )
-
-    return tree
-
-
-__all__ = ["PlanEvaluator", "build_branch_tree", "decompose_atoms"]
+__all__ = ["PlanEvaluator"]

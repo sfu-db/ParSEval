@@ -22,7 +22,7 @@ class TestDistinctEvaluation(unittest.TestCase):
 
         sql = "SELECT DISTINCT name FROM t"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(distinct_unique=1, distinct_duplicate=1))
 
@@ -42,7 +42,7 @@ class TestDistinctEvaluation(unittest.TestCase):
 
         sql = "SELECT DISTINCT name FROM t"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(distinct_unique=1, distinct_duplicate=1))
 

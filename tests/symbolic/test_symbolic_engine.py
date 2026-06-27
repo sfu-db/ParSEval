@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
+from parseval.domain.exceptions import ConstraintConflict
 from parseval.identity import (
     ColumnKind,
     RelationKind,
@@ -23,9 +26,7 @@ from parseval.symbolic import (
     PlanEvaluator,
     SymbolicEngine,
     decompose_atoms,
-    is_infeasible,
 )
-from parseval.symbolic.types import BranchNode
 
 
 SCHEMA = "CREATE TABLE t (a INT, b INT, c TEXT);"
@@ -43,7 +44,7 @@ SCHEMA_FK = (
 def _plan(sql: str, schema: str = SCHEMA, dialect: str = "sqlite") -> Plan:
     instance = Instance(ddls=schema, name="test", dialect=dialect)
     expr = preprocess_sql(sql, instance, dialect=dialect)
-    return Plan(expr)
+    return Plan(expr, instance)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ class TestPlanEvaluator(unittest.TestCase):
     def test_empty_instance_produces_no_observations(self):
         instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
         expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         # Branch node should exist (the filter site) but with no observations.
@@ -104,7 +105,7 @@ class TestPlanEvaluator(unittest.TestCase):
         instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
         instance.create_row("t", {"a": 10, "b": 1})
         expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         filter_nodes = [n for n in tree.nodes if n.site == "filter"]
@@ -117,7 +118,7 @@ class TestPlanEvaluator(unittest.TestCase):
         instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
         instance.create_row("t", {"a": 3, "b": 1})
         expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         filter_nodes = [n for n in tree.nodes if n.site == "filter"]
@@ -128,7 +129,7 @@ class TestPlanEvaluator(unittest.TestCase):
         instance = Instance(ddls=SCHEMA, name="eval", dialect="sqlite")
         instance.place_row("t", {"a": None, "b": 1, "c": "x"})
         expr = preprocess_sql("SELECT a FROM t WHERE a > 5", instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         filter_nodes = [n for n in tree.nodes if n.site == "filter"]
@@ -141,7 +142,7 @@ class TestPlanEvaluator(unittest.TestCase):
         expr = preprocess_sql(
             "SELECT a FROM t WHERE a > 5 AND b < 10", instance, dialect="sqlite"
         )
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         filter_nodes = [n for n in tree.nodes if n.site == "filter"]
@@ -155,7 +156,7 @@ class TestPlanEvaluator(unittest.TestCase):
             instance,
             dialect="sqlite",
         )
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance)
         tree = evaluator.evaluate()
         case_nodes = [n for n in tree.nodes if n.site == "case_arm"]
@@ -168,6 +169,68 @@ class TestPlanEvaluator(unittest.TestCase):
 
 
 class TestBranchTree(unittest.TestCase):
+    def test_uncovered_targets_with_default_thresholds(self):
+        tree = BranchTree(thresholds=CoverageThresholds())
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        # No observations -> atom outcomes are uncovered.
+        targets = tree.uncovered_targets
+        self.assertEqual(len(targets), 3)
+        self.assertEqual(
+            {(target.atom_id, target.target_outcome) for target in targets},
+            {
+                (0, BranchType.ATOM_TRUE),
+                (0, BranchType.ATOM_FALSE),
+                (0, BranchType.ATOM_NULL),
+            },
+        )
+
+    def test_observation_reduces_uncovered(self):
+        tree = BranchTree(thresholds=CoverageThresholds())
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        from parseval.symbolic.types import AtomObservation
+
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
+        )
+        targets = tree.uncovered_targets
+        self.assertEqual(len(targets), 2)
+        self.assertEqual(
+            {(target.atom_id, target.target_outcome) for target in targets},
+            {
+                (0, BranchType.ATOM_FALSE),
+                (0, BranchType.ATOM_NULL),
+            },
+        )
+
+    def test_threshold_zero_skips_branch_type(self):
+        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
+        tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
+        )
+        targets = tree.uncovered_targets
+        # Only TRUE and FALSE atom outcomes, not NULL.
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
+
     def test_infeasible_excluded_from_targets(self):
         tree = BranchTree(thresholds=CoverageThresholds())
         node = tree.get_or_create_node(
@@ -182,39 +245,28 @@ class TestBranchTree(unittest.TestCase):
         targets = tree.uncovered_targets
         self.assertTrue(all(t.target_outcome != BranchType.ATOM_NULL for t in targets))
 
-# ---------------------------------------------------------------------------
-# Infeasibility
-# ---------------------------------------------------------------------------
-
-
-class TestInfeasibility(unittest.TestCase):
-    def test_is_null_predicate_cannot_be_null(self):
-        from sqlglot import parse_one, exp as sqlexp
-
-        pred = parse_one("SELECT * FROM t WHERE a IS NULL").find(sqlexp.Where).this
-        node = BranchNode(
-            step_id="s0", step_type="Filter", site="filter",
-            predicate=pred, atoms=(pred,), tables=("t",),
+    def test_coverage_ratio(self):
+        tree = BranchTree(thresholds=CoverageThresholds(atom_null=0))
+        node = tree.get_or_create_node(
+            step_id="step_0",
+            step_type="Filter",
+            site="filter",
+            predicate=_pred("a > 5"),
+            atoms=(_pred("a > 5"),),
+            tables=("t",),
         )
-        reason = is_infeasible(
-            node, 0, BranchType.ATOM_NULL,
-            Instance(ddls=SCHEMA, name="t", dialect="sqlite"),
-        )
-        self.assertIsNotNone(reason)
+        self.assertEqual(tree.coverage_ratio, 0.0)
+        from parseval.symbolic.types import AtomObservation
 
-    def test_normal_predicate_is_feasible(self):
-        from sqlglot import parse_one, exp as sqlexp
-
-        pred = parse_one("SELECT * FROM t WHERE a > 5").find(sqlexp.Where).this
-        node = BranchNode(
-            step_id="s0", step_type="Filter", site="filter",
-            predicate=pred, atoms=(pred,), tables=("t",),
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_TRUE)
         )
-        reason = is_infeasible(
-            node, 0, BranchType.ATOM_NULL,
-            Instance(ddls=SCHEMA, name="t", dialect="sqlite"),
+        self.assertEqual(tree.coverage_ratio, 0.5)
+        tree.record_observation(
+            node, AtomObservation(atom_id=0, outcome=BranchType.ATOM_FALSE)
         )
-        self.assertIsNone(reason)
+        self.assertEqual(tree.coverage_ratio, 1.0)
+        self.assertTrue(tree.fully_covered)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +315,24 @@ class TestSymbolicEngine(unittest.TestCase):
         final_rows = sum(len(instance.get_rows(t)) for t in instance.tables)
         self.assertGreaterEqual(final_rows, initial_rows)
 
+    def test_unsat_solver_result_does_not_materialize_rows(self):
+        class UnsatSolver:
+            def solve(self, constraint):
+                return SolveResult(sat=False, reason="unsat")
+
+        instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            "SELECT a FROM t WHERE a > 5",
+            dialect="sqlite",
+            solver=UnsatSolver(),
+        )
+
+        constraint = SolverConstraint(target_relations=(instance.table_id("t"),))
+
+        self.assertFalse(engine._solve_and_materialize(constraint))
+        self.assertEqual(sum(len(instance.get_rows(t)) for t in instance.tables), 0)
+
     def test_full_coverage_for_simple_query(self):
         instance = Instance(ddls=SCHEMA, name="engine", dialect="sqlite")
         engine = SymbolicEngine(
@@ -288,6 +358,37 @@ class TestSymbolicEngine(unittest.TestCase):
         # Should cover both atoms' TRUE and FALSE.
         self.assertGreaterEqual(result.coverage, 0.5)
 
+    def test_quoted_storage_relations_materialize_rows(self):
+        schema = """
+        CREATE TABLE IF NOT EXISTS `League` (
+            `id` int PRIMARY KEY,
+            `name` varchar
+        );
+        CREATE TABLE IF NOT EXISTS `Match` (
+            `id` int PRIMARY KEY,
+            `league_id` int,
+            `season` varchar,
+            FOREIGN KEY (`league_id`) REFERENCES `League`(`id`)
+        );
+        """
+        instance = Instance(ddls=schema, name="quoted_engine", dialect="sqlite")
+        engine = SymbolicEngine(
+            instance,
+            (
+                "SELECT t2.name FROM Match AS t1 "
+                "INNER JOIN League AS t2 ON t1.league_id = t2.id "
+                "WHERE t1.season = '2015/2016'"
+            ),
+            dialect="sqlite",
+            max_iterations=3,
+        )
+
+        result = engine.generate(thresholds=CoverageThresholds(atom_null=0))
+
+        self.assertGreater(result.rows_generated, 0)
+        self.assertGreater(len(instance.get_rows("match")), 0)
+        self.assertGreater(len(instance.get_rows("league")), 0)
+
 
 class _FixedSolver:
     def __init__(self, assignments):
@@ -302,41 +403,17 @@ def _people_alias_assignments(instance):
     physical_id = instance.column_id("people", "id")
     physical_name = instance.column_id("people", "name")
     left = relation_id(
-        RelationKind.TABLE,
-        physical.name,
-        alias=identifier_name("a"),
-        scope_id="left",
+        RelationKind.TABLE, physical.name,
+        alias=identifier_name("a"), scope_id="left",
     )
     right = relation_id(
-        RelationKind.TABLE,
-        physical.name,
-        alias=identifier_name("b"),
-        scope_id="right",
+        RelationKind.TABLE, physical.name,
+        alias=identifier_name("b"), scope_id="right",
     )
-    left_id = column_id(
-        ColumnKind.PHYSICAL,
-        identifier_name("id"),
-        left,
-        source_column_id=physical_id,
-    )
-    left_name = column_id(
-        ColumnKind.PHYSICAL,
-        identifier_name("name"),
-        left,
-        source_column_id=physical_name,
-    )
-    right_id = column_id(
-        ColumnKind.PHYSICAL,
-        identifier_name("id"),
-        right,
-        source_column_id=physical_id,
-    )
-    right_name = column_id(
-        ColumnKind.PHYSICAL,
-        identifier_name("name"),
-        right,
-        source_column_id=physical_name,
-    )
+    left_id = column_id(ColumnKind.PHYSICAL, identifier_name("id"), left, source_column_id=physical_id)
+    left_name = column_id(ColumnKind.PHYSICAL, identifier_name("name"), left, source_column_id=physical_name)
+    right_id = column_id(ColumnKind.PHYSICAL, identifier_name("id"), right, source_column_id=physical_id)
+    right_name = column_id(ColumnKind.PHYSICAL, identifier_name("name"), right, source_column_id=physical_name)
     assignments = {
         SolverVar(left_id, left, "r0"): 1,
         SolverVar(left_name, left, "r0"): "Alice",
@@ -349,12 +426,9 @@ def _people_alias_assignments(instance):
 def test_same_table_aliases_materialize_as_separate_rows():
     instance = Instance(
         ddls="CREATE TABLE people (id INT PRIMARY KEY, manager_id INT, name TEXT NOT NULL);",
-        name="self_join_materialization",
-        dialect="sqlite",
+        name="self_join_materialization", dialect="sqlite",
     )
-    physical, physical_id, physical_name, left, right, assignments = (
-        _people_alias_assignments(instance)
-    )
+    physical, physical_id, physical_name, left, right, assignments = _people_alias_assignments(instance)
     constraint = SolverConstraint(
         target_relations=(left, right),
         storage_relations={variable: physical for variable in assignments},
@@ -362,10 +436,8 @@ def test_same_table_aliases_materialize_as_separate_rows():
     engine = SymbolicEngine(
         instance,
         "SELECT a.name FROM people a JOIN people b ON a.id = b.manager_id",
-        solver=_FixedSolver(assignments),
-        max_iterations=1,
+        solver=_FixedSolver(assignments), max_iterations=1,
     )
-
     assert engine._solve_and_materialize(constraint)
     assert sorted(
         (row[physical_id].concrete, row[physical_name].concrete)
@@ -373,30 +445,23 @@ def test_same_table_aliases_materialize_as_separate_rows():
     ) == [(1, "Alice"), (2, "Bob")]
 
 
-def test_conflicting_materialized_assignment_fails_closed():
+def test_conflicting_materialized_assignment_raises_conflict():
     instance = Instance(
         ddls="CREATE TABLE people (id INT PRIMARY KEY, name TEXT NOT NULL);",
-        name="conflicting_materialization",
-        dialect="sqlite",
+        name="conflicting_materialization", dialect="sqlite",
     )
     physical = instance.table_id("people")
     physical_name = instance.column_id("people", "name")
     binding = relation_id(
-        RelationKind.TABLE,
-        physical.name,
-        alias=identifier_name("p"),
-        scope_id="binding",
+        RelationKind.TABLE, physical.name,
+        alias=identifier_name("p"), scope_id="binding",
     )
     first = column_id(
-        ColumnKind.PROJECTED,
-        identifier_name("first_name"),
-        binding,
+        ColumnKind.PROJECTED, identifier_name("first_name"), binding,
         source_column_id=physical_name,
     )
     second = column_id(
-        ColumnKind.PROJECTED,
-        identifier_name("second_name"),
-        binding,
+        ColumnKind.PROJECTED, identifier_name("second_name"), binding,
         source_column_id=physical_name,
     )
     assignments = {
@@ -408,13 +473,11 @@ def test_conflicting_materialized_assignment_fails_closed():
         storage_relations={variable: physical for variable in assignments},
     )
     engine = SymbolicEngine(
-        instance,
-        "SELECT name FROM people",
-        solver=_FixedSolver(assignments),
-        max_iterations=1,
+        instance, "SELECT name FROM people",
+        solver=_FixedSolver(assignments), max_iterations=1,
     )
-
-    assert not engine._solve_and_materialize(constraint)
+    with pytest.raises(ConstraintConflict, match="conflicting_materialized_assignment"):
+        engine._solve_and_materialize(constraint)
     assert not instance.get_rows("people")
 
 

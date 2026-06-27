@@ -12,12 +12,10 @@ Public API::
 from parseval.solver.unified import SolverConstraint
 from .constraints import (
     ConstraintGenerator,
-    PlausibleBranch,
-    ConstraintGenerator,
-    PlausiblePath,
 )
+from .branch_tree import decompose_atoms
 from .engine import SymbolicEngine
-from .evaluator import PlanEvaluator, decompose_atoms
+from .evaluator import PlanEvaluator
 from .types import (
     AtomObservation,
     BranchNode,
@@ -40,9 +38,6 @@ __all__ = [
     "GenerationResult",
     "OperatorObligation",
     "PlanEvaluator",
-    "PlausibleBranch",
-    "ConstraintGenerator",
-    "PlausiblePath",
     "SolverConstraint",
     "SymbolicEngine",
     "decompose_atoms",

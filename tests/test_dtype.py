@@ -6,9 +6,12 @@ from parseval.dtype import (
     TypeProfile,
     TypeService,
     infer_type_from_value,
+    infer_semantic_datatype_from_literal,
+    merge_semantic_datatypes,
     parse_date,
     parse_datetime,
     parse_time,
+    semantic_cast_datatype,
     type_family,
 )
 
@@ -44,3 +47,34 @@ def test_infer_type_from_value():
     assert infer_type_from_value(date(2024, 1, 2)).is_type(DataType.Type.DATE)
     assert infer_type_from_value(datetime(2024, 1, 2, 3, 4, 5)).is_type(DataType.Type.DATETIME)
     assert infer_type_from_value(time(3, 4, 5)).is_type(DataType.Type.TIME)
+
+
+def test_infer_semantic_datatype_from_literal():
+    assert infer_semantic_datatype_from_literal("50").is_type(*DataType.INTEGER_TYPES)
+    assert infer_semantic_datatype_from_literal("50.5").is_type(*DataType.REAL_TYPES)
+    assert infer_semantic_datatype_from_literal("2024-01-02").is_type(DataType.Type.DATE)
+    assert infer_semantic_datatype_from_literal("2024-01-02 03:04:05").is_type(
+        DataType.Type.DATETIME
+    )
+    assert infer_semantic_datatype_from_literal("abc") is None
+
+
+def test_merge_semantic_datatypes_preserves_compatible_widening():
+    assert merge_semantic_datatypes((DataType.build("INT"), DataType.build("BIGINT"))).is_type(
+        *DataType.INTEGER_TYPES
+    )
+    assert merge_semantic_datatypes((DataType.build("INT"), DataType.build("REAL"))).is_type(
+        *DataType.REAL_TYPES
+    )
+    assert merge_semantic_datatypes((DataType.build("DATE"), DataType.build("DATETIME"))).is_type(
+        DataType.Type.DATETIME
+    )
+    assert merge_semantic_datatypes((DataType.build("INT"), DataType.build("DATE"))) is None
+
+
+def test_semantic_cast_datatype_uses_type_family_normalization():
+    assert semantic_cast_datatype(DataType.build("BIGINT")).is_type(*DataType.INTEGER_TYPES)
+    assert semantic_cast_datatype(DataType.build("DECIMAL(10,2)")).is_type(*DataType.REAL_TYPES)
+    assert semantic_cast_datatype(DataType.build("DATE")).is_type(DataType.Type.DATE)
+    assert semantic_cast_datatype(DataType.build("TIMESTAMP")).is_type(DataType.Type.DATETIME)
+    assert semantic_cast_datatype(DataType.build("TEXT")) is None

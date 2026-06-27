@@ -1,7 +1,7 @@
 from parseval.instance import Instance
 from parseval.plan import Plan
 from parseval.query import preprocess_sql
-from parseval.symbolic.evaluator import build_branch_tree
+from parseval.symbolic.branch_tree import build_branch_tree
 from parseval.symbolic.types import BranchType, CoverageThresholds
 
 
@@ -70,3 +70,61 @@ def test_new_thresholds_can_disable_individual_outcomes():
     assert BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED not in distinct_outcomes
     assert BranchType.AGG_DISTINCT_NULL_IGNORED in distinct_outcomes
     assert BranchType.AGG_DISTINCT_MULTIPLE_RETAINED in distinct_outcomes
+
+
+def test_case_group_aggregate_and_join_targets_are_obligations():
+    case_tree = _tree("SELECT CASE WHEN a > 0 THEN b ELSE id END FROM t")
+    case_targets = {
+        (target.obligation.metric, target.target_outcome)
+        for target in case_tree.uncovered_targets
+        if target.node.site == "case_arm"
+    }
+    assert case_targets == {
+        ("case_arm", BranchType.CASE_ARM_TAKEN),
+        ("case_arm", BranchType.CASE_ARM_SKIPPED),
+    }
+
+    group_tree = _tree("SELECT a, COUNT(*) FROM t GROUP BY a")
+    group_targets = {
+        (target.obligation.metric, target.target_outcome)
+        for target in group_tree.uncovered_targets
+        if target.node.site == "group"
+    }
+    assert group_targets == {
+        ("group_size", BranchType.GROUP_SINGLE),
+        ("group_size", BranchType.GROUP_MULTI),
+        ("group_count", BranchType.GROUP_SINGLE),
+        ("group_count", BranchType.GROUP_MULTI),
+    }
+
+    aggregate_tree = _tree("SELECT SUM(a) FROM t")
+    aggregate_targets = {
+        (target.obligation.metric, target.target_outcome)
+        for target in aggregate_tree.uncovered_targets
+        if target.node.site == "aggregate_input"
+    }
+    assert aggregate_targets == {
+        ("aggregate_input_null", BranchType.AGGREGATE_NULL),
+        ("aggregate_input_duplicate", BranchType.DUPLICATE),
+    }
+
+    schema = """
+    CREATE TABLE left_t (id INT PRIMARY KEY, k INT);
+    CREATE TABLE right_t (id INT PRIMARY KEY, k INT);
+    """
+    instance = Instance(schema, name="targets", dialect="sqlite")
+    sql = "SELECT left_t.id FROM left_t INNER JOIN right_t ON left_t.k = right_t.k"
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    join_tree = build_branch_tree(plan, instance, CoverageThresholds(atom_null=0))
+    join_targets = {
+        (target.obligation.metric, target.target_outcome)
+        for target in join_tree.uncovered_targets
+        if target.node.site == "join_on"
+        and target.obligation is not None
+        and target.obligation.metric.startswith("join_")
+    }
+    assert {
+        ("join_match", BranchType.JOIN_MATCH),
+        ("join_left_unmatched", BranchType.JOIN_LEFT),
+        ("join_right_unmatched", BranchType.JOIN_RIGHT),
+    } <= join_targets
