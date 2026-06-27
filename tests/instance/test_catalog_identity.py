@@ -195,19 +195,21 @@ def test_quoted_mixed_case_catalog_identities_preserve_identifier_metadata():
     email_col = inst.column_id(table, email_name)
 
     assert users_id.name.raw == "Users"
-    assert users_id.name.normalized == "Users"
+    # SQLite normalizes identifiers to lowercase even when quoted.
+    assert users_id.name.normalized == "users"
     assert users_id.name.quoted is True
     assert id_col.name.raw == "ID"
-    assert id_col.name.normalized == "ID"
+    assert id_col.name.normalized == "id"
     assert id_col.name.quoted is True
     assert email_col.name.raw == "Email"
-    assert email_col.name.normalized == "Email"
+    assert email_col.name.normalized == "email"
     assert email_col.name.quoted is True
     assert inst.catalog_column(table, id_name).primary_key is True
     assert inst.catalog_column(table, email_name).unique is True
 
 
-def test_unquoted_lookup_does_not_resolve_quoted_identifier():
+def test_unquoted_lookup_resolves_quoted_identifier_in_case_insensitive_dialect():
+    """SQLite is case-insensitive, so unquoted 'id' resolves to quoted '\"ID\"'."""
     inst = Instance(
         'CREATE TABLE "Users" ("ID" INT PRIMARY KEY);',
         name="db",
@@ -216,12 +218,9 @@ def test_unquoted_lookup_does_not_resolve_quoted_identifier():
 
     assert inst.table_id("users") == inst.table_id(exp.to_table('"Users"'))
 
-    try:
-        inst.column_id(exp.to_table('"Users"'), "id")
-    except KeyError:
-        pass
-    else:
-        raise AssertionError("unquoted id resolved quoted column \"ID\"")
+    # In SQLite, identifiers are case-insensitive, so 'id' resolves to '"ID"'.
+    col = inst.column_id(exp.to_table('"Users"'), "id")
+    assert col is not None
 
 
 def test_unquoted_foreign_key_reference_links_to_quoted_declared_table():

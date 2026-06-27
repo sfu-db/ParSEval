@@ -5,7 +5,7 @@ from itertools import product
 
 from sqlglot import exp
 
-from parseval.identity import PARSEVAL_COLUMN_ID, ColumnId
+from parseval.identity import PARSEVAL_COLUMN_ID, ColumnId, column_identity
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
@@ -284,14 +284,48 @@ class RowReader:
         if self.row is not None:
             return self.row.rowid
 
+    def _column_id(self, column):
+        if isinstance(column, ColumnId):
+            return column
+        if isinstance(column, exp.Column):
+            return column_identity(column)
+        return column if column in self.columns else None
+
+    def _slot_for_column_id(self, col_id: ColumnId | None):
+        if col_id is None:
+            return None
+        current = col_id
+        while current is not None:
+            if current in self.columns:
+                return self.columns[current]
+            current = current.source_column_id
+        requested_lineage = set(_column_lineage(col_id))
+        for row_column, slot in self.columns.items():
+            if (
+                isinstance(row_column, ColumnId)
+                and requested_lineage.intersection(_column_lineage(row_column))
+            ):
+                return slot
+        return None
+
+    def resolve(self, column: exp.Column | ColumnId):
+        if self.row is None:
+            raise KeyError(column)
+        col_id = self._column_id(column)
+        slot = self._slot_for_column_id(col_id)
+        if slot is None:
+            raise KeyError(column)
+        try:
+            return tuple(self.row.values())[slot]
+        except IndexError as exc:
+            raise KeyError(column) from exc
+
     def __getitem__(self, column):
-        if self.row is not None:
-            return self.row[column]
+        return self.resolve(column)
 
     def get(self, table, column):
         del table
-        if self.row is not None:
-            return self.row[column]
+        return self.resolve(column)
 
     def items(self):
         if self.row is not None:
@@ -299,8 +333,17 @@ class RowReader:
         return ()
 
     def get_cell(self, table, column):
-        if self.row is not None:
-            return self.row[self.columns[column]]
+        del table
+        return self.resolve(column)
+
+
+def _column_lineage(column_id: ColumnId) -> Tuple[ColumnId, ...]:
+    columns = []
+    current: ColumnId | None = column_id
+    while current is not None:
+        columns.append(current)
+        current = current.source_column_id
+    return tuple(columns)
 
 
 class ProductReader:

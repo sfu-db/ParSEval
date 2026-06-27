@@ -28,6 +28,7 @@ poetry install
 
 ## Technical Guides
 
+- [Planner Module](planner.md): Logical plan builder, query qualification, and data type annotation.
 - [Domain Module](domain.md): Deep dive into the data generation engine.
 - [Instance Module](instance.md): Comprehensive guide to database instance management and data generation.
 - [DB Manager](db_manager.md): Guide to database connection management and SQL operations.

@@ -45,6 +45,7 @@ from parseval.plan.rex import (
     tvl_not,
     tvl_or,
 )
+from parseval.plan.context import DerivedSchema, Row
 
 
 INT = DataType.build("INT")
@@ -292,6 +293,34 @@ class TestEnvironment(unittest.TestCase):
         inner.bind(z_id, 3)
         self.assertEqual(inner.resolve(_annotate_col(_value("z"), z_id)), 3)
         self.assertFalse(outer.contains(_annotate_col(_value("z"), z_id)))
+
+    def test_reader_backed_environment_resolves_column_id_to_cell(self):
+        x_id = _col_id("x", "t")
+        cell = Variable(this="t_0_x", column_id=x_id, rowid=("t", 0))
+        table = DerivedSchema(columns=(x_id,), rows=[Row(this=("t", 0), columns={x_id: cell})])
+        env = Environment.from_readers({"t": table[0]})
+
+        self.assertIs(env.resolve(_annotate_col(_value("t.x"), x_id)), cell)
+        self.assertIs(env.resolve(x_id), cell)
+
+    def test_reader_backed_environment_chains_to_outer_reader(self):
+        x_id = _col_id("x", "tin")
+        y_id = _col_id("y", "tout")
+        inner_cell = Variable(this="tin_0_x", column_id=x_id, rowid=("tin", 0))
+        outer_cell = Variable(this="tout_0_y", column_id=y_id, rowid=("tout", 0))
+        inner_table = DerivedSchema(
+            columns=(x_id,),
+            rows=[Row(this=("inner", 0), columns={x_id: inner_cell})],
+        )
+        outer_table = DerivedSchema(
+            columns=(y_id,),
+            rows=[Row(this=("outer", 0), columns={y_id: outer_cell})],
+        )
+        outer = Environment.from_readers({"tout": outer_table[0]})
+        env = Environment.from_readers({"tin": inner_table[0]}, outer=outer)
+
+        self.assertIs(env.resolve(_annotate_col(_value("tin.x"), x_id)), inner_cell)
+        self.assertIs(env.resolve(_annotate_col(_value("tout.y"), y_id)), outer_cell)
 
 
 # ---------------------------------------------------------------------------

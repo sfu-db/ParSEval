@@ -28,13 +28,33 @@ from parseval.domain.value_space import ValueSpace
 PARSEVAL_SOLVER_VAR = "parseval_solver_var"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SolverVar:
     """A logical solver variable for one column binding."""
 
     column_id: ColumnId
     relation_id: RelationId
     row_scope: str | None = None
+
+    @property
+    def binding_key(self) -> tuple:
+        relation = self.relation_id
+        return (
+            relation.kind.value,
+            relation.name.normalized if relation.name is not None else None,
+            relation.alias.normalized if relation.alias is not None else None,
+            relation.scope_id,
+            self.column_id.name.normalized,
+            self.row_scope,
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.binding_key)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SolverVar):
+            return NotImplemented
+        return self.binding_key == other.binding_key
 
     @property
     def display(self) -> str:

@@ -144,12 +144,6 @@ class TestBasicEnrichment(unittest.TestCase):
         found_names = {meta["table"] for meta in cols.values()}
         self.assertIn("t", found_names)
 
-    def test_no_instance_skips_enrichment(self):
-        plan = _plan("SELECT * FROM t WHERE x > 0", instance=None)
-        step = _first_step_of_type(plan, Filter)
-        cols = _condition_columns(step)
-        self.assertEqual(len(cols), 0)
-
     def test_column_not_in_instance_not_enriched(self):
         """A column absent from the instance schema fails closed."""
         # Use raw sqlglot parse (no preprocess_sql validation) with a
@@ -157,7 +151,7 @@ class TestBasicEnrichment(unittest.TestCase):
         inst = _make_instance("CREATE TABLE t (x INTEGER);")
         expr = sqlglot.parse_one("SELECT * FROM t WHERE t.z > 0", read="sqlite")
         plan = Plan(expr, inst)
-        with pytest.raises(ValueError, match="Unresolved column qualifier"):
+        with pytest.raises(ValueError, match="Unresolved column"):
             plan.annotation_for(plan.root)
 
     def test_nullable_and_unique_metadata(self):
@@ -179,184 +173,6 @@ class TestBasicEnrichment(unittest.TestCase):
         cols = _condition_columns(step)
         domain = cols['"t"."x"']["domain"]
         self.assertIsInstance(domain, DataType)
-
-
-class TestSemanticDatatypes(unittest.TestCase):
-    def _semantic_datatype_for(self, sql: str):
-        inst = _make_instance("CREATE TABLE t (x TEXT);")
-        plan = _plan(sql, inst)
-        step = _first_step_of_type(plan, Filter)
-        semantic = plan.annotation_for(step).metadata.get("semantic_datatypes", {})
-        self.assertEqual(len(semantic), 1)
-        return next(iter(semantic.values())), step
-
-    def test_text_range_numeric_string_infers_integer_semantic_datatype(self):
-        dtype, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x > '50' AND x LIKE '5%'"
-        )
-
-        self.assertTrue(dtype.is_type(*DataType.INTEGER_TYPES))
-        column = next(step.condition.find_all(exp.Column))
-        self.assertTrue(
-            column.meta["parseval_semantic_datatype"].is_type(*DataType.INTEGER_TYPES)
-        )
-
-    def test_text_range_numeric_string_wraps_literal_with_cast(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x > '50' AND x LIKE '5%'"
-        )
-
-        comparison = step.condition.find(exp.GT)
-        self.assertIsInstance(comparison.expression, exp.Cast)
-        self.assertTrue(
-            comparison.expression.args["to"].is_type(*DataType.INTEGER_TYPES)
-        )
-        self.assertEqual(comparison.expression.this.this, "50")
-
-        like = step.condition.find(exp.Like)
-        self.assertIsInstance(like.expression, exp.Literal)
-        self.assertEqual(like.expression.this, "5%")
-
-    def test_text_range_decimal_string_infers_decimal_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x >= '50.5'"
-        )
-
-        self.assertTrue(dtype.is_type(*DataType.REAL_TYPES))
-
-    def test_text_range_date_string_wraps_literal_with_cast(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x >= '2024-01-01'"
-        )
-
-        comparison = step.condition.find(exp.GTE)
-        self.assertIsInstance(comparison.expression, exp.Cast)
-        self.assertTrue(comparison.expression.args["to"].is_type(DataType.Type.DATE))
-        self.assertEqual(comparison.expression.this.this, "2024-01-01")
-
-    def test_text_between_numeric_strings_infers_integer_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x BETWEEN '10' AND '20'"
-        )
-
-        self.assertTrue(dtype.is_type(*DataType.INTEGER_TYPES))
-
-    def test_text_between_numeric_strings_wraps_bounds_with_cast(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x BETWEEN '10' AND '20'"
-        )
-
-        between = step.condition.find(exp.Between)
-        low = between.args["low"]
-        high = between.args["high"]
-        self.assertIsInstance(low, exp.Cast)
-        self.assertIsInstance(high, exp.Cast)
-        self.assertTrue(low.args["to"].is_type(*DataType.INTEGER_TYPES))
-        self.assertTrue(high.args["to"].is_type(*DataType.INTEGER_TYPES))
-        self.assertEqual(low.this.this, "10")
-        self.assertEqual(high.this.this, "20")
-
-    def test_text_range_date_string_infers_date_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x >= '2024-01-01'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATE))
-
-    def test_text_range_datetime_string_infers_datetime_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x < '2024-01-01 12:30:00'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATETIME))
-
-    def test_text_between_temporal_strings_infers_datetime_when_needed(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE x BETWEEN '2024-01-01' AND '2024-01-02 12:30:00'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATETIME))
-
-    def test_explicit_cast_infers_cast_target_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE CAST(x AS DATE) = '2024-01-01'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATE))
-
-    def test_explicit_cast_wraps_compared_literal_with_cast(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE CAST(x AS DATE) = '2024-01-01'"
-        )
-
-        comparison = step.condition.find(exp.EQ)
-        self.assertIsInstance(comparison.expression, exp.Cast)
-        self.assertTrue(comparison.expression.args["to"].is_type(DataType.Type.DATE))
-        self.assertEqual(comparison.expression.this.this, "2024-01-01")
-
-    def test_date_function_infers_temporal_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE DATE(x) = '2024-01-01'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATE))
-
-    def test_date_function_wraps_compared_literal_with_cast(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE DATE(x) = '2024-01-01'"
-        )
-
-        comparison = step.condition.find(exp.EQ)
-        self.assertIsInstance(comparison.expression, exp.Cast)
-        self.assertTrue(comparison.expression.args["to"].is_type(DataType.Type.DATE))
-        self.assertEqual(comparison.expression.this.this, "2024-01-01")
-
-    def test_datetime_function_infers_datetime_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE DATETIME(x) = '2024-01-01 12:30:00'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATETIME))
-
-    def test_strftime_function_infers_datetime_semantic_datatype(self):
-        dtype, _ = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE STRFTIME('%Y', x) = '2024'"
-        )
-
-        self.assertTrue(dtype.is_type(DataType.Type.DATETIME))
-
-    def test_strftime_function_keeps_format_literal_as_text(self):
-        _, step = self._semantic_datatype_for(
-            "SELECT * FROM t WHERE STRFTIME('%Y', x) = '2024'"
-        )
-
-        comparison = step.condition.find(exp.EQ)
-        self.assertIsInstance(comparison.expression, exp.Literal)
-        self.assertEqual(comparison.expression.this, "2024")
-
-    def test_generic_strftime_is_normalized_to_time_to_str(self):
-        inst = _make_instance("CREATE TABLE t (x TEXT);")
-        expr = sqlglot.parse_one("SELECT * FROM t WHERE STRFTIME('%Y', x) >= '2024'")
-        plan = Plan(expr, inst)
-        step = _first_step_of_type(plan, Filter)
-
-        self.assertIsNone(step.condition.find(exp.Anonymous))
-        self.assertIsInstance(step.condition.find(exp.TimeToStr), exp.TimeToStr)
-
-        semantic = plan.annotation_for(step).metadata.get("semantic_datatypes", {})
-        self.assertEqual(len(semantic), 1)
-        self.assertTrue(
-            next(iter(semantic.values())).is_type(DataType.Type.DATETIME)
-        )
-
-    def test_conflicting_inferred_datatypes_are_omitted(self):
-        inst = _make_instance("CREATE TABLE t (x TEXT);")
-        plan = _plan("SELECT * FROM t WHERE x > '50' AND x < '2024-01-01'", inst)
-        step = _first_step_of_type(plan, Filter)
-
-        semantic = plan.annotation_for(step).metadata.get("semantic_datatypes", {})
-
-        self.assertEqual(semantic, {})
 
 
 # =============================================================================

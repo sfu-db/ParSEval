@@ -1,12 +1,27 @@
-"""Tests for current solver value-space and datatype helpers."""
+"""Tests for solver shared types: ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate."""
 import unittest
 
 from sqlglot import exp
 
 from parseval.dtype import DataType
-from parseval.solver.types import (
-    ValueSpace, TypeFamily, col_type, type_family,
+from parseval.identity import (
+    ColumnKind,
+    RelationKind,
+    column_id,
+    identifier_name,
+    relation_id,
 )
+from parseval.solver.types import (
+    ValueSpace, CSPVariable, CSPConstraint, ColumnPredicate, SolverVar, TypeFamily,
+    col_type, set_solver_var, solver_var, type_family,
+)
+
+
+REL = relation_id(RelationKind.TABLE, identifier_name("t1"))
+COL_AGE = column_id(ColumnKind.PHYSICAL, identifier_name("age"), REL)
+COL_ID = column_id(ColumnKind.PHYSICAL, identifier_name("id"), REL)
+AGE = SolverVar(COL_AGE, REL)
+ID = SolverVar(COL_ID, REL)
 
 
 class TestValueSpaceInitial(unittest.TestCase):
@@ -116,6 +131,87 @@ class TestValueSpaceBoolean(unittest.TestCase):
         vs.narrow_neq(False)
         self.assertTrue(vs.is_empty())
         self.assertIsNone(vs.pick())
+
+
+class TestColumnPredicate(unittest.TestCase):
+    def test_basic_fields(self):
+        cp = ColumnPredicate(variable=AGE, op=">", value=18)
+        self.assertEqual(cp.variable, AGE)
+        self.assertEqual(cp.op, ">")
+        self.assertEqual(cp.value, 18)
+
+    def test_equality_op(self):
+        cp = ColumnPredicate(variable=AGE, op="=", value="alice")
+        self.assertEqual(cp.op, "=")
+        self.assertEqual(cp.value, "alice")
+
+
+class TestCSPVariable(unittest.TestCase):
+    def test_basic_fields(self):
+        vs = ValueSpace(family=TypeFamily.TEXT)
+        v = CSPVariable(variable=AGE, space=vs)
+        self.assertEqual(v.name, AGE)
+        self.assertEqual(v.variable, AGE)
+        self.assertIsNone(v.assigned)
+
+    def test_assigned_default(self):
+        vs = ValueSpace(family=TypeFamily.INTEGER)
+        v = CSPVariable(variable=AGE, space=vs)
+        self.assertIsNone(v.assigned)
+
+
+class TestCSPConstraint(unittest.TestCase):
+    def test_basic_fields(self):
+        c = CSPConstraint(kind="eq", left=AGE, right=ID)
+        self.assertEqual(c.kind, "eq")
+        self.assertEqual(c.left, AGE)
+        self.assertEqual(c.right, ID)
+
+
+class TestSolverVarMetadata(unittest.TestCase):
+    def test_round_trips_on_column_meta(self):
+        col = exp.column("age", table="t1")
+
+        set_solver_var(col, AGE)
+
+        self.assertEqual(solver_var(col), AGE)
+
+    def test_solver_var_identity_uses_binding_scope_and_normalized_column_name(self):
+        upper = column_id(ColumnKind.PHYSICAL, identifier_name("CDSCode"), REL)
+        lower = column_id(ColumnKind.PHYSICAL, identifier_name("cdscode"), REL)
+        left_rel = relation_id(
+            RelationKind.TABLE,
+            identifier_name("people"),
+            alias=identifier_name("p"),
+            scope_id="left",
+        )
+        right_rel = relation_id(
+            RelationKind.TABLE,
+            identifier_name("people"),
+            alias=identifier_name("p"),
+            scope_id="right",
+        )
+
+        self.assertEqual(SolverVar(upper, REL, "r0"), SolverVar(lower, REL, "r0"))
+        self.assertNotEqual(SolverVar(upper, left_rel, "r0"), SolverVar(upper, right_rel, "r0"))
+        self.assertNotEqual(SolverVar(upper, REL, "r0"), SolverVar(upper, REL, "r1"))
+
+    def test_projected_alias_names_remain_distinct_even_with_same_source(self):
+        source = column_id(ColumnKind.PHYSICAL, identifier_name("name"), REL)
+        first = column_id(
+            ColumnKind.PROJECTED,
+            identifier_name("first_name"),
+            REL,
+            source_column_id=source,
+        )
+        second = column_id(
+            ColumnKind.PROJECTED,
+            identifier_name("second_name"),
+            REL,
+            source_column_id=source,
+        )
+
+        self.assertNotEqual(SolverVar(first, REL, "r0"), SolverVar(second, REL, "r0"))
 
 
 class TestColType(unittest.TestCase):

@@ -110,7 +110,7 @@ def test_qualified_relation_resolution_does_not_guess_from_name():
     )
 
     with pytest.raises(ValueError, match="unresolved_scoped_column"):
-        ConstraintGenerator(plan, instance)._resolve_relation(
+        ConstraintGenerator(plan, instance, instance.dialect)._resolve_relation(
             exp.column("year", table="races"),
             (outer, inner),
         )
@@ -140,7 +140,7 @@ def test_foreign_key_resolution_returns_physical_relation():
         scope_id="inner",
     )
 
-    resolved = ConstraintGenerator(plan, instance)._resolve_table_relation(
+    resolved = ConstraintGenerator(plan, instance, instance.dialect)._resolve_table_relation(
         exp.to_table("parent"),
         (scoped_parent,),
     )
@@ -171,5 +171,5 @@ def test_inner_alias_cannot_resolve_from_shadowed_outer_alias():
         instance,
     )
 
-    with pytest.raises(ValueError, match="Unresolved column qualifier: X.user_name"):
+    with pytest.raises(ValueError, match="Unresolved column: X.user_name"):
         plan.annotation_for(plan.root)

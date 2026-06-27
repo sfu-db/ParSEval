@@ -27,7 +27,8 @@ from parseval.plan.planner import Aggregate, Join, Project
 from parseval.query import preprocess_sql
 from parseval.solver import Solver, SolverConstraint
 
-from .constraints import PlausibleBranch, ConstraintGenerator
+from .branch_tree import BranchTreeBuilder, CoverageAnalyzer
+from .constraints import ConstraintGenerator
 from .evaluator import PlanEvaluator
 from .types import (
     BranchTree,
@@ -118,6 +119,8 @@ class SymbolicEngine:
     def generate(
         self,
         thresholds: Optional[CoverageThresholds] = None,
+        *,
+        speculate_first: bool = True,
     ) -> GenerationResult:
         """Run the generation loop until coverage is met or budget exhausted."""
         thresholds = thresholds or CoverageThresholds()
@@ -128,18 +131,31 @@ class SymbolicEngine:
 
         rows_before = self._total_rows()
 
-        # Phase 1: Build tree structure and run initial evaluation.
-        from .evaluator import build_branch_tree
-        tree = build_branch_tree(self.plan, self.instance, thresholds)
+        # Phase 1: Speculate to seed the instance with initial data.
+        if speculate_first:
+            from .speculate import speculate, SpeculateConfig
+            spec_config = (
+                SpeculateConfig.from_thresholds(thresholds)
+                if thresholds
+                else SpeculateConfig.gold_non_empty()
+            )
+            speculate(
+                self.plan, self.instance,
+                dialect=self.dialect, config=spec_config,
+            )
+
+        # Phase 2: Build tree structure and run initial evaluation.
+        tree = BranchTreeBuilder(self.plan, self.instance, thresholds).build()
         tree = evaluator.evaluate(tree)
+        analyzer = CoverageAnalyzer(tree)
 
         # Phase 2: Targeted gap-filling.
         iteration = 0
         for iteration in range(self.max_iterations):
-            if tree.fully_covered:
+            if analyzer.fully_covered:
                 break
 
-            targets = tree.root_witness_targets or tree.uncovered_targets
+            targets = analyzer.root_witness_targets or analyzer.uncovered_targets
             if not targets:
                 break
 
@@ -151,18 +167,23 @@ class SymbolicEngine:
             target = self._prioritize(targets)
 
             # Generate complete constraints (including DB constraints).
-            constraint = constraint_gen.compile(PlausibleBranch.from_coverage_target(target))
+            constraint = constraint_gen.compile_target(target)
 
             # Solve and materialize.
             cp = self.instance.checkpoint()
-            success = self._solve_and_materialize(constraint)
+            try:
+                success = self._solve_and_materialize(constraint)
+            except ConstraintConflict:
+                success = False
 
             if success:
                 # Re-evaluate to discover newly covered branches.
                 tree = evaluator.evaluate(tree)
+                analyzer = CoverageAnalyzer(tree)
             else:
                 self.instance.rollback(cp)
-                tree.mark_infeasible(target.node, target.atom_id, target.target_outcome)
+                tree.mark_target_infeasible(target)
+                analyzer = CoverageAnalyzer(tree)
 
         return GenerationResult(
             tree=tree,
@@ -213,10 +234,7 @@ class SymbolicEngine:
         if not result.sat:
             return False
 
-        try:
-            materialized = _materialized_rows(constraint, result.assignments)
-        except ConstraintConflict:
-            return False
+        materialized = _materialized_rows(constraint, result.assignments)
 
         storage_relations = []
         seen_relations = set()
@@ -237,8 +255,10 @@ class SymbolicEngine:
             for row_values in logical_rows:
                 try:
                     self.instance.create_row(storage_relation, values=row_values)
-                except Exception:
-                    return False
+                except Exception as exc:
+                    raise ConstraintConflict(
+                        f"materialization_failed:{storage_relation.display}"
+                    ) from exc
         return True
 
     def _total_rows(self) -> int:
@@ -265,12 +285,12 @@ def _compute_row_budget(plan: Plan) -> int:
         if isinstance(step, Join):
             budget += 2 * len(step.joins)
         elif isinstance(step, Aggregate) and step.group:
-            budget += 2
+            budget += 3
         elif isinstance(step, Project):
             for proj in step.projections:
                 if isinstance(proj, exp.Expression):
                     budget += len(list(proj.find_all(exp.Case)))
-    return min(budget, 20)
+    return budget
 
 
 __all__ = ["SymbolicEngine"]

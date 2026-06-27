@@ -352,20 +352,35 @@ class Environment:
     environment rather than mutating the parent.
     """
 
-    __slots__ = ("_bindings", "_outer")
+    __slots__ = ("_bindings", "_readers", "_outer")
 
     def __init__(
         self,
         bindings: Optional[Dict[ColumnId, Any]] = None,
         outer: Optional["Environment"] = None,
+        readers: Optional[Dict[Any, Any]] = None,
     ) -> None:
         self._bindings: Dict[ColumnId, Any] = dict(bindings) if bindings else {}
+        self._readers: Dict[Any, Any] = dict(readers) if readers else {}
         self._outer: Optional[Environment] = outer
+
+    @classmethod
+    def from_readers(
+        cls,
+        row_readers: Dict[Any, Any],
+        outer: Optional["Environment"] = None,
+    ) -> "Environment":
+        return cls(readers=row_readers, outer=outer)
 
     def _resolve_by_id(self, col_id: ColumnId) -> Any:
         """Direct ColumnId lookup."""
         if col_id in self._bindings:
             return self._bindings[col_id]
+        for reader in self._readers.values():
+            try:
+                return reader.resolve(col_id)
+            except KeyError:
+                continue
         return _MISSING
 
     def resolve(self, column: Union[exp.Column, ColumnId]) -> Any:

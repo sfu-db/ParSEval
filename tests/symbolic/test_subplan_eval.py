@@ -25,7 +25,7 @@ class TestExistsEvaluation(unittest.TestCase):
 
         sql = "SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2 WHERE t2.x = 1)"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(exists_true=1, exists_false=1))
 
@@ -45,7 +45,7 @@ class TestExistsEvaluation(unittest.TestCase):
 
         sql = "SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2 WHERE t2.x = 999)"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(exists_true=1, exists_false=1))
 
@@ -71,7 +71,7 @@ class TestInEvaluation(unittest.TestCase):
 
         sql = "SELECT * FROM t1 WHERE t1.x IN (SELECT t2.x FROM t2)"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(in_match=1, in_no_match=1))
 
@@ -92,7 +92,7 @@ class TestInEvaluation(unittest.TestCase):
 
         sql = "SELECT * FROM t1 WHERE t1.x IN (SELECT t2.x FROM t2)"
         expr = preprocess_sql(sql, instance, dialect="sqlite")
-        plan = Plan(expr)
+        plan = Plan(expr, instance)
         evaluator = PlanEvaluator(plan, instance, "sqlite")
         tree = BranchTree(thresholds=CoverageThresholds(in_match=1, in_no_match=1))
 

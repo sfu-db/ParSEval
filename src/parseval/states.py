@@ -40,7 +40,6 @@ class Verdict(Enum):
     EQ = "eq"              # Queries are equivalent on generated instance
     NEQ = "neq"            # Queries produce different results
     SYNTAX_ERROR = "syntax_error"  # One or both queries have syntax errors
-    RUNTIME_ERROR = "runtime_error"  # Execution error (not syntax)
     TIMEOUT = "timeout"    # Generation or execution timed out
     UNKNOWN = "unknown"    # Could not determine
 
@@ -105,7 +104,7 @@ class GenerationResult:
 class DisproveResult:
     """Result of equivalence disproval attempt."""
     verdict: Verdict
-    semantics: Semantics
+    semantics: str
     q1_result: ExecutionResult
     q2_result: ExecutionResult
     generation: GenerationResult
@@ -120,7 +119,7 @@ class DisproveResult:
         """Convert to a JSON-serializable dict."""
         return {
             "verdict": self.verdict.value,
-            "semantics": self.semantics.value,
+            "semantics": self.semantics,
             "q1_result": self.q1_result.to_dict(),
             "q2_result": self.q2_result.to_dict(),
             "generation": self.generation.to_dict(),
@@ -135,7 +134,6 @@ class InstantiateResult:
     generation: GenerationResult
     q_result: Optional[ExecutionResult] = None
     connection_string: str = ""
-    db_id: str = ""
     error_msg: str = ""
 
 
@@ -147,22 +145,18 @@ class InstantiateResult:
 def compare_results(
     r1: ExecutionResult,
     r2: ExecutionResult,
-    semantics: Semantics = Semantics.BAG,
+    semantics: str = "bag",
 ) -> Verdict:
     """Compare two execution results and return a verdict."""
-    # Syntax errors
     if r1.is_error or r2.is_error:
         return Verdict.SYNTAX_ERROR
 
-    # Compare based on semantics
-    if semantics == Semantics.SET:
+    if semantics == "set":
         eq = set(r1.rows) == set(r2.rows)
     else:
-        # BAG: sort both (order-independent multiset comparison)
         try:
             eq = sorted(r1.rows) == sorted(r2.rows)
         except TypeError:
-            # Unsortable (e.g., None values) — compare as-is
             eq = r1.rows == r2.rows
 
     return Verdict.EQ if eq else Verdict.NEQ

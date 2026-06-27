@@ -4,7 +4,6 @@ import json
 import os
 import argparse
 import datetime
-import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -25,122 +24,303 @@ def load_gold(gold_fp: str):
         return json.load(f)
 
 
-def _process_bird_datagen_case(index, row, schemas, *, execute_sqlite=True):
-    t0 = time.time()
+def _write_and_execute_speculate(instance, sql, db_path):
+    """Write instance rows via to_db and execute the query via DBManager."""
+    from parseval.instance.io import to_db
+    from parseval.db_manager import DBManager
+
+    connection_string = f"sqlite:///{db_path}"
+    to_db(instance, connection_string, dialect="sqlite")
+    with DBManager().get_connection(connection_string, "sqlite") as conn:
+        rows = conn.execute(sql, fetch="all", timeout=30)
+        return rows or []
+
+
+def _write_and_execute_speculate_branch(ddls, rows_per_table, sql, db_path):
+    """Execute one speculate branch in a fresh instance."""
+    from parseval.instance import Instance
+    from parseval.symbolic.speculate import _materialize_rows
+
+    instance = Instance(ddls=ddls, name="speculate_branch", dialect="sqlite")
+    _materialize_rows(instance, rows_per_table)
+    return _write_and_execute_speculate(instance, sql, db_path)
+
+
+def _cleanup_db(db_path):
+    for suffix in ("", "-wal", "-shm"):
+        path = f"{db_path}{suffix}"
+        if os.path.exists(path):
+            os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# Speculate mode
+# ---------------------------------------------------------------------------
+
+def _run_speculate_case(index, row, schemas):
+    """Run speculate() on a single BIRD query and return a result record."""
+    from parseval.instance import Instance
+    from parseval.plan import Plan
+    from parseval.query import preprocess_sql
+    from parseval.symbolic.speculate import speculate, SpeculateConfig
+
     db_id = row.get("db_id")
     sql = row.get("SQL") or ""
     raw_ddls = schemas.get(db_id, [])
     ddls = raw_ddls if isinstance(raw_ddls, str) else ";".join(raw_ddls)
+
     record = {
         "index": index,
         "db_id": db_id,
         "difficulty": row.get("difficulty"),
-        "sql": sql,
+        "sql": sql[:200],
         "status": "unknown",
+        "branches": 0,
         "rows_generated": 0,
-        "coverage": 0.0,
         "non_empty": False,
+        "non_empty_branch": "",
         "error_msg": "",
-        "elapsed_time": 0.0,
+        "elapsed_propagate": 0.0,
+        "elapsed_total": 0.0,
     }
+
+    t0 = time.time()
     try:
-        from parseval.main import instantiate_db
+        instance = Instance(ddls=ddls, name=f"spec_{db_id}_{index}", dialect="sqlite")
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
 
-        db_path = os.path.abspath(f"tmp/worker_{db_id}_{index}.db")
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        for suffix in ("", "-wal", "-shm"):
-            path = f"{db_path}{suffix}"
-            if os.path.exists(path):
-                os.remove(path)
-        connection_string = f"sqlite:///{db_path}"
+        t_prop = time.time()
+        config = SpeculateConfig.gold_non_empty()
+        results = speculate(plan, instance, dialect="sqlite", config=config)
+        record["elapsed_propagate"] = round(time.time() - t_prop, 4)
 
-        result = instantiate_db(
-            sql, ddls, connection_string, "sqlite",
-            db_id=f"{db_id}_{index}",
-            max_iterations=10,
-            atom_null=0,
-            atom_dup=1,
-        )
+        record["branches"] = len(results)
+        total_rows = 0
+        for _branch_name, rows_per_table in results:
+            for _table, table_rows in rows_per_table.items():
+                total_rows += len(table_rows)
+        record["rows_generated"] = total_rows
 
-        record["rows_generated"] = result.generation.rows_generated
-        record["coverage"] = result.generation.coverage
-        if result.q_result is not None:
-            record["non_empty"] = bool(result.q_result.rows)
-            if result.q_result.error_msg:
-                record["error_msg"] = result.q_result.error_msg
-        if not result.success:
-            record["status"] = "generation_error"
-            record["error_msg"] = result.error_msg or record["error_msg"]
-        elif record["non_empty"]:
-            record["status"] = "non_empty"
-        elif result.q_result and result.q_result.error_msg:
-            record["status"] = "execution_error"
-        elif record["rows_generated"] == 0:
-            record["status"] = "empty_generation"
+        if total_rows > 0:
+            db_dir = os.path.abspath("tmp")
+            os.makedirs(db_dir, exist_ok=True)
+            for branch_offset, (branch_name, rows_per_table) in enumerate(results):
+                db_path = os.path.join(
+                    db_dir,
+                    f"speculate_{db_id}_{index}_{branch_offset}_{branch_name}.db",
+                )
+                _cleanup_db(db_path)
+                try:
+                    query_results = _write_and_execute_speculate_branch(
+                        ddls, rows_per_table, sql, db_path,
+                    )
+                    if query_results:
+                        record["non_empty"] = True
+                        record["non_empty_branch"] = branch_name
+                        break
+                finally:
+                    _cleanup_db(db_path)
+            record["status"] = "non_empty" if record["non_empty"] else "empty_result"
         else:
-            record["status"] = "empty_result"
+            record["status"] = "empty_generation"
+
     except Exception as exc:
-        record["status"] = "generation_error"
+        record["status"] = "error"
         record["error_msg"] = str(exc)[:300]
     finally:
-        record["elapsed_time"] = round(time.time() - t0, 4)
+        record["elapsed_total"] = round(time.time() - t0, 4)
+
     return record
 
 
-def _process_bird_datagen_task(task):
-    index, row, schemas, execute_sqlite = task
-    return _process_bird_datagen_case(
-        index,
-        row,
-        schemas,
-        execute_sqlite=execute_sqlite,
-    )
+def run_speculate_experiment(schema_fp, gold_fp, *, limit=None, start=0, workers=1):
+    """Run speculate() on BIRD queries and return metrics."""
+    schemas = load_schema(schema_fp)
+    gold = load_gold(gold_fp)
+    selected = gold[start:]
+    if limit is not None:
+        selected = selected[:limit]
 
+    tasks = [(start + offset, row, schemas) for offset, row in enumerate(selected)]
+    if workers <= 1:
+        records = [
+            _run_speculate_case(*task)
+            for task in tqdm(tasks, desc="Testing speculate()")
+        ]
+    else:
+        records_by_index = {}
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_speculate_case, *t) for t in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Testing speculate()"):
+                record = future.result()
+                records_by_index[record["index"]] = record
+        records = [records_by_index[index] for index, *_rest in tasks]
 
-def summarize_datagen_results(records):
     total = len(records)
-    status_counts = {}
-    total_rows = 0
-    coverages = []
-    for record in records:
-        status = record.get("status", "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-        total_rows += int(record.get("rows_generated") or 0)
-        cov = record.get("coverage")
-        if cov is not None:
-            coverages.append(cov)
-    non_empty = status_counts.get("non_empty", 0)
-    empty_generation = status_counts.get("empty_generation", 0)
-    generation_errors = status_counts.get("generation_error", 0)
-    witness_queries = total - empty_generation - generation_errors
-    generated = total - generation_errors
-    avg_coverage = round(sum(coverages) / len(coverages), 4) if coverages else 0.0
+    non_empty = errors = empty_gen = 0
+    total_rows = total_branches = 0
+    sum_propagate = sum_total = 0.0
+    for r in records:
+        if r["non_empty"]:
+            non_empty += 1
+        status = r["status"]
+        if status == "error":
+            errors += 1
+        elif status == "empty_generation":
+            empty_gen += 1
+        total_rows += r["rows_generated"]
+        total_branches += r["branches"]
+        sum_propagate += r["elapsed_propagate"]
+        sum_total += r["elapsed_total"]
+
     return {
         "total_queries": total,
-        "generated_queries": generated,
-        "witness_queries": witness_queries,
-        "non_empty_queries": non_empty,
-        "generated_rows": total_rows,
-        "average_coverage": avg_coverage,
-        "status_counts": status_counts,
-        "status_ratio": {
-            key: round(value / total, 4) if total else 0
-            for key, value in status_counts.items()
-        },
-        "witness_ratio": round(witness_queries / total, 4) if total else 0,
+        "non_empty": non_empty,
         "non_empty_ratio": round(non_empty / total, 4) if total else 0,
+        "errors": errors,
+        "empty_generation": empty_gen,
+        "total_rows_generated": total_rows,
+        "total_branches": total_branches,
+        "avg_branches": round(total_branches / total, 2) if total else 0,
+        "avg_rows_per_query": round(total_rows / total, 2) if total else 0,
+        "avg_propagate_time": round(sum_propagate / total, 4) if total else 0,
+        "avg_total_time": round(sum_total / total, 4) if total else 0,
+        "records": records,
     }
 
 
-def run_bird_datagen(
-    schema_fp: str,
-    gold_fp: str,
+# ---------------------------------------------------------------------------
+# Engine / Combined mode (shared implementation)
+# ---------------------------------------------------------------------------
+
+def _run_engine_case(
+    index,
+    row,
+    schemas,
     *,
-    limit: int | None = None,
-    start: int = 0,
-    execute_sqlite: bool = True,
-    workers: int = 1,
+    execute_sqlite=True,
+    max_iterations=50,
+    speculate_first=True,
 ):
+    """Run SymbolicEngine on a single BIRD query and return a result record."""
+    from parseval.instance import Instance
+    from parseval.symbolic import CoverageThresholds, SymbolicEngine
+
+    db_id = row.get("db_id")
+    sql = row.get("SQL") or ""
+    raw_ddls = schemas.get(db_id, [])
+    ddls = raw_ddls if isinstance(raw_ddls, str) else ";".join(raw_ddls)
+
+    record = {
+        "index": index,
+        "db_id": db_id,
+        "difficulty": row.get("difficulty"),
+        "sql": sql[:200],
+        "status": "unknown",
+        "rows_generated": 0,
+        "coverage": 0.0,
+        "iterations": 0,
+        "non_empty": False,
+        "error_msg": "",
+        "elapsed_generate": 0.0,
+        "elapsed_total": 0.0,
+    }
+
+    t0 = time.time()
+    try:
+        instance = Instance(ddls=ddls, name=f"engine_{db_id}_{index}", dialect="sqlite")
+        t_generate = time.time()
+        engine = SymbolicEngine(
+            instance, sql, dialect="sqlite", max_iterations=max_iterations,
+        )
+        result = engine.generate(
+            thresholds=CoverageThresholds(atom_null=0),
+            speculate_first=speculate_first,
+        )
+        record["elapsed_generate"] = round(time.time() - t_generate, 4)
+        record["rows_generated"] = result.rows_generated
+        record["coverage"] = result.coverage
+        record["iterations"] = result.iterations
+
+        if record["rows_generated"] <= 0:
+            record["status"] = "empty_generation"
+        elif not execute_sqlite:
+            record["status"] = "generated"
+        else:
+            db_path = os.path.abspath(f"tmp/engine_{db_id}_{index}.db")
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            _cleanup_db(db_path)
+            try:
+                query_results = _write_and_execute_speculate(instance, sql, db_path)
+                record["non_empty"] = bool(query_results)
+            finally:
+                _cleanup_db(db_path)
+            record["status"] = "non_empty" if record["non_empty"] else "empty_result"
+    except Exception as exc:
+        record["status"] = "error"
+        record["error_msg"] = str(exc)[:300]
+    finally:
+        record["elapsed_total"] = round(time.time() - t0, 4)
+    return record
+
+
+def _run_engine_task(task):
+    index, row, schemas, execute_sqlite, max_iterations, speculate_first = task
+    return _run_engine_case(
+        index, row, schemas,
+        execute_sqlite=execute_sqlite,
+        max_iterations=max_iterations,
+        speculate_first=speculate_first,
+    )
+
+
+def summarize_engine_results(records):
+    total = len(records)
+    status_counts = {}
+    non_empty = 0
+    total_rows = 0
+    sum_coverage = sum_iterations = 0.0
+    sum_generate = sum_total = 0.0
+    for r in records:
+        status_counts[r.get("status", "unknown")] = status_counts.get(r.get("status", "unknown"), 0) + 1
+        if r.get("non_empty"):
+            non_empty += 1
+        total_rows += int(r.get("rows_generated") or 0)
+        sum_coverage += r.get("coverage") or 0.0
+        sum_iterations += r.get("iterations") or 0
+        sum_generate += r.get("elapsed_generate") or 0.0
+        sum_total += r.get("elapsed_total") or 0.0
+
+    return {
+        "total_queries": total,
+        "non_empty": non_empty,
+        "non_empty_ratio": round(non_empty / total, 4) if total else 0,
+        "errors": status_counts.get("error", 0),
+        "empty_generation": status_counts.get("empty_generation", 0),
+        "total_rows_generated": total_rows,
+        "avg_rows_per_query": round(total_rows / total, 2) if total else 0,
+        "avg_coverage": round(sum_coverage / total, 4) if total else 0,
+        "avg_iterations": round(sum_iterations / total, 2) if total else 0,
+        "avg_generate_time": round(sum_generate / total, 4) if total else 0,
+        "avg_total_time": round(sum_total / total, 4) if total else 0,
+        "status_counts": status_counts,
+        "records": records,
+    }
+
+
+def run_engine_experiment(
+    schema_fp,
+    gold_fp,
+    *,
+    limit=None,
+    start=0,
+    workers=1,
+    execute_sqlite=True,
+    max_iterations=50,
+    speculate_first=True,
+):
+    """Run SymbolicEngine on BIRD queries and return metrics."""
     schemas = load_schema(schema_fp)
     gold = load_gold(gold_fp)
     selected = gold[start:]
@@ -148,168 +328,97 @@ def run_bird_datagen(
         selected = selected[:limit]
 
     tasks = [
-        (start + offset, row, schemas, execute_sqlite)
+        (start + offset, row, schemas, execute_sqlite, max_iterations, speculate_first)
         for offset, row in enumerate(selected)
     ]
     if workers <= 1:
         records = [
-            _process_bird_datagen_task(task)
-            for task in tqdm(tasks, desc="Generating BIRD test databases")
+            _run_engine_task(task)
+            for task in tqdm(tasks, desc="Testing SymbolicEngine")
         ]
     else:
         records_by_index = {}
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_process_bird_datagen_task, task) for task in tasks]
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Generating BIRD test databases",
-            ):
+            futures = [executor.submit(_run_engine_task, t) for t in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Testing SymbolicEngine"):
                 record = future.result()
                 records_by_index[record["index"]] = record
         records = [records_by_index[index] for index, *_rest in tasks]
-    metrics = summarize_datagen_results(records)
-    metrics["records"] = records
+
+    return summarize_engine_results(records)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _save_and_print(metrics, output_dir, prefix):
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_fp = os.path.join(output_dir, f"{prefix}_{ts}.json")
+    with open(out_fp, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    printable = {k: v for k, v in metrics.items() if k != "records"}
+    print(json.dumps(printable, indent=2))
+
+    failures = [r for r in metrics["records"] if r["status"] != "non_empty"]
+    if failures:
+        print(f"\nNon-successes ({len(failures)}):")
+        for r in failures[:20]:
+            print(f"  [{r['index']}] {r['db_id']} [{r['status']}] rows={r['rows_generated']} err={r['error_msg'][:80]}")
+
+    print(f"\nWrote {len(metrics['records'])} records to {out_fp}")
     return metrics
 
 
-def run_bird_datagen_experiment(args):
+def dispatch_experiment(args):
     os.makedirs(args.output_dir, exist_ok=True)
-    metrics = run_bird_datagen(
+
+    if args.mode == "speculate":
+        metrics = run_speculate_experiment(
+            schema_fp=args.schema_fp,
+            gold_fp=args.gold_fp,
+            limit=args.limit,
+            start=args.start,
+            workers=args.workers,
+        )
+        return _save_and_print(metrics, args.output_dir, "speculate_bird")
+
+    # engine and combined share the same implementation;
+    # combined enables speculate_first (the default).
+    speculate_first = args.mode == "combined"
+    metrics = run_engine_experiment(
         schema_fp=args.schema_fp,
         gold_fp=args.gold_fp,
         limit=args.limit,
         start=args.start,
-        execute_sqlite=not args.no_execute_sqlite,
         workers=args.workers,
+        execute_sqlite=not args.no_execute_sqlite,
+        max_iterations=args.max_iterations,
+        speculate_first=speculate_first,
     )
-
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_fp = os.path.join(args.output_dir, f"sqlite_datagen_{ts}.json")
-    with open(out_fp, "w") as f:
-        json.dump(metrics, f, indent=2)
-
-    printable = {key: value for key, value in metrics.items() if key != "records"}
-    print(json.dumps(printable, indent=2))
-    print(f"Wrote {len(metrics['records'])} datagen records to {out_fp}")
-    return metrics
-
-
-def test_bird_datagen_smoke():
-    try:
-        import pytest
-    except Exception:
-        pytest = None
-    if not os.path.exists("data/sqlite/schema.json") or not os.path.exists("data/sqlite/dev.json"):
-        if pytest is None:
-            return
-        pytest.skip("BIRD SQLite fixtures are not available")
-
-    limit = int(os.environ.get("BIRD_DATAGEN_LIMIT", "25"))
-    min_non_empty_ratio = float(os.environ.get("BIRD_DATAGEN_MIN_NON_EMPTY_RATIO", "0.8"))
-    metrics = run_bird_datagen(
-        schema_fp="data/sqlite/schema.json",
-        gold_fp="data/sqlite/dev.json",
-        limit=limit,
-        execute_sqlite=os.environ.get("BIRD_DATAGEN_NO_EXECUTE", "0") != "1",
-    )
-
-    assert metrics["total_queries"] == limit
-    assert metrics["generated_rows"] > 0
-    assert metrics["witness_ratio"] >= min_non_empty_ratio
-    if os.environ.get("BIRD_DATAGEN_NO_EXECUTE", "0") != "1":
-        assert metrics["non_empty_ratio"] >= min_non_empty_ratio
-
-
-def test_bird_datagen_parallel_smoke():
-    try:
-        import pytest
-    except Exception:
-        pytest = None
-    if not os.path.exists("data/sqlite/schema.json") or not os.path.exists("data/sqlite/dev.json"):
-        if pytest is None:
-            return
-        pytest.skip("BIRD SQLite fixtures are not available")
-
-    metrics = run_bird_datagen(
-        schema_fp="data/sqlite/schema.json",
-        gold_fp="data/sqlite/dev.json",
-        limit=3,
-        workers=2,
-        execute_sqlite=False,
-    )
-
-    assert metrics["total_queries"] == 3
-    assert [record["index"] for record in metrics["records"]] == [0, 1, 2]
-    assert metrics["generated_rows"] > 0
-
-
-def test_toxicology_not_in_subquery_persists_non_null_atom_keys(tmp_path):
-    from parseval.main import instantiate_db
-
-    schema = """
-    CREATE TABLE atom (
-      atom_id TEXT NOT NULL PRIMARY KEY,
-      molecule_id TEXT,
-      element TEXT,
-      FOREIGN KEY (molecule_id) REFERENCES molecule(molecule_id)
-    );
-    CREATE TABLE bond (
-      bond_id TEXT NOT NULL PRIMARY KEY,
-      molecule_id TEXT,
-      bond_type TEXT,
-      FOREIGN KEY (molecule_id) REFERENCES molecule(molecule_id)
-    );
-    CREATE TABLE connected (
-      atom_id TEXT NOT NULL,
-      atom_id2 TEXT NOT NULL,
-      bond_id TEXT,
-      PRIMARY KEY (atom_id, atom_id2),
-      FOREIGN KEY (atom_id) REFERENCES atom(atom_id),
-      FOREIGN KEY (atom_id2) REFERENCES atom(atom_id),
-      FOREIGN KEY (bond_id) REFERENCES bond(bond_id)
-    );
-    CREATE TABLE molecule (
-      molecule_id TEXT NOT NULL PRIMARY KEY,
-      label TEXT
-    );
-    """
-    sql = """
-    SELECT DISTINCT T.element
-    FROM atom AS T
-    WHERE T.element NOT IN (
-      SELECT DISTINCT T1.element
-      FROM atom AS T1
-      INNER JOIN connected AS T2 ON T1.atom_id = T2.atom_id
-    )
-    """
-    database_path = tmp_path / "toxicology_247.sqlite"
-    result = instantiate_db(
-        sql,
-        schema,
-        f"sqlite:///{database_path}",
-        "sqlite",
-        db_id="toxicology_247",
-        max_iterations=10,
-        atom_null=0,
-        atom_dup=1,
-    )
-
-    assert result.success, result.error_msg
-    with sqlite3.connect(database_path) as connection:
-        rows = connection.execute("SELECT atom_id FROM atom").fetchall()
-    assert rows
-    assert all(atom_id is not None for (atom_id,) in rows)
+    prefix = "combined_bird" if speculate_first else "symbolic_engine_bird"
+    return _save_and_print(metrics, args.output_dir, prefix)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run ParSEval Data Generation experiment")
+    parser = argparse.ArgumentParser(
+        description="Run ParSEval BIRD dataset experiment"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["engine", "speculate", "combined"],
+        default="combined",
+        help="Generation mode: 'combined' (speculate+engine), 'engine' (SymbolicEngine), or 'speculate' (Propagator+Resolver)",
+    )
     parser.add_argument("--schema_fp", default="data/sqlite/schema.json")
     parser.add_argument("--gold_fp", default="data/sqlite/dev.json")
     parser.add_argument("--output_dir", default="results")
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--no_execute_sqlite", action="store_true")
+    parser.add_argument("--max_iterations", type=int, default=50)
     args = parser.parse_args()
-    run_bird_datagen_experiment(args)
+
+    dispatch_experiment(args)

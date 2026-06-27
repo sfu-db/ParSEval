@@ -3,7 +3,7 @@ name: Release to GitHub
 on:
   push:
     branches:
-      - dev
+      - main
     tags:
       - "v*"
 

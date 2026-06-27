@@ -604,3 +604,29 @@ class DBManager(metaclass=singletonMeta):
 
     def _shutdown(self) -> None:
         self._clean_stale_pools(idle_seconds=-1)
+
+
+def execute_query(
+    sql: str,
+    connection_string: str,
+    dialect: str = "sqlite",
+    timeout: int = 60,
+) -> "ExecutionResult":
+    """Execute a query and return an ExecutionResult."""
+    from parseval.states import ExecutionResult
+
+    t0 = time.time()
+    try:
+        with DBManager().get_connection(connection_string, dialect) as conn:
+            rows = conn.execute(sql, fetch="all", timeout=timeout)
+            return ExecutionResult(
+                query=sql,
+                rows=rows or [],
+                elapsed_time=time.time() - t0,
+            )
+    except Exception as e:
+        return ExecutionResult(
+            query=sql,
+            error_msg=str(e),
+            elapsed_time=time.time() - t0,
+        )

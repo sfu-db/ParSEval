@@ -53,14 +53,17 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
     }
     try:
         from parseval.main import disprove
-        from parseval.states import Semantics
 
         result = disprove(
             gold_sql, pred_sql, ddls, connection_string, "sqlite",
-            semantics=Semantics.BAG,
+            semantics="bag",
             max_iterations=5,
             atom_null=1,
+            atom_false=1,
             atom_dup=3,
+            project_null=1,
+            distinct_duplicate=1,
+            distinct_unique=1,
         )
         record["verdict"] = result.verdict.value
         record["error_msg"] = result.error_msg or ""

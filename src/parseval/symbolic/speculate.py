@@ -30,14 +30,13 @@ from parseval.dtype import (
     type_family,
 )
 from parseval.identity import (
+    ColumnKind,
     ColumnId,
     PARSEVAL_COLUMN_ID,
-    RelationKind,
     RelationId,
     column_identity,
     identifier_name,
     physical_column,
-    relation_id,
 )
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
@@ -60,7 +59,7 @@ from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var,
 from parseval.solver.types import col_type
 
 from .evaluator import PlanEvaluator
-from .types import BranchTree, BranchType
+from .types import BranchTree, BranchType, CoverageThresholds
 
 logger = logging.getLogger("parseval.speculate")
 
@@ -126,6 +125,7 @@ def _solver_column(
     var = SolverVar(column_id=col_id, relation_id=relation, row_scope=row_scope)
     table_display = relation.display if relation else ""
     col_node = exp.column(col_name, table=table_display)
+    col_node.meta[PARSEVAL_COLUMN_ID] = col_id
     set_solver_var(col_node, var)
     # Use provided meta["domain"] if available.
     if meta is not None and "domain" in meta:
@@ -332,7 +332,7 @@ class BranchSpec:
 
 
 # =============================================================================
-# SpeculateConfig
+# SpeculateConfig — thin wrapper around CoverageThresholds
 # =============================================================================
 
 
@@ -340,39 +340,44 @@ class BranchSpec:
 class SpeculateConfig:
     """Configuration for speculative data generation.
 
+    Derives branch generation thresholds from :class:`CoverageThresholds`.
     Each field controls how many rows to generate for that branch type.
     Set to 0 to skip that branch type entirely.
-
-    Attributes:
-        positive: Number of positive witness rows (satisfy all conditions).
-        negative: Number of negative rows per filter conjunct (violate WHERE).
-        null: Number of NULL rows per nullable column.
-        left_unmatched: Number of left-table rows with no join match.
-        right_unmatched: Number of right-table rows with no join match.
-        having_fail: Number of rows that fail HAVING conditions.
-        case_else: Number of rows exercising CASE WHEN ELSE arms.
-        boundary: Number of boundary value rows for edge-case testing.
     """
 
     positive: int = 1
     negative: int = 1
     null: int = 1
-    left_unmatched: int = 1
-    right_unmatched: int = 1
+    left_unmatched: int = 0
+    right_unmatched: int = 0
     having_fail: int = 1
     case_else: int = 1
-    boundary: int = 1
+    boundary: int = 0
+
+    @classmethod
+    def from_thresholds(cls, thresholds: CoverageThresholds) -> "SpeculateConfig":
+        """Derive speculate config from coverage thresholds."""
+        return cls(
+            positive=max(thresholds.atom_true, 1),
+            negative=thresholds.atom_false,
+            null=thresholds.atom_null,
+            left_unmatched=thresholds.join_no_match,
+            right_unmatched=thresholds.join_no_match,
+            having_fail=thresholds.having_fail,
+            case_else=thresholds.case_arm_skipped,
+            boundary=0,
+        )
 
     @classmethod
     def gold_non_empty(cls) -> SpeculateConfig:
-        """Config for generating only positive witness rows."""
+        """Config for generating positive witness rows plus negative/null/false branches."""
         return cls(
             positive=1,
-            negative=0,
-            null=0,
+            negative=1,
+            null=1,
             left_unmatched=0,
             right_unmatched=0,
-            having_fail=0,
+            having_fail=1,
             case_else=1,
             boundary=0,
         )
@@ -401,68 +406,33 @@ class SpeculateConfig:
 _COMPARISON_NODES = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)
 
 
-def _planner_alias_replacements(
-    steps,
-    *,
-    include_aggregate_aliases: bool,
-):
-    """Build a mapping from planner alias names to their source expressions."""
-    replacements: Dict[tuple, exp.Expression] = {}
-    visited: Set[int] = set()
-
-    def _iter_steps(items):
-        for item in items:
-            if id(item) in visited:
-                continue
-            visited.add(id(item))
-            yield item
-            for subplan in getattr(item, "subplan_dependencies", ()) or ():
-                yield subplan
-                if subplan.inner is not None:
-                    yield from _iter_steps((subplan.inner,))
-            for dep in getattr(item, "chain_dependencies", ()) or ():
-                yield from _iter_steps((dep,))
-
-    for step in _iter_steps(steps):
-        if not isinstance(step, Aggregate):
-            continue
-        source = step.source or step.name or ""
-        if include_aggregate_aliases:
-            for operand in getattr(step, "operands", ()) or ():
-                if isinstance(operand, exp.Alias):
-                    alias = operand.alias_or_name
-                    replacements[(source, alias)] = operand.this.copy()
-                    replacements[("", alias)] = operand.this.copy()
-            for agg_expr in step.aggregations:
-                if isinstance(agg_expr, exp.Alias):
-                    alias = agg_expr.alias_or_name
-                    replacements[(source, alias)] = agg_expr.this.copy()
-                    replacements[("", alias)] = agg_expr.this.copy()
-        for alias, group_expr in step.group.items():
-            replacements[(source, alias)] = group_expr.copy()
-            replacements[("", alias)] = group_expr.copy()
-    return replacements
+def _required_column_identity(col: exp.Column, context: str) -> ColumnId:
+    col_id = column_identity(col)
+    if col_id is None or col_id.relation is None:
+        raise ValueError(f"{context} column lacks planner identity: {col.sql()}")
+    return col_id
 
 
-def _replace_planner_aliases(
-    expression: exp.Expression,
-    replacements: Dict[tuple, exp.Expression],
-) -> exp.Expression:
-    """Replace planner-generated alias columns with their base expressions."""
-    if not replacements:
-        return expression
+def _relation_is_materializable(instance: Instance, relation: RelationId) -> bool:
+    return bool(relation.name and relation.name.normalized in instance.tables)
 
-    def _replace(node):
-        if not isinstance(node, exp.Column):
-            return node
-        table_key = node.table or ""
-        col_key = node.name
-        replacement = replacements.get((table_key, col_key)) or replacements.get(
-            ("", col_key)
-        )
-        return replacement.copy() if replacement is not None else node
 
-    return expression.transform(_replace)
+def _physical_source_id(col_id: ColumnId) -> ColumnId:
+    if col_id.kind is ColumnKind.PHYSICAL:
+        return col_id
+    current = col_id
+    for _ in range(10):
+        source = current.source_column_id
+        if source is None:
+            return current
+        if (
+            source.kind is ColumnKind.PHYSICAL
+            and source.relation is not None
+            and source.relation.name is not None
+        ):
+            return source
+        current = source
+    return current
 
 
 class Propagator:
@@ -506,7 +476,6 @@ class Propagator:
         self._negate_step: Optional[Step] = None
         self._negate_conjunct: int = 0
         self._plan_meta_cache = _build_plan_meta_cache(plan)
-        self._scan_relation_index = self._build_scan_relation_index()
         self._virtual_projection_cache = self._build_virtual_projection_cache()
 
     def _solver_col(
@@ -547,14 +516,9 @@ class Propagator:
 
     def _derive_scan(self, step: Scan, spec: BranchSpec) -> None:
         """Register table requirements for a Scan step."""
-        ann = self.plan.annotations.get(id(step))
-        if ann and ann.projected_columns:
-            relation = ann.projected_columns[0].relation
-            if relation.name and relation.name.normalized in self.instance.tables:
-                spec.require(relation)
-        elif isinstance(step.source, exp.Table):
-            relation = step.relation_id
-            if relation.name and relation.name.normalized in self.instance.tables:
+        relations = self.plan.annotation_for(step).source_relations
+        for relation in relations:
+            if _relation_is_materializable(self.instance, relation):
                 spec.require(relation)
         for sub in step.subplan_dependencies:
             if sub.inner:
@@ -587,68 +551,71 @@ class Propagator:
             source_keys = join_data.get("source_key", [])
             join_keys = join_data.get("join_key", [])
             for sk, jk in zip(source_keys, join_keys):
-                sk_id = self._ensure_column_identity(sk) if isinstance(sk, exp.Column) else None
-                jk_id = self._ensure_column_identity(jk) if isinstance(jk, exp.Column) else None
-                if sk_id is None or jk_id is None:
-                    raise ValueError(f"Join key lacks identity: sk={sk}, jk={jk}")
-                if sk_id and jk_id:
-                    sk_rel = sk_id.relation
-                    jk_rel = jk_id.relation
-                    if sk_rel and jk_rel:
-                        spec.require(sk_rel)
-                        spec.require(jk_rel)
-                        spec.equate(sk_id, jk_id)
-                        # Store join equality as expression.
-                        sk_table = (
-                            sk_rel.name.normalized
-                            if sk_rel.name
-                            else ""
-                        )
-                        jk_table = (
-                            jk_rel.name.normalized
-                            if jk_rel.name
-                            else ""
-                        )
-                        if sk_table and jk_table:
-                            eq_expr = exp.EQ(
-                                this=_solver_column(
-                                    self.instance, sk_id,
-                                ),
-                                expression=_solver_column(
-                                    self.instance, jk_id,
-                                ),
-                            )
-                            spec.requirements[sk_rel].constraints.append(
-                                eq_expr
-                            )
-                            spec.requirements[jk_rel].constraints.append(
-                                eq_expr
-                            )
-                            # Mark join key as group_key_column.
-                            req_jk = spec.require(jk_rel)
-                            if jk_id not in req_jk.group_key_columns:
-                                req_jk.group_key_columns.append(jk_id)
+                if not isinstance(sk, exp.Column) or not isinstance(jk, exp.Column):
+                    self._derive_expression_join_key(sk, spec)
+                    self._derive_expression_join_key(jk, spec)
+                    continue
+                sk_id = _required_column_identity(sk, "Join key")
+                jk_id = _required_column_identity(jk, "Join key")
+                sk_rel = sk_id.relation
+                jk_rel = jk_id.relation
+                spec.require(sk_rel)
+                spec.require(jk_rel)
+                spec.equate(sk_id, jk_id)
+                eq_expr = exp.EQ(
+                    this=_solver_column(self.instance, sk_id),
+                    expression=_solver_column(self.instance, jk_id),
+                )
+                spec.requirements[sk_rel].constraints.append(eq_expr)
+                spec.requirements[jk_rel].constraints.append(eq_expr)
+                req_jk = spec.require(jk_rel)
+                if jk_id not in req_jk.group_key_columns:
+                    req_jk.group_key_columns.append(jk_id)
+
+    def _derive_expression_join_key(
+        self, expr: exp.Expression,
+        spec: BranchSpec,
+    ) -> None:
+        """Require materializable columns referenced by a non-column join key."""
+        if isinstance(expr, exp.Column):
+            col_id = _required_column_identity(expr, "Join key")
+            source_id = _physical_source_id(col_id)
+            if source_id.relation and self._is_materializable_relation(source_id.relation):
+                req = spec.require(source_id.relation)
+                col_name = source_id.name.normalized
+                if not _has_is_not_null(req.constraints, col_name):
+                    req.constraints.append(_make_is_not_null(self._solver_col(source_id)))
+            return
+        for col in expr.find_all(exp.Column):
+            col_id = _required_column_identity(col, "Join key expression")
+            source_id = _physical_source_id(col_id)
+            if source_id.relation is None:
+                continue
+            if not self._is_materializable_relation(source_id.relation):
+                continue
+            req = spec.require(source_id.relation)
+            col_name = source_id.name.normalized
+            if not _has_is_not_null(req.constraints, col_name):
+                req.constraints.append(_make_is_not_null(self._solver_col(source_id)))
 
     def _derive_aggregate(self, step: Aggregate, spec: BranchSpec) -> None:
         """Mark group key columns and add aggregate NULL constraints."""
-        # GROUP BY: mark group columns.
-        if step.group:
-            for group_expr in step.group.values():
-                for col in group_expr.find_all(exp.Column):
-                    col_id = column_identity(col)
-                    if col_id is None:
-                        continue
-                    relation = col_id.relation
-                    matched = col_id.name.normalized
-                    if matched and relation.name:
-                        table_name = relation.name.normalized
-                        if table_name in self.instance.tables:
-                            req = spec.require(relation)
-                            spec.equivalences.find(col_id)
-                            if col_id not in req.group_key_columns:
-                                req.group_key_columns.append(col_id)
-        # Aggregate NULL detection.
-        if not self._is_gold_mode:
+        metadata = self.plan.annotation_for(step).metadata.get("aggregation", {})
+        group_sources = metadata.get("group_sources", {})
+        for sources in group_sources.values():
+            for source_id in sources:
+                if source_id.relation is None:
+                    raise ValueError(f"Group source lacks relation: {source_id}")
+                if not _relation_is_materializable(self.instance, source_id.relation):
+                    continue
+                req = spec.require(source_id.relation)
+                spec.equivalences.find(source_id)
+                if source_id not in req.group_key_columns:
+                    req.group_key_columns.append(source_id)
+                req.min_rows = max(req.min_rows, 3)
+        # Aggregate NULL detection — only for non-positive specs.
+        # Positive specs need real values for aggregates, not NULLs.
+        if spec.branch != "positive":
             for agg_expr in step.aggregations:
                 self._add_aggregate_null_constraints(agg_expr, spec)
         else:
@@ -691,22 +658,7 @@ class Propagator:
                     self._store_expression(scalar_cond, spec)
             else:
                 self._store_expression(step.condition, spec)
-            counted_relation = self._find_counted_table(step.condition)
-            min_size = self._extract_min_group_size(step.condition)
-            if (
-                counted_relation
-                and counted_relation in spec.requirements
-            ):
-                spec.requirements[counted_relation].min_rows = max(
-                    spec.requirements[counted_relation].min_rows,
-                    min_size,
-                )
-            else:
-                for req in spec.requirements.values():
-                    req.min_rows = max(req.min_rows, min_size)
-            self._extract_having_value_constraints(
-                step.condition, spec, min_size
-            )
+            self._apply_having_constraints(step, spec)
         elif step is self._negate_step and step.condition:
             # Negate the HAVING condition.
             negated = negate_predicate(step.condition.copy())
@@ -714,56 +666,40 @@ class Propagator:
 
     def _derive_project(self, step: Project, spec: BranchSpec) -> None:
         """Add IS NOT NULL for projected columns and handle DISTINCT."""
-        projected = self._projected_columns(step)
-        # Build col_name -> ColumnId mapping from column identity.
-        col_ids: dict[str, ColumnId] = {}
-        for proj in step.projections:
-            if not isinstance(proj, exp.Expression):
+        ann = self.plan.annotation_for(step)
+        projected_ids = tuple(ann.projected_columns) + tuple(ann.referenced_columns)
+        for col_id in projected_ids:
+            if (
+                col_id.relation is not None
+                and not _relation_is_materializable(self.instance, col_id.relation)
+                and self._virtual_projection_for_relation(col_id.relation) is not None
+            ):
+                source_id = col_id
+            else:
+                source_id = _physical_source_id(col_id)
+            relation = source_id.relation
+            if relation is None or not self._is_materializable_relation(relation):
                 continue
-            for col in proj.find_all(exp.Column):
-                cid = column_identity(col)
-                if cid is None:
-                    continue
-                col_ids[cid.name.normalized] = cid
-        # Route each projected column to its correct table.
-        for col_name, table_alias in projected:
-            # Skip synthetic aliases (_g0, _h, _a_0) — they don't map to DDL columns.
+            col_name = source_id.name.normalized
             if col_name.startswith("_"):
                 continue
-            for relation_id, tc in spec.requirements.items():
-                norm_alias = table_alias
-                if tc.table != norm_alias and (
-                    tc.alias is None
-                    or tc.alias != norm_alias
-                ):
-                    continue
-                if not _has_is_not_null(tc.constraints, col_name):
-                    # Use plan identity if available to avoid duplicate SolverVars.
-                    plan_cid = col_ids.get(col_name)
-                    if plan_cid is not None:
-                        col_node = _solver_column(
-                            self.instance, plan_cid,
-                        )
-                        sv = solver_var(col_node)
-                        if sv is not None:
-                            plan_sv = SolverVar(column_id=plan_cid, relation_id=sv.relation_id, row_scope=sv.row_scope)
-                            set_solver_var(col_node, plan_sv)
-                    else:
-                        col_node = self._solver_col(physical_column(col_name, relation_id))
-                    tc.constraints.append(_make_is_not_null(col_node))
-                break
+            tc = spec.require(relation)
+            if not _has_is_not_null(tc.constraints, col_name):
+                tc.constraints.append(_make_is_not_null(self._solver_col(source_id)))
         # Duplicate / DISTINCT handling.
         for relation_id, tc in spec.requirements.items():
             dup_ids = []
-            for col_name, table_alias in projected:
-                norm_alias = table_alias
-                if tc.table == norm_alias or (
-                    tc.alias is not None
-                    and tc.alias == norm_alias
+            for col_id in projected_ids:
+                if (
+                    col_id.relation is not None
+                    and not _relation_is_materializable(self.instance, col_id.relation)
+                    and self._virtual_projection_for_relation(col_id.relation) is not None
                 ):
-                    cid = col_ids.get(col_name)
-                    if cid is not None:
-                        dup_ids.append(cid)
+                    source_id = col_id
+                else:
+                    source_id = _physical_source_id(col_id)
+                if source_id.relation == relation_id:
+                    dup_ids.append(source_id)
             if step.distinct and dup_ids:
                 tc.duplicate_columns = dup_ids
                 tc.min_rows = max(tc.min_rows, 2)
@@ -799,34 +735,11 @@ class Propagator:
         else:
             needed = offset + int(limit_val)
         # Apply min_rows to the driving table, resolving alias to real relation.
-        driving_alias = getattr(step, "source", None)
-        if driving_alias:
-            resolved = self._resolve_table_alias(driving_alias)
-            if resolved is not None and resolved in spec.requirements:
-                spec.requirements[resolved].min_rows = max(
-                    spec.requirements[resolved].min_rows, needed
+        for relation in self.plan.annotation_for(step).source_relations:
+            if relation in spec.requirements:
+                spec.requirements[relation].min_rows = max(
+                    spec.requirements[relation].min_rows, needed
                 )
-
-    def _resolve_table_alias(self, alias: str) -> RelationId | None:
-        """Resolve a table alias to the real RelationId via plan annotations."""
-        alias_norm = alias
-        for step in self.plan.ordered_steps:
-            if not isinstance(step, Scan):
-                continue
-            ann = self.plan.annotations.get(id(step))
-            if ann and ann.projected_columns:
-                rel = ann.projected_columns[0].relation
-                # Match by alias or real name
-                if rel.alias and rel.alias.normalized == alias_norm:
-                    return rel
-                if rel.name and rel.name.normalized == alias_norm:
-                    return rel
-            # Also check step.name
-            if step.name and step.name == alias_norm:
-                rid = getattr(step, "relation_id", None)
-                if rid is not None:
-                    return rid
-        return None
 
     def _derive_set_op(self, step: SetOperation, spec: BranchSpec) -> None:
         """No-op for SetOperation steps."""
@@ -839,48 +752,38 @@ class Propagator:
         parent_condition: Optional[exp.Expression] = None,
     ) -> None:
         """Handle EXISTS/IN/SCALAR subplan correlation."""
-        negated_exists = (
-            sub.kind.value == "exists"
-            and self._subplan_anchor_is_negated(
-                parent_condition, sub.anchor
-            )
-        )
-        if sub.kind.value == "exists" and sub.correlation and not negated_exists:
-            for corr_col in sub.correlation:
-                corr_id = column_identity(corr_col)
-                if corr_id is None or corr_id.relation is None:
-                    continue
-                outer_relation = corr_id.relation
-                outer_matched = corr_id.name.normalized
-                if outer_matched:
-                    spec.require(outer_relation)
-                    inner_col_id = self._find_inner_corr_column(sub, spec)
-                    if inner_col_id is not None:
-                        outer_col_id = corr_id if corr_id is not None else physical_column(
-                            outer_matched, outer_relation
-                        )
-                        spec.equate(outer_col_id, inner_col_id)
-                        eq_expr = exp.EQ(
-                            this=self._solver_col(outer_col_id),
-                            expression=self._solver_col(inner_col_id),
-                        )
-                        spec.requirements[outer_relation].constraints.append(
-                            eq_expr
-                        )
+        metadata = self.plan.annotation_for(sub).metadata.get("subquery")
+        if metadata is None:
+            raise ValueError("SubPlan lacks planner subquery metadata")
 
-        elif sub.kind.value == "in":
-            self._propagate_in_subplan(sub, spec)
-
-        elif sub.kind.value == "scalar":
-            self._propagate_scalar_subplan(sub, spec)
-
-        # Scalar subqueries are repaired from deferred predicates.
-        if (
-            sub.inner
-            and not negated_exists
-            and sub.kind.value != "scalar"
-        ):
+        if metadata["cardinality"] != "zero" and sub.inner is not None:
             self._walk_step(sub.inner, spec)
+
+        for output_id in metadata.get("output_columns", ()):
+            source_id = _physical_source_id(output_id)
+            if source_id.relation and _relation_is_materializable(self.instance, source_id.relation):
+                spec.require(source_id.relation)
+
+        predicate_id = metadata.get("predicate_column")
+        output_columns = metadata.get("output_columns", ())
+        if (
+            metadata["kind"] == "in"
+            and metadata["polarity"] == "positive"
+            and predicate_id is not None
+            and output_columns
+        ):
+            self._add_join_equality(
+                _physical_source_id(predicate_id),
+                _physical_source_id(output_columns[0]),
+                spec,
+            )
+
+        for correlation in metadata.get("correlations", ()):
+            if correlation.get("operator") != "eq":
+                continue
+            inner_id = _physical_source_id(correlation["inner"])
+            outer_id = _physical_source_id(correlation["outer"])
+            self._add_join_equality(outer_id, inner_id, spec)
 
     # -----------------------------------------------------------------
     # Top-level propagation
@@ -1047,42 +950,21 @@ class Propagator:
         """Decompose AND, ensure SolverVar, store per-table."""
         conjuncts = self._split_conjuncts(expr)
         for conjunct in conjuncts:
-            # Try to unwrap comparison subqueries before deferring.
-            if isinstance(conjunct, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NEQ)) and (
-                conjunct.this.find(exp.Subquery) or conjunct.expression.find(exp.Subquery)
-            ):
-                if self._unwrap_comparison_subquery(conjunct, spec):
-                    continue
-            # Handle IN (SELECT ...) — extract inner conditions + equality.
-            if isinstance(conjunct, exp.In) and conjunct.args.get("query"):
-                if self._unwrap_in_subquery(conjunct, spec):
-                    continue
-            # Handle NOT IN (SELECT ...) — build != constraints.
-            if isinstance(conjunct, exp.Not) and isinstance(conjunct.this, exp.In) and conjunct.this.args.get("query"):
-                if self._unwrap_not_in_subquery(conjunct.this, spec):
-                    continue
-            # Handle EXISTS (SELECT ...) — extract inner WHERE conditions.
-            if isinstance(conjunct, exp.Exists):
-                if self._unwrap_exists_subquery(conjunct, spec):
-                    continue
-            # Other subquery-containing conjuncts must be deferred.
             if conjunct.find(exp.Exists) or conjunct.find(exp.Subquery):
                 spec.deferred.append(conjunct.copy())
                 continue
             # Ensure SolverVar on all columns.
             for col in conjunct.find_all(exp.Column):
                 if solver_var(col) is None:
-                    col_id = self._ensure_column_identity(col)
-                    if col_id is not None and col_id.relation is not None:
-                        set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
+                    col_id = _required_column_identity(col, "Stored expression")
+                    set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
             # Find the primary relation from the first column with identity.
             relation = None
             for col in conjunct.find_all(exp.Column):
-                col_id = self._ensure_column_identity(col)
-                if col_id and col_id.relation:
-                    if self._is_materializable_relation(col_id.relation):
-                        relation = col_id.relation
-                        break
+                col_id = _required_column_identity(col, "Stored expression")
+                if self._is_materializable_relation(col_id.relation):
+                    relation = col_id.relation
+                    break
             if relation:
                 tc = spec.require(relation)
                 tc.constraints.append(conjunct)
@@ -1113,18 +995,47 @@ class Propagator:
             name = step.name
             if not name:
                 continue
+            sub_output_columns = self.plan.annotation_for(step).metadata.get(
+                "subquery", {}
+            ).get("output_columns", ())
+            sub_outputs = {
+                column.name.normalized: column
+                for column in sub_output_columns
+            }
             projections: Dict[str, exp.Expression] = {}
             for inner_step in _iter_steps_with_subplans(step.inner):
                 if not isinstance(inner_step, Project):
                     continue
-                for projection in inner_step.projections:
+                projected_ids = list(getattr(inner_step, "output_column_ids", ()) or ())
+                fallback_columns = self._step_referenced_column_ids(inner_step)
+                for idx, projection in enumerate(inner_step.projections):
                     if isinstance(projection, exp.Alias):
+                        output_name = projection.alias_or_name
+                        output_id = (
+                            projected_ids[idx]
+                            if idx < len(projected_ids)
+                            else sub_outputs.get(identifier_name(output_name).normalized)
+                        )
                         projections[projection.alias_or_name] = (
-                            self._copy_projection_expression(projection.this)
+                            self._copy_projection_expression(
+                                projection.this,
+                                output_id=output_id,
+                                fallback_columns=fallback_columns,
+                            )
                         )
                     elif isinstance(projection, exp.Column):
+                        output_name = projection.name
+                        output_id = (
+                            projected_ids[idx]
+                            if idx < len(projected_ids)
+                            else sub_outputs.get(identifier_name(output_name).normalized)
+                        )
                         projections[projection.name] = (
-                            self._copy_projection_expression(projection)
+                            self._copy_projection_expression(
+                                projection,
+                                output_id=output_id,
+                                fallback_columns=fallback_columns,
+                            )
                         )
                 if projections:
                     break
@@ -1132,85 +1043,47 @@ class Propagator:
                 cache[name] = projections
         return cache
 
-    def _build_scan_relation_index(self) -> Dict[str, Optional[RelationId]]:
-        """Map scan qualifiers to physical relations when the mapping is unambiguous."""
-        index: Dict[str, Optional[RelationId]] = {}
-        for step in _iter_all_plan_steps(self.plan):
-            if not isinstance(step, Scan) or not isinstance(step.source, exp.Table):
-                continue
-            try:
-                physical = self.instance.table_id(step.source)
-            except (KeyError, ValueError):
-                continue
-            alias_name = step.source.alias_or_name
-            alias_ident = (
-                identifier_name(alias_name, dialect=self.dialect)
-                if alias_name and alias_name != step.source.name
-                else None
-            )
-            relation = relation_id(
-                RelationKind.TABLE,
-                physical.name,
-                catalog=physical.catalog,
-                db=physical.db,
-                alias=alias_ident,
-                scope_id=f"s{id(step)}",
-            )
-            qualifiers = {physical.name.normalized}
-            if alias_ident is not None:
-                qualifiers.add(alias_ident.normalized)
-            for qualifier in qualifiers:
-                existing = index.get(qualifier)
-                if existing is None and qualifier in index:
-                    continue
-                if existing is None:
-                    index[qualifier] = relation
-                elif (
-                    existing.name != relation.name
-                    or existing.alias != relation.alias
-                ):
-                    index[qualifier] = None
-        return index
+    def _step_referenced_column_ids(self, step: Step) -> Tuple[ColumnId, ...]:
+        result: List[ColumnId] = []
+        for expression in _step_expressions(step):
+            for column in expression.find_all(exp.Column):
+                col_id = column_identity(column)
+                if col_id is not None:
+                    result.append(col_id)
+        return tuple(result)
 
     def _copy_projection_expression(
-        self, expression: exp.Expression
+        self,
+        expression: exp.Expression,
+        *,
+        output_id: Optional[ColumnId] = None,
+        fallback_columns: Tuple[ColumnId, ...] = (),
     ) -> exp.Expression:
+        if isinstance(expression, exp.Column):
+            expression_id = column_identity(expression)
+            if expression_id is not None and expression_id.relation is not None:
+                return self._solver_col(expression_id)
+            if output_id is not None:
+                source_id = _physical_source_id(output_id)
+                if source_id.relation is not None:
+                    return self._solver_col(source_id)
         copied = expression.copy()
         original_columns = list(expression.find_all(exp.Column))
         copied_columns = list(copied.find_all(exp.Column))
-        for original, copied_col in zip(original_columns, copied_columns):
-            original_id = self._ensure_column_identity(original)
-            if original_id is not None:
-                copied_col.meta[PARSEVAL_COLUMN_ID] = original_id
-        return copied
-
-    def _ensure_column_identity(
-        self, col: exp.Column
-    ) -> Optional[ColumnId]:
-        col_id = column_identity(col)
-        if col_id is not None:
-            return col_id
-        table = identifier_name(col.table, dialect=self.dialect).normalized
-        if not table:
-            return None
-        if table in self.instance.tables:
-            relation = self.instance.table_id(table)
-        else:
-            relation = self._scan_relation_index.get(table)
-            if relation is None:
-                virtual_projection_cache = getattr(
-                    self, "_virtual_projection_cache", {}
+        for idx, (original, copied_col) in enumerate(zip(original_columns, copied_columns)):
+            original_id = column_identity(original)
+            if original_id is None and idx < len(fallback_columns):
+                original_id = _physical_source_id(fallback_columns[idx])
+            if original_id is None or original_id.relation is None:
+                raise ValueError(
+                    f"Virtual projection column lacks planner identity: {original.sql()}"
                 )
-                projection = virtual_projection_cache.get(table, {}).get(col.name)
-                if isinstance(projection, exp.Column):
-                    projected_id = column_identity(projection)
-                    if projected_id is not None:
-                        col.meta[PARSEVAL_COLUMN_ID] = projected_id
-                        return projected_id
-                return None
-        resolved = physical_column(col.name, relation, dialect=self.dialect)
-        col.meta[PARSEVAL_COLUMN_ID] = resolved
-        return resolved
+            replacement = self._solver_col(_physical_source_id(original_id))
+            copied_col.meta.update(replacement.meta)
+            set_solver_var(copied_col, solver_var(replacement))
+            if hasattr(replacement, "type") and replacement.type is not None:
+                copied_col.type = replacement.type
+        return copied
 
     def _push_virtual_requirements(self, spec: BranchSpec) -> None:
         """Push constraints on virtual CTE/subquery outputs into their producers."""
@@ -1368,262 +1241,6 @@ class Propagator:
         if not source_constraints:
             return None
         return exp.and_(*source_constraints)
-
-    def _unwrap_comparison_subquery(
-        self, conjunct: exp.Expression, spec: BranchSpec
-    ) -> bool:
-        """Unwrap column op (SELECT col FROM table WHERE condition) into:
-        - Inner WHERE conditions added to the inner table's constraints
-        - For EQ: join equality outer_column = inner_column
-        - For other comparisons: outer comparison deferred (needs scalar value)
-
-        Returns True if successfully unwrapped, False otherwise.
-        """
-        left, right = conjunct.this, conjunct.expression
-        # Find which side has the subquery.
-        if right.find(exp.Subquery):
-            outer_col, subquery_side = left, right
-        elif left.find(exp.Subquery):
-            outer_col, subquery_side = right, left
-        else:
-            return False
-
-        # Must be a simple column on the outer side.
-        if not isinstance(outer_col, exp.Column):
-            return False
-
-        # Extract the subquery.
-        subquery = subquery_side.find(exp.Subquery) if not isinstance(subquery_side, exp.Subquery) else subquery_side
-        if subquery is None:
-            return False
-
-        inner_expr = subquery.this if isinstance(subquery, exp.Subquery) else subquery
-        if not isinstance(inner_expr, exp.Select):
-            return False
-
-        # Find the inner SELECT column (first projection).
-        inner_col_name = None
-        for proj in inner_expr.expressions:
-            if isinstance(proj, exp.Column):
-                inner_col_name = proj.name
-                break
-            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
-                inner_col_name = proj.this.name
-                break
-        if inner_col_name is None:
-            return False
-
-        # Find the inner table's RelationId from the plan.
-        inner_relation = self._find_inner_table_relation(inner_expr)
-        if inner_relation is None:
-            return False
-
-        # Get the outer column's identity.
-        outer_id = column_identity(outer_col)
-        if outer_id is None or outer_id.relation is None:
-            return False
-
-        # Add inner WHERE conditions to the inner table's constraints.
-        where = inner_expr.args.get("where")
-        if where:
-            for conjunct_inner in self._split_conjuncts(where.this):
-                if conjunct_inner.find(exp.Subquery) or conjunct_inner.find(exp.Exists):
-                    continue
-                for col in conjunct_inner.find_all(exp.Column):
-                    if solver_var(col) is None:
-                        col_id = column_identity(col)
-                        if col_id is not None and col_id.relation is not None:
-                            set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
-                tc = spec.require(inner_relation)
-                tc.constraints.append(conjunct_inner.copy())
-
-        inner_cid = physical_column(
-            inner_col_name, inner_relation
-        )
-
-        if isinstance(conjunct, exp.EQ):
-            # For EQ: add join equality outer_column = inner_column.
-            inner_col_node = _solver_column(self.instance, inner_cid)
-            outer_col_node = _solver_column(self.instance, outer_id)
-            eq_expr = exp.EQ(this=outer_col_node, expression=inner_col_node)
-            spec.require(outer_id.relation).constraints.append(eq_expr)
-            spec.require(inner_relation).constraints.append(eq_expr)
-            spec.equate(outer_id, inner_cid)
-        else:
-            # For GT/GTE/LT/LTE/NEQ: add inner table requirement and
-            # defer the outer comparison (needs scalar value from subquery).
-            spec.require(inner_relation)
-            spec.deferred.append(conjunct.copy())
-
-        return True
-
-    def _unwrap_in_subquery(
-        self, conjunct: exp.In, spec: BranchSpec
-    ) -> bool:
-        """Unwrap x IN (SELECT col FROM table WHERE condition) into:
-        - Inner WHERE conditions added to the inner table's constraints
-        - Join equality outer_column = inner_column
-        """
-        outer_col = conjunct.this
-        if not isinstance(outer_col, exp.Column):
-            return False
-
-        query = conjunct.args.get("query")
-        if not isinstance(query, exp.Subquery):
-            return False
-        inner_expr = query.this
-        if not isinstance(inner_expr, exp.Select):
-            return False
-
-        # Find the inner SELECT column.
-        inner_col_name = None
-        for proj in inner_expr.expressions:
-            if isinstance(proj, exp.Column):
-                inner_col_name = proj.name
-                break
-            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
-                inner_col_name = proj.this.name
-                break
-        if inner_col_name is None:
-            return False
-
-        # Find the inner table's RelationId from the plan.
-        inner_relation = self._find_inner_table_relation(inner_expr)
-        if inner_relation is None:
-            return False
-
-        # Get the outer column's identity.
-        outer_id = column_identity(outer_col)
-        if outer_id is None or outer_id.relation is None:
-            return False
-
-        # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner_expr, inner_relation, spec)
-
-        # Add join equality: outer_column = inner_column.
-        inner_cid = physical_column(inner_col_name, inner_relation)
-        self._add_join_equality(outer_id, inner_cid, spec)
-
-        return True
-
-    def _unwrap_not_in_subquery(
-        self, conjunct: exp.In, spec: BranchSpec
-    ) -> bool:
-        """Unwrap x NOT IN (SELECT col FROM table WHERE condition) into:
-        - Inner WHERE conditions added to the inner table's constraints
-        - Non-equality constraint x != inner_column (deferred)
-        """
-        outer_col = conjunct.this
-        if not isinstance(outer_col, exp.Column):
-            return False
-
-        query = conjunct.args.get("query")
-        if not isinstance(query, exp.Subquery):
-            return False
-        inner_expr = query.this
-        if not isinstance(inner_expr, exp.Select):
-            return False
-
-        # Find the inner SELECT column.
-        inner_col_name = None
-        for proj in inner_expr.expressions:
-            if isinstance(proj, exp.Column):
-                inner_col_name = proj.name
-                break
-            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
-                inner_col_name = proj.this.name
-                break
-        if inner_col_name is None:
-            return False
-
-        # Find the inner table's RelationId from the plan.
-        inner_relation = self._find_inner_table_relation(inner_expr)
-        if inner_relation is None:
-            return False
-
-        # Get the outer column's identity.
-        outer_id = column_identity(outer_col)
-        if outer_id is None or outer_id.relation is None:
-            return False
-
-        # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner_expr, inner_relation, spec)
-
-        # For NOT IN, we can't directly build != constraints because the
-        # subquery may return multiple values. Defer the evaluation.
-        spec.deferred.append(conjunct.copy())
-        return True
-
-    def _unwrap_exists_subquery(
-        self, conjunct: exp.Exists, spec: BranchSpec
-    ) -> bool:
-        """Unwrap EXISTS (SELECT ... WHERE condition) into:
-        - Inner WHERE conditions added to the inner table's constraints
-        """
-        inner = conjunct.this
-        if isinstance(inner, exp.Subquery):
-            inner = inner.this
-        if not isinstance(inner, exp.Select):
-            return False
-
-        # Find the inner table's RelationId from the plan.
-        inner_relation = self._find_inner_table_relation(inner)
-        if inner_relation is None:
-            return False
-
-        # Add inner WHERE conditions.
-        self._add_inner_where_conditions(inner, inner_relation, spec)
-
-        # EXISTS just needs the inner table to have rows — the WHERE
-        # conditions are already added. No further constraint needed.
-        return True
-
-    def _find_inner_table_name(self, inner_expr: exp.Select) -> Optional[str]:
-        """Find the first real table name in an inner SELECT's FROM clause."""
-        from_clause = inner_expr.args.get("from")
-        if from_clause is None:
-            return None
-        inner_table_node = from_clause.this if isinstance(from_clause, exp.From) else from_clause
-        if isinstance(inner_table_node, exp.Table):
-            return inner_table_node.name
-        return None
-
-    def _find_inner_table_relation(self, inner_expr: exp.Select) -> Optional[RelationId]:
-        """Find the inner table's RelationId from the plan.
-
-        Walks the plan's Scan steps to find one matching the inner table name.
-        """
-        inner_table_name = self._find_inner_table_name(inner_expr)
-        if inner_table_name is None:
-            return None
-        for step in self.plan.ordered_steps:
-            if isinstance(step, Scan) and step.relation_id is not None:
-                rid = step.relation_id
-                table_name = rid.name.normalized if rid.name else ""
-                if table_name == inner_table_name:
-                    return rid
-        # Fallback: try instance lookup.
-        if inner_table_name in self.instance.tables:
-            return _relation_for_table(self.instance, inner_table_name)
-        return None
-
-    def _add_inner_where_conditions(
-        self, inner_expr: exp.Select, inner_relation: RelationId, spec: BranchSpec
-    ) -> None:
-        """Extract WHERE conditions from an inner SELECT and add them to the spec."""
-        where = inner_expr.args.get("where")
-        if not where:
-            return
-        for conjunct_inner in self._split_conjuncts(where.this):
-            if conjunct_inner.find(exp.Subquery) or conjunct_inner.find(exp.Exists):
-                continue
-            for col in conjunct_inner.find_all(exp.Column):
-                if solver_var(col) is None:
-                    col_id = column_identity(col)
-                    if col_id is not None and col_id.relation is not None:
-                        set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
-            tc = spec.require(inner_relation)
-            tc.constraints.append(conjunct_inner.copy())
 
     def _add_join_equality(
         self, outer_id: ColumnId, inner_cid: ColumnId, spec: BranchSpec
@@ -2246,208 +1863,6 @@ class Propagator:
                     )
                     req.constraints.append(not_in)
 
-    def _subplan_anchor_is_negated(
-        self,
-        predicate: Optional[exp.Expression],
-        anchor: Optional[exp.Expression],
-    ) -> bool:
-        """Return True when a subplan anchor has odd NOT polarity."""
-        if predicate is None or anchor is None:
-            return False
-        negations = 0
-        node = anchor.parent
-        while node is not None:
-            if isinstance(node, exp.Not):
-                negations += 1
-            if node is predicate:
-                return negations % 2 == 1
-            node = node.parent
-        return False
-
-    def _propagate_in_subplan(self, sub: SubPlan, spec: BranchSpec):
-        """Handle IN (SELECT col FROM t WHERE ...)."""
-        anchor = sub.anchor
-        if not isinstance(anchor, exp.In):
-            return
-        outer_col = anchor.this
-        if not isinstance(outer_col, exp.Column):
-            return
-        outer_id = column_identity(outer_col)
-        if outer_id and outer_id.relation:
-            outer_relation = outer_id.relation
-            outer_matched = outer_id.name.normalized
-        else:
-            # Skip if no identity — can't resolve alias-based references.
-            return
-        if not outer_matched:
-            return
-        inner_cid = self._find_inner_select_column(sub, spec)
-        if inner_cid is not None:
-            spec.require(outer_relation)
-            outer_cid = outer_id if outer_id is not None else physical_column(
-                outer_matched, outer_relation
-            )
-            spec.equate(outer_cid, inner_cid)
-            eq_expr = exp.EQ(
-                this=self._solver_col(outer_cid),
-                expression=self._solver_col(inner_cid),
-            )
-            spec.requirements[outer_relation].constraints.append(eq_expr)
-
-    def _propagate_scalar_subplan(
-        self, sub: SubPlan, spec: BranchSpec
-    ):
-        """Ensure scalar subquery's inner table has at least one row."""
-        stack = [sub.inner]
-        visited: set = set()
-        while stack:
-            step = stack.pop()
-            if id(step) in visited:
-                continue
-            visited.add(id(step))
-            if isinstance(step, Scan) and step.source:
-                if isinstance(step.source, exp.Table):
-                    name = step.source.name
-                    rel = _relation_for_table(self.instance, name)
-                    tname = rel.name.normalized if rel.name else ""
-                    if tname in self.instance.tables:
-                        spec.require(rel)
-            stack.extend(step.chain_dependencies)
-
-        # Equate correlated columns.
-        if sub.correlation:
-            for corr_col in sub.correlation:
-                corr_id = column_identity(corr_col)
-                if corr_id and corr_id.relation:
-                    outer_relation = corr_id.relation
-                    outer_matched = corr_id.name.normalized
-                else:
-                    outer_relation = _relation_for_table(
-                         self.instance, corr_col.table or ""
-                    )
-                    outer_matched = corr_col.name
-                if not outer_matched:
-                    continue
-                inner_cid = self._find_corr_inner_column(
-                    sub, corr_col.name
-                )
-                if inner_cid is not None:
-                    spec.require(outer_relation)
-                    outer_cid = corr_id if corr_id is not None else physical_column(
-                        outer_matched, outer_relation
-                    )
-                    spec.equate(outer_cid, inner_cid)
-                    eq_expr = exp.EQ(
-                        this=self._solver_col(outer_cid),
-                        expression=self._solver_col(inner_cid),
-                    )
-                    if outer_relation in spec.requirements:
-                        spec.requirements[
-                            outer_relation
-                        ].constraints.append(eq_expr)
-
-    def _find_inner_select_column(
-        self, sub: SubPlan, spec: BranchSpec
-    ) -> Optional[ColumnId]:
-        """Find the inner plan's source column for IN subqueries with full identity.
-
-        Returns ColumnId or None.
-        """
-        proj_col_id = None
-        stack = [sub.inner]
-        visited: set = set()
-        while stack:
-            step = stack.pop()
-            if id(step) in visited:
-                continue
-            visited.add(id(step))
-            if isinstance(step, Project) and step.projections:
-                proj = step.projections[0]
-                if isinstance(proj, exp.Expression):
-                    for col in proj.find_all(exp.Column):
-                        cid = column_identity(col)
-                        if cid is not None:
-                            proj_col_id = cid
-                            break
-            stack.extend(step.chain_dependencies)
-
-        if proj_col_id is None:
-            return None
-
-        # Ensure the Scan table is required.
-        stack = [sub.inner]
-        visited = set()
-        while stack:
-            step = stack.pop()
-            if id(step) in visited:
-                continue
-            visited.add(id(step))
-            if isinstance(step, Scan) and step.source:
-                if isinstance(step.source, exp.Table):
-                    name = step.source.name
-                    rel = _relation_for_table(self.instance, name)
-                    tname = rel.name.normalized if rel.name else ""
-                    if tname in self.instance.tables:
-                        spec.require(rel)
-            stack.extend(step.chain_dependencies)
-        return proj_col_id
-
-    def _find_inner_corr_column(
-        self, sub: SubPlan, spec: BranchSpec
-    ) -> Optional[ColumnId]:
-        """Find the inner plan's correlated column with full identity.
-
-        Returns ColumnId or None.
-        """
-        stack = [sub.inner]
-        while stack:
-            step = stack.pop()
-            if isinstance(step, Filter) and step.condition:
-                for col in step.condition.find_all(exp.Column):
-                    col_id = column_identity(col)
-                    if col_id is None or col_id.relation is None:
-                        continue
-                    tname = (
-                        col_id.relation.name.normalized
-                        if col_id.relation.name
-                        else ""
-                    )
-                    if col_id.name.normalized and tname in self.instance.tables:
-                        spec.require(col_id.relation)
-                        return col_id
-            stack.extend(step.chain_dependencies)
-        return None
-
-    def _find_corr_inner_column(
-        self, sub: SubPlan, col_name: str
-    ) -> Optional[ColumnId]:
-        """Find the inner plan's column matching col_name with full identity.
-
-        Returns ColumnId or None.
-        """
-        stack = [sub.inner]
-        visited: set = set()
-        while stack:
-            step = stack.pop()
-            if id(step) in visited:
-                continue
-            visited.add(id(step))
-            if isinstance(step, Filter) and step.condition:
-                for col in step.condition.find_all(exp.Column):
-                    if col.name.lower() == col_name.lower():
-                        col_id = column_identity(col)
-                        if col_id is None or col_id.relation is None:
-                            continue
-                        tname = (
-                            col_id.relation.name.normalized
-                            if col_id.relation.name
-                            else ""
-                        )
-                        if col_id.name.normalized and tname in self.instance.tables:
-                            return col_id
-            stack.extend(step.chain_dependencies)
-        return None
-
     # -----------------------------------------------------------------
     # Column equality extraction (for Union-Find)
     # -----------------------------------------------------------------
@@ -2478,221 +1893,82 @@ class Propagator:
     # HAVING helpers
     # -----------------------------------------------------------------
 
-    def _extract_agg_and_threshold(self, node: exp.Expression):
-        """Return (agg_expr, threshold, op_class) from a comparison node."""
-        left_has_agg = node.this.find((exp.Avg, exp.Sum, exp.Count))
-        if left_has_agg:
-            return node.this, concrete(node.expression), type(node)
-        right_has_agg = node.expression.find(
-            (exp.Avg, exp.Sum, exp.Count)
+    def _apply_having_constraints(self, step: Having, spec: BranchSpec) -> None:
+        constraints = self.plan.annotation_for(step).metadata.get(
+            "having_constraints", ()
         )
-        if right_has_agg:
-            return node.expression, concrete(node.this), type(node)
-        return None, None, None
+        if not constraints:
+            return
+        for constraint in constraints:
+            argument = constraint.get("argument")
+            if isinstance(argument, ColumnId) and argument.relation is not None:
+                target_requirements = [
+                    spec.requirements[argument.relation]
+                ] if argument.relation in spec.requirements else []
+            else:
+                target_requirements = [
+                    req
+                    for req in spec.requirements.values()
+                    if _relation_is_materializable(self.instance, req.relation)
+                ]
+            required_rows = constraint.get("required_rows")
+            if isinstance(required_rows, int):
+                for req in target_requirements:
+                    req.min_rows = max(req.min_rows, required_rows)
 
-    def _find_counted_table(
-        self, condition: exp.Expression
-    ) -> Optional[RelationId]:
-        """Find the table containing COUNT(col) in a HAVING comparison."""
-        condition = self._resolve_having_aliases(condition.copy())
-        for step in _iter_all_plan_steps(self.plan):
-            if isinstance(step, Aggregate):
-                for agg_expr in step.aggregations:
-                    for comp_node in agg_expr.find_all(_COMPARISON_NODES):
-                        agg_side, _, _ = self._extract_agg_and_threshold(
-                            comp_node
-                        )
-                        if agg_side is None:
-                            continue
-                        for count_node in agg_side.find_all(exp.Count):
-                            if isinstance(count_node.this, exp.Star):
-                                continue
-                            if count_node.args.get("distinct"):
-                                continue
-                            for col in count_node.find_all(exp.Column):
-                                col_id = column_identity(col)
-                                if col_id and col_id.relation:
-                                    tname = (
-                                        col_id.relation.name.normalized
-                                        if col_id.relation.name
-                                        else ""
-                                    )
-                                    if tname in self.instance.tables:
-                                        return col_id.relation
-        # Fallback: check the HAVING condition directly.
-        for comp_node in condition.find_all(_COMPARISON_NODES):
-            agg_side, _, _ = self._extract_agg_and_threshold(comp_node)
-            if agg_side is None:
+            if not isinstance(argument, ColumnId) or argument.relation is None:
                 continue
-            for count_node in agg_side.find_all(exp.Count):
-                if isinstance(count_node.this, exp.Star):
-                    continue
-                for col in count_node.find_all(exp.Column):
-                    col_id = column_identity(col)
-                    if col_id and col_id.relation:
-                        tname = (
-                            col_id.relation.name.normalized
-                            if col_id.relation.name
-                            else ""
-                        )
-                        if tname in self.instance.tables:
-                            return col_id.relation
-        return None
-
-    def _extract_min_group_size(
-        self, condition: exp.Expression
-    ) -> int:
-        """Extract minimum group size from HAVING."""
-        condition = self._resolve_having_aliases(condition.copy())
-        result = 1
-        result = max(result, self._min_group_from_expr(condition))
-        for step in _iter_all_plan_steps(self.plan):
-            if isinstance(step, Aggregate):
-                for agg_expr in step.aggregations:
-                    result = max(
-                        result, self._min_group_from_expr(agg_expr)
-                    )
-        return result
-
-    def _min_group_from_expr(self, expr: exp.Expression) -> int:
-        """Extract min group size from a single expression."""
-        for node in expr.find_all(_COMPARISON_NODES):
-            agg_side, threshold, op_class = (
-                self._extract_agg_and_threshold(node)
+            relation = argument.relation
+            if relation not in spec.requirements:
+                continue
+            if constraint.get("function") not in {"sum", "avg", "min", "max"}:
+                continue
+            row_count = max(spec.requirements[relation].min_rows, 1)
+            self._append_having_value_constraint(
+                spec.requirements[relation],
+                argument,
+                constraint,
+                row_count,
             )
-            if agg_side is None or not isinstance(
-                threshold, (int, float)
-            ):
-                continue
-            if not self._is_direct_count_expr(agg_side):
-                continue
-            if op_class is exp.GT:
-                return int(threshold) + 1
-            if op_class is exp.GTE:
-                return int(threshold)
-            if op_class is exp.EQ:
-                return int(threshold)
-        return 1
 
-    @staticmethod
-    def _is_direct_count_expr(expr: exp.Expression) -> bool:
-        """Return True for COUNT(...) or a simple cast around COUNT."""
-        if isinstance(expr, exp.Count):
-            return True
-        if isinstance(expr, exp.Cast):
-            return isinstance(expr.this, exp.Count)
-        return False
-
-    def _extract_having_value_constraints(
+    def _append_having_value_constraint(
         self,
-        condition: exp.Expression,
-        spec: BranchSpec,
-        min_rows: int,
-    ):
-        """Derive per-row value constraints from HAVING aggregate thresholds."""
-        condition = self._resolve_having_aliases(condition.copy())
-        self._extract_agg_value_from_expr(condition, spec, min_rows)
-        for step in _iter_all_plan_steps(self.plan):
-            if isinstance(step, Aggregate):
-                for agg_expr in step.aggregations:
-                    self._extract_agg_value_from_expr(
-                        agg_expr, spec, min_rows
-                    )
-
-    def _extract_agg_value_from_expr(
-        self,
-        expr: exp.Expression,
-        spec: BranchSpec,
-        min_rows: int,
-    ):
-        """Extract per-row value constraints from an aggregate comparison."""
-        import math
-
-        for node in expr.find_all(_COMPARISON_NODES):
-            agg_side, threshold, op_class = (
-                self._extract_agg_and_threshold(node)
+        req: TableConstraint,
+        argument: ColumnId,
+        constraint: dict,
+        row_count: int,
+    ) -> None:
+        aggregate_expr = None
+        for row in range(row_count):
+            row_col = self._solver_col(argument, row_scope=f"r{row}")
+            aggregate_expr = (
+                row_col
+                if aggregate_expr is None
+                else exp.Add(this=aggregate_expr, expression=row_col)
             )
-            if agg_side is None or not isinstance(
-                threshold, (int, float)
-            ):
-                continue
-            target_col = None
-            per_row_value = None
-            if op_class in (exp.GT, exp.GTE):
-                offset = 1 if op_class is exp.GT else 0
-                if agg_side.find(exp.Avg):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Avg
-                    )
-                    per_row_value = int(threshold) + offset
-                elif agg_side.find(exp.Sum) and agg_side.find(exp.Count):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Sum
-                    )
-                    per_row_value = int(threshold) + offset
-                elif agg_side.find(exp.Sum):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Sum
-                    )
-                    per_row_value = (
-                        int(threshold / max(min_rows, 1)) + offset
-                    )
-            elif op_class in (exp.LT, exp.LTE):
-                if agg_side.find(exp.Avg):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Avg
-                    )
-                    per_row_value = (
-                        int(threshold) - 1
-                        if op_class is exp.LT
-                        else int(threshold)
-                    )
-                elif agg_side.find(exp.Sum):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Sum
-                    )
-                    per_row_value = 1
-            elif op_class is exp.EQ:
-                if agg_side.find(exp.Avg):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Avg
-                    )
-                    per_row_value = int(threshold)
-                elif agg_side.find(exp.Sum):
-                    target_col = self._find_agg_column(
-                        agg_side, exp.Sum
-                    )
-                    per_row_value = math.ceil(
-                        threshold / max(min_rows, 1)
-                    )
+        if aggregate_expr is None:
+            return
+        if constraint.get("function") == "avg":
+            aggregate_expr = exp.Div(
+                this=aggregate_expr,
+                expression=to_literal(row_count),
+            )
 
-            if target_col and per_row_value is not None:
-                col_id = column_identity(target_col)
-                if col_id is None or col_id.relation is None:
-                    continue
-                relation = col_id.relation
-                matched = col_id.name.normalized
-                tname = relation.name.normalized if relation.name else ""
-                if matched and tname and relation in spec.requirements:
-                    if not _has_equality_constraint(
-                        spec.requirements[relation].constraints, matched
-                    ):
-                        col_node = self._solver_col(col_id)
-                        spec.requirements[relation].constraints.append(
-                            exp.EQ(
-                                this=col_node,
-                                expression=to_literal(per_row_value),
-                            )
-                        )
-
-    def _find_agg_column(
-        self, expr: exp.Expression, agg_type
-    ) -> Optional[exp.Column]:
-        """Find the column inside an aggregate function."""
-        for agg in expr.find_all(agg_type):
-            for col in agg.find_all(exp.Column):
-                return col
-        return None
+        literal = to_literal(constraint["value"])
+        operator = constraint["operator"]
+        if operator == "gt":
+            expr = exp.GT(this=aggregate_expr, expression=literal)
+        elif operator == "gte":
+            expr = exp.GTE(this=aggregate_expr, expression=literal)
+        elif operator == "lt":
+            expr = exp.LT(this=aggregate_expr, expression=literal)
+        elif operator == "lte":
+            expr = exp.LTE(this=aggregate_expr, expression=literal)
+        elif operator == "eq":
+            expr = exp.EQ(this=aggregate_expr, expression=literal)
+        else:
+            raise ValueError(f"Unsupported HAVING operator: {operator}")
+        req.constraints.append(expr)
 
     def _gold_having_scalar_constraints(
         self, condition: exp.Expression
@@ -2703,7 +1979,6 @@ class Propagator:
             source = self._find_having_alias_expression(condition)
             if source is None:
                 return []
-        source = self._resolve_having_aliases(source)
         scalar_conditions: List[exp.Expression] = []
         for conjunct in self._split_conjuncts(source):
             if conjunct.find(
@@ -2732,26 +2007,6 @@ class Propagator:
                 if isinstance(agg_expr, exp.Alias) and agg_expr.alias_or_name == alias:
                     return agg_expr.this.copy()
         return None
-
-    def _resolve_group_aliases(
-        self, expression: exp.Expression
-    ) -> exp.Expression:
-        """Replace planner group aliases with their base expressions."""
-        replacements = _planner_alias_replacements(
-            self.plan.ordered_steps,
-            include_aggregate_aliases=False,
-        )
-        return _replace_planner_aliases(expression, replacements)
-
-    def _resolve_having_aliases(
-        self, expression: exp.Expression
-    ) -> exp.Expression:
-        """Replace planner GROUP BY and aggregate aliases in HAVING expressions."""
-        replacements = _planner_alias_replacements(
-            self.plan.ordered_steps,
-            include_aggregate_aliases=True,
-        )
-        return _replace_planner_aliases(expression, replacements)
 
     # -----------------------------------------------------------------
     # CASE WHEN arm coverage
@@ -3503,20 +2758,6 @@ def _iter_all_plan_steps(plan: Plan):
         yield from _iter_steps_with_subplans(step)
 
 
-def _find_subplan_for_subquery(
-    plan: Plan,
-    subquery: exp.Subquery,
-    dialect: str,
-) -> Optional[SubPlan]:
-    """Find SubPlan for a subquery anchor."""
-    target_sql = subquery.sql(dialect=dialect)
-    for step in _iter_all_plan_steps(plan):
-        if isinstance(step, SubPlan) and step.anchor is not None:
-            if step.anchor is subquery or step.anchor.sql(dialect=dialect) == target_sql:
-                return step
-    return None
-
-
 def _scalar_subquery_operand_expression(
     subplan: Optional[SubPlan],
 ) -> Optional[exp.Expression]:
@@ -3682,75 +2923,6 @@ def _solve_scalar_witness_values(
         return _merge_scalar_solver_assignments(rows, result.assignments, all_bindings)
     return set()
 
-
-
-def _include_subquery_conditions(spec: BranchSpec, plan: Plan) -> None:
-    """Extract inner subquery WHERE conditions and add them as constraints.
-
-    When a deferred atom contains a subquery (e.g., x = (SELECT ... WHERE y = 'F')),
-    the inner WHERE condition (y = 'F') should be included in the solver constraints
-    so the solver generates values that satisfy it.
-    """
-    for atom in spec.deferred:
-        # Find the subquery node in the atom.
-        subquery_node = atom.find(exp.Subquery)
-        if subquery_node is None:
-            continue
-
-        # Find the SubPlan whose anchor contains this subquery.
-        subplan = None
-        for step in plan.ordered_steps:
-            from parseval.plan.planner import SubPlan as _SP
-            if isinstance(step, _SP) and step.anchor is not None:
-                # Check if the anchor IS the subquery or contains it.
-                if step.anchor is subquery_node or step.anchor is atom:
-                    subplan = step
-                    break
-                # Check by SQL text for the inner subquery.
-                anchor_sql = step.anchor.sql()
-                sub_sql = subquery_node.sql()
-                if sub_sql in anchor_sql or anchor_sql in sub_sql:
-                    subplan = step
-                    break
-        if subplan is None or subplan.inner is None:
-            continue
-
-        # Walk the inner plan to find Filter conditions.
-        stack = [subplan.inner]
-        visited: set = set()
-        while stack:
-            step = stack.pop()
-            if id(step) in visited:
-                continue
-            visited.add(id(step))
-            if isinstance(step, Filter) and step.condition:
-                for conjunct in _split_conjuncts_static(step.condition):
-                    # Skip subquery-containing conjuncts (avoid infinite recursion).
-                    if conjunct.find(exp.Subquery) or conjunct.find(exp.Exists):
-                        continue
-                    # Ensure SolverVar on columns.
-                    for col in conjunct.find_all(exp.Column):
-                        from parseval.solver import solver_var as _sv, set_solver_var as _ssv, SolverVar as _SV
-                        if _sv(col) is None:
-                            col_id = column_identity(col)
-                            if col_id is not None and col_id.relation is not None:
-                                _ssv(col, _SV(column_id=col_id, relation_id=col_id.relation))
-                    # Find the table for this constraint and add it.
-                    for col in conjunct.find_all(exp.Column):
-                        col_id = column_identity(col)
-                        if col_id and col_id.relation:
-                            tname = col_id.relation.name.normalized if col_id.relation.name else ""
-                            for rel, tc in spec.requirements.items():
-                                if tc.table == tname:
-                                    # Avoid duplicates.
-                                    conj_sql = conjunct.sql()
-                                    if not any(c.sql() == conj_sql for c in tc.constraints):
-                                        tc.constraints.append(conjunct.copy())
-                                    break
-                            break
-            stack.extend(step.chain_dependencies)
-
-
 def _split_conjuncts_static(expr: exp.Expression) -> list:
     """Split a conjunction into its top-level conjuncts (static version)."""
     parts = []
@@ -3777,7 +2949,8 @@ def _satisfy_gold_scalar_subqueries(
     alias-based contexts correctly), then updates rows to satisfy the
     comparison when possible.
     """
-    from parseval.symbolic.evaluator import PlanEvaluator, decompose_atoms
+    from parseval.symbolic.branch_tree import decompose_atoms
+    from parseval.symbolic.evaluator import PlanEvaluator
     from parseval.plan.rex import concrete as _concrete, Environment, Variable
 
     seen: Set[str] = set()
@@ -3867,9 +3040,6 @@ class Resolver:
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
-        # Include inner subquery conditions from deferred atoms.
-        _include_subquery_conditions(spec, self.plan)
-
         # Build global constraint.
         constraint, row_bindings = self._build_global_constraint(spec)
 
@@ -4013,6 +3183,7 @@ def speculate(
     instance: Instance,
     dialect: str = "sqlite",
     config: Optional[SpeculateConfig] = None,
+    thresholds: Optional[CoverageThresholds] = None,
 ) -> List[Tuple[str, Dict[str, List[Dict[str, Any]]]]]:
     """One-call API: propagate + resolve.
 
@@ -4024,12 +3195,16 @@ def speculate(
         instance: The database instance to materialize rows into.
         dialect: SQL dialect (default: "sqlite").
         config: SpeculateConfig controlling which branches to generate.
-            If None, uses SpeculateConfig.gold_non_empty().
+            If None, derived from thresholds or uses gold_non_empty().
+        thresholds: CoverageThresholds to derive config from.
+            Takes precedence over config if both are provided.
 
     Returns:
         List of (branch_name, rows_per_table) tuples.
     """
-    if config is None:
+    if thresholds is not None:
+        config = SpeculateConfig.from_thresholds(thresholds)
+    elif config is None:
         config = SpeculateConfig.gold_non_empty()
 
     _ = plan.annotations  # Ensure identity is prepared on all steps

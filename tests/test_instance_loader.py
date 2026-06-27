@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -118,6 +119,34 @@ class InstanceLoaderTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(rows, [(1, 501.0)])
 
+    def test_default_temporal_values_are_valid_temporals(self):
+        instance = Instance(
+            ddls="""
+            CREATE TABLE events (
+                id INT PRIMARY KEY,
+                occurred_on DATE NULL,
+                happened_at DATETIME NULL,
+                happened_time TIME NULL
+            );
+            """,
+            name="temporal_case",
+            dialect="sqlite",
+        )
+
+        self.assertEqual(instance._default_for_type("DATE"), date(2024, 6, 15))
+        self.assertEqual(
+            instance._default_for_type("DATETIME"),
+            datetime(2024, 6, 15, 0, 0, 0),
+        )
+        self.assertEqual(
+            instance._default_for_type("TIME"),
+            time(0, 0, 0),
+        )
+        self.assertEqual(
+            instance._next_default_value(date(2024, 6, 15), 1),
+            date(2024, 6, 16),
+        )
+
     def test_to_db_passes_connection_string_and_dialect_directly_to_loader(self):
         instance = Instance(ddls=SCHEMA, name="target_case", dialect="sqlite")
 
@@ -234,6 +263,54 @@ class InstanceLoaderTests(unittest.TestCase):
         pairs = [(row["link_to_event"], row["link_to_member"]) for row in attendance_rows]
         self.assertEqual(len(pairs), len(set(pairs)))
 
+    def test_bootstrapped_composite_primary_key_rows_do_not_repeat_pairs(self):
+        schema = """
+        CREATE TABLE patient (
+            id INT PRIMARY KEY
+        );
+        CREATE TABLE laboratory (
+            id INT NOT NULL,
+            date DATE NOT NULL,
+            value INT,
+            PRIMARY KEY (id, date),
+            FOREIGN KEY (id) REFERENCES patient(id)
+        );
+        """
+        instance = Instance(ddls=schema, name="lab_case", dialect="sqlite")
+        instance.create_row("laboratory", {"id": 51})
+        relation = instance.table_id("laboratory")
+        id_col = instance.column_id(relation, "id")
+        instance._create_row_circular_fk(
+            relation,
+            {id_col: 51},
+            len(instance.get_rows(relation)),
+        )
+
+        rows = next(
+            table.rows for table in instance.snapshot().tables if table.table_name == "laboratory"
+        )
+        pairs = [(row["id"], row["date"]) for row in rows]
+        self.assertEqual(len(pairs), len(set(pairs)))
+
+    def test_bootstrapped_single_primary_key_rows_do_not_repeat_defaults(self):
+        schema = """
+        CREATE TABLE badges (
+            Id INTEGER NOT NULL PRIMARY KEY,
+            UserId INTEGER NULL,
+            Name TEXT NULL
+        );
+        """
+        instance = Instance(ddls=schema, name="badge_case", dialect="sqlite")
+        relation = instance.table_id("badges")
+        instance._create_row_circular_fk(relation, {}, len(instance.get_rows(relation)))
+        instance._create_row_circular_fk(relation, {}, len(instance.get_rows(relation)))
+
+        rows = next(
+            table.rows for table in instance.snapshot().tables if table.table_name == "badges"
+        )
+        ids = [row["id"] for row in rows]
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_unique_string_primary_key_respects_length_without_collapsing(self):
         schema = """
         CREATE TABLE molecule (
@@ -250,6 +327,21 @@ class InstanceLoaderTests(unittest.TestCase):
         )
         values = [row["molecule_id"] for row in rows]
         self.assertEqual(len(values), len(set(values)))
+
+    def test_quoted_inline_primary_key_is_preserved_after_normalization(self):
+        schema = """
+        CREATE TABLE IF NOT EXISTS `League` (
+            `id` int PRIMARY KEY,
+            `country_id` int,
+            `name` varchar
+        );
+        """
+        instance = Instance(ddls=schema, name="quoted_pk_case", dialect="sqlite")
+        relation = instance.table_id("league")
+        pk = instance.column_id(relation, "id")
+
+        self.assertEqual(instance.get_primary_key_ids(relation), (pk,))
+        self.assertTrue(instance.is_unique(relation, pk))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from parseval.instance import Instance
 from parseval.plan.planner import Plan, Scan, Filter, Join, Aggregate, Having, Project, SubPlan
+import parseval.symbolic.speculate as speculate_module
 from parseval.symbolic.speculate import Propagator, BranchSpec, SpeculateConfig
 
 
@@ -184,9 +185,8 @@ def test_subplan_correlation_has_identity():
 
 
 def test_propagate_uses_identity_not_strings():
-    """Propagator must not use string-based table resolution for column resolution."""
-    from unittest.mock import patch
-    import parseval.symbolic.speculate as speculate_module
+    """Propagator uses planner identity annotations for column resolution."""
+    from parseval.solver.types import solver_var
 
     sql = """
         SELECT c.name, COUNT(o.id) AS cnt
@@ -202,19 +202,41 @@ def test_propagate_uses_identity_not_strings():
     instance = _make_instance(tables)
     plan = _make_plan(sql, instance)
 
-    call_count = 0
-    original_fn = speculate_module._relation_for_table
+    propagator = Propagator(plan, instance, "sqlite")
+    specs = propagator.propagate()
+    assert len(specs) >= 1
 
-    def patched_fn(instance, name):
-        nonlocal call_count
-        call_count += 1
-        return original_fn(instance, name)
+    # Every column in constraints must carry a SolverVar (set by _constraint_column).
+    for spec in specs:
+        for tc in spec.requirements.values():
+            for constraint in tc.constraints:
+                for col in constraint.find_all(exp.Column):
+                    sv = solver_var(col)
+                    assert sv is not None, f"Column {col.sql()} lacks SolverVar"
 
-    with patch.object(speculate_module, '_relation_for_table', patched_fn):
-        propagator = Propagator(plan, instance, "sqlite")
-        specs = propagator.propagate()
 
-    # _relation_for_table should only be called for Scan step table
-    # resolution and FK reference tables, not for column resolution
-    # (which uses identity instead).
-    assert call_count <= 5, f"Expected <=5 _relation_for_table calls, got {call_count}"
+def test_speculate_no_longer_exposes_planner_fallback_resolvers():
+    """Planner-owned facts must not be rediscovered in speculate.py."""
+    removed_propagator_helpers = {
+        "_build_scan_relation_index",
+        "_ensure_column_identity",
+        "_resolve_table_alias",
+        "_resolve_group_aliases",
+        "_resolve_having_aliases",
+        "_find_inner_table_name",
+        "_find_inner_table_relation",
+        "_find_inner_select_column",
+        "_find_inner_corr_column",
+        "_find_corr_inner_column",
+    }
+    for helper in removed_propagator_helpers:
+        assert not hasattr(Propagator, helper), helper
+
+    removed_module_helpers = {
+        "_planner_alias_replacements",
+        "_replace_planner_aliases",
+        "_find_subplan_for_subquery",
+        "_include_subquery_conditions",
+    }
+    for helper in removed_module_helpers:
+        assert not hasattr(speculate_module, helper), helper
