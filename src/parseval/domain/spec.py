@@ -10,6 +10,7 @@ from parseval.identity import (
     RelationId,
     RelationKind,
     column_id,
+    identifier_key,
     identifier_name,
     relation_id,
 )
@@ -78,8 +79,8 @@ class ColumnSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "datatype", DataType.build(self.datatype))
-        object.__setattr__(self, "table", self.table.lower())
-        object.__setattr__(self, "column", self.column.lower())
+        object.__setattr__(self, "table", identifier_key(self.table, dialect=self.dialect))
+        object.__setattr__(self, "column", identifier_key(self.column, dialect=self.dialect))
         object.__setattr__(self, "semantic_tags", tuple(self.semantic_tags))
         object.__setattr__(self, "checks", tuple(self.checks))
         table_id = self.table_id or relation_id(
@@ -123,17 +124,19 @@ class TableSpec:
     id: Optional[RelationId] = None
     primary_key_ids: Tuple[ColumnId, ...] = ()
     unique_constraint_ids: Tuple[Tuple[ColumnId, ...], ...] = ()
+    dialect: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", self.name.lower())
+        dialect = self.dialect
+        object.__setattr__(self, "name", identifier_key(self.name, dialect=dialect))
         object.__setattr__(
-            self, "primary_key", tuple(column.lower() for column in self.primary_key)
+            self, "primary_key", tuple(identifier_key(column, dialect=dialect) for column in self.primary_key)
         )
         object.__setattr__(
             self,
             "unique_constraints",
             tuple(
-                tuple(column.lower() for column in columns)
+                tuple(identifier_key(column, dialect=dialect) for column in columns)
                 for columns in self.unique_constraints
             ),
         )
@@ -153,7 +156,7 @@ class TableSpec:
                 if column.id == column_name:
                     return column
             raise KeyError(f"Unknown column {column_name.display}")
-        normalized = str(column_name).lower()
+        normalized = identifier_key(str(column_name), dialect=self.dialect)
         for column in self.columns:
             if column.column == normalized:
                 return column
@@ -177,27 +180,28 @@ class SchemaSpec:
     def __post_init__(self) -> None:
         table_ids: dict[str, RelationId] = {}
         column_ids: dict[str, dict[str, ColumnId]] = {}
+        dialect = self.dialect
 
         for table in self.tables:
-            table_key = table.name.lower()
+            table_key = identifier_key(table.name, dialect=dialect)
             table_id = table.id or relation_id(
                 RelationKind.TABLE,
-                identifier_name(table.name, dialect=self.dialect),
+                identifier_name(table.name, dialect=dialect),
             )
             table_ids[table_key] = table_id
             column_ids[table_key] = {}
             for column in table.columns:
-                column_key = column.column.lower()
+                column_key = identifier_key(column.column, dialect=dialect)
                 existing_id = column.id if column.table_id == table_id else None
                 column_ids[table_key][column_key] = existing_id or column_id(
                     ColumnKind.PHYSICAL,
-                    identifier_name(column.column, dialect=self.dialect),
+                    identifier_name(column.column, dialect=dialect),
                     table_id,
                 )
 
         normalized_tables = []
         for table in self.tables:
-            table_key = table.name.lower()
+            table_key = identifier_key(table.name, dialect=dialect)
             table_id = table_ids[table_key]
             foreign_keys = self._normalize_foreign_keys(
                 table,
@@ -210,7 +214,7 @@ class SchemaSpec:
             }
             columns = []
             for column in table.columns:
-                column_key = column.column.lower()
+                column_key = identifier_key(column.column, dialect=dialect)
                 normalized_fk = None
                 if column.foreign_key is not None:
                     fk = self._normalize_foreign_key(
@@ -232,11 +236,11 @@ class SchemaSpec:
                     )
                 )
             primary_key_ids = table.primary_key_ids or tuple(
-                column_ids[table_key][column.lower()]
+                column_ids[table_key][identifier_key(column, dialect=dialect)]
                 for column in table.primary_key
             )
             unique_constraint_ids = table.unique_constraint_ids or tuple(
-                tuple(column_ids[table_key][column.lower()] for column in columns)
+                tuple(column_ids[table_key][identifier_key(column, dialect=dialect)] for column in columns)
                 for columns in table.unique_constraints
             )
             normalized_tables.append(
@@ -282,18 +286,19 @@ class SchemaSpec:
         table_ids: dict[str, RelationId],
         column_ids: dict[str, dict[str, ColumnId]],
     ) -> ForeignKeySpec:
-        source_key = fk.source_table.lower()
-        target_key = fk.target_table.lower()
+        dialect = self.dialect
+        source_key = identifier_key(fk.source_table, dialect=dialect)
+        target_key = identifier_key(fk.target_table, dialect=dialect)
         return replace(
             fk,
             source_table_id=fk.source_table_id or table_ids[source_key],
             source_column_ids=fk.source_column_ids or tuple(
-                column_ids[source_key][column.lower()]
+                column_ids[source_key][identifier_key(column, dialect=dialect)]
                 for column in fk.source_columns
             ),
             target_table_id=fk.target_table_id or table_ids[target_key],
             target_column_ids=fk.target_column_ids or tuple(
-                column_ids[target_key][column.lower()]
+                column_ids[target_key][identifier_key(column, dialect=dialect)]
                 for column in fk.target_columns
             ),
         )
@@ -306,7 +311,7 @@ class SchemaSpec:
                 if table.id == table_name:
                     return table
             raise KeyError(f"Unknown table {table_name.display}")
-        normalized = str(table_name).lower()
+        normalized = identifier_key(str(table_name), dialect=self.dialect)
         for table in self.tables:
             if table.name == normalized:
                 return table

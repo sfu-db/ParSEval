@@ -991,6 +991,7 @@ class Catalog(MappingSchema):
                     id=table_id,
                     primary_key_ids=pk_column_ids,
                     unique_constraint_ids=unique_constraint_ids,
+                    dialect=self.dialect,
                 )
             )
 

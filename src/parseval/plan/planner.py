@@ -588,6 +588,9 @@ class Step:
                         node.replace(exp.column(name, table))
 
             aggregate.add_dependency(step)
+            for aggregation in aggregate.aggregations:
+                if isinstance(aggregation, exp.Expression):
+                    _attach_subplans(aggregate, aggregation, ctes, correlations)
             step = aggregate
 
             # lift HAVING out of Aggregate into its own Having step
@@ -1853,7 +1856,7 @@ def _query_column_for_physical(
     physical_column = instance.column_id(table, exp.to_identifier(column_source))
     return column_id(
         ColumnKind.PHYSICAL,
-        identifier_name(column_key),
+        identifier_name(column_key, dialect=getattr(instance, "dialect", None)),
         relation,
         scope_id=scope_id,
         ordinal=ordinal,
@@ -2332,6 +2335,7 @@ def _aggregation_metadata(step: "Aggregate", instance: t.Any, *, plan: "Plan | N
             "alias": alias_name,
             "function": _aggregate_function_name(aggregate_function),
             "argument": argument,
+            "distinct": _aggregate_is_distinct(aggregate_function),
             "semantic_datatype": _aggregate_semantic_datatype(
                 aggregate_function,
             ),
@@ -2370,7 +2374,7 @@ def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
                 continue
             column.replace(aggregate_function.copy())
             matched = True
-        if not matched:
+        if not matched and _aggregate_comparison_constraint(rewritten) is None:
             continue
         constraint = _aggregate_comparison_constraint(rewritten)
         if constraint is not None:
@@ -2401,6 +2405,7 @@ def _aggregate_comparison_constraint(expression: exp.Expression) -> t.Dict[str, 
     constraint = {
         "function": function,
         "argument": _aggregate_argument_id(aggregate_function),
+        "distinct": _aggregate_is_distinct(aggregate_function),
         "operator": expression.key,
         "value": literal,
         "semantic_datatype": _aggregate_semantic_datatype(
@@ -2455,6 +2460,10 @@ def _aggregate_argument_id(expression: exp.AggFunc) -> ColumnId | None:
         if isinstance(cid, ColumnId):
             return cid
     return None
+
+
+def _aggregate_is_distinct(expression: exp.AggFunc) -> bool:
+    return isinstance(expression.this, exp.Distinct)
 
 
 def _aggregate_semantic_datatype(expression: exp.AggFunc) -> DataType:

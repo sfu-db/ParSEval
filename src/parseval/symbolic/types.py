@@ -51,6 +51,23 @@ class JoinFact:
     side: str = ""
 
 
+@dataclass(frozen=True)
+class RowSetObligation:
+    """Logical upstream rows required to satisfy one operator target."""
+
+    anchor_step_id: str
+    required_rows: int
+    generation_rows: int
+    row_scopes: Tuple[str, ...]
+    relations: Tuple[RelationId, ...] = ()
+    join_facts: Tuple[JoinFact, ...] = ()
+    path_predicates: Tuple[exp.Expression, ...] = ()
+    group_keys: Tuple[ColumnId, ...] = ()
+    counted_expression: Optional[exp.Expression] = None
+    distinct_expression: Optional[exp.Expression] = None
+    ordering: Tuple[exp.Expression, ...] = ()
+
+
 @dataclass(frozen=True, eq=False)
 class PathPredicate:
     """A predicate required for a row to survive along a branch path."""
@@ -85,6 +102,7 @@ class OperatorObligation:
     row_scope: Optional[str] = None
     row_count: int = 1
     expression: Optional[exp.Expression] = None
+    row_set: Optional[RowSetObligation] = None
 
 
 @dataclass(frozen=True)
@@ -435,6 +453,14 @@ class BranchTree:
 
         specs: List[Tuple[int, BranchType, int]] = []
 
+        def root_result_row_count() -> int:
+            counts = [
+                obligation.row_count
+                for obligation in node.obligations
+                if obligation.kind == "root_result"
+            ]
+            return max(counts or [1])
+
         def add(atom_id: int, outcome: BranchType, threshold: int) -> None:
             if threshold > 0:
                 specs.append((atom_id, outcome, threshold))
@@ -444,7 +470,7 @@ class BranchTree:
                 for outcome in obligation.outcomes:
                     threshold = self.thresholds.threshold_for(outcome)
                     if node.site == "root_result" and outcome == BranchType.ATOM_TRUE:
-                        threshold = max(threshold, 1)
+                        threshold = max(threshold, root_result_row_count())
                     add(
                         obligation.atom_id,
                         outcome,
@@ -496,7 +522,7 @@ class BranchTree:
             return specs
 
         if node.site == "root_result":
-            add(0, BranchType.ATOM_TRUE, 1)
+            add(0, BranchType.ATOM_TRUE, root_result_row_count())
             return specs
 
         if node.site == "exists":
