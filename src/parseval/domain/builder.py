@@ -224,7 +224,7 @@ class DatabaseBuilder:
     @staticmethod
     def _row_to_names(table, row: Mapping[ColumnId, Any]) -> Dict[str, Any]:
         return {
-            column.column: row.get(column.id)
+            column.id.name.normalized: row.get(column.id)
             for column in table.columns
         }
 

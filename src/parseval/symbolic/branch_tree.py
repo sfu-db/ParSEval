@@ -14,6 +14,7 @@ from sqlglot import exp
 from parseval.identity import (
     ColumnId,
     ColumnKind,
+    PARSEVAL_COLUMN_ID,
     RelationId,
     column_identity,
     identifier_name,
@@ -46,8 +47,11 @@ from .types import (
     JoinFact,
     OperatorObligation,
     PathPredicate,
+    RowSetObligation,
     SubqueryPath,
 )
+
+MAX_ROOT_GENERATION_ROWS = 20
 
 
 def decompose_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
@@ -91,6 +95,21 @@ def scalar_subquery_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ..
 
     walk(predicate)
     return tuple(atoms)
+
+
+def _column_expr_from_id(column: ColumnId) -> exp.Column:
+    relation = column.relation
+    table_name = ""
+    if relation is not None:
+        visible = relation.alias or relation.name
+        if visible is not None:
+            table_name = visible.raw
+    expression = exp.Column(
+        this=exp.to_identifier(column.name.raw, quoted=column.name.quoted),
+        table=exp.to_identifier(table_name) if table_name else None,
+    )
+    expression.meta[PARSEVAL_COLUMN_ID] = column
+    return expression
 
 
 def _subquery_paths_for_atom(
@@ -490,6 +509,14 @@ class CoverageAnalyzer:
                 return obligation
         return None
 
+    def _root_result_row_count(self, node: BranchNode) -> int:
+        counts = [
+            obligation.row_count
+            for obligation in node.obligations
+            if obligation.kind == "root_result"
+        ]
+        return max(counts or [1])
+
     def _combination_specs_for_node(
         self,
         node: BranchNode,
@@ -557,7 +584,10 @@ class CoverageAnalyzer:
             if node.site == "root_result":
                 if node.is_infeasible(0, BranchType.ATOM_TRUE):
                     continue
-                if node.observation_count(0, BranchType.ATOM_TRUE) < 1:
+                if (
+                    node.observation_count(0, BranchType.ATOM_TRUE)
+                    < self._root_result_row_count(node)
+                ):
                     targets.append(
                         CoverageTarget(
                             node=node,
@@ -936,19 +966,78 @@ def _build_branch_tree(
         step_nodes.setdefault(annotation.step_id, node)
 
     def _root_required_row_count(root: Step) -> int:
-        max_root_rows = 20
         if isinstance(root, Limit):
             offset = max(int(getattr(root, "offset", 0) or 0), 0)
             limit = getattr(root, "limit", 1)
             limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
-            return min(max(offset + limit_value, 1), max_root_rows)
+            return max(offset + limit_value, 1)
         return 1
+
+    def _row_scopes(prefix: str, count: int) -> tuple[str, ...]:
+        return tuple(f"{prefix}{index}" for index in range(max(count, 0)))
+
+    def _root_path_data(root: Step) -> tuple[tuple[exp.Expression, ...], tuple[JoinFact, ...]]:
+        predicates: list[exp.Expression] = []
+        join_facts: list[JoinFact] = []
+        visited: set[int] = set()
+
+        def walk(step: Step) -> None:
+            if id(step) in visited:
+                return
+            visited.add(id(step))
+            condition = getattr(step, "condition", None)
+            if isinstance(condition, exp.Expression) and not isinstance(step, Having):
+                predicates.append(condition)
+            if isinstance(step, Join):
+                join_facts.extend(_join_facts_for_step(plan, step))
+            for dep in step.chain_dependencies:
+                walk(dep)
+
+        for dep in root.chain_dependencies:
+            walk(dep)
+        return tuple(predicates), tuple(join_facts)
+
+    def _having_cardinality_constraints() -> tuple[dict[str, Any], ...]:
+        constraints: list[dict[str, Any]] = []
+        for step in plan.ordered_steps:
+            if isinstance(step, Having):
+                metadata = plan.annotation_for(step).metadata
+                constraints.extend(metadata.get("having_constraints", ()))
+        return tuple(constraints)
+
+    def _aggregate_group_keys_for_having() -> tuple[ColumnId, ...]:
+        for step in plan.ordered_steps:
+            if isinstance(step, Aggregate):
+                metadata = plan.annotation_for(step).metadata.get("aggregation", {})
+                group_sources = metadata.get("group_sources", {})
+                keys: list[ColumnId] = []
+                seen: set[ColumnId] = set()
+                for sources in group_sources.values():
+                    for source in sources:
+                        physical = source.source_column_id or source
+                        if physical in seen:
+                            continue
+                        seen.add(physical)
+                        keys.append(physical)
+                return tuple(keys)
+        return ()
 
     def _root_obligations(root: Step) -> tuple[OperatorObligation, ...]:
         annotation = plan.annotation_for(root)
         row_count = _root_required_row_count(root)
+        generation_row_count = min(row_count, MAX_ROOT_GENERATION_ROWS)
         root_relations = _canonical_relations(
             annotation.source_relations + _lineage_relations(root)
+        )
+        path_predicates, join_facts = _root_path_data(root)
+        root_row_set = RowSetObligation(
+            anchor_step_id=annotation.step_id,
+            required_rows=row_count,
+            generation_rows=generation_row_count,
+            row_scopes=_row_scopes("out", generation_row_count),
+            relations=root_relations,
+            join_facts=join_facts,
+            path_predicates=path_predicates,
         )
         obligations: list[OperatorObligation] = [
             OperatorObligation(
@@ -956,13 +1045,53 @@ def _build_branch_tree(
                 step_id=annotation.step_id,
                 site="root_result",
                 row_count=row_count,
-            )
+            ),
+            OperatorObligation(
+                kind="row_set",
+                step_id=annotation.step_id,
+                site="root_result",
+                row_count=generation_row_count,
+                row_set=root_row_set,
+            ),
         ]
-        return tuple(obligations) + _scan_obligations(
-            annotation.step_id,
-            root_relations,
-            row_count=row_count,
-        )
+        group_keys = _aggregate_group_keys_for_having()
+        for index, constraint in enumerate(_having_cardinality_constraints()):
+            required_rows = constraint.get("required_rows")
+            if not isinstance(required_rows, int) or required_rows <= 0:
+                continue
+            counted = constraint.get("argument")
+            counted_expression = (
+                _column_expr_from_id(counted)
+                if isinstance(counted, ColumnId)
+                else None
+            )
+            having_generation_rows = required_rows
+            having_row_set = RowSetObligation(
+                anchor_step_id=annotation.step_id,
+                required_rows=required_rows,
+                generation_rows=having_generation_rows,
+                row_scopes=_row_scopes(f"having{index}_", having_generation_rows),
+                relations=root_relations,
+                join_facts=join_facts,
+                path_predicates=path_predicates,
+                group_keys=group_keys,
+                counted_expression=counted_expression,
+                distinct_expression=(
+                    counted_expression.copy()
+                    if constraint.get("distinct") and counted_expression is not None
+                    else None
+                ),
+            )
+            obligations.append(
+                OperatorObligation(
+                    kind="row_set",
+                    step_id=annotation.step_id,
+                    site="having",
+                    row_count=having_generation_rows,
+                    row_set=having_row_set,
+                )
+            )
+        return tuple(obligations)
 
     for step in plan.ordered_steps:
         annotation = plan.annotation_for(step)

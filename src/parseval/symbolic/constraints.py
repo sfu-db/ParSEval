@@ -49,6 +49,7 @@ from .types import (
     JoinFact,
     OperatorObligation,
     PathPredicate,
+    RowSetObligation,
     SubqueryPath,
 )
 
@@ -84,6 +85,7 @@ class _AggregateAliasInfo:
     step: Aggregate
     kind: str
     source: exp.Column | None
+    distinct: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,11 +182,26 @@ class ConstraintGenerator:
 
         row_scope_by_relation = self._row_scopes_for_path(path, tables)
 
+        row_sets = tuple(
+            obligation.row_set
+            for obligation in path.obligations
+            if obligation.kind == "row_set" and obligation.row_set is not None
+        )
         for predicate in path.predicates:
+            if self._row_sets_cover_having_predicate(predicate, row_sets):
+                continue
             constraints.extend(self._constraints_for_path_predicate(predicate))
+        constraints.extend(self._constraints_for_row_set_obligations(path.obligations))
+        obligations = path.obligations
+        if any(obligation.kind == "row_set" for obligation in obligations):
+            obligations = tuple(
+                obligation
+                for obligation in obligations
+                if obligation.kind != "scan_exists"
+            )
         constraints.extend(
             self._constraints_for_obligations(
-                path.obligations,
+                obligations,
                 row_scope_by_relation,
             )
         )
@@ -679,11 +696,12 @@ class ConstraintGenerator:
                 if info["alias"] == alias:
                     kind = info["function"]
                     argument = info["argument"]  # ColumnId
+                    distinct = bool(info.get("distinct"))
                     if argument is not None:
                         source_col = _column_expr_from_id(argument)
-                        return _AggregateAliasInfo(step, kind, source_col)
+                        return _AggregateAliasInfo(step, kind, source_col, distinct)
                     # COUNT(*) has no argument column
-                    return _AggregateAliasInfo(step, kind, None)
+                    return _AggregateAliasInfo(step, kind, None, distinct)
         return None
 
     def _literal_number(self, literal: exp.Literal) -> int | float | None:
@@ -716,16 +734,17 @@ class ConstraintGenerator:
         constraints: List[exp.Expression] = []
         counted_cols: List[exp.Column] = []
         for index in range(needed):
-            row_scope = None if index == 0 else f"r{index}"
+            row_scope = f"r{index}"
             counted = self._constraint_column(source_col, row_scope=row_scope)
             counted_cols.append(counted)
             constraints.append(
                 exp.Is(this=counted.copy(), expression=exp.Not(this=exp.Null()))
             )
 
-        for left_index, left in enumerate(counted_cols):
-            for right in counted_cols[left_index + 1:]:
-                constraints.append(exp.NEQ(this=left.copy(), expression=right.copy()))
+        if info.distinct:
+            for left_index, left in enumerate(counted_cols):
+                for right in counted_cols[left_index + 1:]:
+                    constraints.append(exp.NEQ(this=left.copy(), expression=right.copy()))
 
         group_cols = self._aggregate_group_columns(info)
         for group_col in group_cols:
@@ -733,7 +752,7 @@ class ConstraintGenerator:
                 continue
             first = self._constraint_column(
                 group_col,
-                row_scope=None,
+                row_scope="r0",
             )
             constraints.append(
                 exp.Is(this=first.copy(), expression=exp.Not(this=exp.Null()))
@@ -1430,6 +1449,357 @@ class ConstraintGenerator:
                 constraints.append(copied)
         return constraints
 
+    def _constraints_for_row_set_obligations(
+        self,
+        obligations: Tuple[OperatorObligation, ...],
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        for obligation in obligations:
+            if obligation.kind != "row_set" or obligation.row_set is None:
+                continue
+            constraints.extend(self._constraints_for_row_set(obligation.row_set))
+        return constraints
+
+    def _row_sets_cover_having_predicate(
+        self,
+        predicate: PathPredicate,
+        row_sets: Tuple[RowSetObligation, ...],
+    ) -> bool:
+        if predicate.node.site != "having" or predicate.outcome not in _POSITIVE_BITS:
+            return False
+        if not any(row_set.counted_expression is not None for row_set in row_sets):
+            return False
+        return bool(self._having_source_value_constraints(predicate))
+
+    def _row_set_fixed_relations(
+        self,
+        row_set: RowSetObligation,
+    ) -> Set[RelationId]:
+        constant_columns: List[ColumnId] = [
+            self._row_set_column_for_scope(row_set, group_key)
+            for group_key in row_set.group_keys
+        ]
+        changed = True
+        while changed:
+            changed = False
+            for fact in row_set.join_facts:
+                for left, right in fact.equalities:
+                    left_col = self._row_set_column_for_scope(row_set, left)
+                    right_col = self._row_set_column_for_scope(row_set, right)
+                    left_known = any(
+                        self._same_column_identity(left_col, column)
+                        for column in constant_columns
+                    )
+                    right_known = any(
+                        self._same_column_identity(right_col, column)
+                        for column in constant_columns
+                    )
+                    if left_known and not right_known:
+                        constant_columns.append(right_col)
+                        changed = True
+                    elif right_known and not left_known:
+                        constant_columns.append(left_col)
+                        changed = True
+
+        fixed: Set[RelationId] = set()
+        for column in constant_columns:
+            if column.relation is None:
+                continue
+            storage_relation = self._storage_relation_for_column_id(column)
+            if storage_relation is None:
+                continue
+            storage_col = column.source_column_id or column
+            if self.instance.is_unique(storage_relation, storage_col):
+                fixed.add(column.relation)
+        return fixed
+
+    def _constraints_for_row_set(self, row_set: RowSetObligation) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        if not row_set.row_scopes:
+            return constraints
+
+        fixed_rels = self._row_set_fixed_relations(row_set)
+        first_scope = row_set.row_scopes[0]
+
+        for row_scope in row_set.row_scopes:
+            for relation in row_set.relations:
+                eff_scope = first_scope if relation in fixed_rels else row_scope
+                if row_scope == first_scope or relation not in fixed_rels:
+                    constraints.extend(
+                        self._row_set_scan_relation_constraints(
+                            row_set,
+                            relation,
+                            eff_scope,
+                        )
+                    )
+
+            constraints.extend(
+                self._row_set_join_constraints(
+                    row_set,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+            )
+            constraints.extend(
+                self._row_set_predicate_constraints(
+                    row_set,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+            )
+
+            if row_set.counted_expression is not None:
+                counted = self._scoped_expression_for_row_set(
+                    row_set.counted_expression,
+                    row_set.relations,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+                constraints.append(
+                    exp.Is(this=counted, expression=exp.Not(this=exp.Null()))
+                )
+
+        constraints.extend(
+            self._row_set_group_constraints(row_set, fixed_rels, first_scope)
+        )
+        constraints.extend(
+            self._row_set_distinct_constraints(row_set, fixed_rels, first_scope)
+        )
+        return constraints
+
+    def _row_set_relation_columns(self, relation: RelationId) -> Tuple[ColumnId, ...]:
+        table_name = _relation_table_name(
+            self._storage_relation_for_relation(relation) or relation
+        )
+        columns: List[ColumnId] = []
+        for column_name in self.instance.tables.get(table_name, {}):
+            columns.append(self._scoped_physical_column(column_name, relation))
+        return tuple(columns)
+
+    def _storage_relation_for_relation(self, relation: RelationId) -> RelationId | None:
+        if relation.name is None:
+            return None
+        try:
+            table_key = self.instance._table_key_for_storage(relation)
+        except Exception:
+            return None
+        try:
+            return self.instance.table_id(table_key)
+        except Exception:
+            return None
+
+    def _existing_values_for_column(self, column: ColumnId) -> Set[Any]:
+        relation = self._storage_relation_for_column_id(column)
+        if relation is None:
+            return set()
+        obligation = OperatorObligation(
+            kind="scan_exists",
+            step_id="row_set",
+            site="scan",
+            relation=column.relation,
+            storage_relation=relation,
+            columns=(column,),
+        )
+        return self._existing_values_for_obligation(obligation, column)
+
+    def _row_set_scan_relation_constraints(
+        self,
+        row_set: RowSetObligation,
+        relation: RelationId,
+        row_scope: str,
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        columns = self._row_set_relation_columns(relation)
+        if not columns:
+            return constraints
+        identity_col = columns[0]
+        identity = self._constraint_column(identity_col, row_scope=row_scope)
+        constraints.append(
+            exp.Is(this=identity.copy(), expression=exp.Not(this=exp.Null()))
+        )
+        existing_values = self._existing_values_for_column(identity_col)
+        if existing_values:
+            constraints.append(
+                exp.Not(
+                    this=exp.In(
+                        this=identity.copy(),
+                        expressions=[
+                            exp.Literal.number(value)
+                            if isinstance(value, (int, float))
+                            else exp.Literal.string(str(value))
+                            for value in existing_values
+                        ],
+                    )
+                )
+            )
+        return constraints
+
+    def _row_set_join_constraints(
+        self,
+        row_set: RowSetObligation,
+        row_scope: str,
+        fixed_rels: Set[RelationId] | None = None,
+        first_scope: str = "",
+    ) -> List[exp.Expression]:
+        fixed_rels = fixed_rels or set()
+        constraints: List[exp.Expression] = []
+        for fact in row_set.join_facts:
+            eff_source = first_scope if fact.source_relation in fixed_rels else row_scope
+            eff_target = first_scope if fact.target_relation in fixed_rels else row_scope
+            for left, right in fact.equalities:
+                left_scope = (
+                    eff_source
+                    if (
+                        left.relation == fact.source_relation
+                        or self._storage_relation_for_column_id(left)
+                        == self._storage_relation_for_relation(fact.source_relation)
+                    )
+                    else eff_target
+                )
+                right_scope = (
+                    eff_target
+                    if (
+                        right.relation == fact.target_relation
+                        or self._storage_relation_for_column_id(right)
+                        == self._storage_relation_for_relation(fact.target_relation)
+                    )
+                    else eff_source
+                )
+                constraints.append(
+                    exp.EQ(
+                        this=self._constraint_column(left, row_scope=left_scope),
+                        expression=self._constraint_column(right, row_scope=right_scope),
+                    )
+                )
+        return constraints
+
+    def _scoped_expression_for_row_set(
+        self,
+        expression: exp.Expression,
+        tables: Tuple[RelationId, ...],
+        row_scope: str,
+        fixed_rels: Set[RelationId],
+        first_scope: str,
+    ) -> exp.Expression:
+        def scope(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Column):
+                return node
+            col_id = column_identity(node)
+            if col_id is None:
+                raise UnresolvedScopedColumnError(
+                    f'unresolved_scoped_column:{node.sql()}'
+                )
+            eff_scope = row_scope
+            if col_id.relation in fixed_rels:
+                eff_scope = first_scope
+            else:
+                storage = self._storage_relation_for_column_id(col_id)
+                if storage is not None:
+                    for rel in tables:
+                        if (
+                            rel in fixed_rels
+                            and self._storage_relation_for_relation(rel) == storage
+                        ):
+                            eff_scope = first_scope
+                            break
+            return self._constraint_column(col_id, row_scope=eff_scope)
+
+        return expression.copy().transform(scope)
+
+    def _row_set_predicate_constraints(
+        self,
+        row_set: RowSetObligation,
+        row_scope: str,
+        fixed_rels: Set[RelationId] | None = None,
+        first_scope: str = "",
+    ) -> List[exp.Expression]:
+        fixed_rels = fixed_rels or set()
+        constraints: List[exp.Expression] = []
+        for predicate in row_set.path_predicates:
+            if predicate.find(exp.Subquery):
+                continue
+            scoped = self._scoped_expression_for_row_set(
+                predicate,
+                row_set.relations,
+                row_scope,
+                fixed_rels,
+                first_scope,
+            )
+            if not _is_trivial_true(scoped):
+                constraints.append(scoped)
+        return constraints
+
+    def _row_set_column_for_scope(
+        self,
+        row_set: RowSetObligation,
+        column: ColumnId,
+    ) -> ColumnId:
+        source = column.source_column_id or column
+        source_relation = self._storage_relation_for_column_id(column) or source.relation
+        if source_relation is None:
+            return column
+        source_table = _relation_table_name(source_relation)
+        for relation in row_set.relations:
+            storage_relation = self._storage_relation_for_relation(relation) or relation
+            if _relation_table_name(storage_relation) == source_table:
+                return self._scoped_physical_column(source.name.raw, relation)
+        return column
+
+    def _row_set_group_constraints(
+        self,
+        row_set: RowSetObligation,
+        fixed_rels: Set[RelationId] | None = None,
+        first_scope: str = "",
+    ) -> List[exp.Expression]:
+        fixed_rels = fixed_rels or set()
+        if not row_set.group_keys or len(row_set.row_scopes) < 2:
+            return []
+        constraints: List[exp.Expression] = []
+        for row_scope in row_set.row_scopes[1:]:
+            for group_key in row_set.group_keys:
+                scoped_group_key = self._row_set_column_for_scope(row_set, group_key)
+                # Only enforce group equality if the key's relation is not already fixed
+                eff_scope = first_scope if scoped_group_key.relation in fixed_rels else row_scope
+                if eff_scope != first_scope:
+                    constraints.append(
+                        exp.EQ(
+                            this=self._constraint_column(scoped_group_key, row_scope=row_scope),
+                            expression=self._constraint_column(
+                                scoped_group_key,
+                                row_scope=first_scope,
+                            ),
+                        )
+                    )
+        return constraints
+
+    def _row_set_distinct_constraints(
+        self,
+        row_set: RowSetObligation,
+        fixed_rels: Set[RelationId] | None = None,
+        first_scope: str = "",
+    ) -> List[exp.Expression]:
+        fixed_rels = fixed_rels or set()
+        if row_set.distinct_expression is None or len(row_set.row_scopes) < 2:
+            return []
+        constraints: List[exp.Expression] = []
+        scoped_values = [
+            self._scoped_expression_for_row_set(
+                row_set.distinct_expression,
+                row_set.relations,
+                row_scope,
+                fixed_rels,
+                first_scope,
+            )
+            for row_scope in row_set.row_scopes
+        ]
+        for left_index, left in enumerate(scoped_values):
+            for right in scoped_values[left_index + 1:]:
+                constraints.append(exp.NEQ(this=left.copy(), expression=right.copy()))
+        return constraints
+
     def _constraints_for_obligations(
         self,
         obligations: Tuple[OperatorObligation, ...],
@@ -1453,13 +1823,13 @@ class ConstraintGenerator:
             scoped_columns: List[exp.Column] = []
             for index in range(row_count):
                 row_scope = obligation.row_scope
+                if row_scope is None and row_count > 1:
+                    row_scope = f"r{index}"
                 if row_scope is None:
                     row_scope = self._row_scope_for_column(
                         identity_col,
                         row_scope_by_relation,
                     )
-                if row_scope is None and row_count > 1:
-                    row_scope = f"r{index}"
                 col = self._constraint_column(identity_col, row_scope=row_scope)
                 scoped_columns.append(col)
                 constraints.append(
@@ -1689,6 +2059,12 @@ class ConstraintGenerator:
                     )
                 )
             )
+        constraints.extend(
+            self._generated_key_uniqueness_constraints(
+                active_storage_relations,
+                required_vars,
+            )
+        )
         for local_var, ref_rel, ref_col in foreign_keys:
             parent_vals = []
             if _relation_table_name(ref_rel) in self.instance.tables:
@@ -1712,6 +2088,89 @@ class ConstraintGenerator:
                     )
                 )
         return constraints, []
+
+    def _generated_key_uniqueness_constraints(
+        self,
+        active_storage_relations: Set[RelationId],
+        required_vars: Dict[Tuple[Tuple[str, str] | None, str | None], SolverVar],
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+
+        def variable_for(column: ColumnId, row_scope: str | None) -> SolverVar | None:
+            key = self._storage_column_key(column)
+            if key is None:
+                return None
+            return required_vars.get((key, row_scope))
+
+        for relation in active_storage_relations:
+            for column_name in self.instance._table_columns_for_storage(relation):
+                column = self.instance._stored_column_id(relation, column_name)
+                if not self.instance.is_unique(relation, column):
+                    continue
+                key = self._storage_column_key(column)
+                if key is None:
+                    continue
+                scoped = [
+                    variable
+                    for (storage_key, _row_scope), variable in required_vars.items()
+                    if storage_key == key
+                ]
+                for left_index, left_var in enumerate(scoped):
+                    for right_var in scoped[left_index + 1:]:
+                        constraints.append(
+                            exp.NEQ(
+                                this=self._constraint_column(
+                                    left_var.column_id,
+                                    row_scope=left_var.row_scope,
+                                ),
+                                expression=self._constraint_column(
+                                    right_var.column_id,
+                                    row_scope=right_var.row_scope,
+                                ),
+                            )
+                        )
+            for key_columns in self.instance._constraint_groups(relation):
+                scopes = sorted(
+                    {
+                        row_scope
+                        for storage_key, row_scope in required_vars
+                        if storage_key
+                        and storage_key[0] == relation.name.normalized
+                        and variable_for(key_columns[0], row_scope) is not None
+                    },
+                    key=lambda value: "" if value is None else value,
+                )
+                scoped_keys: List[Tuple[SolverVar, ...]] = []
+                for row_scope in scopes:
+                    key_vars = tuple(
+                        variable
+                        for column in key_columns
+                        if (variable := variable_for(column, row_scope)) is not None
+                    )
+                    if len(key_vars) == len(key_columns):
+                        scoped_keys.append(key_vars)
+
+                for left_index, left_key in enumerate(scoped_keys):
+                    for right_key in scoped_keys[left_index + 1:]:
+                        disjunct: exp.Expression | None = None
+                        for left_var, right_var in zip(left_key, right_key):
+                            left = self._constraint_column(
+                                left_var.column_id,
+                                row_scope=left_var.row_scope,
+                            )
+                            right = self._constraint_column(
+                                right_var.column_id,
+                                row_scope=right_var.row_scope,
+                            )
+                            comparison = exp.NEQ(this=left, expression=right)
+                            disjunct = (
+                                comparison
+                                if disjunct is None
+                                else exp.Or(this=disjunct, expression=comparison)
+                            )
+                        if disjunct is not None:
+                            constraints.append(disjunct)
+        return constraints
 
     def _storage_column_key(self, column: ColumnId) -> Tuple[str, str] | None:
         relation = self._storage_relation_for_column_id(column)

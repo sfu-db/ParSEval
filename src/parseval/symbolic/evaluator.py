@@ -425,16 +425,15 @@ class PlanEvaluator:
         rows: List[Row] = []
         for table in output.tables.values():
             rows.extend(table.rows)
-        if not rows:
-            return
-        self._observe(
-            root_node,
-            AtomObservation(
-                atom_id=0,
-                outcome=BranchType.ATOM_TRUE,
-                row_ids=_row_ids(rows[0]),
-            ),
-        )
+        for row in rows:
+            self._observe(
+                root_node,
+                AtomObservation(
+                    atom_id=0,
+                    outcome=BranchType.ATOM_TRUE,
+                    row_ids=_row_ids(row),
+                ),
+            )
 
     def _evaluate_subtree(
         self,
@@ -1721,12 +1720,14 @@ class PlanEvaluator:
             return predicate
 
         scalar_values: Dict[int, Any] = {}
+        scalar_values_by_sql: Dict[str, Any] = {}
         predicate_values: Dict[int, bool] = {}
         outer_env = env or _outer_environment(outer_bindings) or Environment()
         for subplan in subplans:
             key = id(subplan)
             subplan.anchor.meta[_SUBPLAN_ANCHOR_ID] = key
             if subplan.kind is SubPlanKind.SCALAR:
+                anchor_sql = subplan.anchor.sql(dialect=self.dialect)
                 if not subplan.correlated and key in self._uncorrelated_scalar_cache:
                     scalar_values[key] = self._uncorrelated_scalar_cache[key]
                 else:
@@ -1737,6 +1738,7 @@ class PlanEvaluator:
                     if not subplan.correlated:
                         self._uncorrelated_scalar_cache[key] = scalar_value
                     scalar_values[key] = scalar_value
+                scalar_values_by_sql[anchor_sql] = scalar_values[key]
             elif subplan.kind is SubPlanKind.EXISTS:
                 predicate_values[key] = self._inner_plan_has_rows(subplan.inner, outer_bindings)
             elif subplan.kind is SubPlanKind.IN and isinstance(subplan.anchor, exp.In):
@@ -1750,6 +1752,10 @@ class PlanEvaluator:
             key = node.meta.get(_SUBPLAN_ANCHOR_ID)
             if isinstance(node, exp.Subquery) and key in scalar_values:
                 return exp.convert(scalar_values[key])
+            if isinstance(node, exp.Subquery):
+                scalar_sql = node.sql(dialect=self.dialect)
+                if scalar_sql in scalar_values_by_sql:
+                    return exp.convert(scalar_values_by_sql[scalar_sql])
             if isinstance(node, (exp.Exists, exp.In)) and key in predicate_values:
                 return exp.true() if predicate_values[key] else exp.false()
             return node
@@ -1946,6 +1952,12 @@ class PlanEvaluator:
         }
 
         aggregate_expr = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
+        if subplans and aggregate_expr.find(exp.Subquery):
+            aggregate_expr = self._resolve_subquery_predicates(
+                aggregate_expr,
+                subplans,
+                outer_bindings or {},
+            )
         aggregate_types = (exp.Count, exp.Avg, exp.Sum, exp.Min, exp.Max)
         if isinstance(aggregate_expr, aggregate_types):
             return self._aggregate_function_value(
@@ -1971,12 +1983,6 @@ class PlanEvaluator:
             return exp.convert(value)
 
         resolved = aggregate_expr.copy().transform(replace_aggregate)
-        # Resolve any scalar subqueries embedded in the aggregate expression
-        # (e.g. COUNT(x) / (SELECT COUNT(y) FROM t)).
-        if subplans and resolved.find(exp.Subquery):
-            resolved = self._resolve_subquery_predicates(
-                resolved, subplans, outer_bindings or {},
-            )
         if rows:
             return concrete(resolved, _env_from_row(rows[0], outer_bindings))
         return concrete(resolved, Environment())

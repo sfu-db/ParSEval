@@ -24,8 +24,13 @@ class InstanceLoader:
             dialect=target.dialect,
         ) as conn:
             if truncate_first:
+                is_mysql = target.dialect == "mysql"
+                if is_mysql:
+                    conn.execute("SET FOREIGN_KEY_CHECKS = 0", fetch=None)
                 for table in snapshot.tables:
                     conn.drop_table(table.table_name)
+                if is_mysql:
+                    conn.execute("SET FOREIGN_KEY_CHECKS = 1", fetch=None)
             ddls = [ddl.strip() for ddl in snapshot.schema_ddl.split(";") if ddl.strip()]
             if ddls:
                 conn.create_tables(*ddls)
@@ -58,22 +63,28 @@ class InstanceLoader:
             column: f"p{index}"
             for index, column in enumerate(table.columns)
         }
-        statement = exp.Insert(
-            this=exp.Schema(
-                this=self._quoted_table(table.table_name),
-                expressions=[self._quoted_identifier(column) for column in table.columns],
-            ),
-            expression=exp.Values(
-                expressions=[
-                    exp.Tuple(
-                        expressions=[
-                            exp.Placeholder(this=parameter_names[column])
-                            for column in table.columns
-                        ]
-                    )
-                ]
-            ),
-        ).sql(dialect=dialect)
+        # pymysql uses %(name)s placeholders via exec_driver_sql; others use :name
+        if dialect == "mysql":
+            cols = ", ".join(f"`{c}`" for c in table.columns)
+            phs = ", ".join(f"%({parameter_names[c]})s" for c in table.columns)
+            statement = f"INSERT INTO `{table.table_name}` ({cols}) VALUES ({phs})"
+        else:
+            statement = exp.Insert(
+                this=exp.Schema(
+                    this=self._quoted_table(table.table_name),
+                    expressions=[self._quoted_identifier(column) for column in table.columns],
+                ),
+                expression=exp.Values(
+                    expressions=[
+                        exp.Tuple(
+                            expressions=[
+                                exp.Placeholder(this=parameter_names[column])
+                                for column in table.columns
+                            ]
+                        )
+                    ]
+                ),
+            ).sql(dialect=dialect)
         payload = [
             {
                 parameter_names[column]: serialized_row.get(column)

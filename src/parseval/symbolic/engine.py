@@ -23,7 +23,7 @@ from parseval.instance import Instance
 from parseval.identity import ColumnKind, RelationId
 from parseval.domain.exceptions import ConstraintConflict
 from parseval.plan import Plan
-from parseval.plan.planner import Aggregate, Join, Project
+from parseval.plan.planner import Aggregate, Join, Limit, Project
 from parseval.query import preprocess_sql
 from parseval.solver import Solver, SolverConstraint
 
@@ -278,7 +278,7 @@ def _compute_row_budget(plan: Plan) -> int:
     - +2 per JOIN (need match + left-unmatched + right-unmatched).
     - +2 if GROUP BY present (need >=2 groups, one passing HAVING, one failing).
     - +1 per CASE arm (each arm needs a row exercising it).
-    - Cap at 20 to avoid runaway generation.
+    - Raise to root LIMIT offset+limit when the final result requires more rows.
     """
     budget = 3
     for step in plan.ordered_steps:
@@ -290,6 +290,11 @@ def _compute_row_budget(plan: Plan) -> int:
             for proj in step.projections:
                 if isinstance(proj, exp.Expression):
                     budget += len(list(proj.find_all(exp.Case)))
+        elif isinstance(step, Limit):
+            offset = max(int(getattr(step, "offset", 0) or 0), 0)
+            limit = getattr(step, "limit", 1)
+            limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
+            budget = max(budget, offset + limit_value)
     return budget
 
 
