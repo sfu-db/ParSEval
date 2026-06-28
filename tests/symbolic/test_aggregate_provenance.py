@@ -6,7 +6,7 @@ from parseval.plan import Aggregate, Having, Plan
 from parseval.plan.context import build_context_from_instance
 from parseval.query import preprocess_sql
 from parseval.symbolic.evaluator import PlanEvaluator
-from parseval.symbolic.types import BranchTree
+from parseval.symbolic.types import BranchTree, BranchType
 
 
 def _first_step_of_type(plan: Plan, step_type):
@@ -61,6 +61,32 @@ def test_complex_group_key_runtime_uses_planner_identity_and_provenance():
         "SUBSTRING(t1.date, 1, 4)",
     }
     assert len(group.source_row_ids) == 2
+
+
+def test_branch_tree_records_group_lineage_from_evaluator():
+    instance = Instance(
+        ddls="CREATE TABLE sales (dept TEXT, amount INT);",
+        name="test",
+        dialect="sqlite",
+    )
+    instance.create_row("sales", values={"dept": "A", "amount": 10})
+    instance.create_row("sales", values={"dept": "A", "amount": 20})
+    instance.create_row("sales", values={"dept": "B", "amount": 30})
+    sql = "SELECT dept, COUNT(*) AS n FROM sales GROUP BY dept"
+    expr = preprocess_sql(sql, instance, dialect="sqlite")
+    plan = Plan(expr, instance)
+
+    tree = PlanEvaluator(plan, instance, "sqlite").evaluate(BranchTree())
+    group_node = next(node for node in tree.nodes if node.site == "group")
+    multi_traces = [
+        trace
+        for trace in tree.traces_for_node(group_node)
+        if trace.outcome == BranchType.GROUP_MULTI
+    ]
+
+    assert multi_traces
+    assert any(len(trace.input_row_ids) == 2 for trace in multi_traces)
+    assert any(len(group.source_row_ids) == 2 for group in tree.group_lineage.values())
 
 
 def test_having_without_select_alias_evaluates_without_synthetic_placeholder():

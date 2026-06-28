@@ -137,6 +137,39 @@ class PathObservationKey:
     row_ids: Tuple[Any, ...]
 
 
+@dataclass(frozen=True)
+class RowLineage:
+    """Evaluator-derived row flow through one plan operator."""
+
+    step_id: str
+    site: str
+    output_row_ids: Tuple[Any, ...]
+    source_row_ids: Tuple[Tuple[Any, ...], ...] = ()
+    relations: Tuple[RelationId, ...] = ()
+
+
+@dataclass(frozen=True)
+class OperatorTrace:
+    """One operator decision bound to concrete input and output row ids."""
+
+    node_key: Tuple[str, str, str]
+    outcome: BranchType
+    input_row_ids: Tuple[Tuple[Any, ...], ...] = ()
+    output_row_ids: Tuple[Tuple[Any, ...], ...] = ()
+    concrete_values: Tuple[Tuple[ColumnId, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class GroupTrace:
+    """Aggregate output row bound to the source rows that formed the group."""
+
+    step_id: str
+    output_row_ids: Tuple[Any, ...]
+    source_row_ids: Tuple[Tuple[Any, ...], ...]
+    group_key: Tuple[Any, ...] = ()
+    aggregate_values: Tuple[Tuple[Any, Any], ...] = ()
+
+
 # =============================================================================
 # Branch nodes (decision sites in the plan)
 # =============================================================================
@@ -369,6 +402,9 @@ class BranchTree:
     node_map: Dict[Tuple[str, str, str], BranchNode] = field(default_factory=dict)
     row_index: Dict[Tuple[Any, ...], Set[Tuple[str, str, str]]] = field(default_factory=dict)
     observation_keys: Set[PathObservationKey] = field(default_factory=set)
+    row_lineage: Dict[Tuple[Any, ...], RowLineage] = field(default_factory=dict)
+    operator_traces: List[OperatorTrace] = field(default_factory=list)
+    group_lineage: Dict[Tuple[Any, ...], GroupTrace] = field(default_factory=dict)
     _uncovered_cache: Optional[List[CoverageTarget]] = field(
         default=None, repr=False
     )
@@ -447,6 +483,84 @@ class BranchTree:
             entry = self.row_index.setdefault(observation.row_ids, set())
             entry.add(node_key)
         self._cache_dirty = True
+
+    def record_row_lineage(
+        self,
+        *,
+        step_id: str,
+        site: str,
+        output_row_ids: Tuple[Any, ...],
+        source_row_ids: Tuple[Tuple[Any, ...], ...] = (),
+        relations: Tuple[RelationId, ...] = (),
+    ) -> None:
+        self.row_lineage[output_row_ids] = RowLineage(
+            step_id=step_id,
+            site=site,
+            output_row_ids=output_row_ids,
+            source_row_ids=source_row_ids,
+            relations=relations,
+        )
+
+    def record_operator_trace(
+        self,
+        node: BranchNode,
+        *,
+        outcome: BranchType,
+        input_row_ids: Tuple[Tuple[Any, ...], ...] = (),
+        output_row_ids: Tuple[Tuple[Any, ...], ...] = (),
+        concrete_values: Tuple[Tuple[ColumnId, Any], ...] = (),
+    ) -> None:
+        self.operator_traces.append(
+            OperatorTrace(
+                node_key=(node.step_id, node.site, node.predicate_sql),
+                outcome=outcome,
+                input_row_ids=input_row_ids,
+                output_row_ids=output_row_ids,
+                concrete_values=concrete_values,
+            )
+        )
+
+    def record_group_lineage(
+        self,
+        *,
+        step_id: str,
+        output_row_ids: Tuple[Any, ...],
+        source_row_ids: Tuple[Tuple[Any, ...], ...],
+        group_key: Tuple[Any, ...] = (),
+        aggregate_values: Tuple[Tuple[Any, Any], ...] = (),
+    ) -> None:
+        self.group_lineage[output_row_ids] = GroupTrace(
+            step_id=step_id,
+            output_row_ids=output_row_ids,
+            source_row_ids=source_row_ids,
+            group_key=group_key,
+            aggregate_values=aggregate_values,
+        )
+
+    def traces_for_node(self, node: BranchNode) -> List[OperatorTrace]:
+        node_key = (node.step_id, node.site, node.predicate_sql)
+        return [trace for trace in self.operator_traces if trace.node_key == node_key]
+
+    def operator_trace_count(
+        self,
+        node: BranchNode,
+        outcome: BranchType,
+        *,
+        require_output: bool = False,
+    ) -> int:
+        return sum(
+            1
+            for trace in self.traces_for_node(node)
+            if trace.outcome == outcome
+            and (not require_output or bool(trace.output_row_ids))
+        )
+
+    def root_output_lineages(self) -> List[RowLineage]:
+        return [
+            lineage
+            for lineage in self.row_lineage.values()
+            if lineage.site == "root_result"
+        ]
 
     def _target_specs_for_node(self, node: BranchNode) -> List[Tuple[int, BranchType, int]]:
         """Coverage targets for a node, including operator-level outcomes."""
@@ -656,9 +770,13 @@ __all__ = [
     "CoverageObligation",
     "CoverageThresholds",
     "GenerationResult",
+    "GroupTrace",
     "JoinFact",
     "OperatorObligation",
+    "OperatorTrace",
     "PathObservationKey",
     "PathPredicate",
+    "RowLineage",
+    "RowSetObligation",
     "SubqueryPath",
 ]

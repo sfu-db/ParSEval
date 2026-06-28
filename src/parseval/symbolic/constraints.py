@@ -188,6 +188,12 @@ class ConstraintGenerator:
             if obligation.kind == "row_set" and obligation.row_set is not None
         )
         for predicate in path.predicates:
+            if (
+                row_sets
+                and predicate.node is not path.target.node
+                and predicate.expression.find(exp.In)
+            ):
+                continue
             if self._row_sets_cover_having_predicate(predicate, row_sets):
                 continue
             constraints.extend(self._constraints_for_path_predicate(predicate))
@@ -1112,6 +1118,9 @@ class ConstraintGenerator:
         self,
         conjunct: exp.Expression,
     ) -> List[exp.Expression]:
+        in_constraint = self._existing_values_in_constraint(conjunct)
+        if in_constraint is not None:
+            return [in_constraint]
         constraints = [conjunct.copy()]
         if not isinstance(
             conjunct,
@@ -1621,7 +1630,10 @@ class ConstraintGenerator:
             exp.Is(this=identity.copy(), expression=exp.Not(this=exp.Null()))
         )
         existing_values = self._existing_values_for_column(identity_col)
-        if existing_values:
+        storage_relation = self._storage_relation_for_column_id(identity_col)
+        storage_col = identity_col.source_column_id or identity_col
+        is_identity = self._is_unique_storage_column(storage_relation, storage_col)
+        if existing_values and is_identity:
             constraints.append(
                 exp.Not(
                     this=exp.In(
@@ -1636,6 +1648,34 @@ class ConstraintGenerator:
                 )
             )
         return constraints
+
+    def _is_unique_storage_column(
+        self,
+        storage_relation: RelationId | None,
+        storage_col: ColumnId,
+    ) -> bool:
+        if storage_relation is None:
+            return False
+        if self.instance.is_unique(storage_relation, storage_col):
+            return True
+        table_name = _relation_table_name(storage_relation)
+        column_name = storage_col.name.normalized
+        identity_names = {
+            identifier_name(name, dialect=self.dialect).normalized
+            for name in self._identity_column_names(table_name)
+        }
+        if column_name in identity_names:
+            return True
+        for key_columns in self.instance._constraint_groups(storage_relation):
+            if len(key_columns) != 1:
+                continue
+            key_name = identifier_name(
+                key_columns[0].name,
+                dialect=self.dialect,
+            ).normalized
+            if key_name == column_name:
+                return True
+        return False
 
     def _row_set_join_constraints(
         self,
@@ -1719,18 +1759,123 @@ class ConstraintGenerator:
         fixed_rels = fixed_rels or set()
         constraints: List[exp.Expression] = []
         for predicate in row_set.path_predicates:
-            if predicate.find(exp.Subquery):
-                continue
-            scoped = self._scoped_expression_for_row_set(
-                predicate,
-                row_set.relations,
-                row_scope,
-                fixed_rels,
-                first_scope,
-            )
-            if not _is_trivial_true(scoped):
-                constraints.append(scoped)
+            for conjunct in self._split_conjuncts(predicate):
+                if conjunct.find(exp.Subquery):
+                    constraints.extend(
+                        self._row_set_subquery_predicate_constraints(
+                            conjunct,
+                            row_set,
+                            row_scope,
+                            fixed_rels,
+                            first_scope,
+                        )
+                    )
+                    continue
+                scoped = self._scoped_expression_for_row_set(
+                    conjunct,
+                    row_set.relations,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+                if not _is_trivial_true(scoped):
+                    constraints.append(scoped)
         return constraints
+
+    def _row_set_subquery_predicate_constraints(
+        self,
+        predicate: exp.Expression,
+        row_set: RowSetObligation,
+        row_scope: str,
+        fixed_rels: Set[RelationId],
+        first_scope: str,
+    ) -> List[exp.Expression]:
+        if not isinstance(predicate, exp.In):
+            return []
+        if not isinstance(predicate.this, exp.Column):
+            return []
+        subplan = self._find_subplan_for_anchor(predicate)
+        if subplan is None or subplan.inner is None:
+            return []
+        scoped_outer = self._scoped_expression_for_row_set(
+            predicate.this,
+            row_set.relations,
+            row_scope,
+            fixed_rels,
+            first_scope,
+        )
+        inner_relations = self._plan_relations(subplan.inner)
+        inner_value = self._in_inner_value_expression(subplan)
+        if inner_value is None or not inner_relations:
+            return []
+
+        inner_scope = f"{row_scope}_inner"
+        self._scope_expression_columns(inner_value, inner_scope, inner_relations)
+        constraints: List[exp.Expression] = []
+        for relation in inner_relations:
+            constraints.extend(
+                self._row_set_scan_relation_constraints(
+                    row_set,
+                    relation,
+                    inner_scope,
+                )
+            )
+        constraints.append(exp.EQ(this=scoped_outer, expression=inner_value))
+        inner_path = SubqueryPath(
+            node=None,
+            inner_root=subplan.inner,
+            predicate=predicate,
+        )
+        constraints.extend(
+            self._scalar_subquery_inner_constraints(
+                inner_path,
+                row_scope=inner_scope,
+                relations=inner_relations,
+            )
+        )
+        return constraints
+
+    def _existing_values_in_constraint(
+        self,
+        predicate: exp.Expression,
+        outer_expression: exp.Expression | None = None,
+    ) -> exp.Expression | None:
+        if not isinstance(predicate, exp.In):
+            return None
+        if not isinstance(predicate.this, exp.Column):
+            return None
+        if not predicate.find(exp.Subquery):
+            return None
+        subplan = self._find_subplan_for_anchor(predicate)
+        if subplan is None:
+            return None
+        inner_values = self._eval_inner_plan_values(subplan.inner)
+        if not inner_values:
+            return None
+        return exp.In(
+            this=outer_expression or predicate.this.copy(),
+            expressions=[
+                exp.Literal.number(value)
+                if isinstance(value, (int, float))
+                else exp.Literal.string(str(value))
+                for value in inner_values
+            ],
+        )
+
+    def _find_subplan_for_anchor(self, anchor: exp.Expression) -> SubPlan | None:
+        target_sql = anchor.sql(dialect=self.dialect)
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, SubPlan):
+                continue
+            step_anchor = getattr(step, "anchor", None)
+            if step_anchor is anchor:
+                return step
+            if (
+                isinstance(step_anchor, exp.Expression)
+                and step_anchor.sql(dialect=self.dialect) == target_sql
+            ):
+                return step
+        return None
 
     def _row_set_column_for_scope(
         self,
@@ -2066,19 +2211,36 @@ class ConstraintGenerator:
             )
         )
         for local_var, ref_rel, ref_col in foreign_keys:
+            ref_key = self._storage_column_key(ref_col)
+            generated_parent_vars = [
+                variable
+                for variable in required_by_storage.get(ref_key, [])
+                if variable != local_var
+            ] if ref_key is not None else []
             parent_vals = []
             if _relation_table_name(ref_rel) in self.instance.tables:
                 for row in self.instance.get_rows(ref_rel):
                     val = self._row_value(row, ref_col)
                     if val is not None:
                         parent_vals.append(val)
+            local_expr = self._constraint_column(
+                local_var.column_id,
+                row_scope=local_var.row_scope,
+            )
+            choices: List[exp.Expression] = [
+                exp.EQ(
+                    this=local_expr.copy(),
+                    expression=self._constraint_column(
+                        parent_var.column_id,
+                        row_scope=parent_var.row_scope,
+                    ),
+                )
+                for parent_var in generated_parent_vars
+            ]
             if parent_vals:
-                constraints.append(
+                choices.append(
                     exp.In(
-                        this=self._constraint_column(
-                            local_var.column_id,
-                            row_scope=local_var.row_scope,
-                        ),
+                        this=local_expr.copy(),
                         expressions=[
                             exp.Literal.number(v)
                             if isinstance(v, (int, float))
@@ -2087,6 +2249,12 @@ class ConstraintGenerator:
                         ],
                     )
                 )
+            if not choices:
+                continue
+            constraint = choices[0]
+            for choice in choices[1:]:
+                constraint = exp.Or(this=constraint, expression=choice)
+            constraints.append(constraint)
         return constraints, []
 
     def _generated_key_uniqueness_constraints(
@@ -2420,6 +2588,10 @@ class ConstraintGenerator:
                 constraints=[atom] if atom else [],
             )
 
+        coordinated = self._generate_coordinated_in_constraint(target, atom, subplan)
+        if coordinated is not None:
+            return coordinated
+
         inner_values = self._eval_inner_plan_values(subplan.inner)
         outer_col = atom.this
 
@@ -2459,6 +2631,239 @@ class ConstraintGenerator:
             target_relations=target.node.tables,
             constraints=[constraint],
         )
+
+    def _generate_coordinated_in_constraint(
+        self,
+        target: CoverageTarget,
+        atom: exp.In,
+        subplan: SubPlan,
+    ) -> SolverConstraint | None:
+        if target.target_outcome != PlausibleBit.IN_MATCH:
+            return None
+        if not isinstance(atom.this, exp.Column) or subplan.inner is None:
+            return None
+
+        outer_relations = self._in_outer_relations(subplan)
+        inner_relations = self._plan_relations(subplan.inner)
+        if not outer_relations or not inner_relations:
+            return None
+
+        outer_scope = "in_outer"
+        inner_scope = "in_inner"
+        row_scope_by_relation = {
+            **{relation: outer_scope for relation in outer_relations},
+            **{relation: inner_scope for relation in inner_relations},
+        }
+
+        constraints: List[exp.Expression] = []
+        join_equalities: List[Tuple[ColumnId, ColumnId]] = []
+
+        outer_value = atom.this.copy()
+        self._scope_expression_columns(outer_value, outer_scope, outer_relations)
+        inner_value = self._in_inner_value_expression(subplan)
+        if inner_value is None:
+            return None
+        self._scope_expression_columns(inner_value, inner_scope, inner_relations)
+        constraints.append(exp.EQ(this=outer_value, expression=inner_value))
+
+        constraints.extend(
+            self._in_outer_predicate_constraints(
+                subplan,
+                atom,
+                outer_scope,
+                outer_relations,
+            )
+        )
+        inner_path = SubqueryPath(
+            node=target.node,
+            inner_root=subplan.inner,
+            predicate=atom,
+        )
+        constraints.extend(
+            self._scalar_subquery_inner_constraints(
+                inner_path,
+                row_scope=inner_scope,
+                relations=inner_relations,
+            )
+        )
+        join_equalities.extend(self._join_equalities_for_root(subplan.consumer))
+        join_equalities.extend(self._join_equalities_for_root(subplan.inner))
+        constraints.extend(
+            self._distinct_storage_constraints_between_relation_sets(
+                outer_relations,
+                inner_relations,
+                outer_scope,
+                inner_scope,
+                join_equalities,
+            )
+        )
+
+        target_relations = outer_relations + inner_relations
+        self._annotate_solver_vars(
+            constraints,
+            target_relations,
+            row_scope_by_relation=row_scope_by_relation,
+        )
+        constraints, extra_join_equalities = self._apply_database_constraints(
+            constraints=constraints,
+            tables=target_relations,
+            row_scope_by_relation=row_scope_by_relation,
+        )
+        join_equalities.extend(extra_join_equalities)
+        self._annotate_solver_vars(
+            constraints,
+            target_relations,
+            row_scope_by_relation=row_scope_by_relation,
+        )
+        lowered_joins = self._lower_join_equalities(
+            join_equalities,
+            target_relations,
+            row_scope_by_relation=row_scope_by_relation,
+        )
+
+        variables: Dict[SolverVar, DataType] = {}
+        for left_var, right_var in lowered_joins:
+            for variable in (left_var, right_var):
+                dtype = self._datatype_for_column_id(variable.column_id)
+                if dtype is not None:
+                    variables[variable] = dtype
+
+        return SolverConstraint(
+            target_relations=target_relations,
+            constraints=constraints,
+            join_equalities=lowered_joins,
+            variables=variables,
+            storage_relations=self._storage_relations_for_constraint(
+                constraints,
+                lowered_joins,
+                variables,
+                (),
+            ),
+        )
+
+    def _in_outer_relations(self, subplan: SubPlan) -> Tuple[RelationId, ...]:
+        consumer = subplan.consumer
+        if consumer is None:
+            return ()
+        annotation = self.plan.annotation_for(consumer)
+        return tuple(annotation.source_relations)
+
+    def _in_inner_value_expression(self, subplan: SubPlan) -> exp.Expression | None:
+        for step in self._iter_steps_with_subplans(subplan.inner):
+            if not isinstance(step, Project):
+                continue
+            projections = tuple(getattr(step, "projections", ()) or ())
+            if not projections:
+                return None
+            projection = projections[0]
+            return projection.this.copy() if isinstance(projection, exp.Alias) else projection.copy()
+        return None
+
+    def _in_outer_predicate_constraints(
+        self,
+        subplan: SubPlan,
+        atom: exp.In,
+        row_scope: str,
+        relations: Tuple[RelationId, ...],
+    ) -> List[exp.Expression]:
+        consumer = subplan.consumer
+        condition = getattr(consumer, "condition", None)
+        if not isinstance(condition, exp.Expression):
+            return []
+
+        constraints: List[exp.Expression] = []
+        target_sql = atom.sql(dialect=self.dialect)
+        for conjunct in self._split_conjuncts(condition):
+            if conjunct is atom or conjunct.sql(dialect=self.dialect) == target_sql:
+                continue
+            if conjunct.find(exp.Subquery):
+                continue
+            copied = conjunct.copy()
+            self._scope_expression_columns(copied, row_scope, relations)
+            constraints.extend(self._positive_conjunct_constraints(copied))
+        return constraints
+
+    def _join_equalities_for_root(
+        self,
+        root: Step | None,
+    ) -> List[Tuple[ColumnId, ColumnId]]:
+        if root is None:
+            return []
+        equalities: List[Tuple[ColumnId, ColumnId]] = []
+        for step in self._iter_steps_with_subplans(root):
+            if not isinstance(step, Join):
+                continue
+            for join_data in (step.joins or {}).values():
+                source_keys = tuple(join_data.get("source_key", ()) or ())
+                join_keys = tuple(join_data.get("join_key", ()) or ())
+                for source_key, join_key in zip(source_keys, join_keys):
+                    if not isinstance(source_key, exp.Column) or not isinstance(join_key, exp.Column):
+                        continue
+                    source_id = column_identity(source_key)
+                    join_id = column_identity(join_key)
+                    if source_id is not None and join_id is not None:
+                        equalities.append((source_id, join_id))
+        return equalities
+
+    def _distinct_storage_constraints_between_relation_sets(
+        self,
+        left_relations: Tuple[RelationId, ...],
+        right_relations: Tuple[RelationId, ...],
+        left_scope: str,
+        right_scope: str,
+        equalities: List[Tuple[ColumnId, ColumnId]],
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        for left_relation in left_relations:
+            left_table = self._storage_table_name(left_relation)
+            if left_table is None:
+                continue
+            key_names = self._identity_column_names(left_table)
+            if not key_names:
+                continue
+            for right_relation in right_relations:
+                if left_relation == right_relation:
+                    continue
+                if self._storage_table_name(right_relation) != left_table:
+                    continue
+                for key_name in key_names:
+                    left_col = self._scoped_physical_column(key_name, left_relation)
+                    right_col = self._scoped_physical_column(key_name, right_relation)
+                    if self._columns_equated(left_col, right_col, equalities):
+                        continue
+                    constraints.append(
+                        exp.NEQ(
+                            this=self._constraint_column(left_col, row_scope=left_scope),
+                            expression=self._constraint_column(
+                                right_col,
+                                row_scope=right_scope,
+                            ),
+                        )
+                    )
+        return constraints
+
+    def _storage_table_name(self, relation: RelationId) -> str | None:
+        try:
+            return self.instance._table_key_for_storage(relation)
+        except Exception:
+            return None
+
+    def _columns_equated(
+        self,
+        left: ColumnId,
+        right: ColumnId,
+        equalities: List[Tuple[ColumnId, ColumnId]],
+    ) -> bool:
+        for eq_left, eq_right in equalities:
+            if (
+                self._same_column_identity(left, eq_left)
+                and self._same_column_identity(right, eq_right)
+            ) or (
+                self._same_column_identity(left, eq_right)
+                and self._same_column_identity(right, eq_left)
+            ):
+                return True
+        return False
 
     def _generate_distinct_constraint(self, target: CoverageTarget) -> SolverConstraint:
         tables = target.node.tables
@@ -2632,56 +3037,23 @@ class ConstraintGenerator:
 
     def _eval_inner_plan_values(self, root: Step) -> set:
         """Evaluate an inner plan and return the set of projected column values."""
-        from parseval.plan.rex import concrete, Environment
+        from .evaluator import PlanEvaluator
 
-        scans: List[Scan] = []
-        filters: List[Filter] = []
-        projects: List[Project] = []
-
-        def collect(s: Step) -> None:
-            if isinstance(s, Scan):
-                scans.append(s)
-            if isinstance(s, Filter):
-                filters.append(s)
-            if isinstance(s, Project):
-                projects.append(s)
-            for dep in s.chain_dependencies:
-                collect(dep)
-
-        collect(root)
-        if not scans:
-            return set()
-
-        scan = scans[0]
-        source = scan.source
-        table_name = source.name if isinstance(source, exp.Table) else scan.name
-        if table_name not in self.instance.tables:
-            return set()
-
-        from parseval.identity import table_relation as _tr4
-        rows = list(self.instance.get_rows(_tr4(table_name, dialect=self.dialect)))
-        for filt in filters:
-            if filt.condition is None:
-                continue
-            passing = []
-            for row in rows:
-                env = Environment(_row_env_bindings(row))
-                if concrete(filt.condition, env) is True:
-                    passing.append(row)
-            rows = passing
-
-        if not rows or not projects or not projects[0].projections:
-            return set()
-
-        projection = projects[0].projections[0]
-        if isinstance(projection, exp.Alias):
-            projection = projection.this
-
+        ctx = PlanEvaluator(self.plan, self.instance, self.dialect)._evaluate_subtree(root)
         values = set()
-        for row in rows:
-            env = Environment(_row_env_bindings(row))
-            val = concrete(projection, env)
-            values.add(val)
+        for table in ctx.tables.values():
+            columns = tuple(table.columns)
+            for row in table.rows:
+                if columns:
+                    symbol = row[columns[0]]
+                else:
+                    try:
+                        symbol = next(iter(row.columns.values()))
+                    except StopIteration:
+                        continue
+                value = symbol.concrete
+                if value is not None:
+                    values.add(value)
         return values
 
     def _generate_fresh_value(self, existing: set, meta: Optional[dict]) -> Any:
