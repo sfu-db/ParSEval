@@ -341,6 +341,20 @@ class TestAggregationMetadata(unittest.TestCase):
         self.assertEqual(constraints[0]["function"], "count")
         self.assertEqual(constraints[0]["operator"], "gt")
 
+    def test_direct_count_distinct_having_metadata_tracks_distinct_argument(self):
+        plan = _plan(
+            "SELECT dept FROM sales GROUP BY dept HAVING COUNT(DISTINCT event_id) > 1",
+            "CREATE TABLE sales (dept TEXT, event_id INT);",
+        )
+
+        having = _first_step_of_type(plan, Having)
+        constraints = plan.annotation_for(having).metadata["having_constraints"]
+
+        self.assertEqual(constraints[0]["function"], "count")
+        self.assertTrue(constraints[0]["distinct"])
+        self.assertEqual(constraints[0]["argument"].source_column_id.name.normalized, "event_id")
+        self.assertEqual(constraints[0]["required_rows"], 2)
+
     def test_sum_metadata_describes_argument_and_output_datatype(self):
         plan = _plan(
             "SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept",

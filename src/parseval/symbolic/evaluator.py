@@ -434,6 +434,19 @@ class PlanEvaluator:
                     row_ids=_row_ids(row),
                 ),
             )
+            tree.record_row_lineage(
+                step_id=root_node.step_id,
+                site="root_result",
+                output_row_ids=_row_ids(row),
+                source_row_ids=(_row_ids(row),),
+                relations=root_node.tables,
+            )
+            tree.record_operator_trace(
+                root_node,
+                outcome=BranchType.ATOM_TRUE,
+                input_row_ids=(_row_ids(row),),
+                output_row_ids=(_row_ids(row),),
+            )
 
     def _evaluate_subtree(
         self,
@@ -511,7 +524,7 @@ class PlanEvaluator:
                 self._walk(sub, input_ctx, tree)
 
         if isinstance(step, Scan):
-            return self._eval_scan(step, ctx)
+            return self._eval_scan(step, ctx, tree, observe=observe)
         elif isinstance(step, Filter):
             return self._eval_filter(
                 step,
@@ -537,14 +550,42 @@ class PlanEvaluator:
         elif isinstance(step, SubPlan):
             return self._eval_subplan(step, input_ctx, tree)
         elif isinstance(step, Sort):
-            return self._eval_sort(step, input_ctx)
+            return self._eval_sort(step, input_ctx, tree, observe=observe)
         elif isinstance(step, Limit):
-            return self._eval_limit(step, input_ctx)
+            return self._eval_limit(step, input_ctx, tree, observe=observe)
         elif isinstance(step, SetOperation):
             return input_ctx
         return input_ctx
 
-    def _eval_scan(self, step: Scan, ctx: Context) -> Context:
+    def _step_id(self, step: Step) -> str:
+        return self.plan.annotation_for(step).step_id
+
+    def _record_row_flow(
+        self,
+        tree: BranchTree,
+        step: Step,
+        site: str,
+        row: Row,
+        *,
+        sources: Tuple[Tuple[Any, ...], ...] = (),
+        relations: Tuple[RelationId, ...] = (),
+    ) -> None:
+        tree.record_row_lineage(
+            step_id=self._step_id(step),
+            site=site,
+            output_row_ids=_row_ids(row),
+            source_row_ids=sources,
+            relations=relations,
+        )
+
+    def _eval_scan(
+        self,
+        step: Scan,
+        ctx: Context,
+        tree: BranchTree,
+        *,
+        observe: bool = True,
+    ) -> Context:
         output_key = step.relation_id or step.name
         if step.source is None or not isinstance(step.source, exp.Table):
             # For subquery scans, evaluate the SubPlan's inner plan.
@@ -558,20 +599,31 @@ class PlanEvaluator:
                 output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
                 if not output_columns and inner_rows:
                     output_columns = tuple(inner_rows[0].columns)
+                rows = [
+                    Row(
+                        this=row.rowid,
+                        columns={
+                            column: _materialize_column_from_row(column, row)
+                            for column in output_columns
+                        },
+                    )
+                    for row in inner_rows
+                ]
+                if observe:
+                    for row in rows:
+                        self._record_row_flow(
+                            tree,
+                            step,
+                            "derived_scan",
+                            row,
+                            sources=(_row_ids(row),),
+                            relations=(step.relation_id,) if step.relation_id is not None else (),
+                        )
                 return Context(
                     tables={
                         output_key: DerivedSchema(
                             columns=output_columns,
-                            rows=[
-                                Row(
-                                    this=row.rowid,
-                                    columns={
-                                        column: _materialize_column_from_row(column, row)
-                                        for column in output_columns
-                                    },
-                                )
-                                for row in inner_rows
-                            ],
+                            rows=rows,
                         )
                     }
                 )
@@ -579,20 +631,31 @@ class PlanEvaluator:
             if table_name in ctx.tables:
                 table = ctx.tables[table_name]
                 output_columns = tuple(getattr(step, "output_column_ids", ()) or table.columns)
+                rows = [
+                    Row(
+                        this=row.rowid,
+                        columns={
+                            column: _materialize_column_from_row(column, row)
+                            for column in output_columns
+                        },
+                    )
+                    for row in table.rows
+                ]
+                if observe:
+                    for row in rows:
+                        self._record_row_flow(
+                            tree,
+                            step,
+                            "scan",
+                            row,
+                            sources=(_row_ids(row),),
+                            relations=(step.relation_id,) if step.relation_id is not None else (),
+                        )
                 return Context(
                     tables={
                         output_key: DerivedSchema(
                             columns=output_columns,
-                            rows=[
-                                Row(
-                                    this=row.rowid,
-                                    columns={
-                                        column: _materialize_column_from_row(column, row)
-                                        for column in output_columns
-                                    },
-                                )
-                                for row in table.rows
-                            ],
+                            rows=rows,
                         )
                     }
                 )
@@ -603,20 +666,31 @@ class PlanEvaluator:
             return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
         table = ctx.tables[table_name]
         output_columns = tuple(getattr(step, "output_column_ids", ()) or table.columns)
+        rows = [
+            Row(
+                this=row.rowid,
+                columns={
+                    column: _materialize_column_from_row(column, row)
+                    for column in output_columns
+                },
+            )
+            for row in table.rows
+        ]
+        if observe:
+            for row in rows:
+                self._record_row_flow(
+                    tree,
+                    step,
+                    "scan",
+                    row,
+                    sources=(_row_ids(row),),
+                    relations=(step.relation_id,) if step.relation_id is not None else (),
+                )
         return Context(
             tables={
                 output_key: DerivedSchema(
                     columns=output_columns,
-                    rows=[
-                        Row(
-                            this=row.rowid,
-                            columns={
-                                column: _materialize_column_from_row(column, row)
-                                for column in output_columns
-                            },
-                        )
-                        for row in table.rows
-                    ],
+                    rows=rows,
                 )
             }
         )
@@ -759,6 +833,28 @@ class PlanEvaluator:
                 # Full predicate for pass/fail.
                 if predicate_value is True:
                     passing_rows.append(row)
+                    if node is not None:
+                        tree.record_row_lineage(
+                            step_id=node.step_id,
+                            site="filter",
+                            output_row_ids=_row_ids(row),
+                            source_row_ids=(_row_ids(row),),
+                            relations=node.tables,
+                        )
+                        tree.record_operator_trace(
+                            node,
+                            outcome=BranchType.FILTER_TRUE,
+                            input_row_ids=(_row_ids(row),),
+                            output_row_ids=(_row_ids(row),),
+                            concrete_values=_concrete_values(predicate_for_row, env),
+                        )
+                elif node is not None:
+                    tree.record_operator_trace(
+                        node,
+                        outcome=_classify_filter_outcome(predicate_value),
+                        input_row_ids=(_row_ids(row),),
+                        concrete_values=_concrete_values(predicate_for_row, env),
+                    )
 
         return Context(
             tables={
@@ -983,11 +1079,51 @@ class PlanEvaluator:
                     if keys_match and condition_matches:
                         source_matched = True
                         matched_join_rows.add(join_index)
-                        joined_rows.append(_joined_row(source_row, join_row))
+                        joined = _joined_row(source_row, join_row)
+                        joined_rows.append(joined)
+                        if node is not None:
+                            tree.record_row_lineage(
+                                step_id=node.step_id,
+                                site="join",
+                                output_row_ids=_row_ids(joined),
+                                source_row_ids=(
+                                    _row_ids(source_row),
+                                    _row_ids(join_row),
+                                ),
+                                relations=node.tables,
+                            )
+                            tree.record_operator_trace(
+                                node,
+                                outcome=BranchType.JOIN_MATCH,
+                                input_row_ids=(
+                                    _row_ids(source_row),
+                                    _row_ids(join_row),
+                                ),
+                                output_row_ids=(_row_ids(joined),),
+                                concrete_values=join_key_values(env),
+                            )
+                    elif node is not None:
+                        tree.record_operator_trace(
+                            node,
+                            outcome=join_outcome,
+                            input_row_ids=(
+                                _row_ids(source_row),
+                                _row_ids(join_row),
+                            ),
+                            concrete_values=join_key_values(env),
+                        )
                 if preserves_source and not source_matched:
                     null_right = _null_join_row(join_table, _row_ids(source_row))
                     preserved = _joined_row(source_row, null_right)
                     joined_rows.append(preserved)
+                    if node is not None:
+                        tree.record_row_lineage(
+                            step_id=node.step_id,
+                            site="join",
+                            output_row_ids=_row_ids(preserved),
+                            source_row_ids=(_row_ids(source_row),),
+                            relations=node.tables,
+                        )
                     record_preserved_row(
                         preserved,
                         env_for_pair(source_row, null_right),
@@ -1000,6 +1136,14 @@ class PlanEvaluator:
                     null_source = _null_join_row(source_table, _row_ids(join_row))
                     preserved = _joined_row(null_source, join_row)
                     joined_rows.append(preserved)
+                    if node is not None:
+                        tree.record_row_lineage(
+                            step_id=node.step_id,
+                            site="join",
+                            output_row_ids=_row_ids(preserved),
+                            source_row_ids=(_row_ids(join_row),),
+                            relations=node.tables,
+                        )
                     record_preserved_row(
                         preserved,
                         env_for_pair(null_source, join_row),
@@ -1224,6 +1368,37 @@ class PlanEvaluator:
                     outcome = BranchType.GROUP_SINGLE if count == 1 else BranchType.GROUP_MULTI
                     self._observe(node, AtomObservation(atom_id=0, outcome=outcome))
 
+            if observe:
+                aggregate_step_id = self._step_id(step)
+                for output_row_id, group in aggregate_groups.items():
+                    tree.record_group_lineage(
+                        step_id=aggregate_step_id,
+                        output_row_ids=output_row_id,
+                        source_row_ids=group.source_row_ids,
+                        group_key=group.group_key,
+                        aggregate_values=tuple(group.aggregate_values.items()),
+                    )
+                    tree.record_row_lineage(
+                        step_id=aggregate_step_id,
+                        site="aggregate",
+                        output_row_ids=output_row_id,
+                        source_row_ids=group.source_row_ids,
+                        relations=_annotation_relation_ids(
+                            self.plan.annotation_for(step)
+                        ),
+                    )
+                    if node is not None:
+                        tree.record_operator_trace(
+                            node,
+                            outcome=(
+                                BranchType.GROUP_SINGLE
+                                if len(group.source_row_ids) == 1
+                                else BranchType.GROUP_MULTI
+                            ),
+                            input_row_ids=group.source_row_ids,
+                            output_row_ids=(output_row_id,),
+                        )
+
             if aggregate_node is not None:
                 rows_by_id = {_row_ids(row): row for row in table.rows}
                 for output_row_id, group in aggregate_groups.items():
@@ -1386,6 +1561,28 @@ class PlanEvaluator:
                     )
                 if predicate_value is True:
                     passing_rows.append(row)
+                    if node is not None:
+                        tree.record_row_lineage(
+                            step_id=node.step_id,
+                            site="having",
+                            output_row_ids=_row_ids(row),
+                            source_row_ids=(_row_ids(row),),
+                            relations=node.tables,
+                        )
+                        tree.record_operator_trace(
+                            node,
+                            outcome=BranchType.HAVING_PASS,
+                            input_row_ids=(_row_ids(row),),
+                            output_row_ids=(_row_ids(row),),
+                            concrete_values=_concrete_values(predicate, env),
+                        )
+                elif node is not None:
+                    tree.record_operator_trace(
+                        node,
+                        outcome=_classify_having_outcome(predicate_value),
+                        input_row_ids=(_row_ids(row),),
+                        concrete_values=_concrete_values(predicate, env),
+                    )
 
         for table in ctx.tables.values():
             return Context(tables={step.name: table.with_rows(passing_rows, columns=columns)})
@@ -1535,9 +1732,16 @@ class PlanEvaluator:
                 outcome = BranchType.DISTINCT_DUPLICATE if has_duplicates else BranchType.DISTINCT_UNIQUE
                 self._observe(distinct_node, AtomObservation(atom_id=0, outcome=outcome))
 
-        return self._materialize_project(step, ctx)
+        return self._materialize_project(step, ctx, tree, observe=observe)
 
-    def _eval_sort(self, step: Sort, ctx: Context) -> Context:
+    def _eval_sort(
+        self,
+        step: Sort,
+        ctx: Context,
+        tree: BranchTree,
+        *,
+        observe: bool = True,
+    ) -> Context:
         output: Dict[str, DerivedSchema] = {}
         for table_name, table in ctx.tables.items():
             rows = list(table.rows)
@@ -1548,11 +1752,26 @@ class PlanEvaluator:
                     key=lambda row: self._sort_key_value(expr, row),
                     reverse=descending,
                 )
+            if observe:
+                for row in rows:
+                    tree.record_row_lineage(
+                        step_id=self._step_id(step),
+                        site="sort",
+                        output_row_ids=_row_ids(row),
+                        source_row_ids=(_row_ids(row),),
+                    )
             output[step.name] = table.with_rows(rows)
             break
         return Context(tables=output)
 
-    def _eval_limit(self, step: Limit, ctx: Context) -> Context:
+    def _eval_limit(
+        self,
+        step: Limit,
+        ctx: Context,
+        tree: BranchTree,
+        *,
+        observe: bool = True,
+    ) -> Context:
         output: Dict[str, DerivedSchema] = {}
         for _table_name, table in ctx.tables.items():
             offset = max(int(getattr(step, "offset", 0) or 0), 0)
@@ -1561,18 +1780,41 @@ class PlanEvaluator:
             else:
                 limit_value = max(int(step.limit), 0)
                 rows = list(table.rows)[offset : offset + limit_value]
+            if observe:
+                for row in rows:
+                    tree.record_row_lineage(
+                        step_id=self._step_id(step),
+                        site="limit",
+                        output_row_ids=_row_ids(row),
+                        source_row_ids=(_row_ids(row),),
+                    )
             output[step.name] = table.with_rows(rows)
             break
         return Context(tables=output)
 
-    def _materialize_project(self, step: Project, ctx: Context) -> Context:
+    def _materialize_project(
+        self,
+        step: Project,
+        ctx: Context,
+        tree: BranchTree,
+        *,
+        observe: bool = True,
+    ) -> Context:
         output: Dict[str, DerivedSchema] = {}
         for table_name, table in ctx.tables.items():
             rows: List[Row] = []
             visible_columns = self._projected_columns(step, table.columns)
             for row in table.rows:
                 projected = self._projected_values(step, row, table_name)
-                rows.append(Row(this=_row_ids(row), columns=projected))
+                output_row = Row(this=_row_ids(row), columns=projected)
+                rows.append(output_row)
+                if observe:
+                    tree.record_row_lineage(
+                        step_id=self._step_id(step),
+                        site="project",
+                        output_row_ids=_row_ids(output_row),
+                        source_row_ids=(_row_ids(row),),
+                    )
 
             if step.distinct:
                 distinct_rows: List[Row] = []
@@ -1743,7 +1985,13 @@ class PlanEvaluator:
                 predicate_values[key] = self._inner_plan_has_rows(subplan.inner, outer_bindings)
             elif subplan.kind is SubPlanKind.IN and isinstance(subplan.anchor, exp.In):
                 outer_value = concrete(subplan.anchor.this, outer_env)
-                inner_values = self._inner_plan_values(subplan.inner, outer_bindings)
+                inner_values = {
+                    value
+                    for value, _row_id in self._inner_plan_value_rows(
+                        subplan.inner,
+                        outer_bindings,
+                    )
+                }
                 predicate_values[key] = outer_value in inner_values
         if not scalar_values and not predicate_values:
             return predicate
@@ -2071,33 +2319,49 @@ class PlanEvaluator:
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
     ) -> set:
         """Evaluate inner plan and return the set of projected column values."""
+        return {
+            value
+            for value, _row_id in self._inner_plan_value_rows(root, outer_bindings)
+        }
+
+    def _inner_plan_value_rows(
+        self,
+        root: Step,
+        outer_bindings: Optional[Dict[ColumnId, Any]] = None,
+    ) -> List[Tuple[Any, Tuple[Any, ...]]]:
+        """Evaluate inner plan and return projected values with their row ids."""
         rows, table_name, projects = self._eval_inner_plan(root, outer_bindings)
         if not rows:
-            return set()
+            return []
 
-        values: set = set()
+        values: List[Tuple[Any, Tuple[Any, ...]]] = []
         projection = projects[0].projections[0] if projects and projects[0].projections else None
         for row in rows:
             if projection is not None:
                 # Try ColumnId from output_column_ids first
                 output_ids = getattr(projects[0], "output_column_ids", None)
                 if output_ids and output_ids[0] in row:
-                    values.add(_symbol_value(row[output_ids[0]]))
+                    values.append((_symbol_value(row[output_ids[0]]), _row_ids(row)))
                     continue
                 alias = self._projection_name(projection)
                 if alias in row:
-                    values.add(_symbol_value(row[alias]))
+                    values.append((_symbol_value(row[alias]), _row_ids(row)))
                     continue
                 projection_expr = projection.this if isinstance(projection, exp.Alias) else projection
             elif len(row.columns) == 1:
-                values.add(_symbol_value(next(iter(dict(row.items()).values()))))
+                values.append(
+                    (
+                        _symbol_value(next(iter(dict(row.items()).values()))),
+                        _row_ids(row),
+                    )
+                )
                 continue
             else:
                 continue
 
             env = _env_from_row(row, outer_bindings)
             val = concrete(projection_expr, env)
-            values.add(val)
+            values.append((val, _row_ids(row)))
         return values
 
     def _eval_in_subplan(self, step: SubPlan, ctx: Context, tree: BranchTree) -> Context:
@@ -2127,7 +2391,8 @@ class PlanEvaluator:
                 for table_name, table in ctx.tables.items():
                     for row in table.rows:
                         env = _env_from_row(row)
-                        inner_values = self._inner_plan_values(step.inner, env)
+                        inner_value_rows = self._inner_plan_value_rows(step.inner, env)
+                        inner_values = {value for value, _row_id in inner_value_rows}
                         outer_val = _symbol_value(row[outer_col])
 
                         outcome = BranchType.IN_MATCH if outer_val in inner_values else BranchType.IN_NO_MATCH
@@ -2139,6 +2404,18 @@ class PlanEvaluator:
                                 row_ids=_row_ids(row),
                                 concrete_values=_concrete_values(step.anchor, env),
                             ),
+                        )
+                        matching_inner_rows = tuple(
+                            inner_row_id
+                            for value, inner_row_id in inner_value_rows
+                            if value == outer_val
+                        )
+                        tree.record_operator_trace(
+                            node,
+                            outcome=outcome,
+                            input_row_ids=(_row_ids(row),) + matching_inner_rows,
+                            output_row_ids=(_row_ids(row),) if outcome == BranchType.IN_MATCH else (),
+                            concrete_values=_concrete_values(step.anchor, env),
                         )
 
         return ctx

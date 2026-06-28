@@ -475,7 +475,7 @@ class CoverageAnalyzer:
             for atom_id, outcome, threshold in self.target_specs_for_node(node):
                 if node.is_infeasible(atom_id, outcome):
                     continue
-                if node.observation_count(atom_id, outcome) >= threshold:
+                if self._covered_observation_count(node, atom_id, outcome) >= threshold:
                     continue
                 obligation = self._obligation_for(node, atom_id, outcome)
                 targets.append(
@@ -516,6 +516,36 @@ class CoverageAnalyzer:
             if obligation.kind == "root_result"
         ]
         return max(counts or [1])
+
+    def _covered_observation_count(
+        self,
+        node: BranchNode,
+        atom_id: int,
+        outcome: BranchType,
+    ) -> int:
+        if node.site == "root_result" and outcome == BranchType.ATOM_TRUE:
+            return len(self.tree.root_output_lineages())
+        if node.site == "in":
+            return self.tree.operator_trace_count(
+                node,
+                outcome,
+                require_output=outcome == BranchType.IN_MATCH,
+            )
+        if node.site == "group":
+            return self.tree.operator_trace_count(node, outcome, require_output=True)
+        if atom_id < 0:
+            return self.tree.operator_trace_count(
+                node,
+                outcome,
+                require_output=outcome
+                in {
+                    BranchType.FILTER_TRUE,
+                    BranchType.JOIN_MATCH,
+                    BranchType.HAVING_PASS,
+                    BranchType.ATOM_TRUE,
+                },
+            )
+        return node.observation_count(atom_id, outcome)
 
     def _combination_specs_for_node(
         self,
@@ -585,7 +615,7 @@ class CoverageAnalyzer:
                 if node.is_infeasible(0, BranchType.ATOM_TRUE):
                     continue
                 if (
-                    node.observation_count(0, BranchType.ATOM_TRUE)
+                    self._covered_observation_count(node, 0, BranchType.ATOM_TRUE)
                     < self._root_result_row_count(node)
                 ):
                     targets.append(
@@ -596,6 +626,26 @@ class CoverageAnalyzer:
                         )
                     )
                 continue
+            if node.site == "in":
+                threshold = self.tree.thresholds.threshold_for(BranchType.IN_MATCH)
+                if threshold <= 0:
+                    continue
+                if node.is_infeasible(0, BranchType.IN_MATCH):
+                    continue
+                if (
+                    self._covered_observation_count(node, 0, BranchType.IN_MATCH)
+                    >= threshold
+                ):
+                    continue
+                targets.append(
+                    CoverageTarget(
+                        node=node,
+                        atom_id=0,
+                        target_outcome=BranchType.IN_MATCH,
+                        obligation=self._obligation_for(node, 0, BranchType.IN_MATCH),
+                    )
+                )
+                continue
             if node.site in {"filter", "join_on", "scalar_subquery", "having"}:
                 for atom_id in range(len(node.atoms)):
                     threshold = self.tree.thresholds.threshold_for(
@@ -605,7 +655,14 @@ class CoverageAnalyzer:
                         continue
                     if node.is_infeasible(atom_id, BranchType.ATOM_TRUE):
                         continue
-                    if node.observation_count(atom_id, BranchType.ATOM_TRUE) >= threshold:
+                    if (
+                        self._covered_observation_count(
+                            node,
+                            atom_id,
+                            BranchType.ATOM_TRUE,
+                        )
+                        >= threshold
+                    ):
                         continue
                     targets.append(
                         CoverageTarget(
@@ -864,8 +921,7 @@ def _build_branch_tree(
                 relations.append(relation)
 
         def add_column(column: ColumnId) -> None:
-            source = column.source_column_id or column
-            add_relation(source.relation or column.relation)
+            add_relation(column.relation or (column.source_column_id or column).relation)
 
         def walk_step(s: Step, visited: set[int]) -> None:
             if id(s) in visited:
@@ -898,6 +954,12 @@ def _build_branch_tree(
                             col_id = column_identity(col)
                             if col_id is not None:
                                 add_column(col_id)
+            if isinstance(s, SubPlan) and s.inner is not None:
+                walk_step(s.inner, visited)
+            for subplan in getattr(s, "subplan_dependencies", ()) or ():
+                walk_step(subplan, visited)
+                if subplan.inner is not None:
+                    walk_step(subplan.inner, visited)
             for dep in s.chain_dependencies:
                 walk_step(dep, visited)
 

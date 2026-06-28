@@ -1,20 +1,6 @@
 """
 db_manager.py
 Database connection manager using SQLAlchemy connection URLs.
-
-Engines and DB-initialisation state are cached at module level, keyed by
-connection URL.  Multiple DBManager instances (or bare get_connection() calls)
-for the same URL share the same engine automatically — no singleton needed.
-
-Usage:
-    with get_connection("sqlite:////path/to/mydb.sqlite", dialect="sqlite") as conn:
-        conn.create_tables(ddl_string)
-        rows = conn.execute("SELECT * FROM users", fetch="all")
-
-    # class-based (for a custom logger threaded through all calls)
-    mgr = DBManager(log=my_logger)
-    with mgr.get_connection("sqlite:////path/to/mydb.sqlite", dialect="sqlite") as conn:
-        ...
 """
 
 from __future__ import annotations
@@ -25,9 +11,10 @@ import os
 import random
 import threading
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 from threading import Lock
-from typing import Any, Dict, Generator, List, Literal, Optional, Set, Tuple, Union, overload
+from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union, overload
 
 from sqlglot import exp
 from sqlalchemy import Connection, Engine, MetaData, URL, create_engine, text
@@ -35,10 +22,6 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool, StaticPool
 from sqlalchemy.schema import CreateTable
 
-
-# ---------------------------------------------------------------------------
-# Dialect mappings + quoting helpers
-# ---------------------------------------------------------------------------
 
 _DIALECT_TO_BACKEND = {
     "sqlite": "sqlite",
@@ -61,42 +44,26 @@ def _quote_mysql_identifier(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
 
-# ---------------------------------------------------------------------------
-# Module-level engine cache — the resource worth sharing across call sites
-# ---------------------------------------------------------------------------
-
-_engine_cache: Dict[str, Engine] = {}
-_initialized_dbs: Set[Tuple[str, str]] = set()   # (dialect, cache_key)
-_cache_lock: Lock = Lock()
-
-
-def dispose_all() -> None:
+class singletonMeta(type):
     """
-    Dispose every cached engine and clear both caches.
-
-    - Called automatically at process exit via atexit.
-    - Call explicitly in tests between cases to prevent engine/DB state leaking.
+    Thread-safe singleton implementation for the manager.
     """
-    with _cache_lock:
-        for engine in _engine_cache.values():
-            engine.dispose()
-        _engine_cache.clear()
-        _initialized_dbs.clear()
 
+    _instances: dict[type, object] = {}
+    _lock: Lock = Lock()
 
-atexit.register(dispose_all)
+    def __call__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls not in cls._instances:
+                cls._instances[cls] = super().__call__(*args, **kwargs)
+        return cls._instances[cls]
 
-
-# ---------------------------------------------------------------------------
-# Connect — SQL execution wrapper
-# ---------------------------------------------------------------------------
 
 class Connect:
     """
     Executes SQL against a given SQLAlchemy engine.
 
-    Do **not** instantiate directly; use :func:`get_connection` or
-    :meth:`DBManager.get_connection`.
+    Do **not** instantiate directly; use :meth:`DBManager.get_connection`.
     """
 
     def __init__(self, engine: Engine, log: Optional[logging.Logger] = None) -> None:
@@ -157,15 +124,19 @@ class Connect:
         is_sqlite = self.engine.url.get_backend_name() == "sqlite"
         results: Optional[List[Tuple[Any, ...]]] = None
         raw_conn = None
+        cursor_result = None
         guard: Optional["Connect._TimeoutGuard"] = None
         cancelled: Optional[Any] = None
 
-        deadline = time.monotonic() + timeout
+        start_time = time.monotonic()
+        deadline = start_time + timeout
 
         with self.engine.begin() as conn:
             if is_sqlite:
                 guard = Connect._TimeoutGuard()
-                raw_conn, cancelled = self._arm_sqlite_timeout(conn, timeout, guard=guard)
+                raw_conn, cancelled = self._arm_sqlite_timeout(
+                    conn, timeout, guard=guard
+                )
             self._log.debug(
                 "Preparing to execute query with timeout %d seconds: %.120s",
                 timeout,
@@ -181,7 +152,9 @@ class Connect:
                     and cursor_result is not None
                     and (cancelled is None or not cancelled.is_set())
                 ):
-                    results = self._fetch(cursor_result, fetch, deadline, with_column_names)
+                    results = self._fetch(
+                        cursor_result, fetch, deadline, with_column_names
+                    )
             except TimeoutError:
                 raise
             except Exception as exc:
@@ -234,7 +207,8 @@ class Connect:
                 except Exception:
                     pass
 
-        threading.Thread(target=_timer_interrupt, daemon=True).start()
+        timer = threading.Thread(target=_timer_interrupt, daemon=True)
+        timer.start()
 
         def _progress():
             return 1 if time.monotonic() > deadline else 0
@@ -357,10 +331,6 @@ class Connect:
         return exp.Table(this=exp.Identifier(this=table_name, quoted=True))
 
 
-# ---------------------------------------------------------------------------
-# Backend providers
-# ---------------------------------------------------------------------------
-
 class _BackendProvider:
     dialect: str
     backend_name: str
@@ -395,15 +365,32 @@ class _SQLiteProvider(_BackendProvider):
         if not os.path.exists(database):
             open(database, "a").close()
 
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
+    def create_engine(
+        self,
+        url: URL,
+        *,
+        pool_size: int,
+        max_overflow: int,
+        pool_timeout: int,
+        pool_recycle: int,
+        connect_timeout: int,
+    ) -> Engine:
         is_memory = url.database in (None, ":memory:")
         connect_args: Dict[str, Any] = {
             "check_same_thread": False,
             "timeout": connect_timeout,
         }
         if is_memory:
-            return create_engine(url, poolclass=StaticPool, connect_args=connect_args)
-        return create_engine(url, poolclass=NullPool, connect_args=connect_args)
+            return create_engine(
+                url,
+                poolclass=StaticPool,
+                connect_args=connect_args,
+            )
+        return create_engine(
+            url,
+            poolclass=NullPool,
+            connect_args=connect_args,
+        )
 
 
 class _MySQLProvider(_BackendProvider):
@@ -418,12 +405,23 @@ class _MySQLProvider(_BackendProvider):
         try:
             with engine.begin() as conn:
                 conn.execute(
-                    text(f"CREATE DATABASE IF NOT EXISTS {_quote_mysql_identifier(url.database)}")
+                    text(
+                        f"CREATE DATABASE IF NOT EXISTS {_quote_mysql_identifier(url.database)}"
+                    )
                 )
         finally:
             engine.dispose()
 
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
+    def create_engine(
+        self,
+        url: URL,
+        *,
+        pool_size: int,
+        max_overflow: int,
+        pool_timeout: int,
+        pool_recycle: int,
+        connect_timeout: int,
+    ) -> Engine:
         return create_engine(
             url,
             pool_size=pool_size,
@@ -453,12 +451,23 @@ class _PostgresProvider(_BackendProvider):
                 )
                 if not result.fetchone():
                     conn.execute(
-                        text(f"CREATE DATABASE {_quote_postgres_identifier(url.database)}")
+                        text(
+                            f"CREATE DATABASE {_quote_postgres_identifier(url.database)}"
+                        )
                     )
         finally:
             engine.dispose()
 
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
+    def create_engine(
+        self,
+        url: URL,
+        *,
+        pool_size: int,
+        max_overflow: int,
+        pool_timeout: int,
+        pool_recycle: int,
+        connect_timeout: int,
+    ) -> Engine:
         return create_engine(
             url,
             pool_size=pool_size,
@@ -470,128 +479,24 @@ class _PostgresProvider(_BackendProvider):
         )
 
 
-# ---------------------------------------------------------------------------
-# Module-level provider registry + internal helpers
-# ---------------------------------------------------------------------------
-
-_providers: Dict[str, _BackendProvider] = {
-    "sqlite": _SQLiteProvider(),
-    "mysql": _MySQLProvider(),
-    "postgres": _PostgresProvider(),
-}
-
-
-def _normalize_target(
-    connection_string: str,
-    dialect: str,
-) -> Tuple[URL, _BackendProvider, str]:
-    provider = _providers.get(dialect)
-    if provider is None:
-        raise ValueError(
-            f"Unsupported dialect '{dialect}'. Supported: {list(_providers)}"
-        )
-    url = make_url(connection_string)
-    backend_name = url.get_backend_name()
-    expected_backend = _DIALECT_TO_BACKEND[dialect]
-    if backend_name != expected_backend:
-        raise ValueError(
-            f"Connection string backend '{backend_name}' does not match dialect '{dialect}'"
-        )
-    cache_key = url.render_as_string(hide_password=False)
-    return url, provider, cache_key
-
-
-def _get_or_create_engine(
-    url: URL,
-    *,
-    provider: _BackendProvider,
-    cache_key: str,
-    log: logging.Logger,
-    pool_size: int,
-    max_overflow: int,
-    pool_timeout: int,
-    pool_recycle: int,
-    connect_timeout: int,
-) -> Engine:
-    with _cache_lock:
-        engine = _engine_cache.get(cache_key)
-        if engine is None:
-            engine = provider.create_engine(
-                url,
-                pool_size=pool_size,
-                max_overflow=max_overflow,
-                pool_timeout=pool_timeout,
-                pool_recycle=pool_recycle,
-                connect_timeout=connect_timeout,
-            )
-            _engine_cache[cache_key] = engine
-            log.debug(
-                "Created new engine for %s",
-                url.render_as_string(hide_password=True),
-            )
-        return engine
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-@contextmanager
-def get_connection(
-    connection_string: str,
-    dialect: Literal["sqlite", "mysql", "postgres"],
-    pool_size: int = 10,
-    max_overflow: int = 20,
-    pool_timeout: int = 15,
-    pool_recycle: int = 60,
-    connect_timeout: int = 25,
-    create_if_missing: bool = True,
-    log: Optional[logging.Logger] = None,
-) -> Generator[Connect, None, None]:
+class DBManager(metaclass=singletonMeta):
     """
-    Yield a :class:`Connect` instance bound to the requested database.
-
-    Engines and DB-initialisation state are cached module-wide by URL; repeated
-    calls for the same database reuse the same engine (and pool for MySQL/Postgres).
+    Maintain SQLAlchemy engines keyed by connection URL.
     """
-    _log = log or logging.getLogger("qrank.db")
-    url, provider, cache_key = _normalize_target(connection_string, dialect)
 
-    if create_if_missing:
-        init_key = (dialect, cache_key)
-        with _cache_lock:
-            if init_key not in _initialized_dbs:
-                provider.ensure_database(url)
-                _initialized_dbs.add(init_key)
-
-    engine = _get_or_create_engine(
-        url,
-        provider=provider,
-        cache_key=cache_key,
-        log=_log,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_timeout=pool_timeout,
-        pool_recycle=pool_recycle,
-        connect_timeout=connect_timeout,
-    )
-    yield Connect(engine=engine, log=_log)
-
-
-class DBManager:
-    """
-    Thin factory for :class:`Connect` instances.
-
-    No singleton, no shared state on the instance.  The engine cache lives at
-    module level and is shared automatically across all DBManager instances and
-    bare :func:`get_connection` calls.
-
-    The only reason to use DBManager over get_connection() directly is to bind
-    a custom logger once and have it applied to every connection from that manager.
-    """
+    _providers = {
+        "sqlite": _SQLiteProvider(),
+        "mysql": _MySQLProvider(),
+        "postgres": _PostgresProvider(),
+    }
 
     def __init__(self, log: Optional[logging.Logger] = None) -> None:
         self._log = log or logging.getLogger("qrank.db")
+        self._lock = Lock()
+        self._engines: Dict[str, Engine] = {}
+        self._last_used: Dict[str, float] = defaultdict(float)
+        self._initialized_dbs: set[tuple[str, str]] = set()
+        atexit.register(self._shutdown)
 
     @contextmanager
     def get_connection(
@@ -605,18 +510,100 @@ class DBManager:
         connect_timeout: int = 25,
         create_if_missing: bool = True,
     ) -> Generator[Connect, None, None]:
-        with get_connection(
-            connection_string=connection_string,
-            dialect=dialect,
+        url, provider, cache_key = self._normalize_target(connection_string, dialect)
+
+        if create_if_missing:
+            init_key = (dialect, cache_key)
+            with self._lock:
+                if init_key not in self._initialized_dbs:
+                    provider.ensure_database(url)
+                    self._initialized_dbs.add(init_key)
+
+        engine = self._assert_engine(
+            url,
+            provider=provider,
+            cache_key=cache_key,
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
             connect_timeout=connect_timeout,
-            create_if_missing=create_if_missing,
-            log=self._log,
-        ) as conn:
+        )
+        conn = Connect(engine=engine, log=self._log)
+        try:
             yield conn
+        finally:
+            self._clean_stale_pools()
+
+    def _normalize_target(
+        self,
+        connection_string: str,
+        dialect: str,
+    ) -> tuple[URL, _BackendProvider, str]:
+        provider = self._providers.get(dialect)
+        if provider is None:
+            raise ValueError(
+                f"Unsupported dialect '{dialect}'. Supported: {list(self._providers)}"
+            )
+
+        url = make_url(connection_string)
+        backend_name = url.get_backend_name()
+        expected_backend = _DIALECT_TO_BACKEND[dialect]
+        if backend_name != expected_backend:
+            raise ValueError(
+                f"Connection string backend '{backend_name}' does not match dialect '{dialect}'"
+            )
+
+        cache_key = url.render_as_string(hide_password=False)
+        return url, provider, cache_key
+
+    def _assert_engine(
+        self,
+        url: URL,
+        *,
+        provider: _BackendProvider,
+        cache_key: str,
+        pool_size: int,
+        max_overflow: int,
+        pool_timeout: int,
+        pool_recycle: int,
+        connect_timeout: int,
+    ) -> Engine:
+        with self._lock:
+            engine = self._engines.get(cache_key)
+            if engine is None:
+                engine = provider.create_engine(
+                    url,
+                    pool_size=pool_size,
+                    max_overflow=max_overflow,
+                    pool_timeout=pool_timeout,
+                    pool_recycle=pool_recycle,
+                    connect_timeout=connect_timeout,
+                )
+                self._engines[cache_key] = engine
+                self._log.debug(
+                    "Created new engine for %s",
+                    url.render_as_string(hide_password=True),
+                )
+            self._last_used[cache_key] = time.monotonic()
+            return engine
+
+    def _clean_stale_pools(self, idle_seconds: float = 60.0) -> None:
+        now = time.monotonic()
+        evicted = 0
+        with self._lock:
+            for cache_key in list(self._engines.keys()):
+                last_used = self._last_used.get(cache_key, 0)
+                if now - last_used > idle_seconds:
+                    engine = self._engines.pop(cache_key)
+                    engine.dispose()
+                    self._last_used.pop(cache_key, None)
+                    evicted += 1
+        if evicted:
+            self._log.debug("Evicted %d stale thread pool(s).", evicted)
+
+    def _shutdown(self) -> None:
+        self._clean_stale_pools(idle_seconds=-1)
 
 
 def execute_query(
@@ -630,7 +617,7 @@ def execute_query(
 
     t0 = time.time()
     try:
-        with get_connection(connection_string, dialect) as conn:
+        with DBManager().get_connection(connection_string, dialect) as conn:
             rows = conn.execute(sql, fetch="all", timeout=timeout)
             return ExecutionResult(
                 query=sql,

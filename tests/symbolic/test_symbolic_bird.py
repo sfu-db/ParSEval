@@ -60,7 +60,8 @@ def _write_and_execute(instance: Instance, sql: str) -> list:
         for row in rows:
             values = []
             for c in cols:
-                v = row[c].concrete if c in row.columns else None
+                col_id = instance._stored_column_id(table_name, c)
+                v = row[col_id].concrete if col_id in row.columns else None
                 if v is not None and not isinstance(v, (int, float, str, bytes)):
                     v = str(v)
                 values.append(v)

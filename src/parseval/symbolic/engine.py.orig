@@ -209,7 +209,6 @@ class SymbolicEngine:
         site_priority = {
             "root_result": -1,
             "filter": 0,
-            "in": 0,
             "join_on": 1,
             "having": 2,
             "case_arm": 3,
@@ -217,9 +216,7 @@ class SymbolicEngine:
         }
         outcome_priority = {
             BranchType.ATOM_TRUE: 0,
-            BranchType.IN_MATCH: 0,
             BranchType.ATOM_FALSE: 1,
-            BranchType.IN_NO_MATCH: 1,
             BranchType.ATOM_NULL: 2,
         }
 
