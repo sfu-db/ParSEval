@@ -59,7 +59,9 @@ def _materialized_rows(
             continue
         storage_relation = constraint.storage_relations.get(variable)
         storage_column = variable.column_id.source_column_id or variable.column_id
-        if storage_relation is None or storage_column.kind is not ColumnKind.PHYSICAL:
+        if storage_relation is None:
+            continue
+        if storage_column.kind is not ColumnKind.PHYSICAL:
             raise ConstraintConflict(f"missing_physical_lineage:{variable.display}")
         key = _LogicalRowKey(
             relation=variable.relation_id,
@@ -238,6 +240,8 @@ class SymbolicEngine:
             return False
 
         materialized = _materialized_rows(constraint, result.assignments)
+        if not materialized:
+            return False
 
         storage_relations = []
         seen_relations = set()
@@ -259,8 +263,12 @@ class SymbolicEngine:
                 try:
                     self.instance.create_row(storage_relation, values=row_values)
                 except Exception as exc:
+                    reason = str(exc) or type(exc).__name__
                     raise ConstraintConflict(
-                        f"materialization_failed:{storage_relation.display}"
+                        "materialization_failed:"
+                        f"{storage_relation.display}:"
+                        f"{type(exc).__name__}:"
+                        f"{reason}"
                     ) from exc
         return True
 

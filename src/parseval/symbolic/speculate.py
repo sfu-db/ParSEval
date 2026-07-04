@@ -34,6 +34,7 @@ from parseval.identity import (
     ColumnId,
     PARSEVAL_COLUMN_ID,
     RelationId,
+    column_id,
     column_identity,
     identifier_name,
     physical_column,
@@ -252,7 +253,8 @@ def _solver_table_key(binding: RowBinding) -> str:
     """Build a unique solver table key for a row binding."""
     alias = binding.alias or binding.table
     table = binding.table
-    return f"{table}__{alias}__r{binding.row}"
+    scope = binding.relation.scope_id or ""
+    return f"{table}__{alias}__{scope}__r{binding.row}"
 
 
 class ColumnUnionFind:
@@ -669,6 +671,8 @@ class Propagator:
         ann = self.plan.annotation_for(step)
         projected_ids = tuple(ann.projected_columns) + tuple(ann.referenced_columns)
         for col_id in projected_ids:
+            if col_id.kind is ColumnKind.AGGREGATE:
+                continue
             if (
                 col_id.relation is not None
                 and not _relation_is_materializable(self.instance, col_id.relation)
@@ -677,6 +681,8 @@ class Propagator:
                 source_id = col_id
             else:
                 source_id = _physical_source_id(col_id)
+            if source_id.kind is ColumnKind.AGGREGATE:
+                continue
             relation = source_id.relation
             if relation is None or not self._is_materializable_relation(relation):
                 continue
@@ -690,6 +696,8 @@ class Propagator:
         for relation_id, tc in spec.requirements.items():
             dup_ids = []
             for col_id in projected_ids:
+                if col_id.kind is ColumnKind.AGGREGATE:
+                    continue
                 if (
                     col_id.relation is not None
                     and not _relation_is_materializable(self.instance, col_id.relation)
@@ -698,6 +706,8 @@ class Propagator:
                     source_id = col_id
                 else:
                     source_id = _physical_source_id(col_id)
+                if source_id.kind is ColumnKind.AGGREGATE:
+                    continue
                 if source_id.relation == relation_id:
                     dup_ids.append(source_id)
             if step.distinct and dup_ids:
@@ -2123,11 +2133,13 @@ def _bindings_for_requirement(
     """Find bindings matching a requirement."""
     target_table = req.table
     target_alias = req.alias
+    target_scope = req.relation.scope_id
     return [
         binding
         for binding in row_bindings.values()
         if binding.table == target_table
-        and (target_alias is None or binding.alias or "" == target_alias)
+        and binding.alias == target_alias
+        and binding.relation.scope_id == target_scope
     ]
 
 
@@ -2143,24 +2155,59 @@ def _find_binding_for_column(
     return None
 
 
+def _row_binding_sort_key(binding: RowBinding) -> Tuple[str, str, str, int]:
+    return (
+        binding.table,
+        binding.alias or "",
+        binding.relation.scope_id or "",
+        binding.row,
+    )
+
+
+def _scoped_var_key(binding: RowBinding, column_name: str) -> Tuple[str, str, str, int, str]:
+    table, alias, scope, row = _row_binding_sort_key(binding)
+    return (table, alias, scope, row, column_name)
+
+
 def _requirement_for_binding(
     spec: BranchSpec,
     binding: RowBinding,
 ) -> Optional[TableConstraint]:
     """Find the TableConstraint for a binding."""
     for _relation, req in spec.requirements.items():
-        if req.table != binding.table:
-            continue
-        if req.alias:
-            if req.alias == binding.alias or "":
-                return req
-        elif binding.alias == binding.table or binding.alias is None:
-            return req
-    # Fallback: match by table name only.
-    for _relation, req in spec.requirements.items():
-        if req.table == binding.table:
+        if (
+            req.table == binding.table
+            and req.alias == binding.alias
+            and req.relation.scope_id == binding.relation.scope_id
+        ):
             return req
     return None
+
+
+def _row_bound_column_id(column: ColumnId, binding: RowBinding) -> ColumnId:
+    if column.kind not in {ColumnKind.PHYSICAL, ColumnKind.PROJECTED}:
+        return column
+    source = column.source_column_id or column
+    if source.kind is not ColumnKind.PHYSICAL:
+        return column
+    base_source = source.source_column_id or source
+    return column_id(
+        ColumnKind.PHYSICAL,
+        source.name,
+        binding.relation,
+        scope_id=binding.relation.scope_id,
+        source_column_id=base_source,
+    )
+
+
+def _row_bound_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
+    column = _row_bound_column_id(var.column_id, binding)
+    relation = column.relation or binding.relation
+    return SolverVar(
+        column_id=column,
+        relation_id=relation,
+        row_scope=f"r{binding.row}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2172,7 +2219,7 @@ def _rewrite_constraint_for_binding(
     constraint: exp.Expression,
     binding: RowBinding,
     instance: Instance,
-    scoped_vars: Optional[Dict[Tuple[str, str], SolverVar]] = None,
+    scoped_vars: Optional[Dict[Tuple[str, str, str, int, str], SolverVar]] = None,
 ) -> Optional[exp.Expression]:
     """Copy constraint, replace Column nodes with _solver_column scoped to the binding.
 
@@ -2188,15 +2235,13 @@ def _rewrite_constraint_for_binding(
     rewritten = constraint.copy()
     matched = False
     for col in rewritten.find_all(exp.Column):
+        if col.name not in instance.tables.get(binding.table, {}):
+            continue
         sv = solver_var(col)
         if sv is not None:
             if sv.relation_id.name.normalized != binding.table:
                 continue
-            new_var = SolverVar(
-                column_id=sv.column_id,
-                relation_id=sv.relation_id,
-                row_scope=f"r{binding.row}",
-            )
+            new_var = _row_bound_solver_var(sv, binding)
             set_solver_var(col, new_var)
             ct = col_type(col)
             if ct is None:
@@ -2204,7 +2249,7 @@ def _rewrite_constraint_for_binding(
                 if meta is not None and "domain" in meta:
                     col.type = meta["domain"]
             if scoped_vars is not None:
-                scoped_vars[(binding.table, col.name)] = new_var
+                scoped_vars[_scoped_var_key(binding, col.name)] = new_var
             matched = True
         else:
             col_table = col.table or ""
@@ -2214,7 +2259,7 @@ def _rewrite_constraint_for_binding(
                 elif not binding.alias:
                     continue
             # Reuse scoped variable if available.
-            key = (binding.table, col.name)
+            key = _scoped_var_key(binding, col.name)
             existing = scoped_vars.get(key) if scoped_vars is not None else None
             if existing is not None:
                 set_solver_var(col, existing)
@@ -2224,8 +2269,13 @@ def _rewrite_constraint_for_binding(
                     if meta is not None and "domain" in meta:
                         col.type = meta["domain"]
             else:
+                column = _row_bound_column_id(
+                    physical_column(col.name, binding.relation),
+                    binding,
+                )
                 new_col = _solver_column(
-                    instance, physical_column(col.name, binding.relation),
+                    instance,
+                    column,
                     row_scope=f"r{binding.row}",
                 )
                 set_solver_var(col, solver_var(new_col))
@@ -2233,6 +2283,113 @@ def _rewrite_constraint_for_binding(
                     col.type = new_col.type
             matched = True
     return rewritten if matched else None
+
+
+def _database_check_constraints_for_binding(
+    instance: Instance,
+    binding: RowBinding,
+    path_constraints: List[exp.Expression],
+) -> List[exp.Expression]:
+    constraints: List[exp.Expression] = []
+    for check in instance.database_constraints(binding.relation).checks:
+        if not check.supported:
+            raise ValueError(
+                f"unsupported_database_check:{check.reason or 'unknown'}"
+            )
+        column_by_name = {
+            column.name.normalized: column
+            for column in check.referenced_columns
+        }
+        variable_by_name = {
+            column.name.normalized: _path_variable_for_check_column(
+                path_constraints,
+                binding,
+                column,
+            )
+            for column in check.referenced_columns
+        }
+        if any(variable is None for variable in variable_by_name.values()):
+            continue
+        rewritten = check.expression.copy()
+        matched = False
+        for col in rewritten.find_all(exp.Column):
+            column = column_by_name.get(
+                identifier_name(col.name, dialect=instance.dialect).normalized
+            )
+            if column is None:
+                continue
+            variable = variable_by_name[column.name.normalized]
+            assert variable is not None
+            set_solver_var(col, variable)
+            dtype = _dtype_for_solver_var(variable, instance)
+            if dtype is not None:
+                col.type = dtype
+            matched = True
+        if matched:
+            constraints.append(rewritten)
+    return constraints
+
+
+def _database_not_null_constraints_for_binding(
+    instance: Instance,
+    binding: RowBinding,
+    path_constraints: List[exp.Expression],
+) -> List[exp.Expression]:
+    constraints = instance.database_constraints(binding.relation)
+    required_columns = dict.fromkeys(
+        tuple(constraints.not_null_columns) + tuple(constraints.primary_key)
+    )
+    expressions: List[exp.Expression] = []
+    for column in required_columns:
+        variable = _path_variable_for_check_column(
+            path_constraints,
+            binding,
+            column,
+        )
+        if variable is None:
+            continue
+        col_node = _solver_column(
+            instance,
+            variable.column_id,
+            row_scope=variable.row_scope,
+        )
+        set_solver_var(col_node, variable)
+        expressions.append(_make_is_not_null(col_node))
+    return expressions
+
+
+def _path_variable_for_check_column(
+    path_constraints: List[exp.Expression],
+    binding: RowBinding,
+    column: ColumnId,
+) -> Optional[SolverVar]:
+    expected_scope = f"r{binding.row}"
+    expected_source = column.source_column_id or column
+    for constraint in path_constraints:
+        for col in constraint.find_all(exp.Column):
+            variable = solver_var(col)
+            if variable is None or variable.row_scope != expected_scope:
+                continue
+            if variable.relation_id.name is None:
+                continue
+            if variable.relation_id.name.normalized != binding.table:
+                continue
+            if binding.alias and (
+                variable.relation_id.alias is None
+                or variable.relation_id.alias.normalized != binding.alias
+            ):
+                continue
+            if variable.relation_id.scope_id != binding.relation.scope_id:
+                continue
+            variable_source = variable.column_id.source_column_id or variable.column_id
+            if (
+                variable_source.name.normalized == expected_source.name.normalized
+                and variable_source.relation is not None
+                and expected_source.relation is not None
+                and variable_source.relation.name == expected_source.relation.name
+            ):
+                return variable
+    return None
 
 
 def _collect_solver_vars(
@@ -2349,23 +2506,21 @@ def _bindings_for_solver_var(
 ) -> List[RowBinding]:
     table = var.relation_id.name.normalized if var.relation_id.name else ""
     alias = var.relation_id.alias.normalized if var.relation_id.alias else None
+    scope = var.relation_id.scope_id
     return sorted(
         (
             binding
             for binding in row_bindings.values()
             if binding.table == table
-            and (alias is None or binding.alias == alias)
+            and binding.alias == alias
+            and binding.relation.scope_id == scope
         ),
         key=lambda binding: binding.row,
     )
 
 
 def _scoped_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
-    return SolverVar(
-        column_id=var.column_id,
-        relation_id=var.relation_id,
-        row_scope=f"r{binding.row}",
-    )
+    return _row_bound_solver_var(var, binding)
 
 
 # ---------------------------------------------------------------------------
@@ -2375,15 +2530,19 @@ def _scoped_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
 
 def _rows_from_solver_result(
     assignments: Dict[SolverVar, Any],
-    _row_bindings: Dict[str, RowBinding],
+    row_bindings: Dict[str, RowBinding],
     instance: Instance,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
     """Extract concrete rows from solver assignments.
 
     Groups by (table, row_index). Maps SolverVar fields to table/row/column.
     Skips boundary rows (row_idx >= 1000).
     """
-    rows_by_slot: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    rows_by_slot: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    bindings_by_slot = {
+        _row_binding_sort_key(binding): binding
+        for binding in row_bindings.values()
+    }
 
     for var, value in assignments.items():
         table_name = var.relation_id.name.normalized if var.relation_id.name else ""
@@ -2412,13 +2571,15 @@ def _rows_from_solver_result(
         if schema is None or column_name not in schema:
             continue
 
-        slot = (table_name, row_idx)
-        rows_by_slot.setdefault(slot, {})[column_name] = value
+        alias = var.relation_id.alias.normalized if var.relation_id.alias else ""
+        scope = var.relation_id.scope_id or ""
+        slot = (table_name, alias, scope, row_idx)
+        if slot not in bindings_by_slot:
+            continue
+        row = rows_by_slot.setdefault(slot, {})
+        row[column_name] = value
 
-    rows: Dict[str, List[Dict[str, Any]]] = {}
-    for (table, _row_idx), values in sorted(rows_by_slot.items()):
-        rows.setdefault(table, []).append(values)
-    return rows
+    return dict(sorted(rows_by_slot.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -2449,16 +2610,16 @@ def _composite_unique_groups(
     table: str,
 ) -> List[Tuple[str, ...]]:
     """Return composite primary/unique groups that must distinguish rows."""
-    try:
-        table_spec = instance.schema_spec.get_table(table)
-    except Exception:
-        return []
     groups: List[Tuple[str, ...]] = []
-    if len(table_spec.primary_key) > 1:
-        groups.append(tuple(table_spec.primary_key))
-    for group in table_spec.unique_constraints:
+    try:
+        constraints = instance.database_constraints(instance.table_id(table))
+    except KeyError:
+        return groups
+    if len(constraints.primary_key) > 1:
+        groups.append(tuple(column.name.normalized for column in constraints.primary_key))
+    for group in constraints.unique_constraints:
         if len(group) > 1:
-            groups.append(tuple(group))
+            groups.append(tuple(column.name.normalized for column in group))
     return groups
 
 
@@ -2473,8 +2634,28 @@ def _collect_existing_composite_values(
             for existing_row in instance.get_rows(table):
                 row_values = _row_value_dict(existing_row)
                 if all(column in row_values for column in group):
-                    seen.add(tuple(row_values[column] for column in group))
+                    seen.add(_composite_storage_key(instance, table, group, row_values))
     return values
+
+
+def _composite_storage_key(
+    instance: Instance,
+    table: str,
+    group: Tuple[str, ...],
+    row: Dict[str, Any],
+) -> Tuple[Any, ...]:
+    try:
+        relation = instance.table_id(table)
+        return tuple(
+            instance._column_storage_value(
+                relation,
+                instance.column_id(relation, column),
+                row[column],
+            )
+            for column in group
+        )
+    except Exception:
+        return tuple(row[column] for column in group)
 
 
 def _fresh_composite_value(value: Any, attempt: int) -> Any:
@@ -2507,7 +2688,7 @@ def _ensure_composite_unique_rows(
             continue
         key = (binding.table, group)
         seen = composite_values.setdefault(key, set())
-        current = tuple(row[column] for column in group)
+        current = _composite_storage_key(instance, binding.table, group, row)
         if current not in seen:
             seen.add(current)
             continue
@@ -2526,14 +2707,24 @@ def _ensure_composite_unique_rows(
                 )
             except Exception:
                 row[target] = _fresh_composite_value(current[group.index(target)], attempt)
-            current = tuple(row[column] for column in group)
+            current = _composite_storage_key(instance, binding.table, group, row)
             if current not in seen:
                 seen.add(current)
                 break
+        else:
+            for attempt in range(32):
+                row[target] = _fresh_composite_value(
+                    current[group.index(target)],
+                    attempt,
+                )
+                current = _composite_storage_key(instance, binding.table, group, row)
+                if current not in seen:
+                    seen.add(current)
+                    break
 
 
 def _complete_gold_rows(
-    rows: Dict[str, List[Dict[str, Any]]],
+    rows: Dict[Tuple[str, str, str, int], Dict[str, Any]],
     row_bindings: Dict[str, RowBinding],
     spec: BranchSpec,
     instance: Instance,
@@ -2544,12 +2735,9 @@ def _complete_gold_rows(
         for existing_row in instance.get_rows(table_name):
             builder.runtime.remember_row(table_name, _row_value_dict(existing_row))
 
-    pending_rows = {
-        table: [dict(row) for row in table_rows]
-        for table, table_rows in rows.items()
-    }
+    pending_rows = {slot: dict(row) for slot, row in rows.items()}
     completed: Dict[str, List[Dict[str, Any]]] = {}
-    group_values: Dict[Tuple[str, str], Any] = {}
+    group_values: Dict[Tuple[str, Optional[str], Optional[str], str], Any] = {}
     unique_values: Dict[Tuple[str, str], Set[Any]] = {}
     composite_values = _collect_existing_composite_values(instance)
 
@@ -2571,11 +2759,10 @@ def _complete_gold_rows(
 
     ordered_bindings = sorted(
         row_bindings.values(),
-        key=lambda b: (b.table, b.alias or "", b.row),
+        key=_row_binding_sort_key,
     )
     for binding in ordered_bindings:
-        table_rows = pending_rows.setdefault(binding.table, [])
-        row = table_rows.pop(0) if table_rows else {}
+        row = pending_rows.pop(_row_binding_sort_key(binding), {})
         req = _requirement_for_binding(spec, binding)
 
         if req is not None:
@@ -2584,7 +2771,12 @@ def _complete_gold_rows(
             # Apply group_key_columns.
             for cid in req.group_key_columns:
                 col_name = cid.name.normalized
-                key = (binding.table, col_name)
+                key = (
+                    binding.table,
+                    binding.alias,
+                    binding.relation.scope_id,
+                    col_name,
+                )
                 if col_name in row:
                     group_values.setdefault(key, row[col_name])
                 if key not in group_values:
@@ -2670,8 +2862,8 @@ def _complete_gold_rows(
             builder.runtime.remember_row(physical, new_row)
             current_rows.append(new_row)
 
-    for table, table_rows in pending_rows.items():
-        completed.setdefault(table, []).extend(table_rows)
+    for (table, _alias, _scope, _row_idx), row in sorted(pending_rows.items()):
+        completed.setdefault(table, []).append(row)
     return completed
 
 
@@ -3043,21 +3235,19 @@ class Resolver:
         # Build global constraint.
         constraint, row_bindings = self._build_global_constraint(spec)
 
-        # Solve.
-        if self.solver is not None:
-            result = self.solver.solve(constraint)
-            if result.sat:
-                rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
-            else:
-                logger.debug(
-                    "Solver failed for spec=%s reason=%s",
-                    spec.branch, result.reason,
-                )
-                rows = {}
-        else:
-            rows = {}
+        # Solve. Unsatisfied constraints mean this branch cannot produce a witness.
+        if self.solver is None:
+            return {}
+        result = self.solver.solve(constraint)
+        if not result.sat:
+            logger.debug(
+                "Solver failed for spec=%s reason=%s",
+                spec.branch, result.reason,
+            )
+            return {}
+        rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
 
-        # Complete missing columns (generates rows from min_rows even when solver output is empty).
+        # Complete missing columns for satisfiable row bindings.
         rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
 
         if not rows:
@@ -3068,12 +3258,8 @@ class Resolver:
             spec, self.plan, rows, self.instance, self.dialect,
         )
 
-        # Materialize generated witness rows into the shared instance.  Do not
-        # validate here; speculate's contract is constraint-driven generation.
-        try:
-            _materialize_rows(self.instance, rows)
-        except Exception:
-            return {}
+        # Materialize generated witness rows into the shared instance.
+        _materialize_rows(self.instance, rows)
         return rows
 
     def _build_global_constraint(
@@ -3127,6 +3313,23 @@ class Resolver:
                         )
                         if rewritten is not None:
                             constraints.append(rewritten)
+
+        for _relation, _req, req_bindings in all_constraint_items:
+            for binding in req_bindings:
+                constraints.extend(
+                    _database_not_null_constraints_for_binding(
+                        self.instance,
+                        binding,
+                        path_constraints=constraints,
+                    )
+                )
+                constraints.extend(
+                    _database_check_constraints_for_binding(
+                        self.instance,
+                        binding,
+                        path_constraints=constraints,
+                    )
+                )
 
         # Build join equalities.
         join_equalities = _build_join_equalities(spec, row_bindings, self.instance)
@@ -3219,11 +3422,7 @@ def speculate(
     for spec in branch_specs:
         if not spec.requirements:
             continue
-        try:
-            rows = resolver.resolve(spec)
-        except Exception as exc:
-            logger.debug("spec %s failed: %s", spec.branch, exc)
-            rows = {}
+        rows = resolver.resolve(spec)
         if rows:
             results.append((spec.branch, rows))
     return results
