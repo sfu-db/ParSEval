@@ -30,6 +30,7 @@ from parseval.plan.planner import (
     Limit,
     Project,
     Scan,
+    Sort,
     SubPlan,
     SubPlanKind,
 )
@@ -978,6 +979,14 @@ def _build_branch_tree(
                     if storage_relation == relation:
                         mapped = alias_relation
                         break
+                else:
+                    if relation.alias is None and relation.name is not None:
+                        for alias_relation, storage_relation in storage_by_relation.items():
+                            if alias_relation.alias is None or storage_relation.name is None:
+                                continue
+                            if storage_relation.name.normalized == relation.name.normalized:
+                                mapped = alias_relation
+                                break
             if mapped in seen:
                 continue
             seen.add(mapped)
@@ -1028,12 +1037,28 @@ def _build_branch_tree(
         step_nodes.setdefault(annotation.step_id, node)
 
     def _root_required_row_count(root: Step) -> int:
-        if isinstance(root, Limit):
-            offset = max(int(getattr(root, "offset", 0) or 0), 0)
-            limit = getattr(root, "limit", 1)
-            limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
-            return max(offset + limit_value, 1)
-        return 1
+        required = 1
+        visited: set[int] = set()
+
+        def walk(step: Step) -> None:
+            nonlocal required
+            if id(step) in visited:
+                return
+            visited.add(id(step))
+            if isinstance(step, Limit):
+                offset = max(int(getattr(step, "offset", 0) or 0), 0)
+                limit = getattr(step, "limit", 1)
+                limit_value = 1 if limit == float("inf") else max(int(limit or 0), 1)
+                required = max(required, offset + limit_value)
+            for subplan in getattr(step, "subplan_dependencies", ()) or ():
+                walk(subplan)
+                if subplan.inner is not None:
+                    walk(subplan.inner)
+            for dep in step.chain_dependencies:
+                walk(dep)
+
+        walk(root)
+        return max(required, 1)
 
     def _row_scopes(prefix: str, count: int) -> tuple[str, ...]:
         return tuple(f"{prefix}{index}" for index in range(max(count, 0)))
@@ -1052,12 +1077,36 @@ def _build_branch_tree(
                 predicates.append(condition)
             if isinstance(step, Join):
                 join_facts.extend(_join_facts_for_step(plan, step))
+            for subplan in getattr(step, "subplan_dependencies", ()) or ():
+                walk(subplan)
+                if subplan.inner is not None:
+                    walk(subplan.inner)
             for dep in step.chain_dependencies:
                 walk(dep)
 
         for dep in root.chain_dependencies:
             walk(dep)
         return tuple(predicates), tuple(join_facts)
+
+    def _root_ordering(root: Step) -> tuple[exp.Expression, ...]:
+        ordering: list[exp.Expression] = []
+        visited: set[int] = set()
+
+        def walk(step: Step) -> None:
+            if id(step) in visited:
+                return
+            visited.add(id(step))
+            if isinstance(step, Sort):
+                ordering.extend(tuple(getattr(step, "key", ()) or ()))
+            for subplan in getattr(step, "subplan_dependencies", ()) or ():
+                walk(subplan)
+                if subplan.inner is not None:
+                    walk(subplan.inner)
+            for dep in step.chain_dependencies:
+                walk(dep)
+
+        walk(root)
+        return tuple(ordering)
 
     def _having_cardinality_constraints() -> tuple[dict[str, Any], ...]:
         constraints: list[dict[str, Any]] = []
@@ -1068,6 +1117,9 @@ def _build_branch_tree(
         return tuple(constraints)
 
     def _aggregate_group_keys_for_having() -> tuple[ColumnId, ...]:
+        return _aggregate_group_keys()
+
+    def _aggregate_group_keys() -> tuple[ColumnId, ...]:
         for step in plan.ordered_steps:
             if isinstance(step, Aggregate):
                 metadata = plan.annotation_for(step).metadata.get("aggregation", {})
@@ -1084,6 +1136,12 @@ def _build_branch_tree(
                 return tuple(keys)
         return ()
 
+    def _root_group_distinct_expression() -> exp.Expression | None:
+        group_keys = _aggregate_group_keys()
+        if not group_keys:
+            return None
+        return _column_expr_from_id(group_keys[0])
+
     def _root_obligations(root: Step) -> tuple[OperatorObligation, ...]:
         annotation = plan.annotation_for(root)
         row_count = _root_required_row_count(root)
@@ -1092,6 +1150,8 @@ def _build_branch_tree(
             annotation.source_relations + _lineage_relations(root)
         )
         path_predicates, join_facts = _root_path_data(root)
+        ordering = _root_ordering(root)
+        distinct_expression = _root_group_distinct_expression()
         root_row_set = RowSetObligation(
             anchor_step_id=annotation.step_id,
             required_rows=row_count,
@@ -1100,6 +1160,8 @@ def _build_branch_tree(
             relations=root_relations,
             join_facts=join_facts,
             path_predicates=path_predicates,
+            distinct_expression=distinct_expression,
+            ordering=ordering,
         )
         obligations: list[OperatorObligation] = [
             OperatorObligation(

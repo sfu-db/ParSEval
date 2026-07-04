@@ -662,6 +662,50 @@ class PlanEvaluator:
             return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
 
         table_name = step.source.name
+        cte_subplan = next(
+            (
+                subplan
+                for subplan in step.subplan_dependencies
+                if subplan.kind is SubPlanKind.CTE
+            ),
+            None,
+        )
+        if cte_subplan is not None:
+            inner_ctx = self._evaluate_subtree(cte_subplan.inner)
+            inner_rows = []
+            for _name, table in inner_ctx.tables.items():
+                inner_rows.extend(table.rows)
+            output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
+            if not output_columns and inner_rows:
+                output_columns = tuple(inner_rows[0].columns)
+            rows = [
+                Row(
+                    this=row.rowid,
+                    columns={
+                        column: _materialize_column_from_row(column, row)
+                        for column in output_columns
+                    },
+                )
+                for row in inner_rows
+            ]
+            if observe:
+                for row in rows:
+                    self._record_row_flow(
+                        tree,
+                        step,
+                        "cte_scan",
+                        row,
+                        sources=(_row_ids(row),),
+                        relations=(step.relation_id,) if step.relation_id is not None else (),
+                    )
+            return Context(
+                tables={
+                    output_key: DerivedSchema(
+                        columns=output_columns,
+                        rows=rows,
+                    )
+                }
+            )
         if table_name not in ctx.tables:
             return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
         table = ctx.tables[table_name]

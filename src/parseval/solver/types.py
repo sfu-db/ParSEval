@@ -39,12 +39,34 @@ class SolverVar:
     @property
     def binding_key(self) -> tuple:
         relation = self.relation_id
+        source = self.column_id.source_column_id
+        source_key = None
+        if source is not None:
+            source_relation = source.relation
+            source_key = (
+                source.kind.value,
+                source_relation.kind.value if source_relation is not None else None,
+                source_relation.name.normalized
+                if source_relation is not None and source_relation.name is not None
+                else None,
+                source_relation.alias.normalized
+                if source_relation is not None and source_relation.alias is not None
+                else None,
+                source_relation.scope_id if source_relation is not None else None,
+                source.name.normalized,
+                source.scope_id,
+                source.ordinal,
+            )
         return (
             relation.kind.value,
             relation.name.normalized if relation.name is not None else None,
             relation.alias.normalized if relation.alias is not None else None,
             relation.scope_id,
+            self.column_id.kind.value,
             self.column_id.name.normalized,
+            self.column_id.scope_id,
+            self.column_id.ordinal,
+            source_key,
             self.row_scope,
         )
 

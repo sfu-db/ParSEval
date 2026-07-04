@@ -418,7 +418,7 @@ class DatabaseBuilder:
         if not self._has_value_space_constraints(plan):
             return _MISSING
         space = plan.to_value_space()
-        value = space.pick()
+        value = space.pick(hint=column.id)
         if value is None and not space.must_null:
             return _MISSING
         if self.validator.is_valid(plan, value):

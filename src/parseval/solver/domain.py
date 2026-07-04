@@ -665,25 +665,86 @@ class DomainSolver:
             for var in variables.values():
                 if var.space.is_empty():
                     return False
-        # Finalize: pick values for eq-constrained pairs that still lack equals.
-        # Pick from the more constrained side; fall back to the other if pick fails.
-        for c in constraints:
-            if c.kind == "eq":
-                left = variables.get(c.left)
-                right = variables.get(c.right)
-                if left and right and left.space.equals is None and right.space.equals is None:
-                    left_has_bounds = left.space.min_val is not None or left.space.max_val is not None
-                    right_has_bounds = right.space.min_val is not None or right.space.max_val is not None
-                    if right_has_bounds and not left_has_bounds:
-                        val = right.space.pick() or left.space.pick()
-                    elif left_has_bounds and not right_has_bounds:
-                        val = left.space.pick() or right.space.pick()
-                    else:
-                        val = left.space.pick() or right.space.pick()
-                    if val is not None:
-                        left.space.narrow_eq(val)
-                        right.space.narrow_eq(val)
+        if not self._finalize_equality_components(variables, constraints):
+            return False
         return True
+
+    def _finalize_equality_components(
+        self,
+        variables: Dict[SolverVar, CSPVariable],
+        constraints: List[CSPConstraint],
+    ) -> bool:
+        parent: Dict[SolverVar, SolverVar] = {}
+
+        def add(variable: SolverVar) -> None:
+            parent.setdefault(variable, variable)
+
+        def find(variable: SolverVar) -> SolverVar:
+            add(variable)
+            while parent[variable] != variable:
+                parent[variable] = parent[parent[variable]]
+                variable = parent[variable]
+            return variable
+
+        def union(left: SolverVar, right: SolverVar) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[left_root] = right_root
+
+        for constraint in constraints:
+            if constraint.kind != "eq":
+                continue
+            if constraint.left not in variables or constraint.right not in variables:
+                continue
+            union(constraint.left, constraint.right)
+
+        components: Dict[SolverVar, List[CSPVariable]] = {}
+        for variable in parent:
+            if variable in variables:
+                components.setdefault(find(variable), []).append(variables[variable])
+
+        for component in components.values():
+            if len(component) < 2:
+                continue
+            found, value = self._equality_component_value(component)
+            if not found:
+                return False
+            for variable in component:
+                variable.space.narrow_eq(value)
+        return True
+
+    def _equality_component_value(
+        self,
+        component: List[CSPVariable],
+    ) -> Tuple[bool, Any]:
+        candidates: List[Tuple[CSPVariable, Any]] = []
+        for variable in component:
+            if variable.space.equals is not None:
+                candidates.append((variable, variable.space.equals))
+        for variable in component:
+            constrained = (
+                variable.space.allowed is not None
+                or variable.space.min_val is not None
+                or variable.space.max_val is not None
+                or variable.space.must_null
+                or variable.space.not_null
+                or variable.space.like_pattern is not None
+            )
+            if constrained and variable.space.equals is None:
+                candidates.append((variable, variable.space.pick(hint=variable.variable)))
+        for variable in component:
+            if variable.space.equals is None:
+                candidates.append((variable, variable.space.pick(hint=variable.variable)))
+
+        for _variable, value in candidates:
+            if value is None:
+                continue
+            if all(candidate.space._candidate_valid(value) for candidate in component):
+                return True, value
+        if all(candidate.space._candidate_valid(None) for candidate in component):
+            return True, None
+        return False, None
 
     def _assign(
         self,
@@ -691,7 +752,7 @@ class DomainSolver:
     ) -> Dict[SolverVar, Any]:
         result: Dict[SolverVar, Any] = {}
         for var in variables.values():
-            val = var.space.pick()
+            val = var.space.pick(hint=var.variable)
             var.assigned = val
             result[var.variable] = val
         return result
@@ -703,6 +764,6 @@ class DomainSolver:
         for var in variables.values():
             if var.space.must_null:
                 continue
-            if var.space.pick() is None:
+            if var.space.pick(hint=var.variable) is None:
                 return False
         return True
