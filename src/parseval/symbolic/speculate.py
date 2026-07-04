@@ -58,9 +58,7 @@ from parseval.plan.planner import (
 from parseval.plan.rex import column_meta, concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var, solver_var
 from parseval.solver.types import col_type
-
-from .evaluator import PlanEvaluator
-from .types import BranchTree, BranchType, CoverageThresholds
+from .types import BranchTree, CoverageThresholds
 
 logger = logging.getLogger("parseval.speculate")
 
@@ -100,15 +98,6 @@ def _build_plan_meta_cache(plan: Plan) -> Dict[Tuple[str, str], dict]:
 # =============================================================================
 # Identity-aware column creation helpers
 # =============================================================================
-
-
-def _relation_for_table(
-    instance: Instance,
-    name: str,
-) -> RelationId:
-    """Get RelationId for a table name from the instance."""
-    return instance.table_id(name)
-
 
 def _solver_column(
     instance: Instance,
@@ -341,7 +330,6 @@ class BranchSpec:
 @dataclass
 class SpeculateConfig:
     """Configuration for speculative data generation.
-
     Derives branch generation thresholds from :class:`CoverageThresholds`.
     Each field controls how many rows to generate for that branch type.
     Set to 0 to skip that branch type entirely.
@@ -350,11 +338,11 @@ class SpeculateConfig:
     positive: int = 1
     negative: int = 1
     null: int = 1
-    left_unmatched: int = 0
-    right_unmatched: int = 0
+    left_unmatched: int = 1
+    right_unmatched: int = 1
     having_fail: int = 1
     case_else: int = 1
-    boundary: int = 0
+    boundary: int = 1
 
     @classmethod
     def from_thresholds(cls, thresholds: CoverageThresholds) -> "SpeculateConfig":
@@ -367,7 +355,7 @@ class SpeculateConfig:
             right_unmatched=thresholds.join_no_match,
             having_fail=thresholds.having_fail,
             case_else=thresholds.case_arm_skipped,
-            boundary=0,
+            boundary=thresholds.boundary,
         )
 
     @classmethod
@@ -406,14 +394,6 @@ class SpeculateConfig:
 
 
 _COMPARISON_NODES = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)
-
-
-def _required_column_identity(col: exp.Column, context: str) -> ColumnId:
-    col_id = column_identity(col)
-    if col_id is None or col_id.relation is None:
-        raise ValueError(f"{context} column lacks planner identity: {col.sql()}")
-    return col_id
-
 
 def _relation_is_materializable(instance: Instance, relation: RelationId) -> bool:
     return bool(relation.name and relation.name.normalized in instance.tables)
@@ -557,8 +537,8 @@ class Propagator:
                     self._derive_expression_join_key(sk, spec)
                     self._derive_expression_join_key(jk, spec)
                     continue
-                sk_id = _required_column_identity(sk, "Join key")
-                jk_id = _required_column_identity(jk, "Join key")
+                sk_id = column_identity(sk)
+                jk_id = column_identity(jk)
                 sk_rel = sk_id.relation
                 jk_rel = jk_id.relation
                 spec.require(sk_rel)
@@ -580,7 +560,7 @@ class Propagator:
     ) -> None:
         """Require materializable columns referenced by a non-column join key."""
         if isinstance(expr, exp.Column):
-            col_id = _required_column_identity(expr, "Join key")
+            col_id = column_identity(expr) #_required_column_identity(expr, "Join key")
             source_id = _physical_source_id(col_id)
             if source_id.relation and self._is_materializable_relation(source_id.relation):
                 req = spec.require(source_id.relation)
@@ -589,7 +569,7 @@ class Propagator:
                     req.constraints.append(_make_is_not_null(self._solver_col(source_id)))
             return
         for col in expr.find_all(exp.Column):
-            col_id = _required_column_identity(col, "Join key expression")
+            col_id = column_identity(col) #_required_column_identity(col, "Join key expression")
             source_id = _physical_source_id(col_id)
             if source_id.relation is None:
                 continue
@@ -966,12 +946,12 @@ class Propagator:
             # Ensure SolverVar on all columns.
             for col in conjunct.find_all(exp.Column):
                 if solver_var(col) is None:
-                    col_id = _required_column_identity(col, "Stored expression")
+                    col_id = column_identity(col) # _required_column_identity(col, "Stored expression")
                     set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
             # Find the primary relation from the first column with identity.
             relation = None
             for col in conjunct.find_all(exp.Column):
-                col_id = _required_column_identity(col, "Stored expression")
+                col_id = column_identity(col) # _required_column_identity(col, "Stored expression")
                 if self._is_materializable_relation(col_id.relation):
                     relation = col_id.relation
                     break
@@ -2988,7 +2968,7 @@ def _bindings_for_scalar_expression(
                     break
         if physical not in instance.tables:
             continue
-        relation = _relation_for_table(instance, physical)
+        relation = instance.table_id(physical)
         binding = RowBinding(relation=relation, row=row_index)
         bindings[_solver_table_key(binding)] = binding
     return bindings

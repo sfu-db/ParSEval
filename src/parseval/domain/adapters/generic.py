@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 import uuid
 
-from parseval.dtype import DataType, TypeFamily, TypeProfile
+from parseval.dtype import DataType, TypeFamily, TypeProfile, StorageLiteral
 
 from .base import TypeAdapter
 
@@ -50,6 +50,8 @@ class GenericTypeAdapter(TypeAdapter):
         datatype = profile.datatype
         if value is None:
             return None
+        if isinstance(value, StorageLiteral):
+            return str(value)
         if profile.family == TypeFamily.UUID:
             if isinstance(value, uuid.UUID):
                 return value

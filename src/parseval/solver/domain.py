@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlglot import exp
 
 from parseval.coercion import coerce_literal_value
+from parseval.dtype import StorageLiteral
 
 from .types import (
     CSPConstraint,
@@ -19,7 +20,8 @@ from .types import (
     col_type,
     solver_var,
     type_family,
-    infer_type_from_string,
+    infer_type_from_string
+    
 )
 
 _NEGATED_OPS = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
@@ -71,7 +73,7 @@ def _lower_atom(
 ) -> Optional[ColumnPredicate]:
     col, val, op = None, None, None
     if isinstance(atom, exp.EQ):
-        col, val = _extract_col_literal(atom)
+        col, val = _extract_col_literal(atom, preserve_datetime_storage_literal=True)
         op = "="
     elif isinstance(atom, exp.NEQ):
         col, val = _extract_col_literal(atom)
@@ -134,17 +136,43 @@ def _lower_atom(
     return None
 
 
-def _extract_col_literal(node: exp.Expression):
+def _extract_col_literal(
+    node: exp.Expression,
+    *,
+    preserve_datetime_storage_literal: bool = False,
+):
     left, right = node.this, node.expression
     if isinstance(left, exp.Column):
         val = _literal_value(right)
         if val is not None or isinstance(right, exp.Null):
+            if preserve_datetime_storage_literal:
+                val = _storage_literal_if_needed(left, right, val)
             return left, coerce_literal_value(val, col_type(left))
     if isinstance(right, exp.Column):
         val = _literal_value(left)
         if val is not None or isinstance(left, exp.Null):
+            if preserve_datetime_storage_literal:
+                val = _storage_literal_if_needed(right, left, val)
             return right, coerce_literal_value(val, col_type(right))
     return None, None
+
+
+def _storage_literal_if_needed(
+    col: exp.Column,
+    literal: exp.Expression,
+    value: Any,
+) -> Any:
+    if not isinstance(literal, exp.Literal) or not literal.is_string:
+        return value
+    dtype = col_type(col)
+    if dtype is None:
+        return value
+    if type_family(dtype) is not TypeFamily.DATETIME:
+        return value
+    raw = str(literal.this)
+    if "." not in raw:
+        return value
+    return StorageLiteral(raw)
 
 
 def _extract_col_col(node: exp.Expression):

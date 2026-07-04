@@ -10,6 +10,7 @@ from parseval.dtype import (
     parse_datetime,
     parse_time,
     type_family,
+    StorageLiteral
 )
 
 _TYPE_SERVICE = TypeService()
@@ -17,6 +18,8 @@ _TYPE_SERVICE = TypeService()
 
 def coerce_value(value: Any, datatype: DataType, dialect: str | None = None) -> Any:
     """Convert a concrete value into the requested datatype or raise."""
+    if isinstance(value, StorageLiteral):
+        return value
     profile = _TYPE_SERVICE.profile_datatype(DataType.build(datatype), dialect=dialect)
     adapter = _TYPE_SERVICE.registry.resolve(profile.datatype, profile.dialect)
     return adapter.coerce_in(value, profile)
@@ -34,6 +37,8 @@ def coerce_literal_value(
     so the caller can decide whether the expression is still supportable.
     """
     del dialect
+    if isinstance(value, StorageLiteral):
+        return value
     if datatype is None or value is None:
         return value
     dtype = DataType.build(datatype)
