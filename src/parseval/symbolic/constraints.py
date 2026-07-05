@@ -2537,7 +2537,9 @@ class ConstraintGenerator:
         first_scope = first_scope or row_set.row_scopes[0]
         constraints: List[exp.Expression] = []
         for expression in row_set.duplicate_expressions:
-            value_expression = expression.this if isinstance(expression, exp.Alias) else expression
+            value_expression = (
+                expression.this if isinstance(expression, exp.Alias) else expression
+            )
             first_value = self._scoped_expression_for_row_set(
                 value_expression,
                 row_set.relations,
@@ -2566,25 +2568,28 @@ class ConstraintGenerator:
                     )
                 )
 
+        identity_columns: List[ColumnId] = []
         for relation in row_set.relations:
             columns = self._row_set_relation_columns(relation)
-            if not columns:
-                continue
-            identity_col = columns[0]
-            first_identity = self._constraint_column(
-                identity_col,
-                row_scope=first_scope,
-            )
-            for row_scope in row_set.row_scopes[1:]:
-                constraints.append(
-                    exp.NEQ(
-                        this=first_identity.copy(),
-                        expression=self._constraint_column(
-                            identity_col,
-                            row_scope=row_scope,
-                        ),
-                    )
+            if columns:
+                identity_columns.append(columns[0])
+        for row_scope in row_set.row_scopes[1:]:
+            identity_diff: exp.Expression | None = None
+            for identity_col in identity_columns:
+                comparison = exp.NEQ(
+                    this=self._constraint_column(identity_col, row_scope=first_scope),
+                    expression=self._constraint_column(
+                        identity_col,
+                        row_scope=row_scope,
+                    ),
                 )
+                identity_diff = (
+                    comparison
+                    if identity_diff is None
+                    else exp.Or(this=identity_diff, expression=comparison)
+                )
+            if identity_diff is not None:
+                constraints.append(identity_diff)
         return constraints
 
     def _row_set_ordering_constraints(

@@ -1208,13 +1208,6 @@ def _build_branch_tree(
             return None
         return _column_expr_from_id(group_keys[0])
 
-    def _root_duplicate_expressions(root: Step) -> tuple[exp.Expression, ...]:
-        if not isinstance(root, Project) or root.distinct:
-            return ()
-        if any(isinstance(step, Aggregate) for step in plan.ordered_steps):
-            return ()
-        return project_coverage_expressions(root)
-
     def _root_obligations(root: Step) -> tuple[OperatorObligation, ...]:
         annotation = plan.annotation_for(root)
         row_count = _root_required_row_count(root)
@@ -1225,7 +1218,15 @@ def _build_branch_tree(
         path_predicates, join_facts = _root_path_data(root)
         ordering = _root_ordering(root)
         distinct_expression = _root_group_distinct_expression()
-        duplicate_expressions = _root_duplicate_expressions(root)
+        duplicate_expressions = (
+            project_coverage_expressions(root)
+            if (
+                isinstance(root, Project)
+                and not root.distinct
+                and not any(isinstance(step, Aggregate) for step in plan.ordered_steps)
+            )
+            else ()
+        )
         root_row_set = RowSetObligation(
             anchor_step_id=annotation.step_id,
             required_rows=row_count,

@@ -595,9 +595,9 @@ class Propagator:
                 if source_id not in req.group_key_columns:
                     req.group_key_columns.append(source_id)
                 req.min_rows = max(req.min_rows, 3)
-        # Aggregate NULL detection — only for non-positive specs.
-        # Positive specs need real values for aggregates, not NULLs.
-        if spec.branch != "positive":
+        # Aggregate NULL detection belongs to branches that intentionally probe
+        # null sensitivity. Value witnesses need real aggregate arguments.
+        if not self._is_positive_value_witness(spec):
             for agg_expr in step.aggregations:
                 self._add_aggregate_null_constraints(agg_expr, spec)
         else:
@@ -648,50 +648,27 @@ class Propagator:
 
     def _derive_project(self, step: Project, spec: BranchSpec) -> None:
         """Add IS NOT NULL for projected columns and handle DISTINCT."""
-        ann = self.plan.annotation_for(step)
-        projected_ids = tuple(ann.projected_columns) + tuple(ann.referenced_columns)
-        for col_id in projected_ids:
-            if col_id.kind is ColumnKind.AGGREGATE:
-                continue
-            if (
-                col_id.relation is not None
-                and not _relation_is_materializable(self.instance, col_id.relation)
-                and self._virtual_projection_for_relation(col_id.relation) is not None
-            ):
-                source_id = col_id
-            else:
-                source_id = _physical_source_id(col_id)
-            if source_id.kind is ColumnKind.AGGREGATE:
-                continue
+        projected_ids = self._project_source_columns(
+            step, include_referenced=True,
+        )
+        for source_id in projected_ids:
             relation = source_id.relation
-            if relation is None or not self._is_materializable_relation(relation):
-                continue
+            assert relation is not None
             col_name = source_id.name.normalized
-            if col_name.startswith("_"):
-                continue
             tc = spec.require(relation)
             if not _has_is_not_null(tc.constraints, col_name):
                 tc.constraints.append(_make_is_not_null(self._solver_col(source_id)))
         # Duplicate / DISTINCT handling.
+        duplicate_sources = self._project_source_columns_by_relation(
+            step, include_referenced=True,
+        )
         for relation_id, tc in spec.requirements.items():
-            dup_ids = []
-            for col_id in projected_ids:
-                if col_id.kind is ColumnKind.AGGREGATE:
-                    continue
-                if (
-                    col_id.relation is not None
-                    and not _relation_is_materializable(self.instance, col_id.relation)
-                    and self._virtual_projection_for_relation(col_id.relation) is not None
-                ):
-                    source_id = col_id
-                else:
-                    source_id = _physical_source_id(col_id)
-                if source_id.kind is ColumnKind.AGGREGATE:
-                    continue
-                if source_id.relation == relation_id:
-                    dup_ids.append(source_id)
+            dup_ids = duplicate_sources.get(relation_id, [])
             if step.distinct and dup_ids:
-                tc.duplicate_columns = dup_ids
+                tc.duplicate_columns = self._merge_column_ids(
+                    tc.duplicate_columns,
+                    dup_ids,
+                )
                 tc.min_rows = max(tc.min_rows, 2)
                 for _rep, members in spec.equivalences.groups().items():
                     if len(members) < 2:
@@ -896,7 +873,7 @@ class Propagator:
             return specs
         try:
             for case_idx, when_conditions in enumerate(
-                self._collect_case_when_conditions()
+                self._collect_case_when_condition_groups()
             ):
                 case_spec = BranchSpec(branch=f"case_else_{case_idx}")
                 self._walk_plan(case_spec)
@@ -908,12 +885,83 @@ class Propagator:
             logger.debug("CASE WHEN propagation failed: %s", exc)
         return specs
 
+    def _semantic_case_contrast_specs(self) -> List[BranchSpec]:
+        """Build non-neutral CASE witness specs from expression internals."""
+        specs: List[BranchSpec] = []
+        if self.config.positive <= 0:
+            return specs
+        try:
+            for case_idx, when_conditions in enumerate(
+                self._collect_case_when_condition_groups()
+            ):
+                if not when_conditions:
+                    continue
+                spec = BranchSpec(branch=f"semantic_case_contrast_{case_idx}")
+                self._walk_plan(spec)
+                self._store_expression(when_conditions[0], spec)
+                for cond in when_conditions[1:]:
+                    self._store_expression(negate_predicate(cond.copy()), spec)
+                specs.append(spec)
+        except Exception as exc:
+            logger.debug("semantic CASE contrast propagation failed: %s", exc)
+        return specs
+
+    def _semantic_project_duplicate_specs(self) -> List[BranchSpec]:
+        """Build bag duplicate witnesses for non-DISTINCT projections."""
+        specs: List[BranchSpec] = []
+        if self.config.positive <= 0:
+            return specs
+        spec_index = 0
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Project) or step.distinct:
+                continue
+            duplicate_sources = self._project_source_columns_by_relation(
+                step, include_referenced=False,
+            )
+            if not duplicate_sources:
+                continue
+            duplicate_columns = [
+                column
+                for columns in duplicate_sources.values()
+                for column in columns
+            ]
+            if any(
+                self._project_source_column_is_unique(column)
+                for column in duplicate_columns
+            ):
+                continue
+            try:
+                spec = BranchSpec(
+                    branch=f"semantic_project_duplicate_{spec_index}"
+                )
+                self._walk_plan(spec)
+                for req in spec.requirements.values():
+                    req.min_rows = max(req.min_rows, 2)
+                for relation, columns in duplicate_sources.items():
+                    if relation not in spec.requirements:
+                        continue
+                    req = spec.requirements[relation]
+                    req.duplicate_columns = self._merge_column_ids(
+                        req.duplicate_columns,
+                        columns,
+                    )
+                    req.min_rows = max(req.min_rows, 2)
+                specs.append(spec)
+                spec_index += 1
+            except Exception as exc:
+                logger.debug(
+                    "semantic project duplicate propagation failed: %s", exc
+                )
+        return specs
+
     def propagate(self) -> List[BranchSpec]:
         """Produce specs for branches based on config thresholds."""
         specs: List[BranchSpec] = []
         pos = self._positive_spec()
         if pos:
             specs.append(pos)
+        specs.extend(self._semantic_case_contrast_specs())
+        specs.extend(self._semantic_project_duplicate_specs())
         specs.extend(self._negative_specs())
         specs.extend(self._unmatched_join_specs())
         specs.extend(self._having_fail_specs())
@@ -2002,38 +2050,181 @@ class Propagator:
     # CASE WHEN arm coverage
     # -----------------------------------------------------------------
 
-    def _collect_case_when_conditions(
-        self,
-    ) -> List[List[exp.Expression]]:
-        """Collect WHEN conditions from all CASE expressions."""
-        result: List[List[exp.Expression]] = []
+    def _collect_case_when_condition_groups(self) -> List[List[exp.Expression]]:
+        """Collect CASE WHEN predicates grouped by output expression."""
+        groups: List[List[exp.Expression]] = []
+        seen: Set[Tuple[str, ...]] = set()
+        for expr in self._semantic_expression_sources():
+            conditions = self._case_conditions_for_expression(expr)
+            if not conditions:
+                continue
+            key = tuple(cond.sql(dialect=self.dialect) for cond in conditions)
+            if key in seen:
+                continue
+            seen.add(key)
+            groups.append(conditions)
+        return groups
+
+    def _semantic_expression_sources(self) -> List[exp.Expression]:
+        """Return plan expressions whose internals affect generated values."""
+        expressions: List[exp.Expression] = []
         for step in self.plan.ordered_steps:
-            expressions: List[exp.Expression] = []
             condition = getattr(step, "condition", None)
-            if condition is not None:
+            if isinstance(condition, exp.Expression):
                 expressions.append(condition)
-            for proj in getattr(step, "projections", None) or []:
-                if isinstance(proj, exp.Expression):
-                    expressions.append(proj)
-            for agg in getattr(step, "aggregations", None) or []:
-                if isinstance(agg, exp.Expression):
-                    expressions.append(agg)
-            for expr in expressions:
-                for case_expr in expr.find_all(exp.Case):
-                    conditions = []
-                    case_operand = case_expr.this
-                    for if_node in case_expr.args.get("ifs") or []:
-                        cond = if_node.this
-                        if cond is not None:
-                            if case_operand is not None:
-                                cond = exp.EQ(
-                                    this=case_operand.copy(),
-                                    expression=cond.copy(),
-                                )
-                            conditions.append(cond)
-                    if conditions:
-                        result.append(conditions)
-        return result
+            for projection in getattr(step, "projections", None) or ():
+                if isinstance(projection, exp.Expression):
+                    expressions.append(projection)
+            if isinstance(step, Aggregate):
+                for aggregation in getattr(step, "aggregations", None) or ():
+                    if isinstance(aggregation, exp.Expression):
+                        expressions.append(
+                            self._expand_aggregate_operands(step, aggregation)
+                        )
+                for operand in getattr(step, "operands", None) or ():
+                    if isinstance(operand, exp.Expression):
+                        expressions.append(
+                            operand.this if isinstance(operand, exp.Alias) else operand
+                        )
+        return expressions
+
+    def _expand_aggregate_operands(
+        self,
+        step: Aggregate,
+        expression: exp.Expression,
+    ) -> exp.Expression:
+        operands = {
+            operand.alias_or_name: (
+                operand.this if isinstance(operand, exp.Alias) else operand
+            )
+            for operand in (getattr(step, "operands", None) or ())
+            if isinstance(operand, exp.Expression) and operand.alias_or_name
+        }
+
+        def expand(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column) and not node.table:
+                operand = operands.get(node.name)
+                if operand is not None:
+                    return operand.copy()
+            return node
+
+        return expression.copy().transform(expand)
+
+    def _case_conditions_for_expression(
+        self,
+        expression: exp.Expression,
+    ) -> List[exp.Expression]:
+        conditions: List[exp.Expression] = []
+        for case_expr in expression.find_all(exp.Case):
+            case_operand = case_expr.this
+            for if_node in case_expr.args.get("ifs") or ():
+                cond = if_node.this
+                if cond is None:
+                    continue
+                if case_operand is not None:
+                    cond = exp.EQ(
+                        this=case_operand.copy(),
+                        expression=cond.copy(),
+                    )
+                conditions.append(cond)
+        return conditions
+
+    def _is_positive_value_witness(self, spec: BranchSpec) -> bool:
+        return spec.branch == "positive" or spec.branch.startswith("semantic_")
+
+    def _project_source_columns(
+        self,
+        step: Project,
+        *,
+        include_referenced: bool,
+    ) -> List[ColumnId]:
+        ann = self.plan.annotation_for(step)
+        candidates = list(ann.projected_columns)
+        if include_referenced:
+            candidates.extend(ann.referenced_columns)
+        sources: List[ColumnId] = []
+        for col_id in candidates:
+            source_id = self._project_source_column(col_id)
+            if source_id is None:
+                continue
+            sources = self._merge_column_ids(sources, [source_id])
+        return sources
+
+    def _project_source_columns_by_relation(
+        self,
+        step: Project,
+        *,
+        include_referenced: bool,
+    ) -> Dict[RelationId, List[ColumnId]]:
+        columns_by_relation: Dict[RelationId, List[ColumnId]] = {}
+        for source_id in self._project_source_columns(
+            step, include_referenced=include_referenced,
+        ):
+            relation = source_id.relation
+            if relation is None:
+                continue
+            columns_by_relation[relation] = self._merge_column_ids(
+                columns_by_relation.get(relation, []),
+                [source_id],
+            )
+        return columns_by_relation
+
+    def _project_source_column(self, col_id: ColumnId) -> Optional[ColumnId]:
+        if col_id.kind is ColumnKind.AGGREGATE:
+            return None
+        if (
+            col_id.relation is not None
+            and not _relation_is_materializable(self.instance, col_id.relation)
+            and self._virtual_projection_for_relation(col_id.relation) is not None
+        ):
+            source_id = col_id
+        else:
+            source_id = _physical_source_id(col_id)
+        if source_id.kind is ColumnKind.AGGREGATE:
+            return None
+        relation = source_id.relation
+        if relation is None or not self._is_materializable_relation(relation):
+            return None
+        if source_id.name.normalized.startswith("_"):
+            return None
+        return source_id
+
+    def _project_source_column_is_unique(self, col_id: ColumnId) -> bool:
+        relation = col_id.relation
+        if relation is None or relation.name is None:
+            return False
+        if relation.name.normalized not in self.instance.tables:
+            return False
+        return self.instance.is_unique(
+            relation.name.normalized,
+            col_id.name.normalized,
+        )
+
+    @staticmethod
+    def _merge_column_ids(
+        existing: List[ColumnId],
+        additions: List[ColumnId],
+    ) -> List[ColumnId]:
+        merged = list(existing)
+        seen = {
+            (
+                col.relation,
+                col.name.normalized if col.name else "",
+                col.scope_id,
+            )
+            for col in merged
+        }
+        for col in additions:
+            key = (
+                col.relation,
+                col.name.normalized if col.name else "",
+                col.scope_id,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(col)
+        return merged
 
     # -----------------------------------------------------------------
     # Scalar subquery detection
@@ -2501,6 +2692,34 @@ def _bindings_for_solver_var(
 
 def _scoped_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
     return _row_bound_solver_var(var, binding)
+
+
+def _duplicate_column_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    req_bindings: List[RowBinding],
+) -> List[exp.Expression]:
+    if len(req_bindings) < 2 or not req.duplicate_columns:
+        return []
+    first, second = sorted(req_bindings, key=lambda binding: binding.row)[:2]
+    constraints: List[exp.Expression] = []
+    for col_id in req.duplicate_columns:
+        left_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, first),
+            row_scope=f"r{first.row}",
+        )
+        right_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, second),
+            row_scope=f"r{second.row}",
+        )
+        constraints.append(
+            exp.EQ(this=left_column, expression=right_column)
+        )
+        constraints.append(_make_is_not_null(left_column.copy()))
+        constraints.append(_make_is_not_null(right_column.copy()))
+    return constraints
 
 
 # ---------------------------------------------------------------------------
@@ -3310,6 +3529,15 @@ class Resolver:
                         path_constraints=constraints,
                     )
                 )
+
+        for _relation, req, req_bindings in all_constraint_items:
+            constraints.extend(
+                _duplicate_column_constraints(
+                    self.instance,
+                    req,
+                    req_bindings,
+                )
+            )
 
         # Build join equalities.
         join_equalities = _build_join_equalities(spec, row_bindings, self.instance)
