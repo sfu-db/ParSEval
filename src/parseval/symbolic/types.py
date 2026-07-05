@@ -65,6 +65,7 @@ class RowSetObligation:
     group_keys: Tuple[ColumnId, ...] = ()
     counted_expression: Optional[exp.Expression] = None
     distinct_expression: Optional[exp.Expression] = None
+    duplicate_expressions: Tuple[exp.Expression, ...] = ()
     ordering: Tuple[exp.Expression, ...] = ()
 
 
@@ -582,6 +583,19 @@ class BranchTree:
         if node.coverage_obligations:
             for obligation in node.coverage_obligations:
                 for outcome in obligation.outcomes:
+                    if (
+                        node.site == "root_result"
+                        and outcome == BranchType.DUPLICATE
+                        and not any(
+                            row_set.duplicate_expressions
+                            for row_set in (
+                                candidate.row_set
+                                for candidate in node.obligations
+                                if candidate.row_set is not None
+                            )
+                        )
+                    ):
+                        continue
                     threshold = self.thresholds.threshold_for(outcome)
                     if node.site == "root_result" and outcome == BranchType.ATOM_TRUE:
                         threshold = max(threshold, root_result_row_count())

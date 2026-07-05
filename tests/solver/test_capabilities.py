@@ -37,6 +37,9 @@ DATETIME_COL = _var(T, "datetime_col")
 TIME_COL = _var(T, "time_col")
 LEFT_ID = _var(T, "id")
 RIGHT_ID = _var(U, "id")
+LEFT_TEXT = _var(T, "left_text")
+MID_TEXT = _var(T, "mid_text")
+RIGHT_TEXT = _var(T, "right_text")
 ARITH_A = _var(T, "a")
 ARITH_B = _var(T, "b")
 ARITH_C = _var(U, "c")
@@ -194,6 +197,18 @@ def test_iso_datetime_with_offset_is_normalized_for_solver_comparisons():
     assert result.assignments[DATETIME_COL] == datetime(2024, 6, 7, 10, 30, 0)
 
 
+def test_sqlite_datetime_equality_preserves_exact_fractional_literal():
+    result = _solve(
+        exp.EQ(
+            this=_col(DATETIME_COL, "DATETIME"),
+            expression=exp.Literal.string("2010-07-19 19:39:08.0"),
+        ),
+    )
+
+    assert result.sat, result.reason
+    assert result.assignments[DATETIME_COL] == "2010-07-19 19:39:08.0"
+
+
 def test_column_equality_and_join_equality_share_assignments():
     result = _solve(
         exp.GTE(this=_col(LEFT_ID, "INT"), expression=exp.Literal.number(100)),
@@ -204,6 +219,17 @@ def test_column_equality_and_join_equality_share_assignments():
     assert result.sat, result.reason
     assert result.assignments[LEFT_ID] == result.assignments[RIGHT_ID]
     assert result.assignments[LEFT_ID] >= 100
+
+
+def test_text_column_equality_component_uses_one_assignment():
+    result = _solve(
+        exp.EQ(this=_col(MID_TEXT, "TEXT"), expression=_col(LEFT_TEXT, "TEXT")),
+        exp.EQ(this=_col(RIGHT_TEXT, "TEXT"), expression=_col(LEFT_TEXT, "TEXT")),
+    )
+
+    assert result.sat, result.reason
+    assert result.assignments[MID_TEXT] == result.assignments[LEFT_TEXT]
+    assert result.assignments[RIGHT_TEXT] == result.assignments[LEFT_TEXT]
 
 
 def test_contradictory_comparisons_are_unsat():
@@ -327,6 +353,127 @@ def test_temporal_time_to_str_year_supports_pre_1970_dates():
 
     assert result.sat, result.reason
     assert result.assignments[DATE_COL].year == 1920
+
+
+def test_temporal_time_to_str_strict_year_comparisons_are_rewritten_to_date_bounds():
+    after_result = _solve(
+        exp.GT(
+            this=exp.TimeToStr(
+                this=_col(DATE_COL, "DATE"),
+                format=exp.Literal.string("%Y"),
+            ),
+            expression=exp.Literal.string("1995"),
+        ),
+    )
+    before_result = _solve(
+        exp.LT(
+            this=exp.TimeToStr(
+                this=_col(DATETIME_COL, "DATETIME"),
+                format=exp.Literal.string("%Y"),
+            ),
+            expression=exp.Literal.string("1997"),
+        ),
+    )
+
+    assert after_result.sat, after_result.reason
+    assert after_result.assignments[DATE_COL] >= date(1996, 1, 1)
+    assert before_result.sat, before_result.reason
+    assert before_result.assignments[DATETIME_COL] <= datetime(1996, 12, 31, 23, 59, 59)
+
+
+def test_date_wrapper_comparison_is_rewritten_to_temporal_bounds():
+    result = _solve(
+        exp.GT(
+            this=exp.Date(this=_col(DATETIME_COL, "DATETIME")),
+            expression=exp.Literal.string("2014-09-01"),
+        ),
+    )
+
+    assert result.sat, result.reason
+    assert result.assignments[DATETIME_COL] >= datetime(2014, 9, 2, 0, 0, 0)
+
+
+def test_date_wrapper_over_substr_between_is_rewritten_to_text_bounds():
+    result = _solve(
+        exp.Between(
+            this=exp.Date(
+                this=exp.Anonymous(
+                    this="SUBSTR",
+                    expressions=[
+                        _col(TEXT_COL, "TEXT"),
+                        exp.Literal.number(1),
+                        exp.Literal.number(10),
+                    ],
+                ),
+            ),
+            low=exp.Literal.string("2019-03-15"),
+            high=exp.Literal.string("2020-03-20"),
+        ),
+    )
+
+    assert result.sat, result.reason
+    value = result.assignments[TEXT_COL]
+    assert "2019-03-15" <= value[:10] <= "2020-03-20"
+
+
+def test_substr_time_seconds_less_than_threshold_generates_matching_text_time():
+    seconds = exp.Add(
+        this=exp.Mul(
+            this=exp.Cast(
+                this=exp.Anonymous(
+                    this="SUBSTR",
+                    expressions=[
+                        _col(TEXT_COL, "TEXT"),
+                        exp.Literal.number(1),
+                        exp.Literal.number(2),
+                    ],
+                ),
+                to=DataType.build("INT"),
+            ),
+            expression=exp.Literal.number(60),
+        ),
+        expression=exp.Add(
+            this=exp.Cast(
+                this=exp.Anonymous(
+                    this="SUBSTR",
+                    expressions=[
+                        _col(TEXT_COL, "TEXT"),
+                        exp.Literal.number(4),
+                        exp.Literal.number(2),
+                    ],
+                ),
+                to=DataType.build("INT"),
+            ),
+            expression=exp.Div(
+                this=exp.Cast(
+                    this=exp.Anonymous(
+                        this="SUBSTR",
+                        expressions=[
+                            _col(TEXT_COL, "TEXT"),
+                            exp.Literal.number(7),
+                            exp.Literal.number(2),
+                        ],
+                    ),
+                    to=DataType.build("FLOAT"),
+                ),
+                expression=exp.Literal.number(1000),
+            ),
+        ),
+    )
+
+    result = _solve(
+        exp.LT(this=seconds, expression=exp.Literal.number(120)),
+    )
+
+    assert result.sat, result.reason
+    value = result.assignments[TEXT_COL]
+    assert value[:2].isdigit()
+    assert value[2] == ":"
+    assert value[3:5].isdigit()
+    assert value[5] == ":"
+    assert value[6:8].isdigit()
+    total_seconds = int(value[:2]) * 60 + int(value[3:5]) + int(value[6:8]) / 1000
+    assert total_seconds < 120
 
 
 def test_temporal_substr_year_between_is_rewritten_to_date_bounds():

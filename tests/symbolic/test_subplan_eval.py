@@ -106,5 +106,59 @@ class TestInEvaluation(unittest.TestCase):
         self.assertIn(BranchType.IN_NO_MATCH, outcomes)
 
 
+class TestCTEEvaluation(unittest.TestCase):
+    def test_cte_reference_feeds_derived_aggregate_join(self):
+        schema = """
+        CREATE TABLE lapTimes (
+          raceId INT,
+          driverId INT,
+          lap INT,
+          time_in_seconds REAL
+        );
+        CREATE TABLE drivers (
+          driverId INT PRIMARY KEY,
+          forename TEXT,
+          surname TEXT
+        );
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row(
+            "lapTimes",
+            values={
+                "raceId": 1,
+                "driverId": 7,
+                "lap": 1,
+                "time_in_seconds": 91.5,
+            },
+        )
+        instance.create_row(
+            "drivers",
+            values={"driverId": 7, "forename": "Ada", "surname": "Lovelace"},
+        )
+        sql = """
+        WITH lap_times_in_seconds AS (
+          SELECT driverId, time_in_seconds
+          FROM lapTimes
+        )
+        SELECT T2.forename, T2.surname
+        FROM (
+          SELECT driverId, MIN(time_in_seconds) AS min_time_in_seconds
+          FROM lap_times_in_seconds
+          GROUP BY driverId
+        ) AS T1
+        INNER JOIN drivers AS T2 ON T1.driverId = T2.driverId
+        ORDER BY T1.min_time_in_seconds ASC
+        LIMIT 1
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        evaluator = PlanEvaluator(plan, instance, "sqlite")
+
+        output = evaluator.evaluate_context()
+        table = next(iter(output.tables.values()))
+
+        self.assertEqual(len(table.rows), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

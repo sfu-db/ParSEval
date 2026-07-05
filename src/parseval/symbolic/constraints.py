@@ -2131,6 +2131,9 @@ class ConstraintGenerator:
             self._row_set_distinct_constraints(row_set, fixed_rels, first_scope)
         )
         constraints.extend(
+            self._row_set_duplicate_constraints(row_set, fixed_rels, first_scope)
+        )
+        constraints.extend(
             self._row_set_ordering_constraints(row_set, fixed_rels, first_scope)
         )
         return constraints
@@ -2519,6 +2522,69 @@ class ConstraintGenerator:
         for left_index, left in enumerate(scoped_values):
             for right in scoped_values[left_index + 1:]:
                 constraints.append(exp.NEQ(this=left.copy(), expression=right.copy()))
+        return constraints
+
+    def _row_set_duplicate_constraints(
+        self,
+        row_set: RowSetObligation,
+        fixed_rels: Set[RelationId] | None = None,
+        first_scope: str = "",
+    ) -> List[exp.Expression]:
+        fixed_rels = fixed_rels or set()
+        if not row_set.duplicate_expressions or len(row_set.row_scopes) < 2:
+            return []
+
+        first_scope = first_scope or row_set.row_scopes[0]
+        constraints: List[exp.Expression] = []
+        for expression in row_set.duplicate_expressions:
+            value_expression = expression.this if isinstance(expression, exp.Alias) else expression
+            first_value = self._scoped_expression_for_row_set(
+                value_expression,
+                row_set.relations,
+                first_scope,
+                fixed_rels,
+                first_scope,
+            )
+            constraints.append(
+                exp.Is(this=first_value.copy(), expression=exp.Not(this=exp.Null()))
+            )
+            for row_scope in row_set.row_scopes[1:]:
+                scoped_value = self._scoped_expression_for_row_set(
+                    value_expression,
+                    row_set.relations,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+                constraints.append(
+                    exp.EQ(this=first_value.copy(), expression=scoped_value.copy())
+                )
+                constraints.append(
+                    exp.Is(
+                        this=scoped_value.copy(),
+                        expression=exp.Not(this=exp.Null()),
+                    )
+                )
+
+        for relation in row_set.relations:
+            columns = self._row_set_relation_columns(relation)
+            if not columns:
+                continue
+            identity_col = columns[0]
+            first_identity = self._constraint_column(
+                identity_col,
+                row_scope=first_scope,
+            )
+            for row_scope in row_set.row_scopes[1:]:
+                constraints.append(
+                    exp.NEQ(
+                        this=first_identity.copy(),
+                        expression=self._constraint_column(
+                            identity_col,
+                            row_scope=row_scope,
+                        ),
+                    )
+                )
         return constraints
 
     def _row_set_ordering_constraints(

@@ -220,14 +220,21 @@ class SymbolicEngine:
         outcome_priority = {
             BranchType.ATOM_TRUE: 0,
             BranchType.IN_MATCH: 0,
-            BranchType.ATOM_FALSE: 1,
-            BranchType.IN_NO_MATCH: 1,
-            BranchType.ATOM_NULL: 2,
+            BranchType.DUPLICATE: 1,
+            BranchType.DISTINCT_DUPLICATE: 1,
+            BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED: 1,
+            BranchType.GROUP_MULTI: 2,
+            BranchType.ATOM_FALSE: 2,
+            BranchType.IN_NO_MATCH: 2,
+            BranchType.ATOM_NULL: 3,
         }
 
         def key(t: CoverageTarget) -> tuple:
+            priority = outcome_priority.get(t.target_outcome, 9)
+            if t.target_outcome == BranchType.ATOM_TRUE and t.atom_id < 0:
+                priority = 4
             return (
-                outcome_priority.get(t.target_outcome, 9),
+                priority,
                 site_priority.get(t.node.site, 9),
             )
 

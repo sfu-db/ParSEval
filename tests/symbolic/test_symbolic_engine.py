@@ -481,5 +481,35 @@ def test_conflicting_materialized_assignment_raises_conflict():
     assert not instance.get_rows("people")
 
 
+def test_materialization_failure_reports_original_constraint_reason():
+    instance = Instance(
+        ddls="CREATE TABLE t (x INT, CONSTRAINT positive_x CHECK (x > 0));",
+        name="materialization_failure_reason",
+        dialect="sqlite",
+    )
+    physical = instance.table_id("t")
+    physical_x = instance.column_id("t", "x")
+    assignments = {
+        SolverVar(physical_x, physical, "r0"): -1,
+    }
+    constraint = SolverConstraint(
+        target_relations=(physical,),
+        storage_relations={variable: physical for variable in assignments},
+    )
+    engine = SymbolicEngine(
+        instance,
+        "SELECT x FROM t",
+        solver=_FixedSolver(assignments),
+        max_iterations=1,
+    )
+
+    with pytest.raises(
+        ConstraintConflict,
+        match="materialization_failed:t:ConstraintViolationError:check_constraint_failed:t",
+    ):
+        engine._solve_and_materialize(constraint)
+    assert not instance.get_rows("t")
+
+
 if __name__ == "__main__":
     unittest.main()

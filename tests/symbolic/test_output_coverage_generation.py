@@ -88,6 +88,36 @@ def test_distinct_aggregate_duplicate_target_uses_two_non_null_rows():
     _assert_physical_storage(constraint)
 
 
+def test_bag_root_duplicate_target_uses_distinct_equal_project_rows():
+    constraint = _compile(
+        "SELECT a FROM t",
+        "root_result",
+        BranchType.DUPLICATE,
+    )
+
+    equalities = [
+        item
+        for item in constraint.constraints
+        if isinstance(item, exp.EQ)
+    ]
+    assert any(
+        {solver_var(column).row_scope for column in equality.find_all(exp.Column)}
+        == {"out0", "out1"}
+        for equality in equalities
+    )
+    inequalities = [
+        item
+        for item in constraint.constraints
+        if isinstance(item, exp.NEQ)
+    ]
+    assert any(
+        {solver_var(column).row_scope for column in inequality.find_all(exp.Column)}
+        == {"out0", "out1"}
+        for inequality in inequalities
+    )
+    _assert_physical_storage(constraint)
+
+
 def test_distinct_aggregate_multiple_target_uses_unequal_rows():
     constraint = _compile(
         "SELECT SUM(DISTINCT b) FROM t",
@@ -122,6 +152,76 @@ def test_engine_covers_nullable_project_outputs_with_valid_primary_keys():
     assert result.coverage == 1.0
     assert {value["nullable_text"] is None for value in values} == {True, False}
     assert all(value["id"] is not None for value in values)
+
+
+def test_engine_covers_bag_root_duplicate_outputs():
+    instance = Instance(
+        "CREATE TABLE items (id INT PRIMARY KEY NOT NULL, value INT);",
+        name="bag_duplicate_engine",
+        dialect="sqlite",
+    )
+    result = SymbolicEngine(
+        instance,
+        "SELECT value FROM items",
+        dialect="sqlite",
+        max_iterations=5,
+        max_rows_per_table=5,
+    ).generate()
+
+    values = [
+        symbol.concrete
+        for row in instance.get_rows("items")
+        for column, symbol in row.items()
+        if column.name.normalized == "value"
+    ]
+    root_node = next(node for node in result.tree.nodes if node.site == "root_result")
+    assert BranchType.DUPLICATE in root_node.observed_outcomes(0)
+    assert len(values) > len(set(values))
+    assert result.coverage == 1.0
+
+
+def test_engine_prioritizes_joined_distinct_aggregate_duplicates():
+    instance = Instance(
+        """
+        CREATE TABLE event (
+            event_id TEXT PRIMARY KEY NOT NULL,
+            event_name TEXT,
+            event_date TEXT
+        );
+        CREATE TABLE attendance (
+            link_to_event TEXT NOT NULL,
+            link_to_member TEXT NOT NULL,
+            PRIMARY KEY (link_to_event, link_to_member),
+            FOREIGN KEY (link_to_event) REFERENCES event(event_id)
+        );
+        """,
+        name="joined_distinct_duplicate_engine",
+        dialect="sqlite",
+    )
+    result = SymbolicEngine(
+        instance,
+        "SELECT COUNT(DISTINCT link_to_member) "
+        "FROM attendance AS a INNER JOIN event AS e "
+        "ON a.link_to_event = e.event_id "
+        "WHERE e.event_name = 'Community Theater' "
+        "AND STRFTIME('%Y', e.event_date) = '2019'",
+        dialect="sqlite",
+        max_iterations=5,
+        max_rows_per_table=20,
+    ).generate()
+
+    distinct_node = next(
+        node for node in result.tree.nodes if node.site == "aggregate_distinct_input"
+    )
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("attendance")
+    ]
+    member_counts = {}
+    for row in rows:
+        member_counts[row["link_to_member"]] = member_counts.get(row["link_to_member"], 0) + 1
+    assert BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED in distinct_node.observed_outcomes(0)
+    assert any(count > 1 for count in member_counts.values())
 
 
 def test_engine_covers_grouped_distinct_aggregate_inputs():
