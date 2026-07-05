@@ -2,8 +2,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
+from sqlalchemy.engine import make_url
+
+from parseval import db_manager
 from parseval.db_manager import DBManager
 from parseval.db_manager import Connect
 
@@ -50,6 +53,55 @@ class DBManagerTests(unittest.TestCase):
         conn.engine.url.get_backend_name.return_value = "postgresql"
         stmt = conn._render_drop_table("users")
         self.assertEqual(stmt, 'DROP TABLE IF EXISTS "users" CASCADE')
+
+    def test_mysql_ensure_database_uses_server_url(self):
+        engine = MagicMock()
+        engine.begin.return_value.__enter__.return_value = Mock()
+        url = make_url("mysql+pymysql://root:pw@localhost:3306/missing_db")
+
+        with patch("parseval.db_manager.create_engine", return_value=engine) as create_engine:
+            db_manager._providers["mysql"].ensure_database(url)
+
+        admin_url = create_engine.call_args.args[0]
+        self.assertEqual(admin_url.database, "")
+
+    def test_get_connection_does_not_cache_engine_or_database_initialization(self):
+        class FakeProvider:
+            def __init__(self):
+                self.ensure_calls = 0
+                self.engines = []
+
+            def ensure_database(self, url):
+                self.ensure_calls += 1
+
+            def create_engine(
+                self,
+                url,
+                *,
+                pool_size,
+                max_overflow,
+                pool_timeout,
+                pool_recycle,
+                connect_timeout,
+            ):
+                engine = Mock()
+                engine.url = url
+                self.engines.append(engine)
+                return engine
+
+        provider = FakeProvider()
+
+        with patch.dict(db_manager._providers, {"sqlite": provider}):
+            with DBManager().get_connection("sqlite:///:memory:", "sqlite") as first:
+                first_engine = first.engine
+            with DBManager().get_connection("sqlite:///:memory:", "sqlite") as second:
+                second_engine = second.engine
+
+        self.assertEqual(provider.ensure_calls, 2)
+        self.assertEqual(len(provider.engines), 2)
+        self.assertIsNot(first_engine, second_engine)
+        first_engine.dispose.assert_called_once_with()
+        second_engine.dispose.assert_called_once_with()
 
 
 if __name__ == "__main__":

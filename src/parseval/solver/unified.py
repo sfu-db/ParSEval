@@ -22,7 +22,6 @@ assignments.
 
 from __future__ import annotations
 
-import calendar
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +31,7 @@ from sqlglot import exp
 from parseval.dtype import DataType
 from parseval.identity import RelationId
 
+from .normalization import normalize_constraint
 from .types import SolverVar, col_type, solver_var
 
 
@@ -76,268 +76,23 @@ class SolveResult:
     reason: str = ""
 
 
-# =============================================================================
-# Unified Solver
-# =============================================================================
-
-
-def _literal_int(expr: exp.Expression | None) -> Optional[int]:
-    if not isinstance(expr, exp.Literal):
-        return None
-    try:
-        return int(str(expr.this))
-    except (TypeError, ValueError):
-        return None
-
-
-def _literal_text(expr: exp.Expression | None) -> Optional[str]:
-    if not isinstance(expr, exp.Literal):
-        return None
-    return str(expr.this)
-
-
-def _call_name(expr: exp.Expression) -> str:
-    if isinstance(expr, exp.Anonymous):
-        return (expr.name or "").upper()
-    if isinstance(expr, exp.Substring):
-        return "SUBSTR"
-    return expr.key.upper() if expr.key else ""
-
-
-def _call_args(expr: exp.Expression) -> List[exp.Expression]:
-    if isinstance(expr, exp.Substring):
-        args = [expr.this]
-        if expr.args.get("start") is not None:
-            args.append(expr.args["start"])
-        if expr.args.get("length") is not None:
-            args.append(expr.args["length"])
-        return args
-    return [
-        child for child in expr.iter_expressions()
-        if not isinstance(child, exp.DataType)
-    ]
-
-
-def _unwrap_temporal_column(expr: exp.Expression) -> Optional[exp.Column]:
-    if isinstance(expr, (exp.TsOrDsToTimestamp, exp.TsOrDsToDate)):
-        expr = expr.this
-    return expr if isinstance(expr, exp.Column) else None
-
-
-def _temporal_prefix_projection(expr: exp.Expression) -> Optional[Tuple[exp.Column, int]]:
-    """Return ``(column, ISO-prefix-length)`` for supported temporal projections."""
-    supported_formats = {
-        "%Y": 4,
-        "%Y-%m": 7,
-        "%Y-%m-%d": 10,
-    }
-    if isinstance(expr, exp.TimeToStr):
-        fmt = _literal_text(expr.args.get("format"))
-        col = _unwrap_temporal_column(expr.this)
-        if fmt in supported_formats and col is not None:
-            return col, supported_formats[fmt]
-        return None
-    if isinstance(expr, exp.Year):
-        col = _unwrap_temporal_column(expr.this)
-        return (col, 4) if col is not None else None
-    if isinstance(expr, exp.Extract):
-        unit_node = expr.this
-        unit_text = None
-        if isinstance(unit_node, exp.Var):
-            unit_text = unit_node.name.upper()
-        elif isinstance(unit_node, exp.Identifier):
-            unit_text = unit_node.name.upper()
-        elif isinstance(unit_node, exp.Column):
-            unit_text = unit_node.name.upper()
-        if unit_text != "YEAR":
-            return None
-        col = _unwrap_temporal_column(expr.expression)
-        return (col, 4) if col is not None else None
-
-    name = _call_name(expr)
-    if name in {"SUBSTR", "SUBSTRING"}:
-        args = _call_args(expr)
-        if len(args) < 3:
-            return None
-        col = _unwrap_temporal_column(args[0])
-        start = _literal_int(args[1])
-        length = _literal_int(args[2])
-        if col is not None and start == 1 and length in {4, 7, 10}:
-            return col, length
-        return None
-    if name in {"STRFTIME", "TIME_TO_STR"}:
-        args = _call_args(expr)
-        if len(args) < 2:
-            return None
-        if name == "STRFTIME":
-            fmt = _literal_text(args[0])
-            col = _unwrap_temporal_column(args[1])
-        else:
-            col = _unwrap_temporal_column(args[0])
-            fmt = _literal_text(args[1])
-        if fmt in supported_formats and col is not None:
-            return col, supported_formats[fmt]
-    return None
-
-
-def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
-    projection = _temporal_prefix_projection(expr)
-    if projection is None or projection[1] != 4:
-        return None
-    return projection[0]
-
-
-def _prefix_date_bounds(value: str, prefix_length: int):
-    from datetime import date as _date
-
-    try:
-        if prefix_length == 4 and len(value) == 4:
-            year = int(value)
-            return _date(year, 1, 1), _date(year, 12, 31)
-        if prefix_length == 7 and len(value) == 7 and value[4] == "-":
-            year = int(value[:4])
-            month = int(value[5:7])
-            last_day = calendar.monthrange(year, month)[1]
-            return _date(year, month, 1), _date(year, month, last_day)
-        if prefix_length == 10 and len(value) == 10 and value[4] == "-" and value[7] == "-":
-            year = int(value[:4])
-            month = int(value[5:7])
-            day = int(value[8:10])
-            exact = _date(year, month, day)
-            return exact, exact
-    except ValueError:
-        return None
-    return None
-
-
-def _is_temporal_column(col: exp.Column) -> Tuple[bool, bool]:
-    dtype = col_type(col) or DataType.build("TEXT")
-    is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(DataType.Type.DATE32)
-    is_datetime = dtype.is_type(
-        DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
-        DataType.Type.TIMESTAMP_MS, DataType.Type.TIMESTAMP_NS,
-        DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMPLTZ,
-        DataType.Type.DATETIME, DataType.Type.DATETIME64,
-    )
-    return is_date, is_datetime
-
-
-def _rewrite_year_extractor_predicates(constraint: SolverConstraint) -> None:
-    """Replace temporal string-prefix predicates with equivalent column bounds.
-
-    Handles year/month/day prefixes from ``SUBSTR`` and temporal formatting
-    calls. For DATE / TIMESTAMP columns these prefixes are monotone, so they
-    can be represented as direct epoch day/second ranges.
-
-    Mutates ``constraint.constraints`` in place.
-    """
-    from datetime import datetime as _dt
-    from .smt_types import date_to_epoch_day, datetime_to_epoch_second
-
-    rewritten: List[exp.Expression] = []
-    for cexpr in constraint.constraints:
-        targets: List[Tuple[exp.Expression, exp.Column, Any, Any]] = []
-        for node in cexpr.walk():
-            projection = _temporal_prefix_projection(node)
-            if projection is None:
-                continue
-            col, prefix_length = projection
-            is_date, is_datetime = _is_temporal_column(col)
-            if not (is_date or is_datetime):
-                continue
-            cmp_node = node
-            while cmp_node is not None and not isinstance(
-                cmp_node, (exp.EQ, exp.GTE, exp.LTE, exp.Between)
-            ):
-                cmp_node = cmp_node.parent
-            if cmp_node is None:
-                continue
-            lo_value: Optional[str] = None
-            hi_value: Optional[str] = None
-            if isinstance(cmp_node, exp.EQ):
-                lo_value = hi_value = _literal_text(cmp_node.expression)
-            elif isinstance(cmp_node, exp.GTE):
-                lo_value = _literal_text(cmp_node.expression)
-            elif isinstance(cmp_node, exp.LTE):
-                hi_value = _literal_text(cmp_node.expression)
-            else:
-                lo_value = _literal_text(cmp_node.args.get("low"))
-                hi_value = _literal_text(cmp_node.args.get("high"))
-            lo_bounds = _prefix_date_bounds(lo_value, prefix_length) if lo_value else None
-            hi_bounds = _prefix_date_bounds(hi_value, prefix_length) if hi_value else None
-            if lo_value and lo_bounds is None:
-                continue
-            if hi_value and hi_bounds is None:
-                continue
-            lo_date = lo_bounds[0] if lo_bounds is not None else None
-            hi_date = hi_bounds[1] if hi_bounds is not None else None
-            if lo_date is None and hi_date is None:
-                continue
-            targets.append((cmp_node, col, lo_date, hi_date))
-
-        if not targets:
-            rewritten.append(cexpr)
-            continue
-
-        new_expr = cexpr.copy()
-        for old_node, col, lo_date, hi_date in targets:
-            is_date, _is_datetime = _is_temporal_column(col)
-            new_preds: List[exp.Expression] = []
-            if lo_date is not None:
-                if is_date:
-                    payload = date_to_epoch_day(lo_date)
-                else:
-                    payload = datetime_to_epoch_second(
-                        _dt(lo_date.year, lo_date.month, lo_date.day)
-                    )
-                new_preds.append(exp.GTE(
-                    this=col.copy(), expression=exp.Literal.number(payload),
-                ))
-            if hi_date is not None:
-                if is_date:
-                    payload = date_to_epoch_day(hi_date)
-                else:
-                    payload = datetime_to_epoch_second(
-                        _dt(hi_date.year, hi_date.month, hi_date.day, 23, 59, 59)
-                    )
-                new_preds.append(exp.LTE(
-                    this=col.copy(), expression=exp.Literal.number(payload),
-                ))
-
-            new_target = _find_replica(new_expr, old_node)
-            if new_target is None:
-                continue
-            parent = new_target.parent
-            if parent is None:
-                new_expr = new_preds[0] if len(new_preds) == 1 else exp.and_(*new_preds)
-                break
-            for k, v in list(parent.args.items()):
-                if v is new_target:
-                    parent.set(k, new_preds[0] if len(new_preds) == 1
-                               else exp.and_(*new_preds))
-                    break
-        rewritten.append(new_expr)
-    constraint.constraints = rewritten
-
-
-def _find_replica(root: exp.Expression, target: exp.Expression) -> Optional[exp.Expression]:
-    """Locate the node in ``root`` that is structurally identical to ``target``.
-
-    Used after ``root = target.copy()`` to find the matching node when we
-    no longer have identity-based references.
-    """
-    for candidate in root.walk():
-        if type(candidate) is type(target) and candidate.sql() == target.sql():
-            return candidate
-    return None
+def normalize_temporal_predicates(constraint: SolverConstraint) -> None:
+    """Backward-compatible in-place temporal normalization wrapper."""
+    normalized = normalize_constraint(constraint)
+    constraint.constraints = normalized.constraints
+    constraint.join_equalities = normalized.join_equalities
+    constraint.variables = normalized.variables
+    constraint.storage_relations = normalized.storage_relations
 
 
 def narrow_year_bounds(constraint: SolverConstraint) -> None:
-    """In-place: rewrite year-extractor predicates into date bounds.
+    """Backward-compatible alias for temporal predicate normalization."""
+    normalize_temporal_predicates(constraint)
 
-    See :func:`_rewrite_year_extractor_predicates` for the rationale.
-    """
-    _rewrite_year_extractor_predicates(constraint)
+
+# =============================================================================
+# Unified Solver
+# =============================================================================
 
 
 class Solver:
@@ -374,6 +129,7 @@ class Solver:
         ok, reason = self._validate_types(constraint)
         if not ok:
             return SolveResult(sat=False, reason=reason)
+        constraint = normalize_constraint(constraint)
 
         assignments: Dict[SolverVar, Any] = {}
         for component in self._components(constraint):
@@ -430,14 +186,7 @@ class Solver:
         """Solve all constraint expressions with Z3."""
         try:
             from .smt_solver import SMTSolver
-
             smt = SMTSolver(timeout_ms=self.timeout_ms)
-
-            # Narrow search space: STRFTIME('%Y', col) year comparisons
-            # imply tight bounds on col (epoch day/second for the year
-            # span). Without this, Z3 must invert the Hinnant year
-            # decomposition and frequently times out.
-            narrow_year_bounds(constraint)
 
             variables = self._collect_variables(constraint)
             encoded_names = {
@@ -582,4 +331,10 @@ class Solver:
             f"{variable.column_id.name.normalized}"
         ).replace(".", "_").replace("#", "_")
 
-__all__ = ["Solver", "SolveResult", "SolverConstraint"]
+__all__ = [
+    "Solver",
+    "SolveResult",
+    "SolverConstraint",
+    "normalize_temporal_predicates",
+    "narrow_year_bounds",
+]

@@ -59,6 +59,28 @@ def test_mixed_case_table_level_primary_key_populates_catalog_metadata():
     assert inst.is_unique("users", "id") is True
 
 
+def test_named_composite_primary_key_populates_database_constraints():
+    inst = Instance(
+        """
+        CREATE TABLE FOLLOW (
+          FOLLOWEE VARCHAR(30) NOT NULL,
+          FOLLOWER VARCHAR(30) NOT NULL,
+          CONSTRAINT PK_FOLLOW PRIMARY KEY (FOLLOWEE, FOLLOWER),
+          CONSTRAINT CHECK_FOLLOW CHECK (FOLLOWEE <> FOLLOWER)
+        );
+        """,
+        name="db",
+        dialect="sqlite",
+    )
+
+    constraints = inst.database_constraints(inst.table_id("follow"))
+
+    assert constraints.primary_key == (
+        inst.column_id("follow", "followee"),
+        inst.column_id("follow", "follower"),
+    )
+
+
 def test_default_normalization_resolves_unquoted_mixed_case_table_lookup():
     inst = Instance(
         "CREATE TABLE Team (ID INT PRIMARY KEY, Name TEXT);",
@@ -382,6 +404,66 @@ def test_constraints_are_resolved_by_column_and_relation_ids():
     ]
     assert main_checks == ["score > 0"]
     assert aux_checks == ["score > 10"]
+
+
+def test_table_level_check_constraints_are_resolved_by_relation_id():
+    ddl = """
+    CREATE TABLE follow (
+        followee INT,
+        follower INT,
+        CONSTRAINT check_follow CHECK (followee <> follower)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+
+    checks = inst.get_check_constraints(inst.table_id("follow"))
+    db_constraints = inst.database_constraints(inst.table_id("follow"))
+
+    assert [check.sql(dialect="sqlite") for check in checks] == [
+        "followee <> follower"
+    ]
+    assert [column.name.normalized for column in db_constraints.checks[0].referenced_columns] == [
+        "followee",
+        "follower",
+    ]
+    assert db_constraints.checks[0].supported is True
+
+
+def test_database_constraints_exposes_normalized_relation_constraints():
+    ddl = """
+    CREATE TABLE parent (
+        a INT,
+        b INT,
+        PRIMARY KEY (a, b),
+        UNIQUE (b)
+    );
+    CREATE TABLE child (
+        a INT NOT NULL CHECK (a > 0),
+        b INT,
+        CONSTRAINT child_pair CHECK (a <> b),
+        FOREIGN KEY (a, b) REFERENCES parent(a, b)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+
+    parent = inst.database_constraints(inst.table_id("parent"))
+    child = inst.database_constraints(inst.table_id("child"))
+
+    assert parent.primary_key == (
+        inst.column_id("parent", "a"),
+        inst.column_id("parent", "b"),
+    )
+    assert parent.unique_constraints == ((inst.column_id("parent", "b"),),)
+    assert child.not_null_columns == (inst.column_id("child", "a"),)
+    assert child.foreign_keys[0].source_column_ids == (
+        inst.column_id("child", "a"),
+        inst.column_id("child", "b"),
+    )
+    assert [check.expression.sql(dialect="sqlite") for check in child.checks] == [
+        "a <> b",
+        "a > 0",
+    ]
+    assert all(check.supported for check in child.checks)
 
 
 def test_foreign_keys_are_resolved_by_relation_ids():

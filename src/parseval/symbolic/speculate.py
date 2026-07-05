@@ -355,7 +355,7 @@ class SpeculateConfig:
             right_unmatched=thresholds.join_no_match,
             having_fail=thresholds.having_fail,
             case_else=thresholds.case_arm_skipped,
-            boundary=thresholds.boundary,
+            boundary=1,
         )
 
     @classmethod
@@ -369,7 +369,7 @@ class SpeculateConfig:
             right_unmatched=0,
             having_fail=1,
             case_else=1,
-            boundary=0,
+            boundary=1,
         )
 
     @classmethod

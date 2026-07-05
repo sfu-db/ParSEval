@@ -6,6 +6,7 @@ import unittest
 
 from sqlglot import exp
 
+from parseval.identity import ColumnKind
 from parseval.instance import Instance
 from parseval.plan import Plan
 from parseval.query import preprocess_sql
@@ -117,6 +118,33 @@ class TestGroupConstraintGeneration(unittest.TestCase):
         self.assertIsNotNone(constraint, "Constraint should not be None")
 
 
+class TestLogicalSolverVariables(unittest.TestCase):
+    def test_physical_predicate_columns_use_logical_solver_variables_with_storage_lineage(self):
+        instance = Instance(
+            ddls="CREATE TABLE users (id INT PRIMARY KEY, LastAccessDate TEXT);",
+            name="test",
+            dialect="sqlite",
+        )
+        sql = "SELECT COUNT(id) FROM users WHERE date(LastAccessDate) > '2014-09-01'"
+        plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(target for target in tree.root_witness_targets)
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        variables = [
+            solver_var(column)
+            for expression in constraint.constraints
+            for column in expression.find_all(exp.Column)
+            if solver_var(column) is not None
+            and solver_var(column).column_id.name.normalized == "lastaccessdate"
+        ]
+        self.assertTrue(variables)
+        self.assertTrue(all(variable.column_id.kind is not ColumnKind.PHYSICAL for variable in variables))
+        self.assertTrue(all(variable.column_id.source_column_id is not None for variable in variables))
+        self.assertTrue(all(variable.column_id.source_column_id.kind is ColumnKind.PHYSICAL for variable in variables))
+
+
 class TestDatabaseConstraintGeneration(unittest.TestCase):
     def test_scan_obligation_avoids_all_existing_primary_keys(self):
         instance = Instance(
@@ -176,6 +204,145 @@ class TestDatabaseConstraintGeneration(unittest.TestCase):
             and solver_var(item.this).column_id.name.normalized == "parent_id"
         }
         self.assertEqual(fk_scopes, {"r0", "r1"})
+
+    def test_table_level_check_constraints_use_existing_path_variables(self):
+        instance = Instance(
+            ddls=(
+                "CREATE TABLE follow ("
+                "followee INT, follower INT, "
+                "CONSTRAINT check_follow CHECK (followee <> follower)"
+                ");"
+            ),
+            name="test",
+            dialect="sqlite",
+        )
+
+        sql = "SELECT * FROM follow WHERE followee > 0 AND follower > 0"
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == "filter"
+            and target.atom_outcomes
+            and all(outcome == BranchType.TRUE for _atom, outcome in target.atom_outcomes)
+        )
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        check_scopes = {
+            (
+                solver_var(item.this).row_scope,
+                solver_var(item.expression).row_scope,
+            )
+            for item in constraint.constraints
+            if isinstance(item, exp.NEQ)
+            and solver_var(item.this) is not None
+            and solver_var(item.expression) is not None
+            and solver_var(item.this).column_id.name.normalized == "followee"
+            and solver_var(item.expression).column_id.name.normalized == "follower"
+        }
+        self.assertEqual(check_scopes, {(None, None)})
+
+    def test_table_level_check_constraints_skip_missing_path_variables(self):
+        instance = Instance(
+            ddls=(
+                "CREATE TABLE follow ("
+                "followee INT, follower INT, "
+                "CONSTRAINT check_follow CHECK (followee <> follower)"
+                ");"
+            ),
+            name="test",
+            dialect="sqlite",
+        )
+
+        sql = "SELECT COUNT(followee) FROM follow"
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == "aggregate_input"
+            and target.target_outcome == BranchType.DUPLICATE
+        )
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        check_constraints = [
+            item
+            for item in constraint.constraints
+            if isinstance(item, exp.NEQ)
+            and isinstance(item.this, exp.Column)
+            and isinstance(item.expression, exp.Column)
+            and item.this.name == "followee"
+            and item.expression.name == "follower"
+        ]
+        self.assertEqual(check_constraints, [])
+
+    def test_table_level_check_constraints_preserve_self_join_alias_scope(self):
+        instance = Instance(
+            ddls=(
+                "CREATE TABLE follow ("
+                "followee INT, follower INT, "
+                "CONSTRAINT check_follow CHECK (followee <> follower)"
+                ");"
+            ),
+            name="test",
+            dialect="sqlite",
+        )
+
+        sql = (
+            "SELECT * FROM follow AS t1 "
+            "INNER JOIN follow AS t2 ON t1.follower = t2.followee "
+            "WHERE t1.followee > 0 AND t1.follower > 0 "
+            "AND t2.followee > 0 AND t2.follower > 0"
+        )
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == "filter"
+            and target.atom_outcomes
+            and all(outcome == BranchType.TRUE for _atom, outcome in target.atom_outcomes)
+        )
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        check_bindings = {
+            (
+                solver_var(item.this).relation_id.alias.normalized,
+                solver_var(item.this).row_scope,
+                solver_var(item.expression).relation_id.alias.normalized,
+                solver_var(item.expression).row_scope,
+            )
+            for item in constraint.constraints
+            if isinstance(item, exp.NEQ)
+            and solver_var(item.this) is not None
+            and solver_var(item.expression) is not None
+            and solver_var(item.this).column_id.name.normalized == "followee"
+            and solver_var(item.expression).column_id.name.normalized == "follower"
+        }
+        self.assertEqual(check_bindings, {("t1", "r0", "t1", "r0"), ("t2", "r1", "t2", "r1")})
+
+    def test_unsupported_table_level_check_raises_explicit_error(self):
+        instance = Instance(
+            ddls="CREATE TABLE t (x INT, CHECK ((SELECT 1) = 1));",
+            name="test",
+            dialect="sqlite",
+        )
+
+        sql = "SELECT * FROM t WHERE x > 0"
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(target for target in tree.uncovered_targets if target.node.site == "filter")
+
+        with self.assertRaisesRegex(ValueError, "unsupported_database_check:subquery"):
+            ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
 
     def test_unique_lookup_uses_stored_source_for_aliased_join_column(self):
         instance = Instance(
@@ -318,6 +485,72 @@ class TestRowSetObligations(unittest.TestCase):
         }
 
         self.assertTrue({"out0", "out1", "out2", "out3", "out4", "out5"} <= scopes)
+
+    def test_limit_offset_row_set_carries_ordering_obligation(self):
+        schema = "CREATE TABLE schools (id INT PRIMARY KEY, zip TEXT, opened INT);"
+        sql = "SELECT zip FROM schools ORDER BY opened DESC LIMIT 1 OFFSET 2"
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            t for t in tree.root_witness_targets if t.node.site == "root_result"
+        )
+        row_set = next(
+            obligation.row_set
+            for obligation in target.node.obligations
+            if obligation.kind == "row_set"
+        )
+
+        self.assertEqual(row_set.required_rows, 3)
+        self.assertEqual(len(row_set.ordering), 1)
+        self.assertEqual(row_set.ordering[0].this.name, "opened")
+
+    def test_row_set_ordering_lowers_to_rank_constraints(self):
+        schema = "CREATE TABLE schools (id INT PRIMARY KEY, zip TEXT, opened INT);"
+        sql = "SELECT zip FROM schools ORDER BY opened DESC LIMIT 1 OFFSET 2"
+        constraint = self._compile_root_constraint(schema, sql)
+
+        rank_constraints = []
+        for expression in constraint.constraints:
+            if not isinstance(expression, exp.GTE):
+                continue
+            left = solver_var(expression.this)
+            right = solver_var(expression.expression)
+            if left is None or right is None:
+                continue
+            if (
+                left.column_id.name.normalized == "opened"
+                and right.column_id.name.normalized == "opened"
+                and left.row_scope == "out0"
+                and right.row_scope in {"out1", "out2"}
+            ):
+                rank_constraints.append(right.row_scope)
+
+        self.assertEqual(set(rank_constraints), {"out1", "out2"})
+
+    def test_capped_large_offset_row_set_does_not_emit_partial_rank_constraints(self):
+        schema = "CREATE TABLE schools (id INT PRIMARY KEY, zip TEXT, opened INT);"
+        sql = "SELECT zip FROM schools ORDER BY opened DESC LIMIT 1 OFFSET 332"
+        constraint = self._compile_root_constraint(schema, sql)
+
+        rank_constraints = []
+        for expression in constraint.constraints:
+            if not isinstance(expression, exp.GTE):
+                continue
+            left = solver_var(expression.this)
+            right = solver_var(expression.expression)
+            if left is None or right is None:
+                continue
+            if (
+                left.column_id.name.normalized == "opened"
+                and right.column_id.name.normalized == "opened"
+                and left.row_scope == "out0"
+                and right.row_scope
+                and right.row_scope.startswith("out")
+            ):
+                rank_constraints.append(right.row_scope)
+
+        self.assertEqual(rank_constraints, [])
 
     def test_having_row_set_does_not_make_one_group_key_unique_per_counted_row(self):
         schema = (

@@ -425,7 +425,27 @@ class PlanEvaluator:
         rows: List[Row] = []
         for table in output.tables.values():
             rows.extend(table.rows)
+        seen_values: dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
         for row in rows:
+            output_values = tuple(_symbol_value(symbol) for _column, symbol in row.items())
+            previous_row_ids = seen_values.get(output_values)
+            if previous_row_ids is None:
+                seen_values[output_values] = _row_ids(row)
+            else:
+                self._observe(
+                    root_node,
+                    AtomObservation(
+                        atom_id=0,
+                        outcome=BranchType.DUPLICATE,
+                        row_ids=_row_ids(row),
+                    ),
+                )
+                tree.record_operator_trace(
+                    root_node,
+                    outcome=BranchType.DUPLICATE,
+                    input_row_ids=(previous_row_ids, _row_ids(row)),
+                    output_row_ids=(previous_row_ids, _row_ids(row)),
+                )
             self._observe(
                 root_node,
                 AtomObservation(

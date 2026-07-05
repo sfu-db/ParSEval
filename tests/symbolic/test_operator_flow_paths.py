@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from parseval.identity import ColumnKind, RelationKind, identifier_name, relation_id
 from parseval.instance import Instance
 from parseval.plan import Filter, Plan
 from parseval.query import preprocess_sql
-from parseval.solver import Solver
+from parseval.solver import Solver, SolverConstraint
 from parseval.solver.types import solver_var
 from parseval.symbolic.branch_tree import (
     BranchCoverageRecorder,
@@ -301,6 +303,19 @@ def test_branchless_order_limit_engine_generates_non_empty_result():
     assert len(next(iter(rows.values())).rows) == 1
 
 
+def test_engine_does_not_treat_empty_materialization_as_generation_success():
+    instance = Instance(
+        ddls="CREATE TABLE t (id INT PRIMARY KEY);",
+        name="test",
+        dialect="sqlite",
+    )
+    engine = SymbolicEngine(instance, "SELECT id FROM t", dialect="sqlite")
+
+    assert not engine._solve_and_materialize(
+        SolverConstraint(target_relations=(instance.table_id("t"),))
+    )
+
+
 def test_project_order_limit_root_obligation_uses_output_lineage():
     schema = """
     CREATE TABLE frpm (
@@ -386,6 +401,127 @@ def test_having_count_threshold_over_join_generates_same_group_rows():
     assert result.rows_generated >= 22
     assert len(instance.get_rows("attendees")) >= 21
     assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_engine_non_speculate_solves_table_level_check_before_materializing():
+    schema = """
+    CREATE TABLE follow (
+      followee INT NOT NULL,
+      follower INT NOT NULL,
+      CONSTRAINT check_follow CHECK (followee <> follower)
+    );
+    """
+    sql = "SELECT * FROM follow WHERE followee > 0 AND follower > 0"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=5,
+        max_rows_per_table=5,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert len(next(iter(output.tables.values())).rows) > 0
+
+
+def test_engine_non_speculate_applies_table_check_per_self_join_binding():
+    schema = """
+    CREATE TABLE FOLLOW (
+      FOLLOWEE VARCHAR(30) NOT NULL,
+      FOLLOWER VARCHAR(30) NOT NULL,
+      CONSTRAINT PK_FOLLOW PRIMARY KEY (FOLLOWEE, FOLLOWER),
+      CONSTRAINT CHECK_FOLLOW CHECK (FOLLOWEE <> FOLLOWER)
+    );
+    """
+    sql = """
+    SELECT DISTINCT T1.FOLLOWER, COUNT(DISTINCT T2.FOLLOWER) AS NUM
+    FROM FOLLOW AS T1
+    INNER JOIN FOLLOW AS T2 ON T1.FOLLOWER = T2.FOLLOWEE
+    WHERE T2.FOLLOWER IS NOT NULL
+    GROUP BY T1.FOLLOWER
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    conn = sqlite3.connect(":memory:")
+    conn.execute(schema)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO FOLLOW(FOLLOWEE, FOLLOWER) VALUES (?, ?)",
+            (row["followee"], row["follower"]),
+        )
+    output_rows = conn.execute(sql).fetchall()
+
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert output_rows
+
+
+def test_engine_handles_comma_self_join_order_by_projection_alias():
+    schema = """
+    CREATE TABLE FOLLOW (
+      FOLLOWEE VARCHAR(30) NOT NULL,
+      FOLLOWER VARCHAR(30) NOT NULL,
+      CONSTRAINT PK_FOLLOW PRIMARY KEY (FOLLOWEE, FOLLOWER),
+      CONSTRAINT CHECK_FOLLOW CHECK (FOLLOWEE <> FOLLOWER)
+    );
+    """
+    sql = """
+    SELECT DISTINCT T1.FOLLOWER, COUNT(DISTINCT T2.FOLLOWER) AS NUM
+    FROM FOLLOW T1, FOLLOW T2
+    WHERE T1.FOLLOWER = T2.FOLLOWEE
+    GROUP BY T1.FOLLOWER
+    ORDER BY T1.FOLLOWER
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    conn = sqlite3.connect(":memory:")
+    conn.execute(schema)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO FOLLOW(FOLLOWEE, FOLLOWER) VALUES (?, ?)",
+            (row["followee"], row["follower"]),
+        )
+    output_rows = conn.execute(sql).fetchall()
+
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert output_rows
 
 
 def test_having_count_threshold_over_join_allows_counted_fk_as_first_child_column():
@@ -541,6 +677,112 @@ def test_query_required_rows_override_zero_coverage_thresholds():
     assert result.rows_generated >= 4
     assert len(instance.get_rows("sales")) >= 4
     assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_engine_only_filter_on_derived_count_alias_generates_group_rows():
+    schema = """
+    CREATE TABLE badges (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Name TEXT
+    );
+    """
+    sql = """
+    SELECT UserId
+    FROM (
+      SELECT UserId, COUNT(Name) AS num
+      FROM badges
+      GROUP BY UserId
+    ) T
+    WHERE T.num > 2
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("badges")) >= 3
+    assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_qualified_derived_count_alias_uses_matching_subquery_output():
+    schema = """
+    CREATE TABLE badges (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Name TEXT
+    );
+    CREATE TABLE posts (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Title TEXT
+    );
+    """
+    sql = """
+    SELECT B.UserId
+    FROM (
+      SELECT UserId, COUNT(Name) AS num
+      FROM badges
+      GROUP BY UserId
+    ) B
+    JOIN (
+      SELECT UserId, COUNT(Title) AS num
+      FROM posts
+      GROUP BY UserId
+    ) P ON B.UserId = P.UserId
+    WHERE P.num > 2
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=15,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("posts")) >= 3
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+    assert len(next(iter(output.tables.values())).rows) >= 1
+
+
+def test_engine_only_date_function_predicate_generates_physical_row():
+    schema = """
+    CREATE TABLE users (
+      Id INT PRIMARY KEY,
+      LastAccessDate TEXT
+    );
+    """
+    sql = "SELECT COUNT(Id) FROM users WHERE date(LastAccessDate) > '2014-09-01'"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 1
+    assert len(instance.get_rows("users")) >= 1
+    assert next(iter(output.tables.values())).rows
 
 
 def test_scalar_subquery_aggregate_join_generates_inner_witness_group():
@@ -734,6 +976,185 @@ def test_limit_comma_offset_join_engine_generates_required_final_rows():
     ).evaluate_context()
 
     assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_topk_derived_subquery_engine_generates_source_rows():
+    schema = """
+    CREATE TABLE drivers (
+      driverId INT PRIMARY KEY,
+      nationality TEXT,
+      dob DATE
+    );
+    """
+    sql = """
+    SELECT COUNT(*)
+    FROM (
+      SELECT nationality
+      FROM drivers
+      ORDER BY JULIANDAY(dob) DESC
+      LIMIT 3
+    ) AS T3
+    WHERE T3.nationality = 'Dutch'
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("drivers")) >= 3
+
+
+def test_self_join_aliases_keep_distinct_join_edges():
+    schema = """
+    CREATE TABLE superhero (
+      id INT PRIMARY KEY,
+      superhero_name TEXT,
+      eye_colour_id INT,
+      hair_colour_id INT
+    );
+    CREATE TABLE colour (
+      id INT PRIMARY KEY,
+      colour TEXT
+    );
+    """
+    sql = """
+    SELECT T1.superhero_name
+    FROM superhero AS T1
+    INNER JOIN colour AS T2 ON T1.eye_colour_id = T2.id
+    INNER JOIN colour AS T3 ON T1.hair_colour_id = T3.id
+    WHERE T2.colour = 'Blue' AND T3.colour = 'Brown'
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    join_step = next(step for step in plan.ordered_steps if type(step).__name__ == "Join")
+    target = next(
+        target
+        for target in build_branch_tree(plan, instance).root_witness_targets
+        if target.node.site == "root_result"
+    )
+    constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+    join_pairs = {
+        (
+            join_data["source_key"][0].sql(dialect="sqlite"),
+            join_data["join_key"][0].sql(dialect="sqlite"),
+        )
+        for join_data in join_step.joins.values()
+    }
+
+    assert join_pairs == {
+        ('"t1"."eye_colour_id"', '"t2"."id"'),
+        ('"t1"."hair_colour_id"', '"t3"."id"'),
+    }
+    lowered_pairs = {
+        (
+            left.column_id.name.normalized,
+            left.relation_id.display,
+            right.column_id.name.normalized,
+            right.relation_id.display,
+        )
+        for left, right in constraint.join_equalities
+    }
+    assert lowered_pairs == {
+        ("eye_colour_id", "t1", "id", "t2"),
+        ("hair_colour_id", "t1", "id", "t3"),
+    }
+
+
+def test_cte_derived_join_engine_materializes_source_rows():
+    schema = """
+    CREATE TABLE lapTimes (
+      raceId INT,
+      driverId INT,
+      lap INT,
+      time_in_seconds REAL
+    );
+    CREATE TABLE drivers (
+      driverId INT PRIMARY KEY,
+      forename TEXT,
+      surname TEXT
+    );
+    """
+    sql = """
+    WITH lap_times_in_seconds AS (
+      SELECT driverId, time_in_seconds
+      FROM lapTimes
+    )
+    SELECT T2.forename, T2.surname
+    FROM (
+      SELECT driverId, MIN(time_in_seconds) AS min_time_in_seconds
+      FROM lap_times_in_seconds
+      GROUP BY driverId
+    ) AS T1
+    INNER JOIN drivers AS T2 ON T1.driverId = T2.driverId
+    ORDER BY T1.min_time_in_seconds ASC
+    LIMIT 1
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated > 0
+    assert len(instance.get_rows("lapTimes")) >= 1
+    assert len(instance.get_rows("drivers")) >= 1
+    assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_aggregate_ordered_derived_table_engine_materializes_source_rows():
+    schema = """
+    CREATE TABLE atom (
+      atom_id INT PRIMARY KEY,
+      molecule_id INT,
+      element TEXT
+    );
+    CREATE TABLE molecule (
+      molecule_id INT PRIMARY KEY,
+      label TEXT
+    );
+    """
+    sql = """
+    SELECT T.element
+    FROM (
+      SELECT T1.element, COUNT(DISTINCT T1.molecule_id)
+      FROM atom AS T1
+      INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id
+      WHERE T2.label = '-'
+      GROUP BY T1.element
+      ORDER BY COUNT(DISTINCT T1.molecule_id) ASC
+      LIMIT 4
+    ) T
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=20,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 8
+    assert len(instance.get_rows("atom")) >= 4
+    assert len(instance.get_rows("molecule")) >= 4
+    assert len(next(iter(output.tables.values())).rows) >= 1
 
 
 def test_root_result_records_one_observation_per_final_output_row():
@@ -1566,8 +1987,13 @@ def test_nested_alias_solver_vars_keep_distinct_bindings_and_storage():
         identifier_name(var.relation_id.display, dialect="sqlite").normalized
         for var in vars_by_qualifier[t2_key]
     } == {t2_key}
-    assert all(var.column_id.kind is not ColumnKind.SYNTHETIC for var in vars_by_qualifier[t1_key])
-    assert all(var.column_id.kind is not ColumnKind.SYNTHETIC for var in vars_by_qualifier[t2_key])
+    for qualifier in (t1_key, t2_key):
+        assert all(var.column_id.kind is ColumnKind.SYNTHETIC for var in vars_by_qualifier[qualifier])
+        assert all(var.column_id.source_column_id is not None for var in vars_by_qualifier[qualifier])
+        assert all(
+            var.column_id.source_column_id.kind is ColumnKind.PHYSICAL
+            for var in vars_by_qualifier[qualifier]
+        )
     assert {constraint.storage_relations[var].name.normalized for var in vars_by_qualifier["t1"]} == {"atom"}
     assert {constraint.storage_relations[var].name.normalized for var in vars_by_qualifier["t2"]} == {"connected"}
 

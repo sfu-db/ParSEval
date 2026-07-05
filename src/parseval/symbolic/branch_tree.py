@@ -6,6 +6,7 @@ coverage analysis, and path extraction.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import product
 from typing import Any, List, Optional, Tuple
 
@@ -336,6 +337,7 @@ def coverage_obligations_for_site(
     elif site == "root_result":
         expression = atoms[0] if atoms else exp.true()
         add("root_result", 0, expression, (BranchType.ATOM_TRUE,))
+        add("root_duplicate", 0, expression, (BranchType.DUPLICATE,))
     elif site == "exists":
         expression = atoms[0] if atoms else exp.true()
         add("exists", 0, expression, (BranchType.EXISTS_TRUE, BranchType.EXISTS_FALSE))
@@ -682,6 +684,67 @@ class CoverageAnalyzer:
 class BranchPathBuilder:
     """Build root-to-target BranchPath instances from a BranchTree."""
 
+    def _obligations_for_target_node(
+        self,
+        node: BranchNode,
+        target: CoverageTarget,
+    ) -> Tuple[OperatorObligation, ...]:
+        if (
+            node.site in {"aggregate_input", "aggregate_distinct_input"}
+            and target.target_outcome
+            in {BranchType.DUPLICATE, BranchType.AGG_DISTINCT_DUPLICATE_ELIMINATED}
+        ):
+            row_set = RowSetObligation(
+                anchor_step_id=node.step_id,
+                required_rows=2,
+                generation_rows=2,
+                row_scopes=("r0", "r1"),
+                relations=node.tables,
+                join_facts=node.join_facts,
+                path_predicates=node.path_predicates,
+                duplicate_expressions=(target.atom,),
+            )
+            return (
+                *node.obligations,
+                OperatorObligation(
+                    kind="row_set",
+                    step_id=node.step_id,
+                    site=node.site,
+                    row_count=2,
+                    row_set=row_set,
+                ),
+            )
+
+        if (
+            node.site != "root_result"
+            or target.target_outcome != BranchType.DUPLICATE
+        ):
+            return node.obligations
+
+        obligations: List[OperatorObligation] = []
+        for obligation in node.obligations:
+            if obligation.kind != "row_set" or obligation.row_set is None:
+                obligations.append(obligation)
+                continue
+            row_set = obligation.row_set
+            if not row_set.duplicate_expressions:
+                continue
+            generation_rows = max(row_set.generation_rows, 2)
+            duplicate_row_set = replace(
+                row_set,
+                required_rows=max(row_set.required_rows, 2),
+                generation_rows=generation_rows,
+                row_scopes=tuple(f"out{index}" for index in range(generation_rows)),
+            )
+            obligations.append(
+                replace(
+                    obligation,
+                    row_count=generation_rows,
+                    row_set=duplicate_row_set,
+                )
+            )
+        return tuple(obligations)
+
     def path_for_target(self, target: CoverageTarget) -> BranchPath:
         nodes: List[BranchNode] = []
         current: Optional[BranchNode] = target.node
@@ -704,8 +767,8 @@ class BranchPathBuilder:
                     relations.append(relation)
             join_facts.extend(node.join_facts)
             subqueries.extend(node.subqueries)
-            obligations.extend(node.obligations)
             if node is target.node:
+                obligations.extend(self._obligations_for_target_node(node, target))
                 if target.atom_outcomes:
                     predicates.extend(
                         PathPredicate(
@@ -726,6 +789,7 @@ class BranchPathBuilder:
                         )
                     )
             elif node.site in {"filter", "having", "join_on"}:
+                obligations.extend(node.obligations)
                 predicates.append(
                     PathPredicate(
                         node=node,
@@ -734,6 +798,8 @@ class BranchPathBuilder:
                         obligation=None,
                     )
                 )
+            else:
+                obligations.extend(node.obligations)
 
         return BranchPath(
             target=target,
@@ -1142,6 +1208,13 @@ def _build_branch_tree(
             return None
         return _column_expr_from_id(group_keys[0])
 
+    def _root_duplicate_expressions(root: Step) -> tuple[exp.Expression, ...]:
+        if not isinstance(root, Project) or root.distinct:
+            return ()
+        if any(isinstance(step, Aggregate) for step in plan.ordered_steps):
+            return ()
+        return project_coverage_expressions(root)
+
     def _root_obligations(root: Step) -> tuple[OperatorObligation, ...]:
         annotation = plan.annotation_for(root)
         row_count = _root_required_row_count(root)
@@ -1152,6 +1225,7 @@ def _build_branch_tree(
         path_predicates, join_facts = _root_path_data(root)
         ordering = _root_ordering(root)
         distinct_expression = _root_group_distinct_expression()
+        duplicate_expressions = _root_duplicate_expressions(root)
         root_row_set = RowSetObligation(
             anchor_step_id=annotation.step_id,
             required_rows=row_count,
@@ -1161,6 +1235,7 @@ def _build_branch_tree(
             join_facts=join_facts,
             path_predicates=path_predicates,
             distinct_expression=distinct_expression,
+            duplicate_expressions=duplicate_expressions,
             ordering=ordering,
         )
         obligations: list[OperatorObligation] = [
