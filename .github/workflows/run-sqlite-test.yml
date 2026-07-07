@@ -2,7 +2,7 @@ name: Run SQLite Experiment
 
 on:
   push:
-    branches: ["dev"]
+    branches: ["dev", "main"]
   workflow_dispatch:
 
 jobs:

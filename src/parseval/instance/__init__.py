@@ -1,4 +1,5 @@
 from .core import Catalog, Instance
+from .constraints import DatabaseCheckConstraint, DatabaseConstraints
 from .exporter import InstanceExporter
 from .loader import InstanceLoader
 from .types import (
@@ -11,6 +12,8 @@ from .types import (
 
 __all__ = [
     "Catalog",
+    "DatabaseCheckConstraint",
+    "DatabaseConstraints",
     "DatabaseTarget",
     "Instance",
     "InstanceExporter",

@@ -2,9 +2,9 @@
 db_manager.py
 Database connection manager using SQLAlchemy connection URLs.
 
-Engines and DB-initialisation state are cached at module level, keyed by
-connection URL.  Multiple DBManager instances (or bare get_connection() calls)
-for the same URL share the same engine automatically — no singleton needed.
+Each call creates and owns its SQLAlchemy engine for the lifetime of the
+connection context.  Temporary database workflows can drop and recreate
+databases without stale cached engine or initialisation state.
 
 Usage:
     with get_connection("sqlite:////path/to/mydb.sqlite", dialect="sqlite") as conn:
@@ -19,7 +19,6 @@ Usage:
 
 from __future__ import annotations
 
-import atexit
 import logging
 import os
 import random
@@ -27,7 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from threading import Lock
-from typing import Any, Dict, Generator, List, Literal, Optional, Set, Tuple, Union, overload
+from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union, overload
 
 from sqlglot import exp
 from sqlalchemy import Connection, Engine, MetaData, URL, create_engine, text
@@ -61,30 +60,14 @@ def _quote_mysql_identifier(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
 
-# ---------------------------------------------------------------------------
-# Module-level engine cache — the resource worth sharing across call sites
-# ---------------------------------------------------------------------------
-
-_engine_cache: Dict[str, Engine] = {}
-_initialized_dbs: Set[Tuple[str, str]] = set()   # (dialect, cache_key)
-_cache_lock: Lock = Lock()
-
-
 def dispose_all() -> None:
     """
-    Dispose every cached engine and clear both caches.
+    Compatibility hook for callers that used to clear cached engines.
 
-    - Called automatically at process exit via atexit.
-    - Call explicitly in tests between cases to prevent engine/DB state leaking.
+    Engines are no longer cached by this module, so there is no module-level
+    state to dispose.
     """
-    with _cache_lock:
-        for engine in _engine_cache.values():
-            engine.dispose()
-        _engine_cache.clear()
-        _initialized_dbs.clear()
-
-
-atexit.register(dispose_all)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +396,7 @@ class _MySQLProvider(_BackendProvider):
     def ensure_database(self, url: URL) -> None:
         if not url.database:
             raise ValueError("MySQL connection string must include a database name")
-        admin_url = url.set(database=None)
+        admin_url = url.set(database="")
         engine = create_engine(admin_url)
         try:
             with engine.begin() as conn:
@@ -484,7 +467,7 @@ _providers: Dict[str, _BackendProvider] = {
 def _normalize_target(
     connection_string: str,
     dialect: str,
-) -> Tuple[URL, _BackendProvider, str]:
+) -> Tuple[URL, _BackendProvider]:
     provider = _providers.get(dialect)
     if provider is None:
         raise ValueError(
@@ -497,39 +480,7 @@ def _normalize_target(
         raise ValueError(
             f"Connection string backend '{backend_name}' does not match dialect '{dialect}'"
         )
-    cache_key = url.render_as_string(hide_password=False)
-    return url, provider, cache_key
-
-
-def _get_or_create_engine(
-    url: URL,
-    *,
-    provider: _BackendProvider,
-    cache_key: str,
-    log: logging.Logger,
-    pool_size: int,
-    max_overflow: int,
-    pool_timeout: int,
-    pool_recycle: int,
-    connect_timeout: int,
-) -> Engine:
-    with _cache_lock:
-        engine = _engine_cache.get(cache_key)
-        if engine is None:
-            engine = provider.create_engine(
-                url,
-                pool_size=pool_size,
-                max_overflow=max_overflow,
-                pool_timeout=pool_timeout,
-                pool_recycle=pool_recycle,
-                connect_timeout=connect_timeout,
-            )
-            _engine_cache[cache_key] = engine
-            log.debug(
-                "Created new engine for %s",
-                url.render_as_string(hide_password=True),
-            )
-        return engine
+    return url, provider
 
 
 # ---------------------------------------------------------------------------
@@ -551,40 +502,40 @@ def get_connection(
     """
     Yield a :class:`Connect` instance bound to the requested database.
 
-    Engines and DB-initialisation state are cached module-wide by URL; repeated
-    calls for the same database reuse the same engine (and pool for MySQL/Postgres).
+    The returned connection context owns its engine.  The database is ensured
+    for each call when ``create_if_missing`` is true, and the engine is disposed
+    when the context exits.
     """
     _log = log or logging.getLogger("qrank.db")
-    url, provider, cache_key = _normalize_target(connection_string, dialect)
+    url, provider = _normalize_target(connection_string, dialect)
 
     if create_if_missing:
-        init_key = (dialect, cache_key)
-        with _cache_lock:
-            if init_key not in _initialized_dbs:
-                provider.ensure_database(url)
-                _initialized_dbs.add(init_key)
+        provider.ensure_database(url)
 
-    engine = _get_or_create_engine(
+    engine = provider.create_engine(
         url,
-        provider=provider,
-        cache_key=cache_key,
-        log=_log,
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,
         pool_recycle=pool_recycle,
         connect_timeout=connect_timeout,
     )
-    yield Connect(engine=engine, log=_log)
+    _log.debug(
+        "Created engine for %s",
+        url.render_as_string(hide_password=True),
+    )
+    try:
+        yield Connect(engine=engine, log=_log)
+    finally:
+        engine.dispose()
 
 
 class DBManager:
     """
     Thin factory for :class:`Connect` instances.
 
-    No singleton, no shared state on the instance.  The engine cache lives at
-    module level and is shared automatically across all DBManager instances and
-    bare :func:`get_connection` calls.
+    No singleton, no shared state on the instance.  Each connection context owns
+    and disposes its engine.
 
     The only reason to use DBManager over get_connection() directly is to bind
     a custom logger once and have it applied to every connection from that manager.

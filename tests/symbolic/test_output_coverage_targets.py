@@ -82,6 +82,7 @@ def test_case_group_aggregate_and_join_targets_are_obligations():
     assert case_targets == {
         ("case_arm", BranchType.CASE_ARM_TAKEN),
         ("case_arm", BranchType.CASE_ARM_SKIPPED),
+        ("case_positive", BranchType.CASE_ARM_TAKEN),
     }
 
     group_tree = _tree("SELECT a, COUNT(*) FROM t GROUP BY a")

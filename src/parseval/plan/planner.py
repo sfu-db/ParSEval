@@ -617,6 +617,10 @@ class Step:
         # --- ORDER BY -> Sort -------------------------------------------------------
         order = expression.args.get("order")
         if order:
+            _resolve_order_projection_aliases(
+                order.expressions,
+                projections,
+            )
             if aggregate is not None:
                 for i, ordered in enumerate(order.expressions):
                     if extract_agg_operands(
@@ -1130,6 +1134,40 @@ def _has_outer_agg(expression: exp.Expression) -> bool:
     for _ in _iter_outer_agg_funcs(expression):
         return True
     return False
+
+
+def _projection_order_expression(projection: exp.Expression) -> exp.Expression:
+    if isinstance(projection, exp.Alias):
+        return projection.this.copy()
+    return projection.copy()
+
+
+def _resolve_order_projection_aliases(
+    ordered_expressions: t.Sequence[exp.Expression],
+    projections: t.Sequence[exp.Expression],
+) -> None:
+    projection_aliases: t.Dict[str, exp.Expression] = {}
+    ambiguous_aliases: t.Set[str] = set()
+    for projection in projections:
+        alias_name = getattr(projection, "alias_or_name", None)
+        if not alias_name:
+            continue
+        alias_key = identifier_name(alias_name, dialect=None).normalized
+        if alias_key in projection_aliases:
+            ambiguous_aliases.add(alias_key)
+            continue
+        projection_aliases[alias_key] = _projection_order_expression(projection)
+
+    for ordered in ordered_expressions:
+        order_expression = getattr(ordered, "this", None)
+        if not isinstance(order_expression, exp.Column) or order_expression.table:
+            continue
+        order_key = identifier_name(order_expression.this, dialect=None).normalized
+        if order_key in ambiguous_aliases:
+            continue
+        projection_expression = projection_aliases.get(order_key)
+        if projection_expression is not None:
+            order_expression.replace(projection_expression.copy())
 
 
 def _output_columns_of(step: Step) -> t.Tuple[str, ...]:
@@ -1765,9 +1803,9 @@ def _same_relation_identity(
 ) -> bool:
     if candidate is None or expected is None:
         return False
-    qualifiers = []
     if expected.alias is not None:
-        qualifiers.append(expected.alias.raw)
+        return _relation_matches(candidate, expected.alias.raw, dialect)
+    qualifiers = []
     if expected.name is not None:
         qualifiers.append(expected.name.raw)
     return any(_relation_matches(candidate, qualifier, dialect) for qualifier in qualifiers)

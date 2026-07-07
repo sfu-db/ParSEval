@@ -141,7 +141,9 @@ class InstantiateResult:
 # Comparison Logic
 # =============================================================================
 
-
+def normalize_row(row: tuple[Any, ...] | list[Any]) -> tuple[Any, ...]:
+    return tuple(row)
+from collections import Counter
 def compare_results(
     r1: ExecutionResult,
     r2: ExecutionResult,
@@ -151,14 +153,14 @@ def compare_results(
     if r1.is_error or r2.is_error:
         return Verdict.SYNTAX_ERROR
 
+    rows1 = [normalize_row(row) for row in r1.rows]
+    rows2 = [normalize_row(row) for row in r2.rows]
     if semantics == "set":
-        eq = set(r1.rows) == set(r2.rows)
+        eq = set(rows1) == set(rows2)
+    elif semantics == "bag":
+        eq = Counter(rows1) == Counter(rows2)
     else:
-        try:
-            eq = sorted(r1.rows) == sorted(r2.rows)
-        except TypeError:
-            eq = r1.rows == r2.rows
-
+        raise ValueError(f"Unknown semantics: {semantics}")
     return Verdict.EQ if eq else Verdict.NEQ
 
 

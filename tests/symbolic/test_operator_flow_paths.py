@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from decimal import Decimal
+import sqlite3
+
 import pytest
 
-from parseval.identity import ColumnKind, RelationKind, identifier_name, relation_id
+from parseval.identity import ColumnKind, RelationKind, column_identity, identifier_name, relation_id
 from parseval.instance import Instance
 from parseval.plan import Filter, Plan
 from parseval.query import preprocess_sql
-from parseval.solver import Solver
+from parseval.solver import Solver, SolverConstraint
 from parseval.solver.types import solver_var
 from parseval.symbolic.branch_tree import (
     BranchCoverageRecorder,
@@ -77,6 +80,46 @@ def _constraint_column_names(constraint):
                 identifier = exp.to_identifier(column.name)
             names.add(identifier_name(identifier, dialect="sqlite").normalized)
     return names
+
+
+def _instance_table_rows(instance: Instance, table_name: str):
+    return [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows(table_name)
+    ]
+
+
+def _execute_generated(schema: str, instance: Instance, sql: str):
+    def sqlite_value(value):
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        for ddl in schema.split(";"):
+            ddl = ddl.strip()
+            if ddl:
+                connection.execute(ddl)
+        for table_name in instance.tables:
+            rows = _instance_table_rows(instance, table_name)
+            if not rows:
+                continue
+            columns = list(rows[0])
+            quoted = ", ".join(f'"{column}"' for column in columns)
+            placeholders = ", ".join("?" for _column in columns)
+            statement = (
+                f'INSERT INTO "{table_name}" ({quoted}) VALUES ({placeholders})'
+            )
+            for row in rows:
+                connection.execute(
+                    statement,
+                    [sqlite_value(row[column]) for column in columns],
+                )
+        connection.commit()
+        return connection.execute(sql).fetchall()
+    finally:
+        connection.close()
 
 
 def test_branchless_order_limit_query_has_root_witness_target():
@@ -206,6 +249,454 @@ def test_evaluator_records_case_coverage_on_planned_branch_node():
     assert case_nodes[0].observation_count(-1, BranchType.CASE_ARM_TAKEN) == 1
 
 
+def test_case_arm_row_observations_satisfy_case_coverage_targets():
+    schema = """
+    CREATE TABLE t (
+      id INT PRIMARY KEY,
+      a INT
+    );
+    """
+    sql = "SELECT CASE WHEN a > 5 THEN 'big' ELSE 'small' END FROM t"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    instance.create_row("t", values={"id": 1, "a": 10})
+    instance.create_row("t", values={"id": 2, "a": 1})
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = BranchTreeBuilder(plan, instance).build()
+
+    evaluated = PlanEvaluator(plan, instance).evaluate(tree)
+    uncovered_case_outcomes = {
+        target.target_outcome
+        for target in evaluated.uncovered_targets
+        if target.node.site == "case_arm"
+    }
+
+    assert BranchType.CASE_ARM_TAKEN not in uncovered_case_outcomes
+    assert BranchType.CASE_ARM_SKIPPED not in uncovered_case_outcomes
+
+
+def test_case_target_path_carries_case_arm_predicate():
+    schema = """
+    CREATE TABLE t (
+      id INT PRIMARY KEY,
+      a INT
+    );
+    """
+    sql = "SELECT CASE WHEN a > 5 THEN 'big' ELSE 'small' END FROM t"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "case_arm"
+        and target.target_outcome == BranchType.CASE_ARM_TAKEN
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+
+    assert [(predicate.node.site, predicate.expression.sql(), predicate.outcome) for predicate in path.predicates] == [
+        ("case_arm", '"t"."a" > 5', BranchType.CASE_ARM_TAKEN)
+    ]
+
+
+def test_join_fanout_target_path_includes_two_row_obligation():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = "SELECT parent.name FROM parent JOIN child ON parent.id = child.parent_id"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "join_on"
+        and target.obligation is not None
+        and target.obligation.metric == "join_fanout"
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+    row_set = next(
+        obligation.row_set
+        for obligation in path.obligations
+        if obligation.kind == "row_set" and obligation.row_set is not None
+    )
+
+    assert target.target_outcome == BranchType.DUPLICATE
+    assert row_set.required_rows == 2
+    assert row_set.row_scopes == ("r0", "r1")
+    assert [
+        column_identity(expression).name.normalized
+        for expression in row_set.duplicate_expressions
+    ] == ["parent_id"]
+
+
+def test_engine_generates_strategy_only_join_fanout_without_speculation():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = "SELECT parent.name FROM parent JOIN child ON parent.id = child.parent_id"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=12,
+        max_rows_per_table=12,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    uncovered_metrics = {
+        target.obligation.metric
+        for target in result.tree.uncovered_targets
+        if target.obligation is not None
+    }
+
+    assert "join_fanout" not in uncovered_metrics
+
+
+def test_strategy_generation_budget_counts_from_engine_start():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = "SELECT parent.name FROM parent JOIN child ON parent.id = child.parent_id"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=12,
+        max_rows_per_table=12,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert result.rows_generated > 0
+    assert result.tree.fully_covered
+
+
+def test_engine_without_speculation_generates_count_distinct_duplicate_witness():
+    schema = "CREATE TABLE t (pk INT PRIMARY KEY, id INT);"
+    gold_sql = "SELECT COUNT(DISTINCT id) FROM t"
+    pred_sql = "SELECT COUNT(id) FROM t"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        gold_sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert _execute_generated(schema, instance, gold_sql) != _execute_generated(
+        schema,
+        instance,
+        pred_sql,
+    )
+
+
+def test_engine_without_speculation_generates_project_duplicate_witness():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, code TEXT, name TEXT);"
+    gold_sql = "SELECT code, name FROM t"
+    pred_sql = "SELECT DISTINCT code, name FROM t"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        gold_sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert _execute_generated(schema, instance, gold_sql) != _execute_generated(
+        schema,
+        instance,
+        pred_sql,
+    )
+
+
+def test_engine_without_speculation_generates_case_positive_witness():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+    sql = "SELECT SUM(CASE WHEN a > 5 THEN 1 ELSE 0 END) FROM t"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert _execute_generated(schema, instance, sql)[0][0] > 0
+
+
+def test_engine_without_speculation_generates_rank_tie_witness():
+    schema = "CREATE TABLE t (id INT PRIMARY KEY, value INT);"
+    pred_sql = "SELECT id FROM t ORDER BY value DESC LIMIT 1"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        pred_sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    rows = instance.get_rows("t")
+    value_col = instance.column_id("t", exp.to_identifier("value"))
+    id_col = instance.column_id("t", exp.to_identifier("id"))
+    top_value = max(row[value_col].concrete for row in rows)
+    top_ids = {
+        row[id_col].concrete
+        for row in rows
+        if row[value_col].concrete == top_value
+    }
+
+    assert _execute_generated(schema, instance, pred_sql)
+    assert len(top_ids) >= 2
+
+
+def test_aggregate_contrast_target_path_includes_grouped_row_scopes():
+    schema = "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);"
+    sql = "SELECT category, SUM(amount) FROM sales GROUP BY category"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "aggregate_output"
+        and target.obligation is not None
+        and target.obligation.metric == "aggregate_contrast"
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+    row_set = next(
+        obligation.row_set
+        for obligation in path.obligations
+        if obligation.kind == "row_set" and obligation.row_set is not None
+    )
+
+    assert target.target_outcome == BranchType.DUPLICATE
+    assert row_set.group_keys
+    assert row_set.row_scopes == ("r0", "r1")
+    assert row_set.distinct_expression is not None
+    assert row_set.distinct_expression.sql() == '"sales"."amount"'
+
+
+def test_rank_contrast_ordering_only_when_sort_feeds_limit():
+    schema = "CREATE TABLE schools (id INT PRIMARY KEY, opened INT);"
+    limited = Instance(ddls=schema, name="limited", dialect="sqlite")
+    limited_plan = Plan(
+        preprocess_sql(
+            "SELECT id FROM schools ORDER BY opened DESC LIMIT 1",
+            limited,
+            dialect="sqlite",
+        ),
+        limited,
+    )
+    unlimited = Instance(ddls=schema, name="unlimited", dialect="sqlite")
+    unlimited_plan = Plan(
+        preprocess_sql(
+            "SELECT id FROM schools ORDER BY opened DESC",
+            unlimited,
+            dialect="sqlite",
+        ),
+        unlimited,
+    )
+
+    limited_row_set = next(
+        obligation.row_set
+        for target in build_branch_tree(limited_plan, limited).root_witness_targets
+        for obligation in target.node.obligations
+        if obligation.kind == "row_set"
+    )
+    unlimited_row_set = next(
+        obligation.row_set
+        for target in build_branch_tree(unlimited_plan, unlimited).root_witness_targets
+        for obligation in target.node.obligations
+        if obligation.kind == "row_set"
+    )
+
+    assert limited_row_set.ordering
+    assert unlimited_row_set.ordering == ()
+
+
+def test_ranked_join_antimatch_uses_existing_join_unmatched_target():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT, score INT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = (
+        "SELECT parent.name FROM parent "
+        "JOIN child ON parent.id = child.parent_id "
+        "ORDER BY parent.score DESC LIMIT 1"
+    )
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "join_on"
+        and target.obligation is not None
+        and target.obligation.metric == "join_left_unmatched"
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+    row_set = next(
+        obligation.row_set
+        for obligation in path.obligations
+        if obligation.kind == "row_set"
+        and obligation.site == "ranked_join_antimatch"
+        and obligation.row_set is not None
+    )
+
+    assert target.target_outcome == BranchType.JOIN_LEFT
+    assert target.obligation.metric == "join_left_unmatched"
+    assert row_set.row_scopes == ("rank_top", "rank_match")
+    assert row_set.ordering
+
+
+def test_ranked_join_antimatch_uses_scoped_join_outcomes():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT, score INT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = (
+        "SELECT parent.name FROM parent "
+        "JOIN child ON parent.id = child.parent_id "
+        "ORDER BY parent.score DESC LIMIT 1"
+    )
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "join_on"
+        and target.obligation is not None
+        and target.obligation.metric == "join_left_unmatched"
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+    row_set = next(
+        obligation.row_set
+        for obligation in path.obligations
+        if obligation.kind == "row_set"
+        and obligation.site == "ranked_join_antimatch"
+        and obligation.row_set is not None
+    )
+
+    assert row_set.join_facts
+    assert row_set.join_scope_outcomes == (
+        ("rank_top", BranchType.JOIN_LEFT),
+        ("rank_match", BranchType.JOIN_MATCH),
+    )
+
+
+def test_ranked_join_antimatch_reads_ordering_from_join_node_metadata():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT, score INT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = (
+        "SELECT parent.name FROM parent "
+        "JOIN child ON parent.id = child.parent_id "
+        "ORDER BY parent.score DESC LIMIT 1"
+    )
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    join_node = next(node for node in tree.nodes if node.site == "join_on")
+
+    assert join_node.annotation_metadata.get("root_ordering")
+
+
+def test_plain_join_antimatch_does_not_use_ranked_strategy_without_limit():
+    schema = """
+    CREATE TABLE parent (id INT PRIMARY KEY, name TEXT, score INT);
+    CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);
+    """
+    sql = (
+        "SELECT parent.name FROM parent "
+        "JOIN child ON parent.id = child.parent_id "
+        "ORDER BY parent.score DESC"
+    )
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "join_on"
+        and target.obligation is not None
+        and target.obligation.metric == "join_left_unmatched"
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+
+    assert not any(
+        obligation.kind == "row_set"
+        and obligation.site == "ranked_join_antimatch"
+        for obligation in path.obligations
+    )
+
+
+def test_group_count_multi_target_path_uses_group_metric_predicate():
+    schema = "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);"
+    sql = "SELECT category, COUNT(id) FROM sales GROUP BY category"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "group"
+        and target.obligation is not None
+        and target.obligation.metric == "group_count"
+        and target.target_outcome == BranchType.GROUP_MULTI
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+
+    assert any(
+        predicate.node.site == "group"
+        and predicate.obligation is not None
+        and predicate.obligation.metric == "group_count"
+        and predicate.outcome == BranchType.GROUP_MULTI
+        for predicate in path.predicates
+    )
+
+
+def test_group_count_multi_uses_group_metric_constraints_not_extra_row_set():
+    schema = "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);"
+    sql = "SELECT category, COUNT(id) FROM sales GROUP BY category"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance)
+    target = next(
+        target
+        for target in tree.uncovered_targets
+        if target.node.site == "group"
+        and target.obligation is not None
+        and target.obligation.metric == "group_count"
+        and target.target_outcome == BranchType.GROUP_MULTI
+    )
+
+    path = BranchPathBuilder().path_for_target(target)
+
+    assert not any(
+        obligation.kind == "row_set" and obligation.site == "group_count"
+        for obligation in path.obligations
+    )
+
+
 def test_root_witness_target_conjoins_upstream_filter_predicate():
     sql = "SELECT Zip FROM schools WHERE Zip = '94110' ORDER BY OpenDate DESC LIMIT 1"
     instance = Instance(ddls=JOIN_SCHEMA, name="test", dialect="sqlite")
@@ -301,6 +792,19 @@ def test_branchless_order_limit_engine_generates_non_empty_result():
     assert len(next(iter(rows.values())).rows) == 1
 
 
+def test_engine_does_not_treat_empty_materialization_as_generation_success():
+    instance = Instance(
+        ddls="CREATE TABLE t (id INT PRIMARY KEY);",
+        name="test",
+        dialect="sqlite",
+    )
+    engine = SymbolicEngine(instance, "SELECT id FROM t", dialect="sqlite")
+
+    assert not engine._solve_and_materialize(
+        SolverConstraint(target_relations=(instance.table_id("t"),))
+    )
+
+
 def test_project_order_limit_root_obligation_uses_output_lineage():
     schema = """
     CREATE TABLE frpm (
@@ -386,6 +890,127 @@ def test_having_count_threshold_over_join_generates_same_group_rows():
     assert result.rows_generated >= 22
     assert len(instance.get_rows("attendees")) >= 21
     assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_engine_non_speculate_solves_table_level_check_before_materializing():
+    schema = """
+    CREATE TABLE follow (
+      followee INT NOT NULL,
+      follower INT NOT NULL,
+      CONSTRAINT check_follow CHECK (followee <> follower)
+    );
+    """
+    sql = "SELECT * FROM follow WHERE followee > 0 AND follower > 0"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=5,
+        max_rows_per_table=5,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert len(next(iter(output.tables.values())).rows) > 0
+
+
+def test_engine_non_speculate_applies_table_check_per_self_join_binding():
+    schema = """
+    CREATE TABLE FOLLOW (
+      FOLLOWEE VARCHAR(30) NOT NULL,
+      FOLLOWER VARCHAR(30) NOT NULL,
+      CONSTRAINT PK_FOLLOW PRIMARY KEY (FOLLOWEE, FOLLOWER),
+      CONSTRAINT CHECK_FOLLOW CHECK (FOLLOWEE <> FOLLOWER)
+    );
+    """
+    sql = """
+    SELECT DISTINCT T1.FOLLOWER, COUNT(DISTINCT T2.FOLLOWER) AS NUM
+    FROM FOLLOW AS T1
+    INNER JOIN FOLLOW AS T2 ON T1.FOLLOWER = T2.FOLLOWEE
+    WHERE T2.FOLLOWER IS NOT NULL
+    GROUP BY T1.FOLLOWER
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    conn = sqlite3.connect(":memory:")
+    conn.execute(schema)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO FOLLOW(FOLLOWEE, FOLLOWER) VALUES (?, ?)",
+            (row["followee"], row["follower"]),
+        )
+    output_rows = conn.execute(sql).fetchall()
+
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert output_rows
+
+
+def test_engine_handles_comma_self_join_order_by_projection_alias():
+    schema = """
+    CREATE TABLE FOLLOW (
+      FOLLOWEE VARCHAR(30) NOT NULL,
+      FOLLOWER VARCHAR(30) NOT NULL,
+      CONSTRAINT PK_FOLLOW PRIMARY KEY (FOLLOWEE, FOLLOWER),
+      CONSTRAINT CHECK_FOLLOW CHECK (FOLLOWEE <> FOLLOWER)
+    );
+    """
+    sql = """
+    SELECT DISTINCT T1.FOLLOWER, COUNT(DISTINCT T2.FOLLOWER) AS NUM
+    FROM FOLLOW T1, FOLLOW T2
+    WHERE T1.FOLLOWER = T2.FOLLOWEE
+    GROUP BY T1.FOLLOWER
+    ORDER BY T1.FOLLOWER
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    rows = [
+        {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+        for row in instance.get_rows("follow")
+    ]
+    conn = sqlite3.connect(":memory:")
+    conn.execute(schema)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO FOLLOW(FOLLOWEE, FOLLOWER) VALUES (?, ?)",
+            (row["followee"], row["follower"]),
+        )
+    output_rows = conn.execute(sql).fetchall()
+
+    assert result.rows_generated > 0
+    assert rows
+    assert all(row["followee"] != row["follower"] for row in rows)
+    assert output_rows
 
 
 def test_having_count_threshold_over_join_allows_counted_fk_as_first_child_column():
@@ -541,6 +1166,112 @@ def test_query_required_rows_override_zero_coverage_thresholds():
     assert result.rows_generated >= 4
     assert len(instance.get_rows("sales")) >= 4
     assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_engine_only_filter_on_derived_count_alias_generates_group_rows():
+    schema = """
+    CREATE TABLE badges (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Name TEXT
+    );
+    """
+    sql = """
+    SELECT UserId
+    FROM (
+      SELECT UserId, COUNT(Name) AS num
+      FROM badges
+      GROUP BY UserId
+    ) T
+    WHERE T.num > 2
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("badges")) >= 3
+    assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_qualified_derived_count_alias_uses_matching_subquery_output():
+    schema = """
+    CREATE TABLE badges (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Name TEXT
+    );
+    CREATE TABLE posts (
+      Id INT PRIMARY KEY,
+      UserId INT,
+      Title TEXT
+    );
+    """
+    sql = """
+    SELECT B.UserId
+    FROM (
+      SELECT UserId, COUNT(Name) AS num
+      FROM badges
+      GROUP BY UserId
+    ) B
+    JOIN (
+      SELECT UserId, COUNT(Title) AS num
+      FROM posts
+      GROUP BY UserId
+    ) P ON B.UserId = P.UserId
+    WHERE P.num > 2
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=15,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("posts")) >= 3
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+    assert len(next(iter(output.tables.values())).rows) >= 1
+
+
+def test_engine_only_date_function_predicate_generates_physical_row():
+    schema = """
+    CREATE TABLE users (
+      Id INT PRIMARY KEY,
+      LastAccessDate TEXT
+    );
+    """
+    sql = "SELECT COUNT(Id) FROM users WHERE date(LastAccessDate) > '2014-09-01'"
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 1
+    assert len(instance.get_rows("users")) >= 1
+    assert next(iter(output.tables.values())).rows
 
 
 def test_scalar_subquery_aggregate_join_generates_inner_witness_group():
@@ -736,6 +1467,185 @@ def test_limit_comma_offset_join_engine_generates_required_final_rows():
     assert len(next(iter(output.tables.values())).rows) == 1
 
 
+def test_topk_derived_subquery_engine_generates_source_rows():
+    schema = """
+    CREATE TABLE drivers (
+      driverId INT PRIMARY KEY,
+      nationality TEXT,
+      dob DATE
+    );
+    """
+    sql = """
+    SELECT COUNT(*)
+    FROM (
+      SELECT nationality
+      FROM drivers
+      ORDER BY JULIANDAY(dob) DESC
+      LIMIT 3
+    ) AS T3
+    WHERE T3.nationality = 'Dutch'
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert result.rows_generated >= 3
+    assert len(instance.get_rows("drivers")) >= 3
+
+
+def test_self_join_aliases_keep_distinct_join_edges():
+    schema = """
+    CREATE TABLE superhero (
+      id INT PRIMARY KEY,
+      superhero_name TEXT,
+      eye_colour_id INT,
+      hair_colour_id INT
+    );
+    CREATE TABLE colour (
+      id INT PRIMARY KEY,
+      colour TEXT
+    );
+    """
+    sql = """
+    SELECT T1.superhero_name
+    FROM superhero AS T1
+    INNER JOIN colour AS T2 ON T1.eye_colour_id = T2.id
+    INNER JOIN colour AS T3 ON T1.hair_colour_id = T3.id
+    WHERE T2.colour = 'Blue' AND T3.colour = 'Brown'
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    join_step = next(step for step in plan.ordered_steps if type(step).__name__ == "Join")
+    target = next(
+        target
+        for target in build_branch_tree(plan, instance).root_witness_targets
+        if target.node.site == "root_result"
+    )
+    constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+    join_pairs = {
+        (
+            join_data["source_key"][0].sql(dialect="sqlite"),
+            join_data["join_key"][0].sql(dialect="sqlite"),
+        )
+        for join_data in join_step.joins.values()
+    }
+
+    assert join_pairs == {
+        ('"t1"."eye_colour_id"', '"t2"."id"'),
+        ('"t1"."hair_colour_id"', '"t3"."id"'),
+    }
+    lowered_pairs = {
+        (
+            left.column_id.name.normalized,
+            left.relation_id.display,
+            right.column_id.name.normalized,
+            right.relation_id.display,
+        )
+        for left, right in constraint.join_equalities
+    }
+    assert lowered_pairs == {
+        ("eye_colour_id", "t1", "id", "t2"),
+        ("hair_colour_id", "t1", "id", "t3"),
+    }
+
+
+def test_cte_derived_join_engine_materializes_source_rows():
+    schema = """
+    CREATE TABLE lapTimes (
+      raceId INT,
+      driverId INT,
+      lap INT,
+      time_in_seconds REAL
+    );
+    CREATE TABLE drivers (
+      driverId INT PRIMARY KEY,
+      forename TEXT,
+      surname TEXT
+    );
+    """
+    sql = """
+    WITH lap_times_in_seconds AS (
+      SELECT driverId, time_in_seconds
+      FROM lapTimes
+    )
+    SELECT T2.forename, T2.surname
+    FROM (
+      SELECT driverId, MIN(time_in_seconds) AS min_time_in_seconds
+      FROM lap_times_in_seconds
+      GROUP BY driverId
+    ) AS T1
+    INNER JOIN drivers AS T2 ON T1.driverId = T2.driverId
+    ORDER BY T1.min_time_in_seconds ASC
+    LIMIT 1
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated > 0
+    assert len(instance.get_rows("lapTimes")) >= 1
+    assert len(instance.get_rows("drivers")) >= 1
+    assert len(next(iter(output.tables.values())).rows) == 1
+
+
+def test_aggregate_ordered_derived_table_engine_materializes_source_rows():
+    schema = """
+    CREATE TABLE atom (
+      atom_id INT PRIMARY KEY,
+      molecule_id INT,
+      element TEXT
+    );
+    CREATE TABLE molecule (
+      molecule_id INT PRIMARY KEY,
+      label TEXT
+    );
+    """
+    sql = """
+    SELECT T.element
+    FROM (
+      SELECT T1.element, COUNT(DISTINCT T1.molecule_id)
+      FROM atom AS T1
+      INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id
+      WHERE T2.label = '-'
+      GROUP BY T1.element
+      ORDER BY COUNT(DISTINCT T1.molecule_id) ASC
+      LIMIT 4
+    ) T
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=20,
+        max_rows_per_table=20,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+    output = PlanEvaluator(
+        Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance),
+        instance,
+    ).evaluate_context()
+
+    assert result.rows_generated >= 8
+    assert len(instance.get_rows("atom")) >= 4
+    assert len(instance.get_rows("molecule")) >= 4
+    assert len(next(iter(output.tables.values())).rows) >= 1
+
+
 def test_root_result_records_one_observation_per_final_output_row():
     sql = "SELECT Zip FROM schools ORDER BY OpenDate DESC LIMIT 2"
     instance = Instance(ddls=JOIN_SCHEMA, name="test", dialect="sqlite")
@@ -898,6 +1808,46 @@ def test_scalar_subquery_filter_builds_outer_inner_path():
     assert result.sat, result.reason
     names = {var.column_id.name.normalized for var in result.assignments}
     assert {"cds", "cdscode"} <= names
+
+
+def test_scalar_subquery_order_by_limit_generation_returns_outer_match():
+    sql = """
+    SELECT NumTstTakr
+    FROM satscores
+    WHERE cds = (
+      SELECT CDSCode
+      FROM frpm
+      ORDER BY `FRPM Count (K-12)` DESC
+      LIMIT 1
+    )
+    """
+    instance = Instance(ddls=SUBQUERY_SCHEMA, name="test", dialect="sqlite")
+    instance.create_row("frpm", {"CDSCode": "top", "FRPM Count (K-12)": 100})
+    instance.create_row("frpm", {"CDSCode": "lower", "FRPM Count (K-12)": 1})
+
+    SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0))
+
+    assert _execute_generated(SUBQUERY_SCHEMA, instance, sql)
+    frpm_rows = instance.get_rows("frpm")
+    top_row = max(
+        frpm_rows,
+        key=lambda row: row[
+            instance.column_id("frpm", exp.to_identifier("FRPM Count (K-12)"))
+        ].concrete,
+    )
+    top_cdscode = top_row[
+        instance.column_id("frpm", exp.to_identifier("CDSCode"))
+    ].concrete
+    assert any(
+        row["cds"].concrete == top_cdscode
+        for row in instance.get_rows("satscores")
+    )
 
 
 def test_scalar_subquery_join_path_keeps_join_key_datatypes():
@@ -1566,8 +2516,13 @@ def test_nested_alias_solver_vars_keep_distinct_bindings_and_storage():
         identifier_name(var.relation_id.display, dialect="sqlite").normalized
         for var in vars_by_qualifier[t2_key]
     } == {t2_key}
-    assert all(var.column_id.kind is not ColumnKind.SYNTHETIC for var in vars_by_qualifier[t1_key])
-    assert all(var.column_id.kind is not ColumnKind.SYNTHETIC for var in vars_by_qualifier[t2_key])
+    for qualifier in (t1_key, t2_key):
+        assert all(var.column_id.kind is ColumnKind.SYNTHETIC for var in vars_by_qualifier[qualifier])
+        assert all(var.column_id.source_column_id is not None for var in vars_by_qualifier[qualifier])
+        assert all(
+            var.column_id.source_column_id.kind is ColumnKind.PHYSICAL
+            for var in vars_by_qualifier[qualifier]
+        )
     assert {constraint.storage_relations[var].name.normalized for var in vars_by_qualifier["t1"]} == {"atom"}
     assert {constraint.storage_relations[var].name.normalized for var in vars_by_qualifier["t2"]} == {"connected"}
 

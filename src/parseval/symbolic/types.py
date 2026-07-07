@@ -65,7 +65,10 @@ class RowSetObligation:
     group_keys: Tuple[ColumnId, ...] = ()
     counted_expression: Optional[exp.Expression] = None
     distinct_expression: Optional[exp.Expression] = None
+    duplicate_expressions: Tuple[exp.Expression, ...] = ()
     ordering: Tuple[exp.Expression, ...] = ()
+    ordering_mode: str = ""
+    join_scope_outcomes: Tuple[Tuple[str, BranchType], ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -195,6 +198,7 @@ class BranchNode:
     atoms: Tuple[exp.Expression, ...]  # decomposed atomic predicates (live AST)
     tables: Tuple[RelationId, ...] = ()
     infeasible: Set[Tuple[int, BranchType]] = field(default_factory=set)
+    generated_strategies: Set[Tuple[int, BranchType]] = field(default_factory=set)
     infeasible_atom_outcomes: Set[Tuple[Tuple[int, BranchType], ...]] = field(
         default_factory=set
     )
@@ -203,6 +207,8 @@ class BranchNode:
 
     # Cached planner metadata (set during Phase 1 tree construction)
     annotation_metadata: Dict[str, Any] = field(default_factory=dict)
+    _predicate_sql: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    _node_key: Optional[Tuple[str, str, str]] = field(default=None, init=False, repr=False, compare=False)
 
     # Plan hierarchy and runtime parentage
     step: Optional[Any] = None  # direct reference to plan Step object
@@ -224,7 +230,15 @@ class BranchNode:
 
     @property
     def predicate_sql(self) -> str:
-        return self.predicate.sql()
+        if self._predicate_sql is None:
+            self._predicate_sql = self.predicate.sql()
+        return self._predicate_sql
+
+    @property
+    def node_key(self) -> Tuple[str, str, str]:
+        if self._node_key is None:
+            self._node_key = (self.step_id, self.site, self.predicate_sql)
+        return self._node_key
 
     def atom_sql(self, atom_id: int) -> str:
         return self.atoms[atom_id].sql()
@@ -257,6 +271,12 @@ class BranchNode:
 
     def mark_infeasible(self, atom_id: int, outcome: BranchType) -> None:
         self.infeasible.add((atom_id, outcome))
+
+    def is_strategy_generated(self, atom_id: int, outcome: BranchType) -> bool:
+        return (atom_id, outcome) in self.generated_strategies
+
+    def mark_strategy_generated(self, atom_id: int, outcome: BranchType) -> None:
+        self.generated_strategies.add((atom_id, outcome))
 
     def is_atom_outcomes_infeasible(
         self,
@@ -461,6 +481,8 @@ class BranchTree:
         )
         if parent is not None:
             parent.children.append(node)
+        node._predicate_sql = node_key[2]
+        node._node_key = node_key
 
         self.nodes.append(node)
         self.node_map[node_key] = node
@@ -468,7 +490,7 @@ class BranchTree:
         return node
 
     def record_observation(self, node: BranchNode, observation: AtomObservation) -> None:
-        node_key = (node.step_id, node.site, node.predicate_sql)
+        node_key = node.node_key
         key = PathObservationKey(
             node_key=node_key,
             atom_id=observation.atom_id,
@@ -512,7 +534,7 @@ class BranchTree:
     ) -> None:
         self.operator_traces.append(
             OperatorTrace(
-                node_key=(node.step_id, node.site, node.predicate_sql),
+                node_key=node.node_key,
                 outcome=outcome,
                 input_row_ids=input_row_ids,
                 output_row_ids=output_row_ids,
@@ -538,7 +560,7 @@ class BranchTree:
         )
 
     def traces_for_node(self, node: BranchNode) -> List[OperatorTrace]:
-        node_key = (node.step_id, node.site, node.predicate_sql)
+        node_key = node.node_key
         return [trace for trace in self.operator_traces if trace.node_key == node_key]
 
     def operator_trace_count(
@@ -582,6 +604,20 @@ class BranchTree:
         if node.coverage_obligations:
             for obligation in node.coverage_obligations:
                 for outcome in obligation.outcomes:
+                    if (
+                        node.site == "root_result"
+                        and outcome == BranchType.DUPLICATE
+                        and obligation.metric == "project_duplicate"
+                        and not any(
+                            row_set.duplicate_expressions
+                            for row_set in (
+                                candidate.row_set
+                                for candidate in node.obligations
+                                if candidate.row_set is not None
+                            )
+                        )
+                    ):
+                        continue
                     threshold = self.thresholds.threshold_for(outcome)
                     if node.site == "root_result" and outcome == BranchType.ATOM_TRUE:
                         threshold = max(threshold, root_result_row_count())
@@ -697,6 +733,10 @@ class BranchTree:
             target.node.mark_atom_outcomes_infeasible(target.atom_outcomes)
         else:
             target.node.mark_infeasible(target.atom_id, target.target_outcome)
+        self._cache_dirty = True
+
+    def mark_strategy_generated(self, target: CoverageTarget) -> None:
+        target.node.mark_strategy_generated(target.atom_id, target.target_outcome)
         self._cache_dirty = True
 
     # -- Row-level trace queries --
