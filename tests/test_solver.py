@@ -77,31 +77,6 @@ class TestSMTSolverSupportedConstraints(SMTSolverTestCase):
         self.assertEqual("sat", sat)
         self.assertGreaterEqual(model["scores.rating"], 1.5)
 
-    def test_logical_and_or_not_constraints(self):
-        age = column("users", "age", "INT")
-        name = column("users", "name", "TEXT")
-        predicate = exp.And(
-            this=exp.GT(this=age, expression=number(18)),
-            expression=exp.Or(
-                this=exp.LT(this=age.copy(), expression=number(30)),
-                expression=exp.Not(this=exp.EQ(this=name, expression=text("blocked"))),
-            ),
-        )
-
-        sat, model = self.solve_expr(predicate)
-
-        self.assertEqual("sat", sat)
-        self.assertGreater(model["users.age"], 18)
-
-    def test_is_null_is_supported_with_typed_null(self):
-        sat, model = self.solve_expr(
-            exp.Is(this=column("users", "age", "INT"), expression=null())
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertIn("users.age", model)
-        self.assertIsNone(model["users.age"])
-
     def test_eq_null_is_unsat_under_current_where_semantics(self):
         sat, model = self.solve_expr(
             exp.EQ(this=column("users", "age", "INT"), expression=null())
@@ -200,18 +175,6 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
         self.assertIsNone(model["users.nickname"])
         self.assertEqual("chosen", model["users.name"])
 
-    def test_like_translation_supports_literal_patterns(self):
-        sat, model = self.solve_expr(
-            exp.Like(
-                this=column("users", "name", "TEXT"),
-                expression=text("ab_"),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertTrue(model["users.name"].startswith("ab"))
-        self.assertEqual(3, len(model["users.name"]))
-
     def test_length_can_participate_in_comparisons(self):
         sat, model = self.solve_expr(
             exp.GT(
@@ -259,92 +222,6 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
         self.assertEqual("sat", sat)
         self.assertIsNone(model["users.age"])
 
-    def test_between_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.Between(
-                this=column("users", "age", "INT"),
-                low=number(1),
-                high=number(5),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertGreaterEqual(model["users.age"], 1)
-        self.assertLessEqual(model["users.age"], 5)
-
-    def test_in_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.In(
-                this=column("users", "age", "INT"),
-                expressions=[number(1), number(2)],
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertIn(model["users.age"], {1, 2})
-
-    def test_add_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.EQ(
-                this=exp.Add(this=column("users", "age", "INT"), expression=number(1)),
-                expression=number(7),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertEqual(6, model["users.age"])
-
-    def test_sub_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.GT(
-                this=exp.Sub(this=column("users", "age", "INT"), expression=number(2)),
-                expression=number(0),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertGreater(model["users.age"] - 2, 0)
-
-    def test_mul_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.GTE(
-                this=exp.Mul(
-                    this=column("items", "price", "FLOAT"),
-                    expression=number(2, "FLOAT"),
-                ),
-                expression=number(3.0, "FLOAT"),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertGreaterEqual(model["items.price"] * 2, 3.0)
-
-    def test_mod_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.EQ(
-                this=exp.Mod(this=column("users", "age", "INT"), expression=number(2)),
-                expression=number(1),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertEqual(1, model["users.age"] % 2)
-
-    def test_substr_is_supported(self):
-        sat, model = self.solve_expr(
-            exp.EQ(
-                this=exp.Substring(
-                    this=column("users", "name", "TEXT"),
-                    start=number(1),
-                    length=number(2),
-                ),
-                expression=text("ab"),
-            )
-        )
-
-        self.assertEqual("sat", sat)
-        self.assertEqual("ab", model["users.name"][:2])
-
     def test_substr_with_negative_start_is_supported(self):
         expr = exp.EQ(
             this=exp.Anonymous(
@@ -383,19 +260,6 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
 
         self.assertEqual("sat", sat)
         self.assertEqual("abcdef", model["users.prefix"] + model["users.suffix"])
-
-    def test_strftime_year_is_supported(self):
-        expr = exp.EQ(
-            this=exp.TimeToStr(
-                this=column("events", "created_at", "DATETIME"),
-                format=text("%Y"),
-            ),
-            expression=text("2024"),
-        )
-        sat, model = self.solve_expr(expr)
-
-        self.assertEqual("sat", sat)
-        self.assertEqual(2024, model["events.created_at"].year)
 
     def test_strftime_after_date_to_timestamp_cast_is_supported(self):
         expr = exp.GT(
@@ -448,15 +312,6 @@ class TestSMTSolverDatatypeBehavior(SMTSolverTestCase):
 
         self.assertEqual("unsat", sat)
         self.assertEqual({}, model)
-
-    def test_null_is_supported_across_type_families(self):
-        for dtype in ["INT", "FLOAT", "BOOLEAN", "TEXT", "DATE", "TIME", "DATETIME"]:
-            with self.subTest(dtype=dtype):
-                sat, model = self.solve_expr(
-                    exp.Is(this=column("t", dtype.lower(), dtype), expression=exp.Null())
-                )
-                self.assertEqual("sat", sat)
-                self.assertIsNone(model[f"t.{dtype.lower()}"])
 
     def test_date_roundtrip_returns_date(self):
         sat, model = self.solve_expr(

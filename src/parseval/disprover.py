@@ -121,6 +121,7 @@ class Disprover:
         """Generate data for target_sql, execute both queries, compare."""
         # Generate
         gen_result = None
+        instance = None
         try:
             instance = Instance(ddls=self.schema, name="disprove", dialect=self.dialect)
             engine = SymbolicEngine(
@@ -130,7 +131,14 @@ class Disprover:
             )
             gen_result = engine.generate(thresholds=self.thresholds)
         except Exception as e:
-            logger.debug("disprove: generation failed (continuing with partial data): %s", e)
+            logger.debug("disprove: generation failed: %s", e)
+            return self._make_result(
+                Verdict.UNKNOWN,
+                t0,
+                gen_result=gen_result,
+                generation_error_msg=str(e),
+                error_msg=str(e),
+            )
 
         # Persist
         try:
@@ -145,7 +153,14 @@ class Disprover:
         verdict = compare_results(q1, q2, self.semantics)
 
         if verdict == Verdict.SYNTAX_ERROR:
-            return self._make_result(verdict, t0, gen_result=gen_result, q1=q1, q2=q2)
+            return self._make_result(
+                verdict,
+                t0,
+                gen_result=gen_result,
+                q1=q1,
+                q2=q2,
+                error_msg=q1.error_msg or q2.error_msg,
+            )
 
         if verdict == Verdict.NEQ:
             return self._make_result(Verdict.NEQ, t0, gen_result=gen_result, q1=q1, q2=q2)
@@ -167,12 +182,14 @@ class Disprover:
         gen_result=None,
         q1: ExecutionResult | None = None,
         q2: ExecutionResult | None = None,
+        generation_error_msg: str = "",
         error_msg: str = "",
     ) -> DisproveResult:
         generation = GenerationResult(
             success=gen_result is not None,
             rows_generated=gen_result.rows_generated if gen_result else 0,
             coverage=gen_result.coverage if gen_result else 0.0,
+            error_msg=generation_error_msg,
             elapsed_time=time.time() - t0,
         )
         return DisproveResult(

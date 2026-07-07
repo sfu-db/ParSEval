@@ -87,6 +87,38 @@ def test_create_rows_empty_batch_creates_one_row_per_relation():
     assert inst.get_rows(users_id)[0][id_col].concrete is not None
 
 
+def test_create_rows_accepts_sparse_row_batches_and_returns_completed_rows():
+    ddl = """
+    CREATE TABLE parent (
+        id INT PRIMARY KEY,
+        label TEXT NOT NULL
+    );
+    CREATE TABLE child (
+        id INT PRIMARY KEY,
+        parent_id INT NOT NULL,
+        note TEXT NOT NULL,
+        FOREIGN KEY (parent_id) REFERENCES parent(id)
+    );
+    """
+    inst = Instance(ddl, name="db", dialect="sqlite")
+
+    result = inst.create_rows(
+        {
+            "parent": [{"id": 7}],
+            "child": [{"id": 11, "parent_id": 7}],
+        }
+    )
+
+    parent_id = inst.table_id("parent")
+    child_id = inst.table_id("child")
+    parent_label = inst.column_id("parent", "label")
+    child_note = inst.column_id("child", "note")
+
+    assert set(result) == {parent_id, child_id}
+    assert result[parent_id][0].created[parent_id][0][parent_label].concrete is not None
+    assert result[child_id][0].created[child_id][0][child_note].concrete is not None
+
+
 def test_create_row_completion_respects_table_level_check():
     ddl = """
     CREATE TABLE follow (

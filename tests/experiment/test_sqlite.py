@@ -57,7 +57,7 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         result = disprove(
             gold_sql, pred_sql, ddls, connection_string, "sqlite",
             semantics="bag",
-            max_iterations=5,
+            max_iterations=15,
             atom_null=1,
             atom_false=1,
             atom_dup=3,
