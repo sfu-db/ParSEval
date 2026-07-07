@@ -109,3 +109,7 @@ python tests/experiment/test_sqlite.py \
 
 - See the `dev` branch for the latest features and ongoing development.
 - See the `webui` branch for the frontend web interface of ParSEval.
+
+## Experimental Results
+
+Experiment outputs are available from GitHub Actions. Open the repository’s **Actions** tab, choose the corresponding workflow, such as **Run SQLite Experiment** or **Run MySQL Experiment**, and select the latest successful run. The generated result and metric files can be downloaded from the run’s **Artifacts** section.
