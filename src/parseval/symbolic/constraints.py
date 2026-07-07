@@ -34,7 +34,7 @@ from parseval.identity import (
     physical_column,
 )
 from parseval.plan import Plan, Step
-from parseval.plan.planner import Filter, Having, Join, Aggregate, Project, Scan, SubPlan
+from parseval.plan.planner import Filter, Having, Join, Aggregate, Project, Scan, Sort, SubPlan
 from parseval.plan.rex import negate_predicate, column_meta
 from parseval.dtype import DataType
 from parseval.instance import Instance
@@ -562,6 +562,17 @@ class ConstraintGenerator:
                 return self._join_unmatched_constraints(predicate)
             if predicate.node.site == "group":
                 return self._group_constraints(predicate)
+        if predicate.node.site == "case_arm":
+            expression = predicate.expression.copy()
+            if expression.find(exp.Subquery) or expression.find(exp.Exists):
+                return []
+            if predicate.outcome == PlausibleBit.CASE_ARM_TAKEN:
+                return self._positive_predicate_constraints(
+                    expression,
+                    predicate.node.subqueries,
+                )
+            if predicate.outcome == PlausibleBit.CASE_ARM_SKIPPED:
+                return [negate_predicate(expression)]
         if predicate.node.site == "project_output":
             return self._project_output_constraints(predicate)
         if predicate.node.site == "aggregate_output":
@@ -600,6 +611,8 @@ class ConstraintGenerator:
             return (
                 []
                 if _is_trivial_true(expression)
+                else self._scalar_subquery_target_constraints(predicate)
+                if predicate.node.site == "scalar_subquery"
                 else self._positive_predicate_constraints(
                     expression,
                     predicate.node.subqueries,
@@ -620,6 +633,34 @@ class ConstraintGenerator:
         if predicate.outcome == PlausibleBit.JOIN_NO_MATCH:
             return [negate_predicate(expression)] if not _is_trivial_true(expression) else []
         return [expression]
+
+    def _scalar_subquery_target_constraints(
+        self,
+        predicate: PathPredicate,
+    ) -> List[exp.Expression]:
+        constraints = self._positive_predicate_constraints(
+            predicate.expression,
+            predicate.node.subqueries,
+            defer_anti_subquery=False,
+        )
+        step = predicate.node.step
+        condition = getattr(step, "condition", None)
+        if not isinstance(condition, exp.Expression):
+            return constraints
+        target_sql = predicate.expression.sql(dialect=self.dialect)
+        for conjunct in self._split_conjuncts(condition):
+            if conjunct.find(exp.Subquery) or conjunct.find(exp.Exists):
+                continue
+            if conjunct.sql(dialect=self.dialect) == target_sql:
+                continue
+            scoped = conjunct.copy()
+            self._scope_expression_columns(
+                scoped,
+                "scalar_subquery",
+                predicate.node.tables,
+            )
+            constraints.extend(self._positive_conjunct_constraints(scoped))
+        return constraints
 
     def _project_output_constraints(
         self,
@@ -1640,15 +1681,56 @@ class ConstraintGenerator:
         self,
         expression: exp.Expression,
         subqueries: Tuple[SubqueryPath, ...] = (),
+        *,
+        defer_anti_subquery: bool = True,
     ) -> List[exp.Expression]:
         constraints: List[exp.Expression] = []
         for conjunct in self._split_conjuncts(expression):
+            if defer_anti_subquery and self._is_anti_subquery_predicate(conjunct):
+                continue
+            or_constraints = self._scalar_subquery_or_constraints(
+                conjunct,
+                subqueries,
+                defer_anti_subquery=defer_anti_subquery,
+            )
+            if or_constraints is not None:
+                constraints.extend(or_constraints)
+                continue
             unwrapped = self._unwrap_scalar_subquery_comparison(conjunct, subqueries)
             if unwrapped is not None:
                 constraints.extend(unwrapped)
             else:
                 constraints.extend(self._positive_conjunct_constraints(conjunct))
         return constraints
+
+    def _scalar_subquery_or_constraints(
+        self,
+        expression: exp.Expression,
+        subqueries: Tuple[SubqueryPath, ...],
+        *,
+        defer_anti_subquery: bool,
+    ) -> List[exp.Expression] | None:
+        if isinstance(expression, exp.Paren):
+            return self._scalar_subquery_or_constraints(
+                expression.this,
+                subqueries,
+                defer_anti_subquery=defer_anti_subquery,
+            )
+        if not isinstance(expression, exp.Or) or not expression.find(exp.Subquery):
+            return None
+        for branch in (expression.left, expression.right):
+            if branch is None:
+                continue
+            branch_constraints = self._positive_predicate_constraints(
+                branch,
+                subqueries,
+                defer_anti_subquery=defer_anti_subquery,
+            )
+            if branch_constraints and not any(
+                constraint.find(exp.Subquery) for constraint in branch_constraints
+            ):
+                return branch_constraints
+        return None
 
     def _positive_conjunct_constraints(
         self,
@@ -1699,6 +1781,41 @@ class ConstraintGenerator:
         if isinstance(expression, exp.Paren):
             return self._split_conjuncts(expression.this)
         return [expression]
+
+    def _is_anti_subquery_predicate(self, expression: exp.Expression) -> bool:
+        if isinstance(expression, exp.Not):
+            inner = expression.this
+            return isinstance(inner, (exp.In, exp.Exists)) and bool(
+                inner.find(exp.Subquery) or isinstance(inner, exp.Exists)
+            )
+        if not isinstance(expression, exp.EQ):
+            return False
+        left = expression.this
+        right = expression.expression
+        return (
+            self._is_zero_literal(left)
+            and self._is_count_subquery(right)
+        ) or (
+            self._is_zero_literal(right)
+            and self._is_count_subquery(left)
+        )
+
+    def _is_zero_literal(self, expression: exp.Expression | None) -> bool:
+        return (
+            isinstance(expression, exp.Literal)
+            and not expression.is_string
+            and expression.this == "0"
+        )
+
+    def _is_count_subquery(self, expression: exp.Expression | None) -> bool:
+        subquery = (
+            expression
+            if isinstance(expression, exp.Subquery)
+            else expression.find(exp.Subquery) if expression is not None else None
+        )
+        return isinstance(subquery, exp.Subquery) and any(
+            isinstance(item, exp.Count) for item in subquery.find_all(exp.Count)
+        )
 
     def _unwrap_scalar_subquery_comparison(
         self,
@@ -2009,7 +2126,121 @@ class ConstraintGenerator:
                 if row_scope is not None:
                     self._scope_expression_columns(copied, row_scope, relations)
                 constraints.append(copied)
+        constraints.extend(
+            self._scalar_subquery_ordered_selection_constraints(
+                subquery_path,
+                row_scope=row_scope,
+                relations=relations,
+            )
+        )
         return constraints
+
+    def _scalar_subquery_ordered_selection_constraints(
+        self,
+        subquery_path: SubqueryPath,
+        row_scope: str | None,
+        relations: Tuple[RelationId, ...],
+    ) -> List[exp.Expression]:
+        selected_expr = self._scalar_subquery_value_expression_from_path(subquery_path)
+        if not isinstance(selected_expr, exp.Column):
+            return []
+        try:
+            selected_storage = self._storage_column_for_expr(selected_expr, relations)
+        except (KeyError, UnresolvedScopedColumnError):
+            return []
+        if selected_storage is None:
+            return []
+
+        constraints: List[exp.Expression] = []
+        for step in self._iter_steps_with_subplans(subquery_path.inner_root):
+            if not isinstance(step, Sort):
+                continue
+            for ordered in getattr(step, "key", ()) or ():
+                ordered_expr = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+                if not isinstance(ordered_expr, exp.Column):
+                    continue
+                try:
+                    ordered_storage = self._storage_column_for_expr(ordered_expr, relations)
+                except (KeyError, UnresolvedScopedColumnError):
+                    continue
+                if ordered_storage is None:
+                    continue
+                selected_relation, selected_column = selected_storage
+                ordered_relation, ordered_column = ordered_storage
+                if selected_relation != ordered_relation:
+                    continue
+                descending = (
+                    bool(ordered.args.get("desc"))
+                    if isinstance(ordered, exp.Ordered)
+                    else False
+                )
+                top_row = self._top_existing_row(
+                    selected_relation,
+                    ordered_column,
+                    descending=descending,
+                )
+                if top_row is None:
+                    continue
+                selected_value = top_row[selected_column].concrete
+                ordered_value = top_row[ordered_column].concrete
+                for expression, value in (
+                    (selected_expr.copy(), selected_value),
+                    (ordered_expr.copy(), ordered_value),
+                ):
+                    if value is None:
+                        continue
+                    if row_scope is not None:
+                        self._scope_expression_columns(expression, row_scope, relations)
+                    constraints.append(
+                        exp.EQ(
+                            this=expression,
+                            expression=self._literal_for_value(value),
+                        )
+                    )
+                return constraints
+        return constraints
+
+    def _storage_column_for_expr(
+        self,
+        expression: exp.Column,
+        relations: Tuple[RelationId, ...],
+    ) -> Tuple[RelationId, ColumnId] | None:
+        col_id = self._column_id_for_expr(expression, relations)
+        if col_id is None:
+            return None
+        storage_relation = self._storage_relation_for_column_id(col_id)
+        source = col_id.source_column_id or col_id
+        if storage_relation is None and source.relation is not None:
+            storage_relation = self._storage_relation_for_column_id(source)
+        if storage_relation is None:
+            return None
+        storage_column = self.instance.column_id(
+            storage_relation,
+            exp.to_identifier(source.name.raw),
+        )
+        return storage_relation, storage_column
+
+    def _top_existing_row(
+        self,
+        relation: RelationId,
+        ordered_column: ColumnId,
+        descending: bool,
+    ):
+        rows = [
+            row
+            for row in self.instance.get_rows(relation)
+            if row[ordered_column].concrete is not None
+        ]
+        if not rows:
+            return None
+        try:
+            chooser = max if descending else min
+            return chooser(
+                rows,
+                key=lambda candidate: candidate[ordered_column].concrete,
+            )
+        except TypeError:
+            return None
 
     def _constraints_for_row_set_obligations(
         self,
@@ -2080,11 +2311,14 @@ class ConstraintGenerator:
         if not row_set.row_scopes:
             return constraints
 
+        anti_inner_relations = self._anti_subquery_inner_relations(row_set)
         fixed_rels = self._row_set_fixed_relations(row_set)
         first_scope = row_set.row_scopes[0]
 
         for row_scope in row_set.row_scopes:
             for relation in row_set.relations:
+                if relation in anti_inner_relations:
+                    continue
                 eff_scope = first_scope if relation in fixed_rels else row_scope
                 if row_scope == first_scope or relation not in fixed_rels:
                     constraints.extend(
@@ -2096,11 +2330,12 @@ class ConstraintGenerator:
                     )
 
             constraints.extend(
-                self._row_set_join_constraints(
+                self._row_set_join_fact_constraints(
                     row_set,
                     row_scope,
                     fixed_rels,
                     first_scope,
+                    skip_relations=anti_inner_relations,
                 )
             )
             constraints.extend(
@@ -2109,6 +2344,7 @@ class ConstraintGenerator:
                     row_scope,
                     fixed_rels,
                     first_scope,
+                    skip_relations=anti_inner_relations,
                 )
             )
 
@@ -2137,6 +2373,20 @@ class ConstraintGenerator:
             self._row_set_ordering_constraints(row_set, fixed_rels, first_scope)
         )
         return constraints
+
+    def _anti_subquery_inner_relations(
+        self,
+        row_set: RowSetObligation,
+    ) -> Set[RelationId]:
+        relations: Set[RelationId] = set()
+        for predicate in row_set.path_predicates:
+            for conjunct in self._split_conjuncts(predicate):
+                if not self._is_anti_subquery_predicate(conjunct):
+                    continue
+                for subplan in self._subplans_for_predicate(conjunct):
+                    if subplan.inner is not None:
+                        relations.update(self._plan_relations(subplan.inner))
+        return relations
 
     def _row_set_relation_columns(self, relation: RelationId) -> Tuple[ColumnId, ...]:
         table_name = _relation_table_name(
@@ -2236,16 +2486,25 @@ class ConstraintGenerator:
                 return True
         return False
 
-    def _row_set_join_constraints(
+    def _row_set_join_fact_constraints(
         self,
         row_set: RowSetObligation,
         row_scope: str,
         fixed_rels: Set[RelationId] | None = None,
         first_scope: str = "",
+        skip_relations: Set[RelationId] | None = None,
     ) -> List[exp.Expression]:
         fixed_rels = fixed_rels or set()
+        skip_relations = skip_relations or set()
+        scoped_outcomes = dict(row_set.join_scope_outcomes)
+        outcome = scoped_outcomes.get(row_scope, BranchType.JOIN_MATCH)
         constraints: List[exp.Expression] = []
         for fact in row_set.join_facts:
+            if (
+                fact.source_relation in skip_relations
+                or fact.target_relation in skip_relations
+            ):
+                continue
             eff_source = first_scope if fact.source_relation in fixed_rels else row_scope
             eff_target = first_scope if fact.target_relation in fixed_rels else row_scope
             for left, right in fact.equalities:
@@ -2267,18 +2526,34 @@ class ConstraintGenerator:
                     )
                     else eff_source
                 )
-                constraints.append(
-                    exp.EQ(
-                        this=self._constraint_column(
-                            self._visible_storage_column(left),
-                            row_scope=left_scope,
-                        ),
-                        expression=self._constraint_column(
-                            self._visible_storage_column(right),
-                            row_scope=right_scope,
-                        ),
-                    )
+                left_expr = self._constraint_column(
+                    self._visible_storage_column(left),
+                    row_scope=left_scope,
                 )
+                right_expr = self._constraint_column(
+                    self._visible_storage_column(right),
+                    row_scope=right_scope,
+                )
+                if outcome in {BranchType.JOIN_LEFT, BranchType.JOIN_RIGHT}:
+                    constraints.append(
+                        exp.NEQ(this=left_expr.copy(), expression=right_expr.copy())
+                    )
+                    constraints.append(
+                        exp.Is(
+                            this=left_expr.copy(),
+                            expression=exp.Not(this=exp.Null()),
+                        )
+                    )
+                    constraints.append(
+                        exp.Is(
+                            this=right_expr.copy(),
+                            expression=exp.Not(this=exp.Null()),
+                        )
+                    )
+                else:
+                    constraints.append(
+                        exp.EQ(this=left_expr.copy(), expression=right_expr.copy())
+                    )
         return constraints
 
     def _visible_storage_column(self, col_id: ColumnId) -> ColumnId:
@@ -2334,12 +2609,18 @@ class ConstraintGenerator:
         row_scope: str,
         fixed_rels: Set[RelationId] | None = None,
         first_scope: str = "",
+        skip_relations: Set[RelationId] | None = None,
     ) -> List[exp.Expression]:
         fixed_rels = fixed_rels or set()
+        skip_relations = skip_relations or set()
         constraints: List[exp.Expression] = []
         for predicate in row_set.path_predicates:
             for conjunct in self._split_conjuncts(predicate):
-                if conjunct.find(exp.Subquery):
+                if (
+                    self._is_anti_subquery_predicate(conjunct)
+                    or conjunct.find(exp.Subquery)
+                    or conjunct.find(exp.Exists)
+                ):
                     constraints.extend(
                         self._row_set_subquery_predicate_constraints(
                             conjunct,
@@ -2349,6 +2630,8 @@ class ConstraintGenerator:
                             first_scope,
                         )
                     )
+                    continue
+                if self._expression_references_any_relation(conjunct, skip_relations):
                     continue
                 scoped = self._scoped_expression_for_row_set(
                     conjunct,
@@ -2361,6 +2644,17 @@ class ConstraintGenerator:
                     constraints.append(scoped)
         return constraints
 
+    def _expression_references_any_relation(
+        self,
+        expression: exp.Expression,
+        relations: Set[RelationId],
+    ) -> bool:
+        for column in expression.find_all(exp.Column):
+            col_id = column_identity(column)
+            if col_id is not None and col_id.relation in relations:
+                return True
+        return False
+
     def _row_set_subquery_predicate_constraints(
         self,
         predicate: exp.Expression,
@@ -2369,6 +2663,23 @@ class ConstraintGenerator:
         fixed_rels: Set[RelationId],
         first_scope: str,
     ) -> List[exp.Expression]:
+        if self._is_anti_subquery_predicate(predicate):
+            return self._row_set_anti_subquery_predicate_constraints(
+                predicate,
+                row_set,
+                row_scope,
+                fixed_rels,
+                first_scope,
+            )
+        scalar_constraints = self._row_set_scalar_subquery_constraints(
+            predicate,
+            row_set,
+            row_scope,
+            fixed_rels,
+            first_scope,
+        )
+        if scalar_constraints is not None:
+            return scalar_constraints
         if not isinstance(predicate, exp.In):
             return []
         if not isinstance(predicate.this, exp.Column):
@@ -2414,6 +2725,140 @@ class ConstraintGenerator:
         )
         return constraints
 
+    def _row_set_scalar_subquery_constraints(
+        self,
+        predicate: exp.Expression,
+        row_set: RowSetObligation,
+        row_scope: str,
+        fixed_rels: Set[RelationId],
+        first_scope: str,
+    ) -> List[exp.Expression] | None:
+        if isinstance(predicate, exp.Paren):
+            return self._row_set_scalar_subquery_constraints(
+                predicate.this,
+                row_set,
+                row_scope,
+                fixed_rels,
+                first_scope,
+            )
+        if isinstance(predicate, exp.Or):
+            for branch in (predicate.left, predicate.right):
+                if branch is None:
+                    continue
+                constraints = self._row_set_scalar_subquery_constraints(
+                    branch,
+                    row_set,
+                    row_scope,
+                    fixed_rels,
+                    first_scope,
+                )
+                if constraints:
+                    return constraints
+            return []
+        if not isinstance(predicate, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NEQ)):
+            return None
+
+        left = predicate.this
+        right = predicate.expression
+        if left is None or right is None:
+            return None
+        if left.find(exp.Subquery):
+            subquery_expr = left
+            other_expr = right
+            subquery_on_left = True
+        elif right.find(exp.Subquery):
+            subquery_expr = right
+            other_expr = left
+            subquery_on_left = False
+        else:
+            return None
+
+        subquery = (
+            subquery_expr
+            if isinstance(subquery_expr, exp.Subquery)
+            else subquery_expr.find(exp.Subquery)
+        )
+        subplan = self._find_subplan_for_anchor(predicate)
+        if subplan is None and subquery is not None:
+            subplan = self._find_subplan_for_anchor(subquery)
+        if subplan is None or subplan.inner is None:
+            return None
+        inner_relations = self._plan_relations(subplan.inner)
+        if not inner_relations:
+            return None
+        inner_path = SubqueryPath(
+            node=None,
+            inner_root=subplan.inner,
+            predicate=predicate,
+        )
+        inner_value = self._scalar_subquery_value_expression_from_path(inner_path)
+        if inner_value is None:
+            return None
+        self._scope_expression_columns(inner_value, row_scope, inner_relations)
+        scoped_other = self._scoped_expression_for_row_set(
+            other_expr,
+            row_set.relations,
+            row_scope,
+            fixed_rels,
+            first_scope,
+        )
+
+        if subquery_on_left:
+            comparison = type(predicate)(this=inner_value, expression=scoped_other)
+        else:
+            comparison = type(predicate)(this=scoped_other, expression=inner_value)
+        constraints = [comparison]
+        constraints.extend(
+            self._scalar_subquery_inner_constraints(
+                inner_path,
+                row_scope=row_scope,
+                relations=inner_relations,
+            )
+        )
+        return constraints
+
+    def _row_set_anti_subquery_predicate_constraints(
+        self,
+        predicate: exp.Expression,
+        row_set: RowSetObligation,
+        row_scope: str,
+        fixed_rels: Set[RelationId],
+        first_scope: str,
+    ) -> List[exp.Expression]:
+        inner = predicate.this if isinstance(predicate, exp.Not) else predicate
+        if not isinstance(inner, exp.In) or not isinstance(inner.this, exp.Column):
+            return []
+        subplan = self._find_subplan_for_anchor(inner)
+        if subplan is None:
+            return []
+
+        scoped_outer = self._scoped_expression_for_row_set(
+            inner.this,
+            row_set.relations,
+            row_scope,
+            fixed_rels,
+            first_scope,
+        )
+        constraints: List[exp.Expression] = [
+            exp.Is(this=scoped_outer.copy(), expression=exp.Not(this=exp.Null()))
+        ]
+        inner_values = self._eval_inner_plan_values(subplan.inner)
+        if inner_values:
+            constraints.append(
+                exp.Not(
+                    this=exp.In(
+                        this=scoped_outer.copy(),
+                        expressions=[
+                            exp.Literal.number(value)
+                            if isinstance(value, (int, float))
+                            else exp.Literal.string(str(value))
+                            for value in inner_values
+                        ],
+                    )
+                )
+            )
+        return constraints
+
     def _existing_values_in_constraint(
         self,
         predicate: exp.Expression,
@@ -2456,6 +2901,19 @@ class ConstraintGenerator:
                 return step
         return None
 
+    def _subplans_for_predicate(self, predicate: exp.Expression) -> Tuple[SubPlan, ...]:
+        predicate_sql = predicate.sql(dialect=self.dialect)
+        matches: List[SubPlan] = []
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, SubPlan):
+                continue
+            anchor = getattr(step, "anchor", None)
+            if not isinstance(anchor, exp.Expression):
+                continue
+            if anchor is predicate or anchor.sql(dialect=self.dialect) in predicate_sql:
+                matches.append(step)
+        return tuple(matches)
+
     def _row_set_column_for_scope(
         self,
         row_set: RowSetObligation,
@@ -2481,6 +2939,8 @@ class ConstraintGenerator:
         fixed_rels = fixed_rels or set()
         if not row_set.group_keys or len(row_set.row_scopes) < 2:
             return []
+        if self._row_set_distinct_expression_is_group_key(row_set):
+            return []
         constraints: List[exp.Expression] = []
         for row_scope in row_set.row_scopes[1:]:
             for group_key in row_set.group_keys:
@@ -2498,6 +2958,26 @@ class ConstraintGenerator:
                         )
                     )
         return constraints
+
+    def _row_set_distinct_expression_is_group_key(
+        self,
+        row_set: RowSetObligation,
+    ) -> bool:
+        if row_set.distinct_expression is None:
+            return False
+        if not isinstance(row_set.distinct_expression, exp.Column):
+            return False
+        distinct_id = column_identity(row_set.distinct_expression)
+        if distinct_id is None:
+            return False
+        distinct_col = self._row_set_column_for_scope(row_set, distinct_id)
+        return any(
+            self._same_column_identity(
+                distinct_col,
+                self._row_set_column_for_scope(row_set, group_key),
+            )
+            for group_key in row_set.group_keys
+        )
 
     def _row_set_distinct_constraints(
         self,
@@ -2648,10 +3128,15 @@ class ConstraintGenerator:
                         expression=exp.Not(this=exp.Null()),
                     )
                 )
-                comparison = exp.GTE if descending else exp.LTE
-                constraints.append(
-                    comparison(this=selected.copy(), expression=competitor)
-                )
+                if row_set.ordering_mode == "tie":
+                    constraints.append(
+                        exp.EQ(this=selected.copy(), expression=competitor)
+                    )
+                else:
+                    comparison = exp.GTE if descending else exp.LTE
+                    constraints.append(
+                        comparison(this=selected.copy(), expression=competitor)
+                    )
         return constraints
 
     def _constraints_for_obligations(

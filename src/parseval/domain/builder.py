@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from parseval.coercion import coerce_value, values_equivalent
-from parseval.dtype import DataType, TypeFamily, type_family
+from parseval.dtype import DataType, TypeFamily, TypeProfile, type_family
 from parseval.identity import ColumnId, RelationId
 from .compiler import ConstraintCompiler
 from .exceptions import (
@@ -18,6 +18,7 @@ from .spec import SchemaSpec
 from .state import RowContext, SchemaRuntime
 
 from .compiler import ColumnDomainPlan, ConstraintValidator
+from .providers.base import ValueProvider
 
 @dataclass(frozen=True)
 class BuildPolicy:
@@ -58,11 +59,23 @@ class DatabaseBuilder:
         self.compiler = ConstraintCompiler()
         self.validator = ConstraintValidator()
         self._plans: Dict[ColumnId, ColumnDomainPlan] = {}
+        self._providers: Dict[ColumnId, ValueProvider] = {}
+        self._type_profiles: Dict[ColumnId, TypeProfile] = {}
 
     def _get_plan(self, column) -> ColumnDomainPlan:
         if column.id not in self._plans:
             self._plans[column.id] = self.compiler.compile(column)
         return self._plans[column.id]
+
+    def _get_provider(self, column) -> ValueProvider:
+        if column.id not in self._providers:
+            self._providers[column.id] = self.registry.resolve(column)
+        return self._providers[column.id]
+
+    def _get_type_profile(self, column) -> TypeProfile:
+        if column.id not in self._type_profiles:
+            self._type_profiles[column.id] = self.registry.type_service.profile(column)
+        return self._type_profiles[column.id]
 
     def build(self, policy: Optional[BuildPolicy] = None) -> Dict[str, list[Dict[str, Any]]]:
         """Generate synthetic rows for every table in the schema.
@@ -329,6 +342,8 @@ class DatabaseBuilder:
         foreign_key = column.foreign_key
         if foreign_key is None or len(foreign_key.target_column_ids) != 1:
             return value in referenced_values
+        if value in referenced_values:
+            return True
 
         target_column = self.schema.get_table(foreign_key.target_table_id).get_column(
             foreign_key.target_column_ids[0]
@@ -391,8 +406,8 @@ class DatabaseBuilder:
         if value_space_value is not _MISSING:
             return value_space_value
 
-        provider = self.registry.resolve(column)
-        type_profile = self.registry.type_service.profile(column)
+        provider = self._get_provider(column)
+        type_profile = self._get_type_profile(column)
         max_retries = 10 if plan.residual_predicates else 1
         value = None
         for _ in range(max_retries):

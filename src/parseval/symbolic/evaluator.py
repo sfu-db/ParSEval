@@ -390,6 +390,7 @@ class PlanEvaluator:
         # before the first context is built or any expression is evaluated.
         self.plan.annotations
         self._uncorrelated_scalar_cache: Dict[int, Any] = {}
+        self._uncorrelated_predicate_cache: Dict[int, exp.Expression] = {}
         self._coverage_recorder: Optional[BranchCoverageRecorder] = None
 
     def evaluate(self, tree: Optional[BranchTree] = None) -> BranchTree:
@@ -403,6 +404,7 @@ class PlanEvaluator:
             tree = BranchTreeBuilder(self.plan, self.instance).build()
         self._coverage_recorder = BranchCoverageRecorder(tree)
         self._uncorrelated_scalar_cache = {}
+        self._uncorrelated_predicate_cache = {}
         ctx = build_context_from_instance(self.instance)
         output = self._walk(self.plan.root, ctx, tree)
         self._record_root_result(output, tree)
@@ -2024,6 +2026,14 @@ class PlanEvaluator:
             or predicate.find(exp.In)
         ):
             return predicate
+        cacheable = all(
+            subplan.kind is SubPlanKind.SCALAR and not subplan.correlated
+            for subplan in subplans
+        )
+        if cacheable:
+            cached = self._uncorrelated_predicate_cache.get(id(predicate))
+            if cached is not None:
+                return cached
 
         scalar_values: Dict[int, Any] = {}
         scalar_values_by_sql: Dict[str, Any] = {}
@@ -2072,7 +2082,10 @@ class PlanEvaluator:
                 return exp.true() if predicate_values[key] else exp.false()
             return node
 
-        return predicate.copy().transform(replace_subquery)
+        resolved = predicate.copy().transform(replace_subquery)
+        if cacheable:
+            self._uncorrelated_predicate_cache[id(predicate)] = resolved
+        return resolved
 
     def _eval_inner_plan(
         self,

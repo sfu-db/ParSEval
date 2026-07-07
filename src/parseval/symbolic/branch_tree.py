@@ -54,6 +54,14 @@ from .types import (
 )
 
 MAX_ROOT_GENERATION_ROWS = 20
+_STRATEGY_ONLY_METRICS = {
+    "join_fanout",
+    "aggregate_contrast",
+    "project_duplicate",
+    "count_distinct_duplicate",
+    "case_positive",
+    "rank_tie",
+}
 
 
 def decompose_atoms(predicate: exp.Expression) -> Tuple[exp.Expression, ...]:
@@ -282,6 +290,12 @@ def coverage_obligations_for_site(
             expression,
             (BranchType.CASE_ARM_TAKEN, BranchType.CASE_ARM_SKIPPED),
         )
+        add(
+            "case_positive",
+            -2,
+            expression,
+            (BranchType.CASE_ARM_TAKEN,),
+        )
     elif site == "group":
         size_expr = atoms[0] if atoms else exp.Literal.string("GROUP_SIZE")
         count_expr = atoms[1] if len(atoms) > 1 else exp.Literal.string("GROUP_COUNT")
@@ -334,10 +348,11 @@ def coverage_obligations_for_site(
         add("join_left_unmatched", -2, expression, (BranchType.JOIN_LEFT,))
         add("join_right_unmatched", -3, expression, (BranchType.JOIN_RIGHT,))
         add("join_null", -4, expression, (BranchType.JOIN_NULL,))
+        add("join_fanout", -5, expression, (BranchType.DUPLICATE,))
     elif site == "root_result":
         expression = atoms[0] if atoms else exp.true()
         add("root_result", 0, expression, (BranchType.ATOM_TRUE,))
-        add("root_duplicate", 0, expression, (BranchType.DUPLICATE,))
+        add("project_duplicate", 0, expression, (BranchType.DUPLICATE,))
     elif site == "exists":
         expression = atoms[0] if atoms else exp.true()
         add("exists", 0, expression, (BranchType.EXISTS_TRUE, BranchType.EXISTS_FALSE))
@@ -478,6 +493,10 @@ class CoverageAnalyzer:
             for atom_id, outcome, threshold in self.target_specs_for_node(node):
                 if node.is_infeasible(atom_id, outcome):
                     continue
+                if self._is_strategy_only_target(
+                    node, atom_id, outcome
+                ) and node.is_strategy_generated(atom_id, outcome):
+                    continue
                 if self._covered_observation_count(node, atom_id, outcome) >= threshold:
                     continue
                 obligation = self._obligation_for(node, atom_id, outcome)
@@ -512,6 +531,18 @@ class CoverageAnalyzer:
                 return obligation
         return None
 
+    def _is_strategy_only_target(
+        self,
+        node: BranchNode,
+        atom_id: int,
+        outcome: BranchType,
+    ) -> bool:
+        obligation = self._obligation_for(node, atom_id, outcome)
+        return (
+            obligation is not None
+            and obligation.metric in _STRATEGY_ONLY_METRICS
+        )
+
     def _root_result_row_count(self, node: BranchNode) -> int:
         counts = [
             obligation.row_count
@@ -536,6 +567,13 @@ class CoverageAnalyzer:
             )
         if node.site == "group":
             return self.tree.operator_trace_count(node, outcome, require_output=True)
+        if node.site == "case_arm":
+            if atom_id < 0:
+                return sum(
+                    node.observation_count(case_atom_id, outcome)
+                    for case_atom_id in node.observations
+                )
+            return node.observation_count(atom_id, outcome)
         if atom_id < 0:
             return self.tree.operator_trace_count(
                 node,
@@ -603,12 +641,30 @@ class CoverageAnalyzer:
                 1
                 for atom_id, outcome, _threshold in self.target_specs_for_node(node)
                 if not node.is_infeasible(atom_id, outcome)
+                and not self._is_strategy_only_target(node, atom_id, outcome)
             )
         return count
 
     @property
     def covered_count(self) -> int:
-        return self.total_targets - len(self.uncovered_targets)
+        uncovered = sum(
+            1
+            for target in self.uncovered_targets
+            if not (
+                target.obligation is not None
+                and target.obligation.metric in _STRATEGY_ONLY_METRICS
+            )
+        )
+        return self.total_targets - uncovered
+
+    @property
+    def strategy_targets(self) -> List[CoverageTarget]:
+        return [
+            target
+            for target in self.uncovered_targets
+            if target.obligation is not None
+            and target.obligation.metric in _STRATEGY_ONLY_METRICS
+        ]
 
     @property
     def root_witness_targets(self) -> List[CoverageTarget]:
@@ -678,17 +734,198 @@ class CoverageAnalyzer:
 
     @property
     def fully_covered(self) -> bool:
-        return len(self.uncovered_targets) == 0
+        return all(
+            target.obligation is not None
+            and target.obligation.metric in _STRATEGY_ONLY_METRICS
+            for target in self.uncovered_targets
+        )
 
 
 class BranchPathBuilder:
     """Build root-to-target BranchPath instances from a BranchTree."""
+
+    def _group_columns_for_node(self, node: BranchNode) -> Tuple[ColumnId, ...]:
+        meta = node.annotation_metadata.get("aggregation", {})
+        group_sources = meta.get("group_sources", {})
+        columns: List[ColumnId] = []
+        seen: set[ColumnId] = set()
+        for source_ids in group_sources.values():
+            for col_id in source_ids:
+                physical = col_id.source_column_id or col_id
+                if physical.relation is None or physical in seen:
+                    continue
+                seen.add(physical)
+                columns.append(physical)
+        return tuple(columns)
+
+    def _aggregate_argument(
+        self,
+        expression: exp.Expression,
+    ) -> exp.Expression | None:
+        function = next(expression.find_all(exp.AggFunc), None)
+        if function is None:
+            return None
+        argument = function.this
+        if isinstance(argument, exp.Distinct):
+            if not argument.expressions:
+                return None
+            argument = argument.expressions[0]
+        if argument is None or isinstance(argument, exp.Star):
+            return None
+        return argument.copy()
+
+    def _ranked_join_antimatch_obligations(
+        self,
+        node: BranchNode,
+        target: CoverageTarget,
+    ) -> Tuple[OperatorObligation, ...] | None:
+        if (
+            target.obligation is None
+            or target.obligation.metric
+            not in {"join_left_unmatched", "join_right_unmatched"}
+            or target.target_outcome not in {BranchType.JOIN_LEFT, BranchType.JOIN_RIGHT}
+        ):
+            return None
+        ordering = tuple(node.annotation_metadata.get("root_ordering", ()))
+        if not ordering or not node.join_facts:
+            return None
+
+        row_set = RowSetObligation(
+            anchor_step_id=node.step_id,
+            required_rows=2,
+            generation_rows=2,
+            row_scopes=("rank_top", "rank_match"),
+            relations=node.tables,
+            join_facts=node.join_facts,
+            path_predicates=node.path_predicates,
+            ordering=ordering,
+            join_scope_outcomes=(
+                ("rank_top", target.target_outcome),
+                ("rank_match", BranchType.JOIN_MATCH),
+            ),
+        )
+        return (
+            *node.obligations,
+            OperatorObligation(
+                kind="row_set",
+                step_id=node.step_id,
+                site="ranked_join_antimatch",
+                row_count=2,
+                row_set=row_set,
+            ),
+        )
 
     def _obligations_for_target_node(
         self,
         node: BranchNode,
         target: CoverageTarget,
     ) -> Tuple[OperatorObligation, ...]:
+        ranked_antimatch = self._ranked_join_antimatch_obligations(node, target)
+        if ranked_antimatch is not None:
+            return ranked_antimatch
+
+        if (
+            target.obligation is not None
+            and target.obligation.metric == "join_fanout"
+            and target.target_outcome == BranchType.DUPLICATE
+        ):
+            duplicate_expressions = tuple(
+                _column_expr_from_id(right)
+                for fact in node.join_facts
+                for _left, right in fact.equalities
+            )
+            if not duplicate_expressions:
+                duplicate_expressions = tuple(
+                    _column_expr_from_id(left)
+                    for fact in node.join_facts
+                    for left, _right in fact.equalities
+                )
+            row_set = RowSetObligation(
+                anchor_step_id=node.step_id,
+                required_rows=2,
+                generation_rows=2,
+                row_scopes=("r0", "r1"),
+                relations=node.tables,
+                join_facts=node.join_facts,
+                path_predicates=node.path_predicates,
+                duplicate_expressions=duplicate_expressions,
+            )
+            return (
+                *node.obligations,
+                OperatorObligation(
+                    kind="row_set",
+                    step_id=node.step_id,
+                    site="join_fanout",
+                    row_count=2,
+                    row_set=row_set,
+                ),
+            )
+
+        if (
+            target.obligation is not None
+            and target.obligation.metric == "count_distinct_duplicate"
+            and target.target_outcome == BranchType.DUPLICATE
+        ):
+            aggregate_argument = self._aggregate_argument(target.atom)
+            row_set = RowSetObligation(
+                anchor_step_id=node.step_id,
+                required_rows=2,
+                generation_rows=2,
+                row_scopes=("r0", "r1"),
+                relations=node.tables,
+                join_facts=node.join_facts,
+                path_predicates=node.path_predicates,
+                counted_expression=aggregate_argument,
+                duplicate_expressions=(
+                    (aggregate_argument.copy(),)
+                    if aggregate_argument is not None
+                    else ()
+                ),
+            )
+            return (
+                *node.obligations,
+                OperatorObligation(
+                    kind="row_set",
+                    step_id=node.step_id,
+                    site="count_distinct_duplicate",
+                    row_count=2,
+                    row_set=row_set,
+                ),
+            )
+
+        if (
+            target.obligation is not None
+            and target.obligation.metric == "aggregate_contrast"
+            and target.target_outcome == BranchType.DUPLICATE
+        ):
+            aggregate_argument = self._aggregate_argument(target.atom)
+            group_keys = self._group_columns_for_node(node)
+            row_set = RowSetObligation(
+                anchor_step_id=node.step_id,
+                required_rows=2,
+                generation_rows=2,
+                row_scopes=("r0", "r1"),
+                relations=node.tables,
+                join_facts=node.join_facts,
+                path_predicates=node.path_predicates,
+                group_keys=group_keys,
+                counted_expression=aggregate_argument,
+                distinct_expression=aggregate_argument
+                if aggregate_argument is not None
+                and not isinstance(next(target.atom.find_all(exp.AggFunc), None), exp.Count)
+                else None,
+            )
+            return (
+                *node.obligations,
+                OperatorObligation(
+                    kind="row_set",
+                    step_id=node.step_id,
+                    site="aggregate_contrast",
+                    row_count=2,
+                    row_set=row_set,
+                ),
+            )
+
         if (
             node.site in {"aggregate_input", "aggregate_distinct_input"}
             and target.target_outcome
@@ -714,6 +951,42 @@ class BranchPathBuilder:
                     row_set=row_set,
                 ),
             )
+
+        if (
+            node.site == "root_result"
+            and target.obligation is not None
+            and target.obligation.metric == "rank_tie"
+            and target.target_outcome == BranchType.DUPLICATE
+        ):
+            obligations: List[OperatorObligation] = []
+            for obligation in node.obligations:
+                if obligation.kind != "row_set" or obligation.row_set is None:
+                    obligations.append(obligation)
+                    continue
+                row_set = obligation.row_set
+                if not row_set.ordering:
+                    continue
+                generation_rows = max(row_set.generation_rows, 2)
+                ordered_expressions = tuple(
+                    ordered.this if isinstance(ordered, exp.Ordered) else ordered
+                    for ordered in row_set.ordering
+                )
+                tie_row_set = replace(
+                    row_set,
+                    required_rows=max(row_set.required_rows, 2),
+                    generation_rows=generation_rows,
+                    row_scopes=tuple(f"out{index}" for index in range(generation_rows)),
+                    duplicate_expressions=ordered_expressions,
+                    ordering_mode="tie",
+                )
+                obligations.append(
+                    replace(
+                        obligation,
+                        row_count=generation_rows,
+                        row_set=tie_row_set,
+                    )
+                )
+            return tuple(obligations)
 
         if (
             node.site != "root_result"
@@ -1066,6 +1339,7 @@ def _build_branch_tree(
         predicate: exp.Expression,
         atoms: tuple[exp.Expression, ...],
         tables: tuple[RelationId, ...],
+        coverage_obligations: tuple[CoverageObligation, ...] | None = None,
     ) -> None:
         annotation = plan.annotation_for(step)
         parent_node = _find_parent(step)
@@ -1074,6 +1348,9 @@ def _build_branch_tree(
         own_join_equalities = tuple(
             equality for fact in join_facts for equality in fact.equalities
         )
+        annotation_metadata = dict(annotation.metadata)
+        if root_ordering_metadata:
+            annotation_metadata["root_ordering"] = root_ordering_metadata
         node = tree.get_or_create_node(
             step_id=annotation.step_id,
             step_type=step_type,
@@ -1087,7 +1364,10 @@ def _build_branch_tree(
             join_equalities=tuple(join_eqs) + own_join_equalities,
             join_facts=join_facts,
             obligations=_scan_obligations(annotation.step_id, tables, keyed_only=True),
-            annotation_metadata=annotation.metadata,
+            coverage_obligations=coverage_obligations
+            if coverage_obligations is not None
+            else coverage_obligations_for_site(site, atoms),
+            annotation_metadata=annotation_metadata,
             discovery="planned",
             origin=f"planner:{step_type}",
         )
@@ -1156,12 +1436,16 @@ def _build_branch_tree(
 
     def _root_ordering(root: Step) -> tuple[exp.Expression, ...]:
         ordering: list[exp.Expression] = []
+        has_limit = False
         visited: set[int] = set()
 
         def walk(step: Step) -> None:
+            nonlocal has_limit
             if id(step) in visited:
                 return
             visited.add(id(step))
+            if isinstance(step, Limit):
+                has_limit = True
             if isinstance(step, Sort):
                 ordering.extend(tuple(getattr(step, "key", ()) or ()))
             for subplan in getattr(step, "subplan_dependencies", ()) or ():
@@ -1172,7 +1456,60 @@ def _build_branch_tree(
                 walk(dep)
 
         walk(root)
-        return tuple(ordering)
+        return tuple(ordering) if has_limit else ()
+
+    root_ordering_metadata = _root_ordering(plan.root)
+
+    def _aggregate_output_obligations(
+        step: Aggregate,
+        atoms: tuple[exp.Expression, ...],
+    ) -> tuple[CoverageObligation, ...]:
+        obligations = list(coverage_obligations_for_site("aggregate_output", atoms))
+        for atom_id, atom in enumerate(atoms):
+            function = next(atom.find_all(exp.AggFunc), None)
+            argument = function.this if function is not None else None
+            if isinstance(argument, exp.Distinct) and argument.expressions:
+                obligations.append(
+                    CoverageObligation(
+                        metric="count_distinct_duplicate",
+                        atom_id=atom_id,
+                        expression=atom,
+                        outcomes=(BranchType.DUPLICATE,),
+                    )
+                )
+        if step.group:
+            for atom_id, atom in enumerate(atoms):
+                obligations.append(
+                    CoverageObligation(
+                        metric="aggregate_contrast",
+                        atom_id=atom_id,
+                        expression=atom,
+                        outcomes=(BranchType.DUPLICATE,),
+                    )
+                )
+        return tuple(obligations)
+
+    def _root_result_coverage_obligations(
+        obligations: tuple[OperatorObligation, ...],
+    ) -> tuple[CoverageObligation, ...]:
+        coverage = list(coverage_obligations_for_site("root_result", (exp.true(),)))
+        if any(
+            row_set.ordering
+            for row_set in (
+                obligation.row_set
+                for obligation in obligations
+                if obligation.row_set is not None
+            )
+        ):
+            coverage.append(
+                CoverageObligation(
+                    metric="rank_tie",
+                    atom_id=-6,
+                    expression=exp.true(),
+                    outcomes=(BranchType.DUPLICATE,),
+                )
+            )
+        return tuple(coverage)
 
     def _having_cardinality_constraints() -> tuple[dict[str, Any], ...]:
         constraints: list[dict[str, Any]] = []
@@ -1216,7 +1553,7 @@ def _build_branch_tree(
             annotation.source_relations + _lineage_relations(root)
         )
         path_predicates, join_facts = _root_path_data(root)
-        ordering = _root_ordering(root)
+        ordering = root_ordering_metadata
         distinct_expression = _root_group_distinct_expression()
         duplicate_expressions = (
             project_coverage_expressions(root)
@@ -1324,6 +1661,23 @@ def _build_branch_tree(
                 )
             if step.aggregations:
                 aggregate_expressions = _aggregate_coverage_expressions(step)
+                for aggregation in aggregate_expressions:
+                    for case_expr in aggregation.find_all(exp.Case):
+                        ifs = case_expr.args.get("ifs") or []
+                        for arm in ifs:
+                            raw_arm_pred = arm.args.get("this")
+                            if not isinstance(raw_arm_pred, exp.Expression):
+                                continue
+                            arm_pred = _case_arm_condition(case_expr, raw_arm_pred)
+                            atoms = decompose_atoms(arm_pred)
+                            _add_node(
+                                step,
+                                "Aggregate",
+                                "case_arm",
+                                arm_pred,
+                                atoms,
+                                tables,
+                            )
                 _add_node(
                     step,
                     "Aggregate",
@@ -1331,6 +1685,10 @@ def _build_branch_tree(
                     exp.Literal.string("AGGREGATE_OUTPUT"),
                     aggregate_expressions,
                     tables,
+                    coverage_obligations=_aggregate_output_obligations(
+                        step,
+                        aggregate_expressions,
+                    ),
                 )
                 aggregate_inputs = tuple(
                     argument
@@ -1418,6 +1776,7 @@ def _build_branch_tree(
             step_obj=plan.root,
             parent=_find_parent(plan.root),
             obligations=root_obligations,
+            coverage_obligations=_root_result_coverage_obligations(root_obligations),
             discovery="planned",
             origin=f"planner:{type(plan.root).__name__}",
         )

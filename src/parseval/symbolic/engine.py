@@ -39,12 +39,26 @@ from .types import (
 )
 
 logger = logging.getLogger("parseval.engine")
+_STRATEGY_ONLY_METRICS = {
+    "join_fanout",
+    "aggregate_contrast",
+    "project_duplicate",
+    "count_distinct_duplicate",
+    "case_positive",
+    "rank_tie",
+}
 
 
 @dataclass(frozen=True)
 class _LogicalRowKey:
     relation: RelationId
     row_scope: str
+
+
+class _GenerationStatus:
+    GENERATED = "generated"
+    INFEASIBLE = "infeasible"
+    DEFERRED = "deferred"
 
 
 def _materialized_rows(
@@ -153,17 +167,49 @@ class SymbolicEngine:
 
         # Phase 2: Targeted gap-filling.
         iteration = 0
+        deferred_targets = set()
+        root_budget_rescue_used = False
         for iteration in range(self.max_iterations):
-            if analyzer.fully_covered:
+            strategy_targets = analyzer.strategy_targets
+            if analyzer.fully_covered and not strategy_targets:
                 break
 
-            targets = analyzer.root_witness_targets or analyzer.uncovered_targets
+            root_targets = [
+                target
+                for target in analyzer.root_witness_targets
+                if self._target_key(target) not in deferred_targets
+                and not self._defer_target_by_policy(target)
+            ]
+            if root_targets:
+                targets = root_targets
+            elif strategy_targets:
+                targets = [
+                    target
+                    for target in strategy_targets
+                    if self._target_key(target) not in deferred_targets
+                    and not self._defer_target_by_policy(target)
+                ]
+            else:
+                targets = [
+                    target
+                    for target in analyzer.uncovered_targets
+                    if self._target_key(target) not in deferred_targets
+                    and not self._defer_target_by_policy(target)
+                ]
             if not targets:
                 break
 
             # Check row budget.
             if self._over_budget(rows_before):
-                break
+                rescue_targets = [
+                    target
+                    for target in root_targets
+                    if target.node.site == "root_result"
+                ]
+                if root_budget_rescue_used or not rescue_targets:
+                    break
+                targets = rescue_targets
+                root_budget_rescue_used = True
 
             # Process one target per iteration.
             target = self._prioritize(targets)
@@ -173,18 +219,20 @@ class SymbolicEngine:
 
             # Solve and materialize.
             cp = self.instance.checkpoint()
-            try:
-                success = self._solve_and_materialize(constraint)
-            except ConstraintConflict:
-                success = False
+            status = self._solve_and_materialize_for_target(constraint)
 
-            if success:
+            if status == _GenerationStatus.GENERATED:
+                if self._is_strategy_only_target(target):
+                    tree.mark_strategy_generated(target)
                 # Re-evaluate to discover newly covered branches.
                 tree = evaluator.evaluate(tree)
                 analyzer = CoverageAnalyzer(tree)
             else:
                 self.instance.rollback(cp)
-                tree.mark_target_infeasible(target)
+                if status == _GenerationStatus.INFEASIBLE:
+                    tree.mark_target_infeasible(target)
+                else:
+                    deferred_targets.add(self._target_key(target))
                 analyzer = CoverageAnalyzer(tree)
 
         return GenerationResult(
@@ -231,6 +279,11 @@ class SymbolicEngine:
 
         def key(t: CoverageTarget) -> tuple:
             priority = outcome_priority.get(t.target_outcome, 9)
+            if (
+                t.obligation is not None
+                and t.obligation.metric in _STRATEGY_ONLY_METRICS
+            ):
+                priority = max(priority, 99)
             if t.target_outcome == BranchType.ATOM_TRUE and t.atom_id < 0:
                 priority = 4
             return (
@@ -240,15 +293,60 @@ class SymbolicEngine:
 
         return min(targets, key=key)
 
+    def _is_strategy_only_target(self, target: CoverageTarget) -> bool:
+        return (
+            target.obligation is not None
+            and target.obligation.metric in _STRATEGY_ONLY_METRICS
+        )
+
+    def _target_key(self, target: CoverageTarget) -> tuple:
+        return (
+            target.node.node_key,
+            target.atom_id,
+            target.target_outcome,
+            target.atom_outcomes,
+            target.obligation.metric if target.obligation is not None else None,
+        )
+
+    def _defer_target_by_policy(self, target: CoverageTarget) -> bool:
+        if target.node.site != "in" or target.target_outcome != BranchType.IN_MATCH:
+            if target.node.site != "scalar_subquery":
+                return False
+            predicate = target.node.predicate
+            if isinstance(predicate, exp.Not):
+                inner = predicate.this
+                return isinstance(inner, (exp.In, exp.Exists))
+            return False
+        subquery_meta = target.node.annotation_metadata.get("subquery", {})
+        return subquery_meta.get("polarity") == "negative"
+
     def _solve_and_materialize(self, constraint: SolverConstraint) -> bool:
         """Invoke the unified solver and materialize results into the instance."""
+        return (
+            self._solve_and_materialize_for_target(constraint)
+            == _GenerationStatus.GENERATED
+        )
+
+    def _solve_and_materialize_for_target(
+        self,
+        constraint: SolverConstraint,
+    ) -> str:
+        """Invoke the solver and classify generation failures."""
         result = self.solver.solve(constraint)
         if not result.sat:
-            return False
+            if result.reason == "unsat":
+                return _GenerationStatus.INFEASIBLE
+            return _GenerationStatus.DEFERRED
 
-        materialized = _materialized_rows(constraint, result.assignments)
+        try:
+            materialized = _materialized_rows(constraint, result.assignments)
+        except ConstraintConflict as exc:
+            reason = str(exc)
+            if reason.startswith("missing_physical_lineage:"):
+                return _GenerationStatus.DEFERRED
+            return _GenerationStatus.INFEASIBLE
         if not materialized:
-            return False
+            return _GenerationStatus.DEFERRED
 
         storage_relations = []
         seen_relations = set()
@@ -269,15 +367,9 @@ class SymbolicEngine:
             for row_values in logical_rows:
                 try:
                     self.instance.create_row(storage_relation, values=row_values)
-                except Exception as exc:
-                    reason = str(exc) or type(exc).__name__
-                    raise ConstraintConflict(
-                        "materialization_failed:"
-                        f"{storage_relation.display}:"
-                        f"{type(exc).__name__}:"
-                        f"{reason}"
-                    ) from exc
-        return True
+                except Exception:
+                    return _GenerationStatus.INFEASIBLE
+        return _GenerationStatus.GENERATED
 
     def _total_rows(self) -> int:
         return sum(len(self.instance.get_rows(t)) for t in self.instance.tables)
