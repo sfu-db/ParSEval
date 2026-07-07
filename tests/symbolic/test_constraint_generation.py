@@ -118,6 +118,389 @@ class TestGroupConstraintGeneration(unittest.TestCase):
         self.assertIsNotNone(constraint, "Constraint should not be None")
 
 
+class TestSemanticBranchConstraintGeneration(unittest.TestCase):
+    def _compile_target(
+        self,
+        schema: str,
+        sql: str,
+        site: str,
+        outcome: BranchType,
+        metric: str | None = None,
+    ) -> SolverConstraint:
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == site
+            and target.target_outcome == outcome
+            and (
+                metric is None
+                or (
+                    target.obligation is not None
+                    and target.obligation.metric == metric
+                )
+            )
+        )
+        return ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+    def test_case_taken_compiles_to_arm_predicate(self):
+        constraint = self._compile_target(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT);",
+            "SELECT CASE WHEN a > 5 THEN 'big' ELSE 'small' END FROM t",
+            "case_arm",
+            BranchType.CASE_ARM_TAKEN,
+        )
+
+        self.assertTrue(any(isinstance(item, exp.GT) for item in constraint.constraints))
+
+    def test_case_skipped_compiles_to_negated_arm_predicate(self):
+        constraint = self._compile_target(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT);",
+            "SELECT CASE WHEN a > 5 THEN 'big' ELSE 'small' END FROM t",
+            "case_arm",
+            BranchType.CASE_ARM_SKIPPED,
+        )
+
+        self.assertTrue(
+            any(
+                isinstance(item, exp.LTE)
+                or (isinstance(item, exp.Not) and isinstance(item.this, exp.GT))
+                for item in constraint.constraints
+            )
+        )
+
+    def test_join_fanout_emits_equal_many_side_key_and_distinct_row_identity(self):
+        constraint = self._compile_target(
+            (
+                "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);"
+                "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);"
+            ),
+            "SELECT parent.name FROM parent JOIN child ON parent.id = child.parent_id",
+            "join_on",
+            BranchType.DUPLICATE,
+        )
+
+        key_equalities = []
+        identity_differences = []
+        for expression in constraint.constraints:
+            if isinstance(expression, exp.EQ):
+                columns = list(expression.find_all(exp.Column))
+                vars_ = [solver_var(column) for column in columns]
+                if (
+                    len(vars_) == 2
+                    and {var.row_scope for var in vars_} == {"r0", "r1"}
+                    and all(var.column_id.name.normalized == "parent_id" for var in vars_)
+                ):
+                    key_equalities.append(expression)
+            if isinstance(expression, exp.NEQ):
+                columns = list(expression.find_all(exp.Column))
+                vars_ = [solver_var(column) for column in columns]
+                if (
+                    len(vars_) == 2
+                    and {var.row_scope for var in vars_} == {"r0", "r1"}
+                    and all(var.column_id.name.normalized == "id" for var in vars_)
+                ):
+                    identity_differences.append(expression)
+
+        self.assertTrue(key_equalities)
+        self.assertTrue(identity_differences)
+
+    def test_project_duplicate_emits_equal_project_values_and_distinct_row_identity(self):
+        constraint = self._compile_target(
+            "CREATE TABLE t (id INT PRIMARY KEY, code TEXT, name TEXT);",
+            "SELECT code, name FROM t",
+            "root_result",
+            BranchType.DUPLICATE,
+            metric="project_duplicate",
+        )
+
+        project_equalities = []
+        identity_differences = []
+        for expression in constraint.constraints:
+            if isinstance(expression, exp.EQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"out0", "out1"}
+                    and left.column_id.name.normalized in {"code", "name"}
+                    and right.column_id.name.normalized == left.column_id.name.normalized
+                ):
+                    project_equalities.append(expression)
+            if isinstance(expression, exp.NEQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"out0", "out1"}
+                    and left.column_id.name.normalized == "id"
+                    and right.column_id.name.normalized == "id"
+                ):
+                    identity_differences.append(expression)
+
+        self.assertGreaterEqual(len(project_equalities), 2)
+        self.assertTrue(identity_differences)
+
+    def test_count_distinct_duplicate_emits_equal_counted_value_and_distinct_rows(self):
+        constraint = self._compile_target(
+            "CREATE TABLE t (pk INT PRIMARY KEY, id INT);",
+            "SELECT COUNT(DISTINCT id) FROM t",
+            "aggregate_output",
+            BranchType.DUPLICATE,
+            metric="count_distinct_duplicate",
+        )
+
+        counted_equalities = []
+        identity_differences = []
+        counted_not_null = []
+        for expression in constraint.constraints:
+            if isinstance(expression, exp.EQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"r0", "r1"}
+                    and left.column_id.name.normalized == "id"
+                    and right.column_id.name.normalized == "id"
+                ):
+                    counted_equalities.append(expression)
+            if isinstance(expression, exp.NEQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"r0", "r1"}
+                    and left.column_id.name.normalized == "pk"
+                    and right.column_id.name.normalized == "pk"
+                ):
+                    identity_differences.append(expression)
+            if isinstance(expression, exp.Is):
+                value = solver_var(expression.this)
+                if value is not None and value.column_id.name.normalized == "id":
+                    counted_not_null.append(expression)
+
+        self.assertTrue(counted_equalities)
+        self.assertTrue(identity_differences)
+        self.assertGreaterEqual(len(counted_not_null), 2)
+
+    def test_case_positive_strategy_target_includes_when_predicate(self):
+        constraint = self._compile_target(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT);",
+            "SELECT SUM(CASE WHEN a > 5 THEN 1 ELSE 0 END) FROM t",
+            "case_arm",
+            BranchType.CASE_ARM_TAKEN,
+            metric="case_positive",
+        )
+
+        self.assertTrue(any(isinstance(item, exp.GT) for item in constraint.constraints))
+
+    def test_rank_tie_emits_equal_non_null_order_values_and_distinct_rows(self):
+        constraint = self._compile_target(
+            "CREATE TABLE schools (id INT PRIMARY KEY, opened INT);",
+            "SELECT id FROM schools ORDER BY opened DESC LIMIT 1",
+            "root_result",
+            BranchType.DUPLICATE,
+            metric="rank_tie",
+        )
+
+        order_equalities = []
+        identity_differences = []
+        order_not_null = []
+        for expression in constraint.constraints:
+            if isinstance(expression, exp.EQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"out0", "out1"}
+                    and left.column_id.name.normalized == "opened"
+                    and right.column_id.name.normalized == "opened"
+                ):
+                    order_equalities.append(expression)
+            if isinstance(expression, exp.NEQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and {left.row_scope, right.row_scope} == {"out0", "out1"}
+                    and left.column_id.name.normalized == "id"
+                    and right.column_id.name.normalized == "id"
+                ):
+                    identity_differences.append(expression)
+            if isinstance(expression, exp.Is):
+                value = solver_var(expression.this)
+                if value is not None and value.column_id.name.normalized == "opened":
+                    order_not_null.append(expression)
+
+        self.assertTrue(order_equalities)
+        self.assertTrue(identity_differences)
+        self.assertGreaterEqual(len(order_not_null), 2)
+
+    def test_rank_contrast_emits_non_null_order_values_and_winner_comparison(self):
+        constraint = self._compile_target(
+            "CREATE TABLE schools (id INT PRIMARY KEY, opened INT);",
+            "SELECT id FROM schools ORDER BY opened DESC LIMIT 1 OFFSET 1",
+            "root_result",
+            BranchType.ATOM_TRUE,
+        )
+
+        scoped_order_columns = [
+            solver_var(column)
+            for expression in constraint.constraints
+            for column in expression.find_all(exp.Column)
+            if solver_var(column) is not None
+            and solver_var(column).column_id.name.normalized == "opened"
+        ]
+        comparisons = [
+            expression
+            for expression in constraint.constraints
+            if isinstance(expression, exp.GTE)
+            and solver_var(expression.this) is not None
+            and solver_var(expression.expression) is not None
+            and solver_var(expression.this).row_scope == "out0"
+            and solver_var(expression.expression).row_scope == "out1"
+        ]
+
+        self.assertTrue({"out0", "out1"} <= {var.row_scope for var in scoped_order_columns})
+        self.assertTrue(comparisons)
+
+    def test_aggregate_contrast_emits_grouped_count_rows(self):
+        constraint = self._compile_target(
+            "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT);",
+            "SELECT category, COUNT(id) FROM sales GROUP BY category",
+            "aggregate_output",
+            BranchType.DUPLICATE,
+        )
+
+        group_equalities = [
+            expression
+            for expression in constraint.constraints
+            if isinstance(expression, exp.EQ)
+            and solver_var(expression.this) is not None
+            and solver_var(expression.expression) is not None
+            and solver_var(expression.this).column_id.name.normalized == "category"
+            and {solver_var(expression.this).row_scope, solver_var(expression.expression).row_scope}
+            == {"r0", "r1"}
+        ]
+        counted_not_null = [
+            expression
+            for expression in constraint.constraints
+            if isinstance(expression, exp.Is)
+            and solver_var(expression.this) is not None
+            and solver_var(expression.this).column_id.name.normalized == "id"
+        ]
+
+        self.assertTrue(group_equalities)
+        self.assertGreaterEqual(len(counted_not_null), 2)
+
+    def test_aggregate_contrast_emits_sum_value_contrast(self):
+        constraint = self._compile_target(
+            "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);",
+            "SELECT category, SUM(amount) FROM sales GROUP BY category",
+            "aggregate_output",
+            BranchType.DUPLICATE,
+        )
+
+        value_differences = [
+            expression
+            for expression in constraint.constraints
+            if isinstance(expression, exp.NEQ)
+            and solver_var(expression.this) is not None
+            and solver_var(expression.expression) is not None
+            and solver_var(expression.this).column_id.name.normalized == "amount"
+            and {solver_var(expression.this).row_scope, solver_var(expression.expression).row_scope}
+            == {"r0", "r1"}
+        ]
+
+        self.assertTrue(value_differences)
+
+    def test_ranked_join_antimatch_emits_top_neq_match_eq_and_ordering(self):
+        constraint = self._compile_target(
+            (
+                "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT, score INT);"
+                "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT);"
+            ),
+            (
+                "SELECT parent.name FROM parent "
+                "JOIN child ON parent.id = child.parent_id "
+                "ORDER BY parent.score DESC LIMIT 1"
+            ),
+            "join_on",
+            BranchType.JOIN_LEFT,
+        )
+
+        top_neq = []
+        match_eq = []
+        ordering = []
+        for expression in constraint.constraints:
+            if isinstance(expression, exp.NEQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if left is not None and right is not None and {left.row_scope, right.row_scope} == {"rank_top"}:
+                    top_neq.append(expression)
+            if isinstance(expression, exp.EQ):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if left is not None and right is not None and {left.row_scope, right.row_scope} == {"rank_match"}:
+                    match_eq.append(expression)
+            if isinstance(expression, exp.GTE):
+                left = solver_var(expression.this)
+                right = solver_var(expression.expression)
+                if (
+                    left is not None
+                    and right is not None
+                    and left.column_id.name.normalized == "score"
+                    and right.column_id.name.normalized == "score"
+                    and left.row_scope == "rank_top"
+                    and right.row_scope == "rank_match"
+                ):
+                    ordering.append(expression)
+
+        self.assertTrue(top_neq)
+        self.assertTrue(match_eq)
+        self.assertTrue(ordering)
+
+    def test_group_count_multi_emits_group_key_inequality_without_same_group_equality(self):
+        constraint = self._compile_target(
+            "CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);",
+            "SELECT category, COUNT(id) FROM sales GROUP BY category",
+            "group",
+            BranchType.GROUP_MULTI,
+            metric="group_count",
+        )
+
+        group_neq = []
+        group_eq = []
+        for expression in constraint.constraints:
+            if not isinstance(expression, (exp.EQ, exp.NEQ)):
+                continue
+            left = solver_var(expression.this)
+            right = solver_var(expression.expression)
+            if (
+                left is None
+                or right is None
+                or left.column_id.name.normalized != "category"
+                or right.column_id.name.normalized != "category"
+                or {left.row_scope, right.row_scope} != {"r0", "r1"}
+            ):
+                continue
+            if isinstance(expression, exp.NEQ):
+                group_neq.append(expression)
+            else:
+                group_eq.append(expression)
+
+        self.assertTrue(group_neq)
+        self.assertEqual(group_eq, [])
+
+
 class TestLogicalSolverVariables(unittest.TestCase):
     def test_physical_predicate_columns_use_logical_solver_variables_with_storage_lineage(self):
         instance = Instance(

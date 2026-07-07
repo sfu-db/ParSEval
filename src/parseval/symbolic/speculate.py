@@ -301,6 +301,7 @@ class TableConstraint:
     group_key_columns: List[ColumnId] = field(default_factory=list)
     ordered_columns: List[ColumnId] = field(default_factory=list)
     contrast_columns: List[ColumnId] = field(default_factory=list)
+    distinct_columns: List[ColumnId] = field(default_factory=list)
     row_intents: Dict[int, Set[str]] = field(default_factory=dict)
     boundary_rows: List[Dict[ColumnId, Any]] = field(default_factory=list)
 
@@ -809,7 +810,7 @@ class Propagator:
 
         is_anti = (
             metadata["polarity"] == "negative"
-            or self._is_count_zero_subquery(parent_condition)
+            or self._is_count_zero_subplan(sub, parent_condition)
         )
         if is_anti:
             predicate_id = metadata.get("predicate_column")
@@ -860,6 +861,40 @@ class Propagator:
             if _is_zero_literal(left) and _contains_count_subquery(right):
                 return True
             if _is_zero_literal(right) and _contains_count_subquery(left):
+                return True
+        return False
+
+    def _is_count_zero_subplan(
+        self,
+        sub: SubPlan,
+        condition: Optional[exp.Expression],
+    ) -> bool:
+        if condition is None:
+            return False
+        for eq_node in condition.find_all(exp.EQ):
+            left, right = eq_node.this, eq_node.expression
+            if _is_zero_literal(left) and self._expression_contains_anchor_subquery(
+                right,
+                sub.anchor,
+            ):
+                return True
+            if _is_zero_literal(right) and self._expression_contains_anchor_subquery(
+                left,
+                sub.anchor,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _expression_contains_anchor_subquery(
+        expression: exp.Expression,
+        anchor: exp.Expression,
+    ) -> bool:
+        if expression is anchor:
+            return True
+        anchor_sql = anchor.sql()
+        for subquery in expression.find_all(exp.Subquery):
+            if subquery is anchor or subquery.sql() == anchor_sql:
                 return True
         return False
 
@@ -1356,7 +1391,10 @@ class Propagator:
                 sub for sub in step.subplan_dependencies
                 if self._is_simple_scalar_row_lookup(sub)
             ]
-            for atom, subplan in zip(atoms, subplans):
+            for atom in atoms:
+                subplan = self._scalar_subplan_for_atom(atom, subplans)
+                if subplan is None:
+                    continue
                 try:
                     spec = BranchSpec(
                         branch=f"positive_semantic_scalar_subquery_{spec_index}",
@@ -1389,6 +1427,16 @@ class Propagator:
         if not _relation_is_materializable(self.instance, output_id.relation):
             return False
         return not any(isinstance(step, Aggregate) for step in _iter_steps_with_subplans(subplan))
+
+    def _scalar_subplan_for_atom(
+        self,
+        atom: exp.Expression,
+        subplans: List[SubPlan],
+    ) -> Optional[SubPlan]:
+        for subplan in subplans:
+            if self._expression_contains_anchor_subquery(atom, subplan.anchor):
+                return subplan
+        return None
 
     def _add_scalar_subquery_atom_constraint(
         self,
@@ -2401,8 +2449,21 @@ class Propagator:
 
             if not isinstance(argument, ColumnId) or argument.relation is None:
                 continue
+            argument = self._spec_requirement_column(argument, spec)
             relation = argument.relation
             if relation not in spec.requirements:
+                continue
+            if (
+                constraint.get("function") == "count"
+                and constraint.get("distinct")
+            ):
+                req = spec.requirements[relation]
+                req.distinct_columns = self._merge_column_ids(
+                    req.distinct_columns,
+                    [argument],
+                )
+                if not _has_is_not_null(req.constraints, argument.name.normalized):
+                    req.constraints.append(_make_is_not_null(self._solver_col(argument)))
                 continue
             if constraint.get("function") not in {"sum", "avg", "min", "max"}:
                 continue
@@ -3288,6 +3349,22 @@ def _solver_var_matches_binding(var: SolverVar, binding: RowBinding) -> bool:
     )
 
 
+def _binding_for_solver_var_row(
+    var: SolverVar,
+    preferred_row: int,
+    row_bindings: Optional[Dict[str, RowBinding]],
+) -> Optional[RowBinding]:
+    if row_bindings is None:
+        return None
+    matches = _bindings_for_solver_var(var, row_bindings)
+    if not matches:
+        return None
+    for candidate in matches:
+        if candidate.row == preferred_row:
+            return candidate
+    return matches[0]
+
+
 # ---------------------------------------------------------------------------
 # Constraint rewriting for row scoping
 # ---------------------------------------------------------------------------
@@ -3297,6 +3374,7 @@ def _rewrite_constraint_for_binding(
     constraint: exp.Expression,
     binding: RowBinding,
     instance: Instance,
+    row_bindings: Optional[Dict[str, RowBinding]] = None,
     scoped_vars: Optional[Dict[Tuple[str, str, str, int, str], SolverVar]] = None,
 ) -> Optional[exp.Expression]:
     """Copy constraint, replace Column nodes with _solver_column scoped to the binding.
@@ -3318,11 +3396,14 @@ def _rewrite_constraint_for_binding(
         sv = solver_var(col)
         if sv is not None:
             if not _solver_var_matches_binding(sv, binding):
-                scoped = SolverVar(
-                    column_id=sv.column_id,
-                    relation_id=sv.relation_id,
-                    row_scope=f"r{binding.row}",
+                target_binding = _binding_for_solver_var_row(
+                    sv,
+                    binding.row,
+                    row_bindings,
                 )
+                if target_binding is None:
+                    target_binding = binding
+                scoped = _row_bound_solver_var(sv, target_binding)
                 set_solver_var(col, scoped)
                 ct = col_type(col)
                 if ct is None:
@@ -3791,6 +3872,34 @@ def _contrast_column_constraints(
             constraints.append(exp.NEQ(this=first_column, expression=second_column))
         constraints.append(_make_is_not_null(first_column.copy()))
         constraints.append(_make_is_not_null(second_column.copy()))
+    return constraints
+
+
+def _distinct_column_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    req_bindings: List[RowBinding],
+) -> List[exp.Expression]:
+    if len(req_bindings) < 2 or not req.distinct_columns:
+        return []
+    ordered = sorted(req_bindings, key=lambda binding: binding.row)
+    constraints: List[exp.Expression] = []
+    for col_id in req.distinct_columns:
+        columns = [
+            _solver_column(
+                instance,
+                _row_bound_column_id(col_id, binding),
+                row_scope=f"r{binding.row}",
+            )
+            for binding in ordered
+        ]
+        for column in columns:
+            constraints.append(_make_is_not_null(column.copy()))
+        for left_index, left_column in enumerate(columns):
+            for right_column in columns[left_index + 1:]:
+                constraints.append(
+                    exp.NEQ(this=left_column.copy(), expression=right_column.copy())
+                )
     return constraints
 
 
@@ -4317,6 +4426,7 @@ def _pre_fill_plan_distinct_values(
         force
         or req.duplicate_columns
         or req.contrast_columns
+        or req.distinct_columns
         or req.ordered_columns
         or req.row_intents
     ):
@@ -4452,9 +4562,6 @@ def _materialization_column_map(
                 alias = relation.alias.normalized if relation.alias else ""
                 scope = relation.scope_id or ""
                 aliases[(table, alias, scope, col.name)] = source_name
-                aliases.setdefault((table, "", scope, col.name), source_name)
-                aliases.setdefault((table, alias, "", col.name), source_name)
-                aliases.setdefault((table, "", "", col.name), source_name)
     return aliases
 
 
@@ -4464,16 +4571,7 @@ def _resolve_materialization_column(
     aliases: MaterializationColumnMap,
 ) -> Optional[str]:
     table, alias, scope, _row_idx = slot
-    for key in (
-        (table, alias, scope, column),
-        (table, "", scope, column),
-        (table, alias, "", column),
-        (table, "", "", column),
-    ):
-        target = aliases.get(key)
-        if target is not None:
-            return target
-    return None
+    return aliases.get((table, alias, scope, column))
 
 
 def _normalize_pending_rows_for_materialization(
@@ -4781,6 +4879,7 @@ class Resolver:
                     for binding in req_bindings:
                         rewritten = _rewrite_constraint_for_binding(
                             constraint_expr, binding, self.instance,
+                            row_bindings=row_bindings,
                             scoped_vars=scoped_vars,
                         )
                         if rewritten is not None:
@@ -4817,6 +4916,13 @@ class Resolver:
             )
             constraints.extend(
                 _contrast_column_constraints(
+                    self.instance,
+                    req,
+                    req_bindings,
+                )
+            )
+            constraints.extend(
+                _distinct_column_constraints(
                     self.instance,
                     req,
                     req_bindings,

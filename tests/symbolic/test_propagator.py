@@ -36,6 +36,18 @@ def _propagate(sql: str, tables: dict[str, dict[str, str]],
     return propagator.propagate()
 
 
+def _positive_spec(specs: list[BranchSpec]) -> BranchSpec:
+    return next(spec for spec in specs if spec.branch == "positive")
+
+
+def _constraints(spec: BranchSpec) -> list[exp.Expression]:
+    return [
+        constraint
+        for req in spec.requirements.values()
+        for constraint in req.constraints
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Task 2: Positive branch propagation
 # ---------------------------------------------------------------------------
@@ -48,10 +60,9 @@ def test_positive_simple_select():
     specs = _propagate(sql, tables, SpeculateConfig(positive=1, negative=0, null=0,
                                                      left_unmatched=0, right_unmatched=0,
                                                      having_fail=0, case_else=0, boundary=0))
-    assert len(specs) == 1
-    assert specs[0].branch == "positive"
-    assert any(tc.table == "orders" for tc in specs[0].requirements.values())
-    orders_req = next(tc for tc in specs[0].requirements.values() if tc.table == "orders")
+    spec = _positive_spec(specs)
+    assert any(tc.table == "orders" for tc in spec.requirements.values())
+    orders_req = next(tc for tc in spec.requirements.values() if tc.table == "orders")
     assert len(orders_req.constraints) >= 1
 
 
@@ -118,13 +129,103 @@ def test_join_creates_equivalence():
     specs = _propagate(sql, tables, SpeculateConfig(positive=1, negative=0, null=0,
                                                      left_unmatched=0, right_unmatched=0,
                                                      having_fail=0, case_else=0, boundary=0))
-    assert len(specs) == 1
-    spec = specs[0]
+    spec = _positive_spec(specs)
     table_names = {tc.table for tc in spec.requirements.values()}
     assert "orders" in table_names
     assert "customers" in table_names
     groups = spec.equivalences.groups()
     assert len(groups) >= 1, "Expected at least one equivalence group from join"
+
+
+def test_semantic_join_antimatch_requires_unequal_non_null_keys():
+    sql = """
+        SELECT o.id, c.name
+        FROM orders AS o
+        JOIN customers AS c ON o.customer_id = c.id
+    """
+    tables = {
+        "orders": {"id": "INT", "customer_id": "INT"},
+        "customers": {"id": "INT PRIMARY KEY", "name": "TEXT"},
+    }
+    specs = _propagate(
+        sql,
+        tables,
+        SpeculateConfig(
+            positive=0, negative=0, null=0,
+            left_unmatched=0, right_unmatched=0,
+            having_fail=0, case_else=0, boundary=0,
+            join_antimatch=1, join_fanout=0,
+            aggregate_contrast=0, rank_contrast=0,
+        ),
+    )
+
+    spec = next(spec for spec in specs if spec.branch.startswith("semantic_join_antimatch_"))
+
+    assert {req.table for req in spec.requirements.values()} == {"orders", "customers"}
+    constraints = _constraints(spec)
+    assert any(isinstance(constraint, exp.NEQ) for constraint in constraints)
+    not_null_columns = [
+        col.name
+        for constraint in constraints
+        if isinstance(constraint, exp.Is) and isinstance(constraint.expression, exp.Not)
+        for col in constraint.find_all(exp.Column)
+    ]
+    assert "customer_id" in not_null_columns
+    assert "id" in not_null_columns
+
+
+def test_semantic_join_fanout_duplicates_many_side_key():
+    sql = """
+        SELECT o.id, c.name
+        FROM orders AS o
+        JOIN customers AS c ON o.customer_id = c.id
+    """
+    tables = {
+        "orders": {"id": "INT PRIMARY KEY", "customer_id": "INT"},
+        "customers": {"id": "INT PRIMARY KEY", "name": "TEXT"},
+    }
+    specs = _propagate(
+        sql,
+        tables,
+        SpeculateConfig(
+            positive=0, negative=0, null=0,
+            left_unmatched=0, right_unmatched=0,
+            having_fail=0, case_else=0, boundary=0,
+            join_antimatch=0, join_fanout=1,
+            aggregate_contrast=0, rank_contrast=0,
+        ),
+    )
+
+    spec = next(spec for spec in specs if spec.branch.startswith("semantic_join_fanout_"))
+    orders_req = next(req for req in spec.requirements.values() if req.table == "orders")
+    customers_req = next(req for req in spec.requirements.values() if req.table == "customers")
+
+    assert orders_req.min_rows >= 2
+    assert customers_req.min_rows >= 1
+    assert {column.name.normalized for column in orders_req.duplicate_columns} == {"customer_id"}
+
+
+def test_semantic_rank_contrast_records_ordered_column_and_challenger():
+    sql = "SELECT s.id FROM scores AS s ORDER BY s.score DESC LIMIT 1"
+    tables = {"scores": {"id": "INT PRIMARY KEY", "score": "INT"}}
+    specs = _propagate(
+        sql,
+        tables,
+        SpeculateConfig(
+            positive=0, negative=0, null=0,
+            left_unmatched=0, right_unmatched=0,
+            having_fail=0, case_else=0, boundary=0,
+            join_antimatch=0, join_fanout=0,
+            aggregate_contrast=0, rank_contrast=1,
+        ),
+    )
+
+    spec = next(spec for spec in specs if spec.branch.startswith("semantic_rank_contrast_"))
+    req = next(req for req in spec.requirements.values() if req.table == "scores")
+
+    assert req.min_rows >= 2
+    assert {column.name.normalized for column in req.ordered_columns} == {"score"}
+    assert any(isinstance(constraint, exp.GT) for constraint in req.constraints)
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +245,39 @@ def test_having_sets_min_rows():
     specs = _propagate(sql, tables, SpeculateConfig(positive=1, negative=0, null=0,
                                                      left_unmatched=0, right_unmatched=0,
                                                      having_fail=0, case_else=0, boundary=0))
-    assert len(specs) == 1
-    spec = specs[0]
+    spec = _positive_spec(specs)
     for tc in spec.requirements.values():
         if tc.table == "orders":
             assert tc.min_rows >= 3, f"Expected min_rows >= 3 for COUNT > 2, got {tc.min_rows}"
+
+
+def test_semantic_aggregate_contrast_creates_two_groups_and_count_difference():
+    sql = """
+        SELECT o.customer_id, COUNT(*) AS cnt
+        FROM orders AS o
+        GROUP BY o.customer_id
+        ORDER BY cnt DESC
+        LIMIT 1
+    """
+    tables = {"orders": {"id": "INT PRIMARY KEY", "customer_id": "INT", "amount": "REAL"}}
+    specs = _propagate(
+        sql,
+        tables,
+        SpeculateConfig(
+            positive=0, negative=0, null=0,
+            left_unmatched=0, right_unmatched=0,
+            having_fail=0, case_else=0, boundary=0,
+            join_antimatch=0, join_fanout=0,
+            aggregate_contrast=1, rank_contrast=0,
+        ),
+    )
+
+    spec = next(spec for spec in specs if spec.branch.startswith("semantic_aggregate_contrast_"))
+    req = next(req for req in spec.requirements.values() if req.table == "orders")
+
+    assert req.min_rows >= 3
+    assert {column.name.normalized for column in req.group_key_columns} == {"customer_id"}
+    assert {column.name.normalized for column in req.contrast_columns} == {"customer_id"}
 
 
 # ---------------------------------------------------------------------------
