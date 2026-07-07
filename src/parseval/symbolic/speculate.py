@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
@@ -23,6 +24,7 @@ from sqlglot import exp
 from parseval.dtype import (
     DataType,
     TypeFamily,
+    StorageLiteral,
     date_to_epoch_day,
     datetime_to_epoch_second,
     parse_date,
@@ -34,11 +36,13 @@ from parseval.identity import (
     ColumnId,
     PARSEVAL_COLUMN_ID,
     RelationId,
+    column_id,
     column_identity,
     identifier_name,
     physical_column,
 )
 from parseval.instance import Instance
+from parseval.domain.exceptions import ConstraintViolationError
 from parseval.plan import Plan, Step
 from parseval.plan.helper import to_literal
 from parseval.plan.planner import (
@@ -57,11 +61,14 @@ from parseval.plan.planner import (
 from parseval.plan.rex import column_meta, concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var, solver_var
 from parseval.solver.types import col_type
-
-from .evaluator import PlanEvaluator
-from .types import BranchTree, BranchType, CoverageThresholds
+from .types import CoverageThresholds
 
 logger = logging.getLogger("parseval.speculate")
+
+_ROW_INTENT_GROUP_A = "group_a"
+_ROW_INTENT_GROUP_B = "group_b"
+_ROW_INTENT_MATCHED_RANK_LOWER = "matched_rank_lower"
+_ROW_INTENT_UNMATCHED_RANK_TOP = "unmatched_rank_top"
 
 
 # =============================================================================
@@ -99,15 +106,6 @@ def _build_plan_meta_cache(plan: Plan) -> Dict[Tuple[str, str], dict]:
 # =============================================================================
 # Identity-aware column creation helpers
 # =============================================================================
-
-
-def _relation_for_table(
-    instance: Instance,
-    name: str,
-) -> RelationId:
-    """Get RelationId for a table name from the instance."""
-    return instance.table_id(name)
-
 
 def _solver_column(
     instance: Instance,
@@ -252,7 +250,8 @@ def _solver_table_key(binding: RowBinding) -> str:
     """Build a unique solver table key for a row binding."""
     alias = binding.alias or binding.table
     table = binding.table
-    return f"{table}__{alias}__r{binding.row}"
+    scope = binding.relation.scope_id or ""
+    return f"{table}__{alias}__{scope}__r{binding.row}"
 
 
 class ColumnUnionFind:
@@ -300,6 +299,10 @@ class TableConstraint:
     min_rows: int = 1
     duplicate_columns: List[ColumnId] = field(default_factory=list)
     group_key_columns: List[ColumnId] = field(default_factory=list)
+    ordered_columns: List[ColumnId] = field(default_factory=list)
+    contrast_columns: List[ColumnId] = field(default_factory=list)
+    distinct_columns: List[ColumnId] = field(default_factory=list)
+    row_intents: Dict[int, Set[str]] = field(default_factory=dict)
     boundary_rows: List[Dict[ColumnId, Any]] = field(default_factory=list)
 
     @property
@@ -310,15 +313,22 @@ class TableConstraint:
     def alias(self) -> Optional[str]:
         return self.relation.alias.normalized if self.relation.alias else None
 
+    def mark_row(self, row_index: int, purpose: str) -> None:
+        self.row_intents.setdefault(row_index, set()).add(purpose)
+
 
 @dataclass
 class BranchSpec:
     """Requirements for one branch outcome."""
 
     branch: str
+    goals: Set[str] = field(default_factory=set)
     requirements: Dict[RelationId, TableConstraint] = field(default_factory=dict)
     equivalences: ColumnUnionFind = field(default_factory=ColumnUnionFind)
     deferred: List[exp.Expression] = field(default_factory=list)
+
+    def has_goal(self, goal: str) -> bool:
+        return goal in self.goals
 
     def require(self, relation: RelationId) -> TableConstraint:
         """Get or create the TableConstraint for a relation."""
@@ -339,7 +349,6 @@ class BranchSpec:
 @dataclass
 class SpeculateConfig:
     """Configuration for speculative data generation.
-
     Derives branch generation thresholds from :class:`CoverageThresholds`.
     Each field controls how many rows to generate for that branch type.
     Set to 0 to skip that branch type entirely.
@@ -348,11 +357,16 @@ class SpeculateConfig:
     positive: int = 1
     negative: int = 1
     null: int = 1
-    left_unmatched: int = 0
-    right_unmatched: int = 0
+    left_unmatched: int = 1
+    right_unmatched: int = 1
     having_fail: int = 1
     case_else: int = 1
-    boundary: int = 0
+    boundary: int = 1
+    join_antimatch: int = 1
+    join_fanout: int = 1
+    aggregate_contrast: int = 1
+    rank_contrast: int = 1
+    project_duplicate: int = 1
 
     @classmethod
     def from_thresholds(cls, thresholds: CoverageThresholds) -> "SpeculateConfig":
@@ -365,7 +379,12 @@ class SpeculateConfig:
             right_unmatched=thresholds.join_no_match,
             having_fail=thresholds.having_fail,
             case_else=thresholds.case_arm_skipped,
-            boundary=0,
+            boundary=1,
+            join_antimatch=1,
+            join_fanout=1,
+            aggregate_contrast=1,
+            rank_contrast=1,
+            project_duplicate=1,
         )
 
     @classmethod
@@ -379,7 +398,12 @@ class SpeculateConfig:
             right_unmatched=0,
             having_fail=1,
             case_else=1,
-            boundary=0,
+            boundary=1,
+            join_antimatch=1,
+            join_fanout=1,
+            aggregate_contrast=1,
+            rank_contrast=1,
+            project_duplicate=1,
         )
 
     @classmethod
@@ -394,6 +418,11 @@ class SpeculateConfig:
             having_fail=1,
             case_else=1,
             boundary=1,
+            join_antimatch=1,
+            join_fanout=1,
+            aggregate_contrast=1,
+            rank_contrast=1,
+            project_duplicate=1,
         )
 
 
@@ -404,14 +433,6 @@ class SpeculateConfig:
 
 
 _COMPARISON_NODES = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)
-
-
-def _required_column_identity(col: exp.Column, context: str) -> ColumnId:
-    col_id = column_identity(col)
-    if col_id is None or col_id.relation is None:
-        raise ValueError(f"{context} column lacks planner identity: {col.sql()}")
-    return col_id
-
 
 def _relation_is_materializable(instance: Instance, relation: RelationId) -> bool:
     return bool(relation.name and relation.name.normalized in instance.tables)
@@ -433,6 +454,15 @@ def _physical_source_id(col_id: ColumnId) -> ColumnId:
             return source
         current = source
     return current
+
+
+def _is_zero_literal(expression: exp.Expression) -> bool:
+    value = concrete(expression)
+    return value == 0
+
+
+def _contains_count_subquery(expression: exp.Expression) -> bool:
+    return expression.find(exp.Subquery) is not None and expression.find(exp.Count) is not None
 
 
 class Propagator:
@@ -466,6 +496,7 @@ class Propagator:
         self.instance = instance
         self.dialect = dialect
         self.config = config or SpeculateConfig.gold_non_empty()
+        _ = self.plan.annotations
         self._is_gold_mode = (
             self.config.negative == 0
             and self.config.null == 0
@@ -475,6 +506,7 @@ class Propagator:
         )
         self._negate_step: Optional[Step] = None
         self._negate_conjunct: int = 0
+        self._selected_scalar_subplan: Optional[SubPlan] = None
         self._plan_meta_cache = _build_plan_meta_cache(plan)
         self._virtual_projection_cache = self._build_virtual_projection_cache()
 
@@ -555,8 +587,8 @@ class Propagator:
                     self._derive_expression_join_key(sk, spec)
                     self._derive_expression_join_key(jk, spec)
                     continue
-                sk_id = _required_column_identity(sk, "Join key")
-                jk_id = _required_column_identity(jk, "Join key")
+                sk_id = column_identity(sk)
+                jk_id = column_identity(jk)
                 sk_rel = sk_id.relation
                 jk_rel = jk_id.relation
                 spec.require(sk_rel)
@@ -578,7 +610,7 @@ class Propagator:
     ) -> None:
         """Require materializable columns referenced by a non-column join key."""
         if isinstance(expr, exp.Column):
-            col_id = _required_column_identity(expr, "Join key")
+            col_id = column_identity(expr) #_required_column_identity(expr, "Join key")
             source_id = _physical_source_id(col_id)
             if source_id.relation and self._is_materializable_relation(source_id.relation):
                 req = spec.require(source_id.relation)
@@ -587,7 +619,7 @@ class Propagator:
                     req.constraints.append(_make_is_not_null(self._solver_col(source_id)))
             return
         for col in expr.find_all(exp.Column):
-            col_id = _required_column_identity(col, "Join key expression")
+            col_id = column_identity(col) #_required_column_identity(col, "Join key expression")
             source_id = _physical_source_id(col_id)
             if source_id.relation is None:
                 continue
@@ -613,9 +645,9 @@ class Propagator:
                 if source_id not in req.group_key_columns:
                     req.group_key_columns.append(source_id)
                 req.min_rows = max(req.min_rows, 3)
-        # Aggregate NULL detection — only for non-positive specs.
-        # Positive specs need real values for aggregates, not NULLs.
-        if spec.branch != "positive":
+        # Aggregate NULL detection belongs to branches that intentionally probe
+        # null sensitivity. Value witnesses need real aggregate arguments.
+        if not self._is_positive_value_witness(spec):
             for agg_expr in step.aggregations:
                 self._add_aggregate_null_constraints(agg_expr, spec)
         else:
@@ -666,42 +698,27 @@ class Propagator:
 
     def _derive_project(self, step: Project, spec: BranchSpec) -> None:
         """Add IS NOT NULL for projected columns and handle DISTINCT."""
-        ann = self.plan.annotation_for(step)
-        projected_ids = tuple(ann.projected_columns) + tuple(ann.referenced_columns)
-        for col_id in projected_ids:
-            if (
-                col_id.relation is not None
-                and not _relation_is_materializable(self.instance, col_id.relation)
-                and self._virtual_projection_for_relation(col_id.relation) is not None
-            ):
-                source_id = col_id
-            else:
-                source_id = _physical_source_id(col_id)
+        projected_ids = self._project_source_columns(
+            step, include_referenced=True,
+        )
+        for source_id in projected_ids:
             relation = source_id.relation
-            if relation is None or not self._is_materializable_relation(relation):
-                continue
+            assert relation is not None
             col_name = source_id.name.normalized
-            if col_name.startswith("_"):
-                continue
             tc = spec.require(relation)
             if not _has_is_not_null(tc.constraints, col_name):
                 tc.constraints.append(_make_is_not_null(self._solver_col(source_id)))
         # Duplicate / DISTINCT handling.
+        duplicate_sources = self._project_source_columns_by_relation(
+            step, include_referenced=True,
+        )
         for relation_id, tc in spec.requirements.items():
-            dup_ids = []
-            for col_id in projected_ids:
-                if (
-                    col_id.relation is not None
-                    and not _relation_is_materializable(self.instance, col_id.relation)
-                    and self._virtual_projection_for_relation(col_id.relation) is not None
-                ):
-                    source_id = col_id
-                else:
-                    source_id = _physical_source_id(col_id)
-                if source_id.relation == relation_id:
-                    dup_ids.append(source_id)
+            dup_ids = duplicate_sources.get(relation_id, [])
             if step.distinct and dup_ids:
-                tc.duplicate_columns = dup_ids
+                tc.duplicate_columns = self._merge_column_ids(
+                    tc.duplicate_columns,
+                    dup_ids,
+                )
                 tc.min_rows = max(tc.min_rows, 2)
                 for _rep, members in spec.equivalences.groups().items():
                     if len(members) < 2:
@@ -723,8 +740,36 @@ class Propagator:
                                 )
 
     def _derive_sort(self, step: Sort, spec: BranchSpec) -> None:
-        """No-op for Sort steps."""
-        pass
+        """Record simple ORDER BY keys for ranking witnesses."""
+        if not spec.has_goal("rank"):
+            return
+        for ordered in step.key or ():
+            col_id = self._order_column_id(ordered)
+            if col_id is None or col_id.relation is None:
+                continue
+            source_id = _physical_source_id(col_id)
+            source_id = self._spec_requirement_column(source_id, spec)
+            if source_id.relation is None:
+                continue
+            if not _relation_is_materializable(self.instance, source_id.relation):
+                continue
+            req = spec.require(source_id.relation)
+            req.min_rows = max(req.min_rows, 2)
+            req.ordered_columns = self._merge_column_ids(
+                req.ordered_columns,
+                [source_id],
+            )
+            comparison = (
+                exp.GT
+                if self._order_descending(ordered)
+                else exp.LT
+            )
+            req.constraints.append(
+                comparison(
+                    this=self._solver_col(source_id, row_scope="r0"),
+                    expression=self._solver_col(source_id, row_scope="r1"),
+                )
+            )
 
     def _derive_limit(self, step: Limit, spec: BranchSpec) -> None:
         """Set min_rows on driving table."""
@@ -756,6 +801,26 @@ class Propagator:
         if metadata is None:
             raise ValueError("SubPlan lacks planner subquery metadata")
 
+        if (
+            metadata["kind"] == "scalar"
+            and self._selected_scalar_subplan is not None
+            and sub is not self._selected_scalar_subplan
+        ):
+            return
+
+        is_anti = (
+            metadata["polarity"] == "negative"
+            or self._is_count_zero_subplan(sub, parent_condition)
+        )
+        if is_anti:
+            predicate_id = metadata.get("predicate_column")
+            if metadata["kind"] == "in" and predicate_id is not None:
+                outer_id = _physical_source_id(predicate_id)
+                if outer_id.relation is not None:
+                    req = spec.require(outer_id.relation)
+                    req.constraints.append(_make_is_not_null(self._solver_col(outer_id)))
+            return
+
         if metadata["cardinality"] != "zero" and sub.inner is not None:
             self._walk_step(sub.inner, spec)
 
@@ -785,6 +850,54 @@ class Propagator:
             outer_id = _physical_source_id(correlation["outer"])
             self._add_join_equality(outer_id, inner_id, spec)
 
+    @staticmethod
+    def _is_count_zero_subquery(
+        condition: Optional[exp.Expression],
+    ) -> bool:
+        if condition is None:
+            return False
+        for eq_node in condition.find_all(exp.EQ):
+            left, right = eq_node.this, eq_node.expression
+            if _is_zero_literal(left) and _contains_count_subquery(right):
+                return True
+            if _is_zero_literal(right) and _contains_count_subquery(left):
+                return True
+        return False
+
+    def _is_count_zero_subplan(
+        self,
+        sub: SubPlan,
+        condition: Optional[exp.Expression],
+    ) -> bool:
+        if condition is None:
+            return False
+        for eq_node in condition.find_all(exp.EQ):
+            left, right = eq_node.this, eq_node.expression
+            if _is_zero_literal(left) and self._expression_contains_anchor_subquery(
+                right,
+                sub.anchor,
+            ):
+                return True
+            if _is_zero_literal(right) and self._expression_contains_anchor_subquery(
+                left,
+                sub.anchor,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _expression_contains_anchor_subquery(
+        expression: exp.Expression,
+        anchor: exp.Expression,
+    ) -> bool:
+        if expression is anchor:
+            return True
+        anchor_sql = anchor.sql()
+        for subquery in expression.find_all(exp.Subquery):
+            if subquery is anchor or subquery.sql() == anchor_sql:
+                return True
+        return False
+
     # -----------------------------------------------------------------
     # Top-level propagation
     # -----------------------------------------------------------------
@@ -794,8 +907,9 @@ class Propagator:
         if self.config.positive <= 0:
             return None
         try:
-            pos = BranchSpec(branch="positive")
+            pos = BranchSpec(branch="positive", goals={"value"})
             self._walk_plan(pos)
+            self._name_deferred_positive_spec(pos)
             if self.config.boundary > 0:
                 self._collect_boundary_values(pos)
             return pos
@@ -812,7 +926,10 @@ class Propagator:
                     if isinstance(step, Filter) and step.condition:
                         conjuncts = self._split_conjuncts(step.condition)
                         for idx in range(len(conjuncts)):
-                            neg = BranchSpec(branch=f"negative_c{idx}")
+                            neg = BranchSpec(
+                                branch=f"negative_c{idx}",
+                                goals={"negative"},
+                            )
                             self._negate_step = step
                             self._negate_conjunct = idx
                             self._walk_plan(neg)
@@ -836,14 +953,18 @@ class Propagator:
             try:
                 if isinstance(step, Join):
                     if self.config.left_unmatched > 0:
-                        left_un = BranchSpec(branch="left_unmatched")
+                        left_un = BranchSpec(
+                            branch="left_unmatched",
+                            goals={"join_unmatched"},
+                        )
                         self._propagate_unmatched_left(step, left_un)
                         specs.append(left_un)
                     if self.config.right_unmatched > 0:
                         for join_rel in step.joins or {}:
                             join_display = join_rel.alias.normalized if join_rel.alias else (join_rel.name.normalized if join_rel.name else "?")
                             right_un = BranchSpec(
-                                branch=f"right_unmatched_{join_display}"
+                                branch=f"right_unmatched_{join_display}",
+                                goals={"join_unmatched"},
                             )
                             self._propagate_unmatched_right(
                                 step, join_rel, right_un
@@ -862,7 +983,10 @@ class Propagator:
             for step in self.plan.ordered_steps:
                 try:
                     if isinstance(step, Having) and step.condition:
-                        fail = BranchSpec(branch="having_fail")
+                        fail = BranchSpec(
+                            branch="having_fail",
+                            goals={"having_fail"},
+                        )
                         self._negate_step = step
                         self._walk_plan(fail)
                         specs.append(fail)
@@ -877,13 +1001,14 @@ class Propagator:
         if self.config.null <= 0:
             return specs
         try:
-            pos = pos or BranchSpec(branch="positive")
+            pos = pos or BranchSpec(branch="positive", goals={"value"})
             null_targets = self._collect_null_target_columns(pos)
             if null_targets:
                 for table, cols in null_targets.items():
                     for col_name in cols:
                         null_spec = BranchSpec(
-                            branch=f"null_{table}.{col_name}"
+                            branch=f"null_{table}.{col_name}",
+                            goals={"null"},
                         )
                         self._walk_plan(null_spec)
                         self._apply_single_null_override(
@@ -891,7 +1016,10 @@ class Propagator:
                         )
                         specs.append(null_spec)
             else:
-                null_spec = BranchSpec(branch="null_branch")
+                null_spec = BranchSpec(
+                    branch="null_branch",
+                    goals={"null"},
+                )
                 self._walk_plan(null_spec)
                 self._apply_null_overrides(null_spec)
                 specs.append(null_spec)
@@ -906,9 +1034,12 @@ class Propagator:
             return specs
         try:
             for case_idx, when_conditions in enumerate(
-                self._collect_case_when_conditions()
+                self._collect_case_when_condition_groups()
             ):
-                case_spec = BranchSpec(branch=f"case_else_{case_idx}")
+                case_spec = BranchSpec(
+                    branch=f"case_else_{case_idx}",
+                    goals={"case_else"},
+                )
                 self._walk_plan(case_spec)
                 for cond in when_conditions:
                     negated = negate_predicate(cond.copy())
@@ -918,12 +1049,290 @@ class Propagator:
             logger.debug("CASE WHEN propagation failed: %s", exc)
         return specs
 
+    def _semantic_case_contrast_specs(self) -> List[BranchSpec]:
+        """Build non-neutral CASE witness specs from expression internals."""
+        specs: List[BranchSpec] = []
+        if self.config.positive <= 0:
+            return specs
+        try:
+            for case_idx, when_conditions in enumerate(
+                self._collect_case_when_condition_groups()
+            ):
+                if not when_conditions:
+                    continue
+                spec = BranchSpec(
+                    branch=f"semantic_case_contrast_{case_idx}",
+                    goals={"value", "case"},
+                )
+                self._walk_plan(spec)
+                self._store_expression(when_conditions[0], spec)
+                for cond in when_conditions[1:]:
+                    self._store_expression(negate_predicate(cond.copy()), spec)
+                specs.append(spec)
+        except Exception as exc:
+            logger.debug("semantic CASE contrast propagation failed: %s", exc)
+        return specs
+
+    def _semantic_project_duplicate_specs(self) -> List[BranchSpec]:
+        """Build bag duplicate witnesses for non-DISTINCT projections."""
+        specs: List[BranchSpec] = []
+        if self.config.positive <= 0 or self.config.project_duplicate <= 0:
+            return specs
+        spec_index = 0
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Project) or step.distinct:
+                continue
+            duplicate_sources = self._project_source_columns_by_relation(
+                step, include_referenced=False,
+            )
+            if not duplicate_sources:
+                continue
+            duplicate_columns = [
+                column
+                for columns in duplicate_sources.values()
+                for column in columns
+            ]
+            if any(
+                self._project_source_column_is_unique(column)
+                for column in duplicate_columns
+            ):
+                continue
+            try:
+                spec = BranchSpec(
+                    branch=f"semantic_project_duplicate_{spec_index}",
+                    goals={"value", "duplicate"},
+                )
+                self._walk_plan(spec)
+                for req in spec.requirements.values():
+                    req.min_rows = max(req.min_rows, 2)
+                for relation, columns in duplicate_sources.items():
+                    if relation not in spec.requirements:
+                        continue
+                    req = spec.requirements[relation]
+                    req.duplicate_columns = self._merge_column_ids(
+                        req.duplicate_columns,
+                        columns,
+                    )
+                    req.min_rows = max(req.min_rows, 2)
+                self._bind_duplicate_scalar_avg_filters(spec)
+                specs.append(spec)
+                spec_index += 1
+            except Exception as exc:
+                logger.debug(
+                    "semantic project duplicate propagation failed: %s", exc
+                )
+        return specs
+
+    def _semantic_join_antimatch_specs(self) -> List[BranchSpec]:
+        """Build semantic join specs with non-null unequal join keys."""
+        specs: List[BranchSpec] = []
+        if self.config.join_antimatch <= 0:
+            return specs
+        spec_index = 0
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Join):
+                continue
+            for _join_rel, join_data in (step.joins or {}).items():
+                for left_col, right_col in self._simple_join_key_pairs(join_data):
+                    try:
+                        spec = BranchSpec(
+                            branch=f"semantic_join_antimatch_{spec_index}",
+                            goals={"value", "join_antimatch", "rank"},
+                        )
+                        self._walk_plan(spec)
+                        if not self._add_ranked_join_antimatch_intent(
+                            spec, left_col, right_col,
+                        ):
+                            self._remove_join_equality_constraints(
+                                spec, left_col, right_col,
+                            )
+                            self._add_join_antimatch_constraints(
+                                spec, left_col, right_col,
+                            )
+                        specs.append(spec)
+                        spec_index += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "semantic join antimatch propagation failed: %s",
+                            exc,
+                        )
+        return specs
+
+    def _semantic_join_fanout_specs(self) -> List[BranchSpec]:
+        """Build semantic join specs with two many-side rows per match."""
+        specs: List[BranchSpec] = []
+        if self.config.join_fanout <= 0:
+            return specs
+        spec_index = 0
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Join):
+                continue
+            for _join_rel, join_data in (step.joins or {}).items():
+                for left_col, right_col in self._simple_join_key_pairs(join_data):
+                    try:
+                        many_col, one_col = self._fanout_columns(left_col, right_col)
+                        if many_col is None or one_col is None:
+                            continue
+                        spec = BranchSpec(
+                            branch=f"semantic_join_fanout_{spec_index}",
+                            goals={"value", "join_fanout"},
+                        )
+                        self._walk_plan(spec)
+                        many_req = spec.require(many_col.relation)
+                        one_req = spec.require(one_col.relation)
+                        many_req.min_rows = max(many_req.min_rows, 2)
+                        one_req.min_rows = max(one_req.min_rows, 1)
+                        many_req.duplicate_columns = self._merge_column_ids(
+                            many_req.duplicate_columns,
+                            [many_col],
+                        )
+                        specs.append(spec)
+                        spec_index += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "semantic join fanout propagation failed: %s",
+                            exc,
+                        )
+        return specs
+
+    def _semantic_rank_contrast_specs(self) -> List[BranchSpec]:
+        """Build semantic ORDER BY/LIMIT challenger specs."""
+        specs: List[BranchSpec] = []
+        if self.config.rank_contrast <= 0:
+            return specs
+        spec_index = 0
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Sort):
+                continue
+            if not self._sort_feeds_limit(step):
+                continue
+            try:
+                spec = BranchSpec(
+                    branch=f"semantic_rank_contrast_{spec_index}",
+                    goals={"value", "rank"},
+                )
+                self._walk_plan(spec)
+                self._expand_ordered_join_requirements(spec)
+                for req in spec.requirements.values():
+                    if req.ordered_columns:
+                        req.min_rows = max(req.min_rows, 2)
+                if spec.requirements:
+                    specs.append(spec)
+                    spec_index += 1
+            except Exception as exc:
+                logger.debug("semantic rank contrast propagation failed: %s", exc)
+        return specs
+
+    def _semantic_aggregate_contrast_specs(self) -> List[BranchSpec]:
+        """Build semantic grouped aggregate contrast specs."""
+        specs: List[BranchSpec] = []
+        if self.config.aggregate_contrast <= 0:
+            return specs
+        spec_index = 0
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Aggregate):
+                continue
+            if not self._aggregate_feeds_rank_limit(step):
+                continue
+            metadata = self.plan.annotation_for(step).metadata.get("aggregation", {})
+            group_sources = metadata.get("group_sources", {})
+            if not group_sources:
+                continue
+            aggregate_outputs = metadata.get("aggregate_outputs", {})
+            aggregate_argument_relations = {
+                output.get("argument").relation
+                for output in aggregate_outputs.values()
+                if isinstance(output.get("argument"), ColumnId)
+                and output.get("argument").relation is not None
+            }
+            try:
+                spec = BranchSpec(
+                    branch=f"semantic_aggregate_contrast_{spec_index}",
+                    goals={"value", "aggregate"},
+                )
+                self._walk_plan(spec)
+                materialized = False
+                for sources in group_sources.values():
+                    for source_id in sources:
+                        source_id = self._spec_requirement_column(source_id, spec)
+                        if source_id.relation is None:
+                            continue
+                        if not _relation_is_materializable(
+                            self.instance, source_id.relation,
+                        ):
+                            continue
+                        req = spec.require(source_id.relation)
+                        min_rows = (
+                            3
+                            if not aggregate_argument_relations
+                            or source_id.relation in aggregate_argument_relations
+                            else 2
+                        )
+                        req.min_rows = max(req.min_rows, min_rows)
+                        req.group_key_columns = self._merge_column_ids(
+                            req.group_key_columns,
+                            [source_id],
+                        )
+                        req.contrast_columns = self._merge_column_ids(
+                            req.contrast_columns,
+                            [source_id],
+                        )
+                        self._mark_aggregate_group_rows(req, min_rows)
+                        materialized = True
+                for output in aggregate_outputs.values():
+                    argument = output.get("argument")
+                    if not isinstance(argument, ColumnId) or argument.relation is None:
+                        continue
+                    argument = self._spec_requirement_column(argument, spec)
+                    if output.get("function") != "sum":
+                        continue
+                    if not _relation_is_materializable(
+                        self.instance, argument.relation,
+                    ):
+                        continue
+                    req = spec.require(argument.relation)
+                    req.min_rows = max(req.min_rows, 3)
+                    req.contrast_columns = self._merge_column_ids(
+                        req.contrast_columns,
+                        [argument],
+                    )
+                    self._mark_sum_contrast_rows(req)
+                if materialized:
+                    specs.append(spec)
+                    spec_index += 1
+            except Exception as exc:
+                logger.debug(
+                    "semantic aggregate contrast propagation failed: %s",
+                    exc,
+                )
+        return specs
+
+    @staticmethod
+    def _mark_aggregate_group_rows(req: TableConstraint, min_rows: int) -> None:
+        req.mark_row(0, _ROW_INTENT_GROUP_A)
+        req.mark_row(1, _ROW_INTENT_GROUP_B if min_rows == 2 else _ROW_INTENT_GROUP_A)
+        if min_rows >= 3:
+            req.mark_row(2, _ROW_INTENT_GROUP_B)
+
+    @staticmethod
+    def _mark_sum_contrast_rows(req: TableConstraint) -> None:
+        req.mark_row(0, _ROW_INTENT_GROUP_A)
+        req.mark_row(1, _ROW_INTENT_GROUP_A)
+        req.mark_row(2, _ROW_INTENT_GROUP_B)
+
     def propagate(self) -> List[BranchSpec]:
         """Produce specs for branches based on config thresholds."""
         specs: List[BranchSpec] = []
         pos = self._positive_spec()
         if pos:
             specs.append(pos)
+        specs.extend(self._semantic_case_contrast_specs())
+        specs.extend(self._semantic_scalar_subquery_specs())
+        specs.extend(self._semantic_project_duplicate_specs())
+        specs.extend(self._semantic_join_antimatch_specs())
+        specs.extend(self._semantic_join_fanout_specs())
+        specs.extend(self._semantic_rank_contrast_specs())
+        specs.extend(self._semantic_aggregate_contrast_specs())
         specs.extend(self._negative_specs())
         specs.extend(self._unmatched_join_specs())
         specs.extend(self._having_fail_specs())
@@ -942,6 +1351,128 @@ class Propagator:
                 del spec.requirements[key]
         return specs
 
+    def _name_deferred_positive_spec(self, spec: BranchSpec) -> None:
+        if not spec.deferred:
+            return
+        if self._has_negative_subquery(kind="in"):
+            spec.branch = "positive_semantic_not_in"
+        elif self._has_negative_subquery(kind="exists"):
+            spec.branch = "positive_semantic_not_exists"
+        elif any(
+            self._is_count_zero_subquery(getattr(step, "condition", None))
+            for step in self.plan.ordered_steps
+            if isinstance(step, Filter)
+        ):
+            spec.branch = "positive_semantic_count_zero"
+        else:
+            spec.branch = "positive_seed_deferred"
+
+    def _has_negative_subquery(self, *, kind: str) -> bool:
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, SubPlan):
+                continue
+            metadata = self.plan.annotation_for(step).metadata.get("subquery", {})
+            if metadata.get("kind") == kind and metadata.get("polarity") == "negative":
+                return True
+        return False
+
+    def _semantic_scalar_subquery_specs(self) -> List[BranchSpec]:
+        specs: List[BranchSpec] = []
+        if self.config.positive <= 0:
+            return specs
+        spec_index = 0
+        for step in self.plan.ordered_steps:
+            if not isinstance(step, Filter) or step.condition is None:
+                continue
+            atoms = list(self._iter_scalar_subquery_atoms(step.condition))
+            if not atoms:
+                continue
+            subplans = [
+                sub for sub in step.subplan_dependencies
+                if self._is_simple_scalar_row_lookup(sub)
+            ]
+            for atom in atoms:
+                subplan = self._scalar_subplan_for_atom(atom, subplans)
+                if subplan is None:
+                    continue
+                try:
+                    spec = BranchSpec(
+                        branch=f"positive_semantic_scalar_subquery_{spec_index}",
+                        goals={"value"},
+                    )
+                    self._selected_scalar_subplan = subplan
+                    self._walk_plan(spec)
+                    self._add_scalar_subquery_atom_constraint(spec, atom, subplan)
+                    if spec.requirements:
+                        specs.append(spec)
+                        spec_index += 1
+                except Exception as exc:
+                    logger.debug(
+                        "semantic scalar subquery propagation failed: %s", exc
+                    )
+                finally:
+                    self._selected_scalar_subplan = None
+        return specs
+
+    def _is_simple_scalar_row_lookup(self, subplan: SubPlan) -> bool:
+        metadata = self.plan.annotation_for(subplan).metadata.get("subquery", {})
+        if metadata.get("kind") != "scalar" or subplan.inner is None:
+            return False
+        output_columns = metadata.get("output_columns", ())
+        if not output_columns:
+            return False
+        output_id = _physical_source_id(output_columns[0])
+        if output_id.relation is None:
+            return False
+        if not _relation_is_materializable(self.instance, output_id.relation):
+            return False
+        return not any(isinstance(step, Aggregate) for step in _iter_steps_with_subplans(subplan))
+
+    def _scalar_subplan_for_atom(
+        self,
+        atom: exp.Expression,
+        subplans: List[SubPlan],
+    ) -> Optional[SubPlan]:
+        for subplan in subplans:
+            if self._expression_contains_anchor_subquery(atom, subplan.anchor):
+                return subplan
+        return None
+
+    def _add_scalar_subquery_atom_constraint(
+        self,
+        spec: BranchSpec,
+        atom: exp.Expression,
+        subplan: SubPlan,
+    ) -> None:
+        metadata = self.plan.annotation_for(subplan).metadata.get("subquery", {})
+        output_columns = metadata.get("output_columns", ())
+        if not output_columns:
+            return
+        output_id = _physical_source_id(output_columns[0])
+        if output_id.relation is None:
+            return
+        literal = self._scalar_atom_literal(atom)
+        if literal is None:
+            return
+        req = spec.require(output_id.relation)
+        req.constraints.append(
+            exp.EQ(
+                this=self._solver_col(output_id),
+                expression=literal.copy(),
+            )
+        )
+
+    @staticmethod
+    def _scalar_atom_literal(atom: exp.Expression) -> Optional[exp.Expression]:
+        if not isinstance(atom, exp.EQ):
+            return None
+        left, right = atom.this, atom.expression
+        if left.find(exp.Subquery) and not right.find(exp.Subquery):
+            return right
+        if right.find(exp.Subquery) and not left.find(exp.Subquery):
+            return left
+        return None
+
     # -----------------------------------------------------------------
     # Expression storage
     # -----------------------------------------------------------------
@@ -956,12 +1487,12 @@ class Propagator:
             # Ensure SolverVar on all columns.
             for col in conjunct.find_all(exp.Column):
                 if solver_var(col) is None:
-                    col_id = _required_column_identity(col, "Stored expression")
+                    col_id = column_identity(col) # _required_column_identity(col, "Stored expression")
                     set_solver_var(col, SolverVar(column_id=col_id, relation_id=col_id.relation))
             # Find the primary relation from the first column with identity.
             relation = None
             for col in conjunct.find_all(exp.Column):
-                col_id = _required_column_identity(col, "Stored expression")
+                col_id = column_identity(col) # _required_column_identity(col, "Stored expression")
                 if self._is_materializable_relation(col_id.relation):
                     relation = col_id.relation
                     break
@@ -1918,8 +2449,21 @@ class Propagator:
 
             if not isinstance(argument, ColumnId) or argument.relation is None:
                 continue
+            argument = self._spec_requirement_column(argument, spec)
             relation = argument.relation
             if relation not in spec.requirements:
+                continue
+            if (
+                constraint.get("function") == "count"
+                and constraint.get("distinct")
+            ):
+                req = spec.requirements[relation]
+                req.distinct_columns = self._merge_column_ids(
+                    req.distinct_columns,
+                    [argument],
+                )
+                if not _has_is_not_null(req.constraints, argument.name.normalized):
+                    req.constraints.append(_make_is_not_null(self._solver_col(argument)))
                 continue
             if constraint.get("function") not in {"sum", "avg", "min", "max"}:
                 continue
@@ -2012,38 +2556,370 @@ class Propagator:
     # CASE WHEN arm coverage
     # -----------------------------------------------------------------
 
-    def _collect_case_when_conditions(
-        self,
-    ) -> List[List[exp.Expression]]:
-        """Collect WHEN conditions from all CASE expressions."""
-        result: List[List[exp.Expression]] = []
+    def _collect_case_when_condition_groups(self) -> List[List[exp.Expression]]:
+        """Collect CASE WHEN predicates grouped by output expression."""
+        groups: List[List[exp.Expression]] = []
+        seen: Set[Tuple[str, ...]] = set()
+        for expr in self._semantic_expression_sources():
+            conditions = self._case_conditions_for_expression(expr)
+            if not conditions:
+                continue
+            key = tuple(cond.sql(dialect=self.dialect) for cond in conditions)
+            if key in seen:
+                continue
+            seen.add(key)
+            groups.append(conditions)
+        return groups
+
+    def _semantic_expression_sources(self) -> List[exp.Expression]:
+        """Return plan expressions whose internals affect generated values."""
+        expressions: List[exp.Expression] = []
         for step in self.plan.ordered_steps:
-            expressions: List[exp.Expression] = []
             condition = getattr(step, "condition", None)
-            if condition is not None:
+            if isinstance(condition, exp.Expression):
                 expressions.append(condition)
-            for proj in getattr(step, "projections", None) or []:
-                if isinstance(proj, exp.Expression):
-                    expressions.append(proj)
-            for agg in getattr(step, "aggregations", None) or []:
-                if isinstance(agg, exp.Expression):
-                    expressions.append(agg)
-            for expr in expressions:
-                for case_expr in expr.find_all(exp.Case):
-                    conditions = []
-                    case_operand = case_expr.this
-                    for if_node in case_expr.args.get("ifs") or []:
-                        cond = if_node.this
-                        if cond is not None:
-                            if case_operand is not None:
-                                cond = exp.EQ(
-                                    this=case_operand.copy(),
-                                    expression=cond.copy(),
-                                )
-                            conditions.append(cond)
-                    if conditions:
-                        result.append(conditions)
-        return result
+            for projection in getattr(step, "projections", None) or ():
+                if isinstance(projection, exp.Expression):
+                    expressions.append(projection)
+            if isinstance(step, Aggregate):
+                for aggregation in getattr(step, "aggregations", None) or ():
+                    if isinstance(aggregation, exp.Expression):
+                        expressions.append(
+                            self._expand_aggregate_operands(step, aggregation)
+                        )
+                for operand in getattr(step, "operands", None) or ():
+                    if isinstance(operand, exp.Expression):
+                        expressions.append(
+                            operand.this if isinstance(operand, exp.Alias) else operand
+                        )
+        return expressions
+
+    def _expand_aggregate_operands(
+        self,
+        step: Aggregate,
+        expression: exp.Expression,
+    ) -> exp.Expression:
+        operands = {
+            operand.alias_or_name: (
+                operand.this if isinstance(operand, exp.Alias) else operand
+            )
+            for operand in (getattr(step, "operands", None) or ())
+            if isinstance(operand, exp.Expression) and operand.alias_or_name
+        }
+
+        def expand(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column) and not node.table:
+                operand = operands.get(node.name)
+                if operand is not None:
+                    return operand.copy()
+            return node
+
+        return expression.copy().transform(expand)
+
+    def _case_conditions_for_expression(
+        self,
+        expression: exp.Expression,
+    ) -> List[exp.Expression]:
+        conditions: List[exp.Expression] = []
+        for case_expr in expression.find_all(exp.Case):
+            case_operand = case_expr.this
+            for if_node in case_expr.args.get("ifs") or ():
+                cond = if_node.this
+                if cond is None:
+                    continue
+                if case_operand is not None:
+                    cond = exp.EQ(
+                        this=case_operand.copy(),
+                        expression=cond.copy(),
+                    )
+                conditions.append(cond)
+        return conditions
+
+    def _is_positive_value_witness(self, spec: BranchSpec) -> bool:
+        return spec.has_goal("value")
+
+    def _bind_duplicate_scalar_avg_filters(self, spec: BranchSpec) -> None:
+        if not spec.has_goal("duplicate"):
+            return
+        for atom in spec.deferred:
+            binding = self._duplicate_avg_filter_binding(atom)
+            if binding is None:
+                continue
+            outer_col, avg_col, positive = binding
+            outer_relation = outer_col.relation
+            avg_relation = avg_col.relation
+            if outer_relation is None or outer_relation not in spec.requirements:
+                continue
+            self._bind_duplicate_avg_column(spec, outer_col, positive)
+            if avg_relation is not None and avg_relation in spec.requirements:
+                self._bind_duplicate_avg_column(spec, avg_col, positive)
+                eq_expr = exp.EQ(
+                    this=self._solver_col(outer_col),
+                    expression=self._solver_col(avg_col),
+                )
+                spec.requirements[outer_relation].constraints.append(eq_expr)
+                spec.requirements[avg_relation].constraints.append(eq_expr.copy())
+
+    def _bind_duplicate_avg_column(
+        self,
+        spec: BranchSpec,
+        col_id: ColumnId,
+        positive: bool,
+    ) -> None:
+        relation = col_id.relation
+        if relation is None or relation not in spec.requirements:
+            return
+        req = spec.requirements[relation]
+        req.duplicate_columns = self._merge_column_ids(
+            req.duplicate_columns,
+            [col_id],
+        )
+        req.min_rows = max(req.min_rows, 2)
+        col_node = self._solver_col(col_id)
+        zero = exp.Literal.number(0)
+        constraint = (
+            exp.GT(this=col_node, expression=zero)
+            if positive
+            else exp.LT(this=col_node, expression=zero)
+        )
+        req.constraints.append(constraint)
+
+    def _duplicate_avg_filter_binding(
+        self,
+        atom: exp.Expression,
+    ) -> Optional[Tuple[ColumnId, ColumnId, bool]]:
+        if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            return None
+        left_outer = self._scaled_outer_column(atom.this)
+        right_avg = self._scaled_avg_subquery_column(atom.expression)
+        if left_outer is not None and right_avg is not None:
+            return self._avg_filter_sign(atom, left_outer, right_avg)
+
+        right_outer = self._scaled_outer_column(atom.expression)
+        left_avg = self._scaled_avg_subquery_column(atom.this)
+        if right_outer is not None and left_avg is not None:
+            flipped = atom.copy()
+            flipped.set("this", atom.expression.copy())
+            flipped.set("expression", atom.this.copy())
+            flipped = self._flip_comparison(flipped)
+            return self._avg_filter_sign(flipped, right_outer, left_avg)
+        return None
+
+    def _avg_filter_sign(
+        self,
+        atom: exp.Expression,
+        outer: Tuple[ColumnId, float],
+        avg: Tuple[ColumnId, float],
+    ) -> Optional[Tuple[ColumnId, ColumnId, bool]]:
+        outer_col, outer_scale = outer
+        avg_col, avg_scale = avg
+        if not self._same_physical_column(outer_col, avg_col):
+            return None
+        if outer_scale == avg_scale:
+            return None
+        if isinstance(atom, (exp.GT, exp.GTE)):
+            return outer_col, avg_col, outer_scale > avg_scale
+        if isinstance(atom, (exp.LT, exp.LTE)):
+            return outer_col, avg_col, outer_scale < avg_scale
+        return None
+
+    def _scaled_outer_column(
+        self,
+        expression: exp.Expression,
+    ) -> Optional[Tuple[ColumnId, float]]:
+        if expression.find(exp.Subquery):
+            return None
+        return self._scaled_column(expression)
+
+    def _scaled_avg_subquery_column(
+        self,
+        expression: exp.Expression,
+    ) -> Optional[Tuple[ColumnId, float]]:
+        if not expression.find(exp.Subquery):
+            return None
+        if isinstance(expression, exp.Mul):
+            left = self._scaled_avg_subquery_column(expression.this)
+            right_literal = self._numeric_literal(expression.expression)
+            if left is not None and right_literal is not None:
+                col_id, scale = left
+                return col_id, scale * right_literal
+            right = self._scaled_avg_subquery_column(expression.expression)
+            left_literal = self._numeric_literal(expression.this)
+            if right is not None and left_literal is not None:
+                col_id, scale = right
+                return col_id, scale * left_literal
+            return None
+        subquery = (
+            expression
+            if isinstance(expression, exp.Subquery)
+            else expression.find(exp.Subquery)
+        )
+        if subquery is None:
+            return None
+        avg_node = next(subquery.find_all(exp.Avg), None)
+        if avg_node is None:
+            return None
+        avg_col = next(avg_node.find_all(exp.Column), None)
+        if avg_col is None:
+            return None
+        col_id = column_identity(avg_col)
+        if col_id is None:
+            return None
+        source_id = _physical_source_id(col_id)
+        if source_id.relation is None:
+            return None
+        return source_id, 1.0
+
+    def _scaled_column(
+        self,
+        expression: exp.Expression,
+    ) -> Optional[Tuple[ColumnId, float]]:
+        if isinstance(expression, exp.Column):
+            col_id = column_identity(expression)
+            if col_id is None:
+                return None
+            source_id = _physical_source_id(col_id)
+            if source_id.relation is None:
+                return None
+            return source_id, 1.0
+        if not isinstance(expression, exp.Mul):
+            return None
+        left = self._scaled_column(expression.this)
+        right_literal = self._numeric_literal(expression.expression)
+        if left is not None and right_literal is not None:
+            col_id, scale = left
+            return col_id, scale * right_literal
+        right = self._scaled_column(expression.expression)
+        left_literal = self._numeric_literal(expression.this)
+        if right is not None and left_literal is not None:
+            col_id, scale = right
+            return col_id, scale * left_literal
+        return None
+
+    @staticmethod
+    def _numeric_literal(expression: exp.Expression) -> Optional[float]:
+        if not isinstance(expression, exp.Literal) or expression.is_string:
+            return None
+        try:
+            return float(expression.this)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _same_physical_column(left: ColumnId, right: ColumnId) -> bool:
+        if left.relation is None or right.relation is None:
+            return False
+        if left.name.normalized != right.name.normalized:
+            return False
+        if left.relation.name is None or right.relation.name is None:
+            return False
+        return left.relation.name.normalized == right.relation.name.normalized
+
+    @staticmethod
+    def _flip_comparison(atom: exp.Expression) -> exp.Expression:
+        if isinstance(atom, exp.GT):
+            return exp.LT(this=atom.this, expression=atom.expression)
+        if isinstance(atom, exp.GTE):
+            return exp.LTE(this=atom.this, expression=atom.expression)
+        if isinstance(atom, exp.LT):
+            return exp.GT(this=atom.this, expression=atom.expression)
+        if isinstance(atom, exp.LTE):
+            return exp.GTE(this=atom.this, expression=atom.expression)
+        return atom
+
+    def _project_source_columns(
+        self,
+        step: Project,
+        *,
+        include_referenced: bool,
+    ) -> List[ColumnId]:
+        ann = self.plan.annotation_for(step)
+        candidates = list(ann.projected_columns)
+        if include_referenced:
+            candidates.extend(ann.referenced_columns)
+        sources: List[ColumnId] = []
+        for col_id in candidates:
+            source_id = self._project_source_column(col_id)
+            if source_id is None:
+                continue
+            sources = self._merge_column_ids(sources, [source_id])
+        return sources
+
+    def _project_source_columns_by_relation(
+        self,
+        step: Project,
+        *,
+        include_referenced: bool,
+    ) -> Dict[RelationId, List[ColumnId]]:
+        columns_by_relation: Dict[RelationId, List[ColumnId]] = {}
+        for source_id in self._project_source_columns(
+            step, include_referenced=include_referenced,
+        ):
+            relation = source_id.relation
+            if relation is None:
+                continue
+            columns_by_relation[relation] = self._merge_column_ids(
+                columns_by_relation.get(relation, []),
+                [source_id],
+            )
+        return columns_by_relation
+
+    def _project_source_column(self, col_id: ColumnId) -> Optional[ColumnId]:
+        if col_id.kind is ColumnKind.AGGREGATE:
+            return None
+        if (
+            col_id.relation is not None
+            and not _relation_is_materializable(self.instance, col_id.relation)
+            and self._virtual_projection_for_relation(col_id.relation) is not None
+        ):
+            source_id = col_id
+        else:
+            source_id = _physical_source_id(col_id)
+        if source_id.kind is ColumnKind.AGGREGATE:
+            return None
+        relation = source_id.relation
+        if relation is None or not self._is_materializable_relation(relation):
+            return None
+        if source_id.name.normalized.startswith("_"):
+            return None
+        return source_id
+
+    def _project_source_column_is_unique(self, col_id: ColumnId) -> bool:
+        relation = col_id.relation
+        if relation is None or relation.name is None:
+            return False
+        if relation.name.normalized not in self.instance.tables:
+            return False
+        return self.instance.is_unique(
+            relation.name.normalized,
+            col_id.name.normalized,
+        )
+
+    @staticmethod
+    def _merge_column_ids(
+        existing: List[ColumnId],
+        additions: List[ColumnId],
+    ) -> List[ColumnId]:
+        merged = list(existing)
+        seen = {
+            (
+                col.relation,
+                col.name.normalized if col.name else "",
+                col.scope_id,
+            )
+            for col in merged
+        }
+        for col in additions:
+            key = (
+                col.relation,
+                col.name.normalized if col.name else "",
+                col.scope_id,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(col)
+        return merged
 
     # -----------------------------------------------------------------
     # Scalar subquery detection
@@ -2080,6 +2956,261 @@ class Propagator:
                     cols.append((col.name, col.table or ""))
         return cols
 
+    def _simple_join_key_pairs(
+        self,
+        join_data: dict,
+    ) -> List[Tuple[ColumnId, ColumnId]]:
+        pairs: List[Tuple[ColumnId, ColumnId]] = []
+        source_keys = join_data.get("source_key", [])
+        join_keys = join_data.get("join_key", [])
+        for source_key, join_key in zip(source_keys, join_keys):
+            if not isinstance(source_key, exp.Column):
+                continue
+            if not isinstance(join_key, exp.Column):
+                continue
+            source_id = column_identity(source_key)
+            join_id = column_identity(join_key)
+            if source_id is None or join_id is None:
+                continue
+            source_id = _physical_source_id(source_id)
+            join_id = _physical_source_id(join_id)
+            if source_id.relation is None or join_id.relation is None:
+                continue
+            if not _relation_is_materializable(self.instance, source_id.relation):
+                continue
+            if not _relation_is_materializable(self.instance, join_id.relation):
+                continue
+            pairs.append((source_id, join_id))
+        return pairs
+
+    def _remove_join_equality_constraints(
+        self,
+        spec: BranchSpec,
+        left_col: ColumnId,
+        right_col: ColumnId,
+    ) -> None:
+        pair = {
+            (left_col.relation, left_col.name.normalized),
+            (right_col.relation, right_col.name.normalized),
+        }
+        for req in spec.requirements.values():
+            retained: List[exp.Expression] = []
+            for constraint in req.constraints:
+                if not isinstance(constraint, exp.EQ):
+                    retained.append(constraint)
+                    continue
+                columns = list(constraint.find_all(exp.Column))
+                if len(columns) != 2:
+                    retained.append(constraint)
+                    continue
+                found = set()
+                for col in columns:
+                    col_id = column_identity(col)
+                    if col_id is None:
+                        retained.append(constraint)
+                        break
+                    source_id = _physical_source_id(col_id)
+                    found.add((source_id.relation, source_id.name.normalized))
+                else:
+                    if found == pair:
+                        continue
+                    retained.append(constraint)
+            req.constraints = retained
+
+    def _add_join_antimatch_constraints(
+        self,
+        spec: BranchSpec,
+        left_col: ColumnId,
+        right_col: ColumnId,
+    ) -> None:
+        left_req = spec.require(left_col.relation)
+        right_req = spec.require(right_col.relation)
+        left_node = self._solver_col(left_col)
+        right_node = self._solver_col(right_col)
+        neq = exp.NEQ(this=left_node, expression=right_node)
+        for req, node in ((left_req, left_node), (right_req, right_node)):
+            if not _has_is_not_null(req.constraints, node.name):
+                req.constraints.append(_make_is_not_null(node.copy()))
+            req.constraints.append(neq.copy())
+
+    def _add_ranked_join_antimatch_intent(
+        self,
+        spec: BranchSpec,
+        left_col: ColumnId,
+        right_col: ColumnId,
+    ) -> bool:
+        ordering_col = self._join_rank_order_column(left_col, right_col)
+        if ordering_col is None or ordering_col.relation is None:
+            return False
+        if self._same_relation(ordering_col.relation, left_col.relation):
+            ordering_join_col = left_col
+            joined_col = right_col
+        elif self._same_relation(ordering_col.relation, right_col.relation):
+            ordering_join_col = right_col
+            joined_col = left_col
+        else:
+            return False
+
+        ordering_req = spec.require(ordering_join_col.relation)
+        joined_req = spec.require(joined_col.relation)
+        ordering_req.min_rows = max(ordering_req.min_rows, 2)
+        joined_req.min_rows = max(joined_req.min_rows, 1)
+        ordering_req.mark_row(0, _ROW_INTENT_UNMATCHED_RANK_TOP)
+        ordering_req.mark_row(1, _ROW_INTENT_MATCHED_RANK_LOWER)
+        joined_req.mark_row(0, _ROW_INTENT_MATCHED_RANK_LOWER)
+
+        top_join_key = self._solver_col(ordering_join_col, row_scope="r0")
+        matched_join_key = self._solver_col(joined_col, row_scope="r0")
+        ordering_req.constraints.append(
+            exp.NEQ(this=top_join_key, expression=matched_join_key)
+        )
+        ordering_req.constraints.append(_make_is_not_null(top_join_key.copy()))
+        joined_req.constraints.append(_make_is_not_null(matched_join_key.copy()))
+        return True
+
+    def _fanout_columns(
+        self,
+        left_col: ColumnId,
+        right_col: ColumnId,
+    ) -> Tuple[Optional[ColumnId], Optional[ColumnId]]:
+        left_unique = self._column_is_unique(left_col)
+        right_unique = self._column_is_unique(right_col)
+        if right_unique and not left_unique:
+            return left_col, right_col
+        if left_unique and not right_unique:
+            return right_col, left_col
+        if not left_unique:
+            return left_col, right_col
+        if not right_unique:
+            return right_col, left_col
+        return None, None
+
+    def _column_is_unique(self, col_id: ColumnId) -> bool:
+        relation = col_id.relation
+        if relation is None or relation.name is None:
+            return False
+        table = relation.name.normalized
+        if table not in self.instance.tables:
+            return False
+        return self.instance.is_unique(table, col_id.name.normalized)
+
+    def _spec_requirement_column(
+        self,
+        col_id: ColumnId,
+        spec: BranchSpec,
+    ) -> ColumnId:
+        relation = col_id.relation
+        if relation in spec.requirements:
+            return col_id
+        table = relation.name.normalized if relation and relation.name else ""
+        if not table:
+            return col_id
+        for req_relation in spec.requirements:
+            req_table = (
+                req_relation.name.normalized
+                if req_relation.name
+                else ""
+            )
+            if req_table != table:
+                continue
+            return column_id(
+                ColumnKind.PHYSICAL,
+                col_id.name,
+                req_relation,
+                scope_id=req_relation.scope_id,
+                source_column_id=col_id.source_column_id or col_id,
+            )
+        return col_id
+
+    def _expand_ordered_join_requirements(self, spec: BranchSpec) -> None:
+        ordered_relations = {
+            relation
+            for relation, req in spec.requirements.items()
+            if req.ordered_columns and req.min_rows >= 2
+        }
+        if not ordered_relations:
+            return
+        for _rep, members in spec.equivalences.groups().items():
+            member_relations = {member.relation for member in members if member.relation}
+            if not (ordered_relations & member_relations):
+                continue
+            for relation in member_relations:
+                if relation in spec.requirements:
+                    spec.requirements[relation].min_rows = max(
+                        spec.requirements[relation].min_rows,
+                        2,
+                    )
+
+    def _sort_feeds_limit(self, sort_step: Sort) -> bool:
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Limit):
+                continue
+            if self._step_depends_on(step, sort_step):
+                return True
+        return False
+
+    def _aggregate_feeds_rank_limit(self, aggregate_step: Aggregate) -> bool:
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Sort):
+                continue
+            if not self._sort_feeds_limit(step):
+                continue
+            if self._step_depends_on(step, aggregate_step):
+                return True
+        return False
+
+    def _step_depends_on(self, step: Step, target: Step) -> bool:
+        if step is target:
+            return True
+        for dep in step.chain_dependencies:
+            if self._step_depends_on(dep, target):
+                return True
+        return False
+
+    def _order_column_id(self, ordered: exp.Expression) -> Optional[ColumnId]:
+        expression = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+        if not isinstance(expression, exp.Column):
+            return None
+        col_id = column_identity(expression)
+        if col_id is None:
+            return None
+        return _physical_source_id(col_id)
+
+    def _join_rank_order_column(
+        self,
+        left_col: ColumnId,
+        right_col: ColumnId,
+    ) -> Optional[ColumnId]:
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, Sort) or not self._sort_feeds_limit(step):
+                continue
+            for ordered in step.key or ():
+                ordered_col = self._order_column_id(ordered)
+                if ordered_col is None or ordered_col.relation is None:
+                    continue
+                if self._same_relation(ordered_col.relation, left_col.relation):
+                    return ordered_col
+                if self._same_relation(ordered_col.relation, right_col.relation):
+                    return ordered_col
+        return None
+
+    @staticmethod
+    def _same_relation(
+        left: Optional[RelationId],
+        right: Optional[RelationId],
+    ) -> bool:
+        if left is None or right is None:
+            return False
+        return (
+            left.name == right.name
+            and left.alias == right.alias
+            and left.scope_id == right.scope_id
+        )
+
+    @staticmethod
+    def _order_descending(ordered: exp.Expression) -> bool:
+        return isinstance(ordered, exp.Ordered) and bool(ordered.args.get("desc"))
+
 
 # =============================================================================
 # Resolver: solver integration and row materialization
@@ -2090,7 +3221,10 @@ def _row_value_dict(row) -> Dict[str, Any]:
     values: Dict[str, Any] = {}
     for column, value in row.items():
         key = column.name.normalized if isinstance(column, ColumnId) else str(column)
-        values[key] = value.concrete if hasattr(value, "concrete") else value
+        concrete_value = value.concrete if hasattr(value, "concrete") else value
+        if isinstance(concrete_value, Decimal):
+            concrete_value = float(concrete_value)
+        values[key] = concrete_value
     return values
 
 
@@ -2123,11 +3257,13 @@ def _bindings_for_requirement(
     """Find bindings matching a requirement."""
     target_table = req.table
     target_alias = req.alias
+    target_scope = req.relation.scope_id
     return [
         binding
         for binding in row_bindings.values()
         if binding.table == target_table
-        and (target_alias is None or binding.alias or "" == target_alias)
+        and binding.alias == target_alias
+        and binding.relation.scope_id == target_scope
     ]
 
 
@@ -2143,24 +3279,90 @@ def _find_binding_for_column(
     return None
 
 
+def _row_binding_sort_key(binding: RowBinding) -> Tuple[str, str, str, int]:
+    return (
+        binding.table,
+        binding.alias or "",
+        binding.relation.scope_id or "",
+        binding.row,
+    )
+
+
+def _scoped_var_key(binding: RowBinding, column_name: str) -> Tuple[str, str, str, int, str]:
+    table, alias, scope, row = _row_binding_sort_key(binding)
+    return (table, alias, scope, row, column_name)
+
+
+PathVariableIndex = Dict[Tuple[str, str, str, int, str], SolverVar]
+
+
 def _requirement_for_binding(
     spec: BranchSpec,
     binding: RowBinding,
 ) -> Optional[TableConstraint]:
     """Find the TableConstraint for a binding."""
     for _relation, req in spec.requirements.items():
-        if req.table != binding.table:
-            continue
-        if req.alias:
-            if req.alias == binding.alias or "":
-                return req
-        elif binding.alias == binding.table or binding.alias is None:
-            return req
-    # Fallback: match by table name only.
-    for _relation, req in spec.requirements.items():
-        if req.table == binding.table:
+        if (
+            req.table == binding.table
+            and req.alias == binding.alias
+            and req.relation.scope_id == binding.relation.scope_id
+        ):
             return req
     return None
+
+
+def _row_bound_column_id(column: ColumnId, binding: RowBinding) -> ColumnId:
+    if column.kind not in {ColumnKind.PHYSICAL, ColumnKind.PROJECTED}:
+        return column
+    source = column.source_column_id or column
+    if source.kind is not ColumnKind.PHYSICAL:
+        return column
+    base_source = source.source_column_id or source
+    return column_id(
+        ColumnKind.PHYSICAL,
+        source.name,
+        binding.relation,
+        scope_id=binding.relation.scope_id,
+        source_column_id=base_source,
+    )
+
+
+def _row_bound_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
+    column = _row_bound_column_id(var.column_id, binding)
+    relation = column.relation or binding.relation
+    return SolverVar(
+        column_id=column,
+        relation_id=relation,
+        row_scope=f"r{binding.row}",
+    )
+
+
+def _solver_var_matches_binding(var: SolverVar, binding: RowBinding) -> bool:
+    relation = var.relation_id
+    table = relation.name.normalized if relation.name else ""
+    alias = relation.alias.normalized if relation.alias else None
+    scope = relation.scope_id
+    return (
+        table == binding.table
+        and alias == binding.alias
+        and scope == binding.relation.scope_id
+    )
+
+
+def _binding_for_solver_var_row(
+    var: SolverVar,
+    preferred_row: int,
+    row_bindings: Optional[Dict[str, RowBinding]],
+) -> Optional[RowBinding]:
+    if row_bindings is None:
+        return None
+    matches = _bindings_for_solver_var(var, row_bindings)
+    if not matches:
+        return None
+    for candidate in matches:
+        if candidate.row == preferred_row:
+            return candidate
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -2172,7 +3374,8 @@ def _rewrite_constraint_for_binding(
     constraint: exp.Expression,
     binding: RowBinding,
     instance: Instance,
-    scoped_vars: Optional[Dict[Tuple[str, str], SolverVar]] = None,
+    row_bindings: Optional[Dict[str, RowBinding]] = None,
+    scoped_vars: Optional[Dict[Tuple[str, str, str, int, str], SolverVar]] = None,
 ) -> Optional[exp.Expression]:
     """Copy constraint, replace Column nodes with _solver_column scoped to the binding.
 
@@ -2188,15 +3391,27 @@ def _rewrite_constraint_for_binding(
     rewritten = constraint.copy()
     matched = False
     for col in rewritten.find_all(exp.Column):
+        if col.name not in instance.tables.get(binding.table, {}):
+            continue
         sv = solver_var(col)
         if sv is not None:
-            if sv.relation_id.name.normalized != binding.table:
+            if not _solver_var_matches_binding(sv, binding):
+                target_binding = _binding_for_solver_var_row(
+                    sv,
+                    binding.row,
+                    row_bindings,
+                )
+                if target_binding is None:
+                    target_binding = binding
+                scoped = _row_bound_solver_var(sv, target_binding)
+                set_solver_var(col, scoped)
+                ct = col_type(col)
+                if ct is None:
+                    meta = column_meta(col)
+                    if meta is not None and "domain" in meta:
+                        col.type = meta["domain"]
                 continue
-            new_var = SolverVar(
-                column_id=sv.column_id,
-                relation_id=sv.relation_id,
-                row_scope=f"r{binding.row}",
-            )
+            new_var = _row_bound_solver_var(sv, binding)
             set_solver_var(col, new_var)
             ct = col_type(col)
             if ct is None:
@@ -2204,7 +3419,7 @@ def _rewrite_constraint_for_binding(
                 if meta is not None and "domain" in meta:
                     col.type = meta["domain"]
             if scoped_vars is not None:
-                scoped_vars[(binding.table, col.name)] = new_var
+                scoped_vars[_scoped_var_key(binding, col.name)] = new_var
             matched = True
         else:
             col_table = col.table or ""
@@ -2214,7 +3429,7 @@ def _rewrite_constraint_for_binding(
                 elif not binding.alias:
                     continue
             # Reuse scoped variable if available.
-            key = (binding.table, col.name)
+            key = _scoped_var_key(binding, col.name)
             existing = scoped_vars.get(key) if scoped_vars is not None else None
             if existing is not None:
                 set_solver_var(col, existing)
@@ -2224,8 +3439,13 @@ def _rewrite_constraint_for_binding(
                     if meta is not None and "domain" in meta:
                         col.type = meta["domain"]
             else:
+                column = _row_bound_column_id(
+                    physical_column(col.name, binding.relation),
+                    binding,
+                )
                 new_col = _solver_column(
-                    instance, physical_column(col.name, binding.relation),
+                    instance,
+                    column,
                     row_scope=f"r{binding.row}",
                 )
                 set_solver_var(col, solver_var(new_col))
@@ -2233,6 +3453,130 @@ def _rewrite_constraint_for_binding(
                     col.type = new_col.type
             matched = True
     return rewritten if matched else None
+
+
+def _database_check_constraints_for_binding(
+    instance: Instance,
+    binding: RowBinding,
+    path_variables: PathVariableIndex,
+) -> List[exp.Expression]:
+    constraints: List[exp.Expression] = []
+    for check in instance.database_constraints(binding.relation).checks:
+        if not check.supported:
+            raise ValueError(
+                f"unsupported_database_check:{check.reason or 'unknown'}"
+            )
+        column_by_name = {
+            column.name.normalized: column
+            for column in check.referenced_columns
+        }
+        variable_by_name = {
+            column.name.normalized: _path_variable_for_binding_column(
+                path_variables,
+                binding,
+                column,
+            )
+            for column in check.referenced_columns
+        }
+        if any(variable is None for variable in variable_by_name.values()):
+            continue
+        rewritten = check.expression.copy()
+        matched = False
+        for col in rewritten.find_all(exp.Column):
+            column = column_by_name.get(
+                identifier_name(col.name, dialect=instance.dialect).normalized
+            )
+            if column is None:
+                continue
+            variable = variable_by_name[column.name.normalized]
+            assert variable is not None
+            set_solver_var(col, variable)
+            dtype = _dtype_for_solver_var(variable, instance)
+            if dtype is not None:
+                col.type = dtype
+            matched = True
+        if matched:
+            constraints.append(rewritten)
+    return constraints
+
+
+def _database_not_null_constraints_for_binding(
+    instance: Instance,
+    binding: RowBinding,
+    path_variables: PathVariableIndex,
+) -> List[exp.Expression]:
+    constraints = instance.database_constraints(binding.relation)
+    required_columns = dict.fromkeys(
+        tuple(constraints.not_null_columns) + tuple(constraints.primary_key)
+    )
+    expressions: List[exp.Expression] = []
+    for column in required_columns:
+        variable = _path_variable_for_binding_column(
+            path_variables,
+            binding,
+            column,
+        )
+        if variable is None:
+            continue
+        col_node = _solver_column(
+            instance,
+            variable.column_id,
+            row_scope=variable.row_scope,
+        )
+        set_solver_var(col_node, variable)
+        expressions.append(_make_is_not_null(col_node))
+    return expressions
+
+
+def _path_variable_index_for_constraints(
+    path_constraints: List[exp.Expression],
+    row_bindings: Dict[str, RowBinding],
+) -> PathVariableIndex:
+    binding_keys = {
+        (
+            binding.table,
+            binding.alias or "",
+            binding.relation.scope_id or "",
+            binding.row,
+        )
+        for binding in row_bindings.values()
+    }
+    variables: PathVariableIndex = {}
+    for constraint in path_constraints:
+        for col in constraint.find_all(exp.Column):
+            variable = solver_var(col)
+            if variable is None or variable.row_scope is None:
+                continue
+            if variable.relation_id.name is None:
+                continue
+            if not variable.row_scope.startswith("r"):
+                continue
+            try:
+                row = int(variable.row_scope[1:])
+            except ValueError:
+                continue
+            key_prefix = (
+                variable.relation_id.name.normalized,
+                variable.relation_id.alias.normalized if variable.relation_id.alias else "",
+                variable.relation_id.scope_id or "",
+                row,
+            )
+            if key_prefix not in binding_keys:
+                continue
+            source = variable.column_id.source_column_id or variable.column_id
+            variables.setdefault((*key_prefix, source.name.normalized), variable)
+    return variables
+
+
+def _path_variable_for_binding_column(
+    path_variables: PathVariableIndex,
+    binding: RowBinding,
+    column: ColumnId,
+) -> Optional[SolverVar]:
+    expected_source = column.source_column_id or column
+    return path_variables.get(
+        _scoped_var_key(binding, expected_source.name.normalized)
+    )
 
 
 def _collect_solver_vars(
@@ -2248,6 +3592,13 @@ def _collect_solver_vars(
         if dt is not None:
             variables[sv] = dt
     return variables
+
+
+def _has_explicit_row_scope(expr: exp.Expression) -> bool:
+    return any(
+        (solver_var(col) is not None and solver_var(col).row_scope is not None)
+        for col in expr.find_all(exp.Column)
+    )
 
 
 def _dtype_for_solver_var(var: SolverVar, instance: Instance) -> Optional[DataType]:
@@ -2271,8 +3622,7 @@ def _dtype_for_solver_var(var: SolverVar, instance: Instance) -> Optional[DataTy
 
 def _build_join_equalities(
     spec: BranchSpec,
-    row_bindings: Dict[str, RowBinding],
-    _instance: Instance,
+    row_bindings: Dict[str, RowBinding]
 ) -> List[Tuple[SolverVar, SolverVar]]:
     """Extract solver join equalities from join EQ expressions in constraints.
 
@@ -2298,7 +3648,7 @@ def _build_join_equalities(
             if left_sv.relation_id == right_sv.relation_id:
                 continue
             for left_scoped, right_scoped in _scope_join_equality(
-                left_sv, right_sv, row_bindings
+                spec, left_sv, right_sv, row_bindings
             ):
                 pair_key = (
                     min(left_scoped.display, right_scoped.display),
@@ -2313,6 +3663,7 @@ def _build_join_equalities(
 
 
 def _scope_join_equality(
+    spec: BranchSpec,
     left_var: SolverVar,
     right_var: SolverVar,
     row_bindings: Dict[str, RowBinding],
@@ -2323,6 +3674,18 @@ def _scope_join_equality(
     right_bindings = _bindings_for_solver_var(right_var, row_bindings)
     if not left_bindings or not right_bindings:
         return []
+
+    intent_pairs = _intent_join_binding_pairs(
+        spec, left_bindings, right_bindings,
+    )
+    if intent_pairs:
+        return [
+            (
+                _scoped_solver_var(left_var, left_binding),
+                _scoped_solver_var(right_var, right_binding),
+            )
+            for left_binding, right_binding in intent_pairs
+        ]
 
     pairs: List[Tuple[RowBinding, RowBinding]] = []
     if len(left_bindings) == len(right_bindings):
@@ -2343,29 +3706,267 @@ def _scope_join_equality(
     ]
 
 
+def _intent_join_binding_pairs(
+    spec: BranchSpec,
+    left_bindings: List[RowBinding],
+    right_bindings: List[RowBinding],
+) -> List[Tuple[RowBinding, RowBinding]]:
+    purposes = (
+        _ROW_INTENT_MATCHED_RANK_LOWER,
+        _ROW_INTENT_GROUP_A,
+        _ROW_INTENT_GROUP_B,
+    )
+    pairs: List[Tuple[RowBinding, RowBinding]] = []
+    seen: Set[Tuple[Tuple[str, str, str, int], Tuple[str, str, str, int]]] = set()
+    for purpose in purposes:
+        left_matches = [
+            binding for binding in left_bindings
+            if _binding_has_intent(spec, binding, purpose)
+        ]
+        right_matches = [
+            binding for binding in right_bindings
+            if _binding_has_intent(spec, binding, purpose)
+        ]
+        if not left_matches or not right_matches:
+            continue
+        for left_binding in left_matches:
+            for right_binding in right_matches:
+                key = (
+                    _row_binding_sort_key(left_binding),
+                    _row_binding_sort_key(right_binding),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((left_binding, right_binding))
+    return pairs
+
+
+def _binding_has_intent(
+    spec: BranchSpec,
+    binding: RowBinding,
+    purpose: str,
+) -> bool:
+    req = _requirement_for_binding(spec, binding)
+    if req is None:
+        return False
+    return purpose in req.row_intents.get(binding.row, set())
+
+
 def _bindings_for_solver_var(
     var: SolverVar,
     row_bindings: Dict[str, RowBinding],
 ) -> List[RowBinding]:
     table = var.relation_id.name.normalized if var.relation_id.name else ""
     alias = var.relation_id.alias.normalized if var.relation_id.alias else None
+    scope = var.relation_id.scope_id
     return sorted(
         (
             binding
             for binding in row_bindings.values()
             if binding.table == table
-            and (alias is None or binding.alias == alias)
+            and binding.alias == alias
+            and binding.relation.scope_id == scope
         ),
         key=lambda binding: binding.row,
     )
 
 
 def _scoped_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
-    return SolverVar(
-        column_id=var.column_id,
-        relation_id=var.relation_id,
-        row_scope=f"r{binding.row}",
-    )
+    return _row_bound_solver_var(var, binding)
+
+
+def _duplicate_column_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    req_bindings: List[RowBinding],
+) -> List[exp.Expression]:
+    if len(req_bindings) < 2 or not req.duplicate_columns:
+        return []
+    first, second = sorted(req_bindings, key=lambda binding: binding.row)[:2]
+    constraints: List[exp.Expression] = []
+    for col_id in req.duplicate_columns:
+        left_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, first),
+            row_scope=f"r{first.row}",
+        )
+        right_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, second),
+            row_scope=f"r{second.row}",
+        )
+        constraints.append(
+            exp.EQ(this=left_column, expression=right_column)
+        )
+        constraints.append(_make_is_not_null(left_column.copy()))
+        constraints.append(_make_is_not_null(right_column.copy()))
+    duplicate_names = {
+        col_id.name.normalized for col_id in req.duplicate_columns
+    }
+    for col_name in instance.tables.get(req.table, {}):
+        if col_name in duplicate_names:
+            continue
+        if not instance.is_unique(req.table, col_name):
+            continue
+        col_id = physical_column(col_name, req.relation)
+        left_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, first),
+            row_scope=f"r{first.row}",
+        )
+        right_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, second),
+            row_scope=f"r{second.row}",
+        )
+        constraints.append(
+            exp.NEQ(this=left_column, expression=right_column)
+        )
+        constraints.append(_make_is_not_null(left_column.copy()))
+        constraints.append(_make_is_not_null(right_column.copy()))
+    return constraints
+
+
+def _contrast_column_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    req_bindings: List[RowBinding],
+) -> List[exp.Expression]:
+    if len(req_bindings) < 2 or not req.contrast_columns:
+        return []
+    ordered = sorted(req_bindings, key=lambda binding: binding.row)
+    first, second = ordered[:2]
+    third = ordered[2] if len(ordered) > 2 else second
+    constraints: List[exp.Expression] = []
+    group_names = {col_id.name.normalized for col_id in req.group_key_columns}
+    for col_id in req.contrast_columns:
+        intent_constraints = _aggregate_intent_contrast_constraints(
+            instance, req, ordered, col_id, group_names,
+        )
+        if intent_constraints:
+            constraints.extend(intent_constraints)
+            continue
+        first_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, first),
+            row_scope=f"r{first.row}",
+        )
+        second_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, second),
+            row_scope=f"r{second.row}",
+        )
+        third_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, third),
+            row_scope=f"r{third.row}",
+        )
+        if col_id.name.normalized in group_names and len(ordered) > 2:
+            constraints.append(
+                exp.EQ(this=first_column.copy(), expression=second_column.copy())
+            )
+            constraints.append(exp.NEQ(this=first_column, expression=third_column))
+            constraints.append(_make_is_not_null(third_column.copy()))
+        else:
+            constraints.append(exp.NEQ(this=first_column, expression=second_column))
+        constraints.append(_make_is_not_null(first_column.copy()))
+        constraints.append(_make_is_not_null(second_column.copy()))
+    return constraints
+
+
+def _distinct_column_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    req_bindings: List[RowBinding],
+) -> List[exp.Expression]:
+    if len(req_bindings) < 2 or not req.distinct_columns:
+        return []
+    ordered = sorted(req_bindings, key=lambda binding: binding.row)
+    constraints: List[exp.Expression] = []
+    for col_id in req.distinct_columns:
+        columns = [
+            _solver_column(
+                instance,
+                _row_bound_column_id(col_id, binding),
+                row_scope=f"r{binding.row}",
+            )
+            for binding in ordered
+        ]
+        for column in columns:
+            constraints.append(_make_is_not_null(column.copy()))
+        for left_index, left_column in enumerate(columns):
+            for right_column in columns[left_index + 1:]:
+                constraints.append(
+                    exp.NEQ(this=left_column.copy(), expression=right_column.copy())
+                )
+    return constraints
+
+
+def _aggregate_intent_contrast_constraints(
+    instance: Instance,
+    req: TableConstraint,
+    bindings: List[RowBinding],
+    col_id: ColumnId,
+    group_names: Set[str],
+) -> List[exp.Expression]:
+    group_a = [
+        binding for binding in bindings
+        if _ROW_INTENT_GROUP_A in req.row_intents.get(binding.row, set())
+    ]
+    group_b = [
+        binding for binding in bindings
+        if _ROW_INTENT_GROUP_B in req.row_intents.get(binding.row, set())
+    ]
+    if not group_a or not group_b:
+        return []
+
+    constraints: List[exp.Expression] = []
+    if col_id.name.normalized in group_names:
+        first = group_a[0]
+        second = group_a[1] if len(group_a) > 1 else group_a[0]
+        third = group_b[0]
+        first_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, first),
+            row_scope=f"r{first.row}",
+        )
+        second_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, second),
+            row_scope=f"r{second.row}",
+        )
+        third_column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, third),
+            row_scope=f"r{third.row}",
+        )
+        constraints.append(
+            exp.EQ(this=first_column.copy(), expression=second_column.copy())
+        )
+        constraints.append(exp.NEQ(this=first_column, expression=third_column))
+        constraints.append(_make_is_not_null(second_column.copy()))
+        constraints.append(_make_is_not_null(third_column.copy()))
+        return constraints
+
+    if len(group_a) < 2:
+        return []
+
+    for binding, value in (
+        (group_a[0], 2),
+        (group_a[1], 2),
+        (group_b[0], 3),
+    ):
+        column = _solver_column(
+            instance,
+            _row_bound_column_id(col_id, binding),
+            row_scope=f"r{binding.row}",
+        )
+        constraints.append(
+            exp.EQ(this=column.copy(), expression=exp.Literal.number(value))
+        )
+        constraints.append(_make_is_not_null(column))
+    return constraints
 
 
 # ---------------------------------------------------------------------------
@@ -2375,15 +3976,19 @@ def _scoped_solver_var(var: SolverVar, binding: RowBinding) -> SolverVar:
 
 def _rows_from_solver_result(
     assignments: Dict[SolverVar, Any],
-    _row_bindings: Dict[str, RowBinding],
+    row_bindings: Dict[str, RowBinding],
     instance: Instance,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
     """Extract concrete rows from solver assignments.
 
     Groups by (table, row_index). Maps SolverVar fields to table/row/column.
     Skips boundary rows (row_idx >= 1000).
     """
-    rows_by_slot: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    rows_by_slot: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    bindings_by_slot = {
+        _row_binding_sort_key(binding): binding
+        for binding in row_bindings.values()
+    }
 
     for var, value in assignments.items():
         table_name = var.relation_id.name.normalized if var.relation_id.name else ""
@@ -2412,13 +4017,107 @@ def _rows_from_solver_result(
         if schema is None or column_name not in schema:
             continue
 
-        slot = (table_name, row_idx)
-        rows_by_slot.setdefault(slot, {})[column_name] = value
+        alias = var.relation_id.alias.normalized if var.relation_id.alias else ""
+        scope = var.relation_id.scope_id or ""
+        slot = (table_name, alias, scope, row_idx)
+        if slot not in bindings_by_slot:
+            continue
+        row = rows_by_slot.setdefault(slot, {})
+        row[column_name] = value
 
-    rows: Dict[str, List[Dict[str, Any]]] = {}
-    for (table, _row_idx), values in sorted(rows_by_slot.items()):
-        rows.setdefault(table, []).append(values)
-    return rows
+    return dict(sorted(rows_by_slot.items()))
+
+
+def _slot_for_solver_var(
+    var: SolverVar,
+    row_bindings: Dict[str, RowBinding],
+) -> Optional[Tuple[str, str, str, int]]:
+    table_name = var.relation_id.name.normalized if var.relation_id.name else ""
+    if not table_name:
+        return None
+    row_scope = var.row_scope or "r0"
+    if not row_scope.startswith("r"):
+        return None
+    try:
+        row_idx = int(row_scope[1:])
+    except ValueError:
+        return None
+    alias = var.relation_id.alias.normalized if var.relation_id.alias else ""
+    scope = var.relation_id.scope_id or ""
+    slot = (table_name, alias, scope, row_idx)
+    if slot not in {
+        _row_binding_sort_key(binding)
+        for binding in row_bindings.values()
+    }:
+        return None
+    return slot
+
+
+def _join_value_preference(
+    left_var: SolverVar,
+    right_var: SolverVar,
+    instance: Instance,
+) -> str:
+    left_table = left_var.relation_id.name.normalized if left_var.relation_id.name else ""
+    right_table = right_var.relation_id.name.normalized if right_var.relation_id.name else ""
+    left_column = left_var.column_id.name.normalized if left_var.column_id.name else ""
+    right_column = right_var.column_id.name.normalized if right_var.column_id.name else ""
+    left_unique = bool(left_table and left_column and instance.is_unique(left_table, left_column))
+    right_unique = bool(right_table and right_column and instance.is_unique(right_table, right_column))
+    if right_unique and not left_unique:
+        return "right"
+    return "left"
+
+
+def _enforce_join_equalities_on_rows(
+    rows: Dict[Tuple[str, str, str, int], Dict[str, Any]],
+    join_equalities: List[Tuple[SolverVar, SolverVar]],
+    row_bindings: Dict[str, RowBinding],
+    instance: Instance,
+) -> None:
+    for left_var, right_var in join_equalities:
+        left_slot = _slot_for_solver_var(left_var, row_bindings)
+        right_slot = _slot_for_solver_var(right_var, row_bindings)
+        if left_slot is None or right_slot is None:
+            continue
+        left_column = left_var.column_id.name.normalized if left_var.column_id.name else ""
+        right_column = right_var.column_id.name.normalized if right_var.column_id.name else ""
+        if not left_column or not right_column:
+            continue
+        left_row = rows.setdefault(left_slot, {})
+        right_row = rows.setdefault(right_slot, {})
+        left_value = left_row.get(left_column)
+        right_value = right_row.get(right_column)
+        if left_value is None and right_value is None:
+            continue
+        if left_value is None:
+            value = right_value
+        elif right_value is None:
+            value = left_value
+        elif left_value == right_value:
+            value = left_value
+        elif _join_value_preference(left_var, right_var, instance) == "right":
+            value = right_value
+        else:
+            value = left_value
+        left_row[left_column] = value
+        right_row[right_column] = value
+
+
+def _completed_rows_by_slot(
+    completed: Dict[str, List[Dict[str, Any]]],
+    row_bindings: Dict[str, RowBinding],
+) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
+    slot_rows: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    table_positions: Dict[str, int] = {}
+    for binding in sorted(row_bindings.values(), key=_row_binding_sort_key):
+        table_rows = completed.get(binding.table, [])
+        position = table_positions.get(binding.table, 0)
+        table_positions[binding.table] = position + 1
+        if position >= len(table_rows):
+            continue
+        slot_rows[_row_binding_sort_key(binding)] = table_rows[position]
+    return slot_rows
 
 
 # ---------------------------------------------------------------------------
@@ -2431,247 +4130,574 @@ def _rows_from_solver_result(
 # ---------------------------------------------------------------------------
 
 
-def _gold_fk_columns(instance: Instance, table: str) -> Set[str]:
-    """Get FK column names for a table."""
-    columns: Set[str] = set()
-    try:
-        rel_id = instance.table_id(table)
-    except KeyError:
-        return columns
-    for fk_spec in instance.get_foreign_keys_by_relation_id(rel_id):
-        for col_id in fk_spec.source_column_ids:
-            columns.add(col_id.name.normalized)
-    return columns
-
-
-def _composite_unique_groups(
-    instance: Instance,
-    table: str,
-) -> List[Tuple[str, ...]]:
-    """Return composite primary/unique groups that must distinguish rows."""
-    try:
-        table_spec = instance.schema_spec.get_table(table)
-    except Exception:
-        return []
-    groups: List[Tuple[str, ...]] = []
-    if len(table_spec.primary_key) > 1:
-        groups.append(tuple(table_spec.primary_key))
-    for group in table_spec.unique_constraints:
-        if len(group) > 1:
-            groups.append(tuple(group))
-    return groups
-
-
-def _collect_existing_composite_values(
-    instance: Instance,
-) -> Dict[Tuple[str, Tuple[str, ...]], Set[Tuple[Any, ...]]]:
-    values: Dict[Tuple[str, Tuple[str, ...]], Set[Tuple[Any, ...]]] = {}
-    for table in instance.tables:
-        for group in _composite_unique_groups(instance, table):
-            key = (table, group)
-            seen = values.setdefault(key, set())
-            for existing_row in instance.get_rows(table):
-                row_values = _row_value_dict(existing_row)
-                if all(column in row_values for column in group):
-                    seen.add(tuple(row_values[column] for column in group))
-    return values
-
-
-def _fresh_composite_value(value: Any, attempt: int) -> Any:
-    if isinstance(value, bool):
-        return int(value) + attempt + 1
-    if isinstance(value, int):
-        return value + attempt + 1
-    if isinstance(value, float):
-        return value + float(attempt + 1)
-    if value is None:
-        return f"value_{attempt + 1}"
-    return f"{value}_{attempt + 1}"
-
-
-def _ensure_composite_unique_rows(
+def _apply_literal_constraints_to_row(
     row: Dict[str, Any],
     binding: RowBinding,
-    req: Optional[TableConstraint],
+    req: TableConstraint,
     instance: Instance,
-    builder,
-    composite_values: Dict[Tuple[str, Tuple[str, ...]], Set[Tuple[Any, ...]]],
 ) -> None:
-    """Preserve solved group keys while making composite key rows distinct."""
-    protected = {
-        col_id.name.normalized
-        for col_id in (req.group_key_columns if req is not None else ())
-    }
-    for group in _composite_unique_groups(instance, binding.table):
-        if not all(column in row for column in group):
+    for constraint in req.constraints:
+        assignment = _literal_assignment_for_constraint(
+            constraint, binding, instance,
+        )
+        if assignment is None:
             continue
-        key = (binding.table, group)
-        seen = composite_values.setdefault(key, set())
-        current = tuple(row[column] for column in group)
-        if current not in seen:
-            seen.add(current)
+        col_name, value = assignment
+        row[col_name] = value
+    _apply_inequality_constraints_to_row(row, binding, req, instance)
+
+
+def _apply_inequality_constraints_to_row(
+    row: Dict[str, Any],
+    binding: RowBinding,
+    req: TableConstraint,
+    instance: Instance,
+) -> None:
+    for constraint in req.constraints:
+        if not isinstance(constraint, exp.NEQ):
             continue
-        candidates = [column for column in group if column not in protected]
-        if not candidates:
-            candidates = list(group)
-        target = candidates[0]
+        if not (
+            isinstance(constraint.this, exp.Column)
+            and isinstance(constraint.expression, exp.Column)
+        ):
+            continue
+        left = _binding_column_name(constraint.this, binding, instance)
+        right = _binding_column_name(constraint.expression, binding, instance)
+        if left is None or right is None:
+            continue
+        left_value = row.get(left)
+        right_value = row.get(right)
+        if left_value is None and right_value is None:
+            continue
+        if left_value is None:
+            row[left] = _different_column_value(
+                instance,
+                binding.table,
+                left,
+                row,
+                right_value,
+            )
+        elif right_value is None:
+            row[right] = _different_column_value(
+                instance,
+                binding.table,
+                right,
+                row,
+                left_value,
+            )
+        elif _storage_equivalent_value_key(
+            instance,
+            binding.table,
+            left,
+            left_value,
+        ) == _storage_equivalent_value_key(
+            instance,
+            binding.table,
+            left,
+            right_value,
+        ):
+            row[right] = _different_column_value(
+                instance,
+                binding.table,
+                right,
+                row,
+                left_value,
+            )
+
+
+def _binding_column_name(
+    column: exp.Column,
+    binding: RowBinding,
+    instance: Instance,
+) -> Optional[str]:
+    if not _column_matches_binding(column, binding, instance):
+        return None
+    normalized = identifier_name(column.name, dialect=instance.dialect).normalized
+    if normalized in instance.tables.get(binding.table, {}):
+        return normalized
+    if column.name in instance.tables.get(binding.table, {}):
+        return column.name
+    return None
+
+
+def _different_column_value(
+    instance: Instance,
+    table: str,
+    column: str,
+    row: Dict[str, Any],
+    forbidden: Any,
+) -> Any:
+    context = dict(row)
+    context.pop(column, None)
+    forbidden_key = _storage_equivalent_value_key(instance, table, column, forbidden)
+    for _attempt in range(16):
+        value = instance.generate_value(
+            table,
+            column,
+            row_context=context,
+        )
+        if _storage_equivalent_value_key(instance, table, column, value) != forbidden_key:
+            return value
+    if isinstance(forbidden, str):
+        return _coerce_literal_for_column(instance, table, column, f"{forbidden}_neq")
+    if isinstance(forbidden, bool):
+        return _coerce_literal_for_column(instance, table, column, int(not forbidden))
+    if isinstance(forbidden, (int, float)):
+        return _coerce_literal_for_column(instance, table, column, forbidden + 1)
+    return instance.generate_value(table, column, row_context=context)
+
+
+def _literal_assignment_for_constraint(
+    constraint: exp.Expression,
+    binding: RowBinding,
+    instance: Instance,
+) -> Optional[Tuple[str, Any]]:
+    if isinstance(constraint, exp.EQ):
+        return _literal_assignment_from_binary(
+            constraint.this, constraint.expression, binding, instance,
+        )
+    if isinstance(constraint, exp.Between) and isinstance(constraint.this, exp.Column):
+        col = constraint.this
+        if not _column_matches_binding(col, binding, instance):
+            return None
+        low = concrete(constraint.args.get("low"))
+        if low is None:
+            return None
+        high = concrete(constraint.args.get("high"))
+        value = _between_literal_for_row(low, high, binding.row)
+        return (
+            col.name,
+            _coerce_literal_for_column(instance, binding.table, col.name, value),
+        )
+    return None
+
+
+def _literal_assignment_from_binary(
+    left: exp.Expression,
+    right: exp.Expression,
+    binding: RowBinding,
+    instance: Instance,
+) -> Optional[Tuple[str, Any]]:
+    if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
+        col, literal = left, right
+    elif isinstance(right, exp.Column) and not isinstance(left, exp.Column):
+        col, literal = right, left
+    else:
+        return None
+    if not _column_matches_binding(col, binding, instance):
+        return None
+    value = concrete(literal)
+    if value is None:
+        return None
+    return col.name, _coerce_literal_for_column(instance, binding.table, col.name, value)
+
+
+def _column_matches_binding(
+    col: exp.Column,
+    binding: RowBinding,
+    instance: Instance,
+) -> bool:
+    if col.name not in instance.tables.get(binding.table, {}):
+        return False
+    col_table = col.table or ""
+    if not col_table:
+        return True
+    return col_table == binding.table or (
+        binding.alias is not None and col_table == binding.alias
+    )
+
+
+def _coerce_literal_for_column(
+    instance: Instance,
+    table: str,
+    column: str,
+    value: Any,
+) -> Any:
+    dtype = instance.tables.get(table, {}).get(column, "")
+    normalized = str(dtype).lower()
+    try:
+        family = type_family(DataType.build(dtype))
+    except Exception:
+        family = TypeFamily.UNKNOWN
+    if family in {TypeFamily.DATE, TypeFamily.DATETIME, TypeFamily.TIME}:
+        if isinstance(value, str):
+            return StorageLiteral(value)
+    if any(token in normalized for token in ("char", "text", "clob", "varchar")):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return value
+
+
+def _between_literal_for_row(low: Any, high: Any, row_index: int) -> Any:
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        candidate = low + row_index
+        if candidate <= high:
+            return candidate
+    if isinstance(low, str) and isinstance(high, str):
+        try:
+            low_int = int(low)
+            high_int = int(high)
+        except ValueError:
+            return low
+        candidate = low_int + row_index
+        if candidate <= high_int:
+            return str(candidate)
+    return low
+
+
+def _fk_ordered_bindings(
+    row_bindings: Dict[str, RowBinding],
+    instance: Instance,
+) -> List[RowBinding]:
+    """Sort bindings by FK dependency order (parent tables first).
+
+    instance.data keys are already in FK topological order because
+    Instance.create_rows inserts via _creation_order.
+    """
+    fk_order = {name: idx for idx, name in enumerate(instance.data.keys())}
+    return sorted(
+        row_bindings.values(),
+        key=lambda b: (fk_order.get(b.table, 9999), _row_binding_sort_key(b)),
+    )
+
+
+def _pre_fill_group_key_values(
+    row: Dict[str, Any],
+    binding: RowBinding,
+    req: TableConstraint,
+    instance: Instance,
+    group_cache: Dict[Tuple[str, Optional[str], Optional[str], str], Any],
+) -> None:
+    """Pre-fill GROUP BY column values to ensure consistency across rows.
+
+    Rows sharing the same (table, alias, scope, column_name) group key
+    get the same generated value, ensuring GROUP BY produces meaningful groupings.
+    """
+    contrast_names = {col_id.name.normalized for col_id in req.contrast_columns}
+    for cid in req.group_key_columns:
+        col_name = cid.name.normalized
+        if col_name not in instance.tables.get(binding.table, {}):
+            continue
+        if col_name in contrast_names:
+            continue
+        key = (
+            binding.table,
+            binding.alias,
+            binding.relation.scope_id,
+            col_name,
+        )
+        if col_name in row:
+            group_cache.setdefault(key, row[col_name])
+        if key not in group_cache:
+            group_cache[key] = instance.generate_value(
+                binding.table, col_name, row_context=row,
+            )
+        if key in group_cache:
+            row[col_name] = group_cache[key]
+
+
+def _storage_equivalent_value_key(
+    instance: Instance,
+    table: str,
+    column: str,
+    value: Any,
+) -> Any:
+    relation = instance.table_id(table)
+    column_id = instance.column_id(relation, column)
+    return instance._column_storage_value(relation, column_id, value)
+
+
+def _pre_fill_plan_distinct_values(
+    row: Dict[str, Any],
+    binding: RowBinding,
+    req: TableConstraint,
+    instance: Instance,
+    seen_values: Dict[Tuple[str, str], Set[Any]],
+    *,
+    force: bool = False,
+) -> None:
+    """Pre-fill unique column values to ensure distinctness across rows.
+
+    Ensures that unique columns get different values across all rows in the spec,
+    not just within a single table insertion.
+    """
+    if not (
+        force
+        or req.duplicate_columns
+        or req.contrast_columns
+        or req.distinct_columns
+        or req.ordered_columns
+        or req.row_intents
+    ):
+        return
+    protected_columns = tuple(req.duplicate_columns)
+    if not force:
+        protected_columns += tuple(req.group_key_columns)
+    protected = {column.name.normalized for column in protected_columns}
+    for col_name in instance.tables.get(binding.table, {}):
+        if col_name in protected or not instance.is_unique(binding.table, col_name):
+            continue
+        key = (binding.table, col_name)
+        seen = seen_values.setdefault(key, set())
+        value = row.get(col_name)
+        if value is not None:
+            storage_key = _storage_equivalent_value_key(
+                instance, binding.table, col_name, value,
+            )
+            if storage_key not in seen:
+                seen.add(storage_key)
+                continue
         context = dict(row)
-        context.pop(target, None)
-        for attempt in range(32):
-            try:
-                row[target] = builder.generate_value(
-                    binding.table,
-                    target,
-                    row_context=context,
-                )
-            except Exception:
-                row[target] = _fresh_composite_value(current[group.index(target)], attempt)
-            current = tuple(row[column] for column in group)
-            if current not in seen:
-                seen.add(current)
+        context.pop(col_name, None)
+        for _attempt in range(16):
+            value = instance.generate_value(
+                binding.table,
+                col_name,
+                row_context=context,
+            )
+            storage_key = _storage_equivalent_value_key(
+                instance, binding.table, col_name, value,
+            )
+            if storage_key not in seen:
+                row[col_name] = value
+                seen.add(storage_key)
                 break
 
 
-def _complete_gold_rows(
-    rows: Dict[str, List[Dict[str, Any]]],
+def _clone_rows_for_high_limit(
+    rows: Dict[Tuple[str, str, str, int], Dict[str, Any]],
     row_bindings: Dict[str, RowBinding],
     spec: BranchSpec,
     instance: Instance,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """Fill missing columns using instance.builder.generate_value."""
-    builder = type(instance.builder)(instance.schema_spec)
-    for table_name in instance.tables:
-        for existing_row in instance.get_rows(table_name):
-            builder.runtime.remember_row(table_name, _row_value_dict(existing_row))
+) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
+    """Clone rows to satisfy min_rows requirements for high LIMIT queries.
 
-    pending_rows = {
-        table: [dict(row) for row in table_rows]
-        for table, table_rows in rows.items()
-    }
-    completed: Dict[str, List[Dict[str, Any]]] = {}
-    group_values: Dict[Tuple[str, str], Any] = {}
-    unique_values: Dict[Tuple[str, str], Set[Any]] = {}
-    composite_values = _collect_existing_composite_values(instance)
-
-    # Collect existing unique values.
-    for table_name in instance.tables:
-        schema = instance.tables.get(table_name)
-        if not schema:
-            continue
-        for col_name in schema:
-            if not instance.is_unique(table_name, col_name):
-                continue
-            key = (table_name, col_name)
-            values = unique_values.setdefault(key, set())
-            for existing_row in instance.get_rows(table_name):
-                if col_name in existing_row:
-                    cell = existing_row[col_name]
-                    if cell is not None:
-                        values.add(cell.concrete if hasattr(cell, "concrete") else cell)
-
-    ordered_bindings = sorted(
-        row_bindings.values(),
-        key=lambda b: (b.table, b.alias or "", b.row),
-    )
-    for binding in ordered_bindings:
-        table_rows = pending_rows.setdefault(binding.table, [])
-        row = table_rows.pop(0) if table_rows else {}
-        req = _requirement_for_binding(spec, binding)
-
-        if req is not None:
-            fk_columns = _gold_fk_columns(instance, binding.table)
-
-            # Apply group_key_columns.
-            for cid in req.group_key_columns:
-                col_name = cid.name.normalized
-                key = (binding.table, col_name)
-                if col_name in row:
-                    group_values.setdefault(key, row[col_name])
-                if key not in group_values:
-                    try:
-                        group_values[key] = builder.generate_value(
-                            binding.table, col_name, row_context=row,
-                        )
-                    except Exception:
-                        pass
-                if key in group_values:
-                    row[col_name] = group_values[key]
-
-            # Fill missing columns from schema.
-            for col_name in instance.tables.get(binding.table, {}):
-                if col_name in row:
-                    continue
-                try:
-                    row[col_name] = builder.generate_value(
-                        binding.table, col_name, row_context=row,
-                    )
-                except Exception:
-                    pass
-
-            # Ensure unique columns have distinct values.
-            for col_name in instance.tables.get(binding.table, {}):
-                if not instance.is_unique(binding.table, col_name):
-                    continue
-                key = (binding.table, col_name)
-                seen_values = unique_values.setdefault(key, set())
-                value = row.get(col_name)
-                if value is None or value in seen_values:
-                    if col_name in fk_columns:
-                        row.pop(col_name, None)
-                        continue
-                    context = dict(row)
-                    context.pop(col_name, None)
-                    generated = False
-                    for _ in range(16):
-                        try:
-                            value = builder.generate_value(
-                                binding.table, col_name, row_context=context,
-                            )
-                            if value not in seen_values:
-                                row[col_name] = value
-                                generated = True
-                                break
-                        except Exception:
-                            break
-                    if not generated:
-                        row.pop(col_name, None)
-                        continue
-                if col_name in row:
-                    seen_values.add(row[col_name])
-
-            _ensure_composite_unique_rows(
-                row, binding, req, instance, builder, composite_values,
-            )
-
-        builder.runtime.remember_row(binding.table, row)
-        completed.setdefault(binding.table, []).append(row)
-
-    # High LIMIT support: clone rows to satisfy min_rows.
+    When the spec requires more rows than currently exist (due to LIMIT + OFFSET),
+    this function clones existing rows and regenerates unique column values to
+    produce additional rows.
+    """
     MAX_TOTAL_ROWS = 500
+    cloned: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+
+    # Count existing rows per table
+    table_row_counts: Dict[str, int] = {}
+    for (table, _alias, _scope, _row_idx) in rows:
+        table_row_counts[table] = table_row_counts.get(table, 0) + 1
+
     for _relation, req in spec.requirements.items():
         physical = req.table
-        if physical not in completed or not completed[physical]:
-            continue
+        current_count = table_row_counts.get(physical, 0)
         target = min(req.min_rows, MAX_TOTAL_ROWS)
-        current_rows = completed[physical]
-        while len(current_rows) < target:
-            base_row = current_rows[-1]
-            new_row = dict(base_row)
+        if current_count >= target:
+            continue
+
+        # Find the last row for this table to clone
+        last_slot = None
+        for slot in sorted(rows.keys()):
+            if slot[0] == physical:
+                last_slot = slot
+        if last_slot is None:
+            continue
+
+        base_row = rows[last_slot]
+        while current_count < target:
+            new_row = {
+                col_name: value
+                for col_name, value in base_row.items()
+                if col_name in instance.tables.get(physical, {})
+            }
             for col_name in instance.tables.get(physical, {}):
                 if instance.is_unique(physical, col_name):
                     context = dict(new_row)
                     context.pop(col_name, None)
-                    try:
-                        new_row[col_name] = builder.generate_value(
-                            physical, col_name, row_context=context,
-                        )
-                    except Exception:
-                        pass
-            builder.runtime.remember_row(physical, new_row)
-            current_rows.append(new_row)
+                    new_row[col_name] = instance.generate_value(
+                        physical, col_name, row_context=context,
+                    )
+            # Create new slot with next row index
+            new_row_idx = current_count
+            new_slot = (physical, last_slot[1], last_slot[2], new_row_idx)
+            cloned[new_slot] = new_row
+            current_count += 1
+            table_row_counts[physical] = current_count
 
-    for table, table_rows in pending_rows.items():
-        completed.setdefault(table, []).extend(table_rows)
+    return cloned
+
+
+MaterializationColumnMap = Dict[Tuple[str, str, str, str], str]
+
+
+def _materialization_column_map(
+    spec: BranchSpec,
+    instance: Instance,
+) -> MaterializationColumnMap:
+    aliases: MaterializationColumnMap = {}
+    for req in spec.requirements.values():
+        for constraint in req.constraints:
+            for col in constraint.find_all(exp.Column):
+                col_id = column_identity(col)
+                if col_id is None:
+                    variable = solver_var(col)
+                    col_id = variable.column_id if variable is not None else None
+                if col_id is None:
+                    continue
+                relation = col_id.relation
+                source = _physical_source_id(col_id)
+                if (
+                    relation is None
+                    or relation.name is None
+                    or source.kind is not ColumnKind.PHYSICAL
+                    or source.relation is None
+                    or source.relation.name is None
+                ):
+                    continue
+                table = relation.name.normalized
+                source_table = source.relation.name.normalized
+                source_name = source.name.normalized
+                if table != source_table:
+                    continue
+                physical_columns = instance.tables.get(table, {})
+                if col.name in physical_columns or source_name not in physical_columns:
+                    continue
+                alias = relation.alias.normalized if relation.alias else ""
+                scope = relation.scope_id or ""
+                aliases[(table, alias, scope, col.name)] = source_name
+    return aliases
+
+
+def _resolve_materialization_column(
+    slot: Tuple[str, str, str, int],
+    column: str,
+    aliases: MaterializationColumnMap,
+) -> Optional[str]:
+    table, alias, scope, _row_idx = slot
+    return aliases.get((table, alias, scope, column))
+
+
+def _normalize_pending_rows_for_materialization(
+    rows: Dict[Tuple[str, str, str, int], Dict[str, Any]],
+    spec: BranchSpec,
+    instance: Instance,
+) -> Dict[Tuple[str, str, str, int], Dict[str, Any]]:
+    aliases = _materialization_column_map(spec, instance)
+    normalized_rows: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    for slot, row in rows.items():
+        table = slot[0]
+        physical_columns = instance.tables.get(table, {})
+        normalized: Dict[str, Any] = {}
+        for column, value in row.items():
+            if column in physical_columns:
+                if value is None and not instance.nullable(table, column):
+                    logger.debug(
+                        "speculate_materialization_skip_non_nullable_null table=%s column=%s",
+                        table,
+                        column,
+                    )
+                    continue
+                normalized[column] = value
+                continue
+            target = _resolve_materialization_column(slot, column, aliases)
+            if target is not None and target in physical_columns:
+                if value is None and not instance.nullable(table, target):
+                    logger.debug(
+                        "speculate_materialization_skip_non_nullable_null table=%s column=%s source=%s",
+                        table,
+                        column,
+                        target,
+                    )
+                    continue
+                normalized.setdefault(target, value)
+                logger.debug(
+                    "speculate_materialization_rewrite table=%s column=%s source=%s",
+                    table,
+                    column,
+                    target,
+                )
+                continue
+            logger.debug(
+                "speculate_materialization_skip_non_physical table=%s column=%s",
+                table,
+                column,
+            )
+        normalized_rows[slot] = normalized
+    return normalized_rows
+
+
+def _complete_gold_rows(
+    rows: Dict[Tuple[str, str, str, int], Dict[str, Any]],
+    row_bindings: Dict[str, RowBinding],
+    spec: BranchSpec,
+    instance: Instance,
+    join_equalities: Optional[List[Tuple[SolverVar, SolverVar]]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Fill missing columns using instance.create_rows.
+
+    This function pre-fills special values (group keys, plan distinct values,
+    high LIMIT clones) and then delegates to instance.create_rows for the rest.
+    """
+    import time as _time
+    _t0 = _time.monotonic()
+
+    pending_rows = {slot: dict(row) for slot, row in rows.items()}
+    group_values: Dict[Tuple[str, Optional[str], Optional[str], str], Any] = {}
+    plan_distinct_values: Dict[Tuple[str, str], Set[Any]] = {}
+
+    _t_fill_start = _time.monotonic()
+    ordered_bindings = _fk_ordered_bindings(row_bindings, instance)
+
+    # Phase 1: Pre-fill special values
+    for binding in ordered_bindings:
+        row = pending_rows.get(_row_binding_sort_key(binding), {})
+        req = _requirement_for_binding(spec, binding)
+
+        if req is not None:
+            _apply_literal_constraints_to_row(row, binding, req, instance)
+            _pre_fill_group_key_values(row, binding, req, instance, group_values)
+            _pre_fill_plan_distinct_values(
+                row, binding, req, instance, plan_distinct_values,
+                force=spec.has_goal("duplicate"),
+            )
+            _apply_literal_constraints_to_row(row, binding, req, instance)
+
+    _t_fill_end = _time.monotonic()
+    _t_post_fill_start = _time.monotonic()
+
+    # Phase 2: Clone rows for high LIMIT
+    cloned_rows = _clone_rows_for_high_limit(pending_rows, row_bindings, spec, instance)
+    pending_rows.update(cloned_rows)
+    pending_rows = _normalize_pending_rows_for_materialization(
+        pending_rows,
+        spec,
+        instance,
+    )
+
+    # Phase 3: Group rows by table for create_rows
+    rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
+    for (table, _alias, _scope, _row_idx), row in sorted(pending_rows.items()):
+        rows_by_table.setdefault(table, []).append(row)
+
+    # Phase 4: Use instance.create_rows to fill in remaining columns
+    completed: Dict[str, List[Dict[str, Any]]] = {}
+    if rows_by_table:
+        completed = _materialize_rows(instance, rows_by_table)
+
+    # Phase 5: Enforce join equalities on completed rows
+    if join_equalities:
+        _enforce_join_equalities_on_rows(
+            _completed_rows_by_slot(completed, row_bindings),
+            join_equalities,
+            row_bindings,
+            instance,
+        )
+
+    _t_end = _time.monotonic()
+    logger.debug(
+        "_complete_gold_rows: fill=%.3fs clone=%.3fs create_rows=%.3fs total=%.3fs",
+        _t_fill_end - _t_fill_start,
+        _t_post_fill_start - _t_fill_start,
+        _t_end - _t_post_fill_start,
+        _t_end - _t0,
+    )
     return completed
 
 
@@ -2680,51 +4706,35 @@ def _complete_gold_rows(
 # ---------------------------------------------------------------------------
 
 
-def _gold_materialization_order(
-    instance: Instance,
-    rows: Dict[str, List[Dict[str, Any]]],
-) -> List[str]:
-    """Topological sort of tables by FK dependencies."""
-    requested = [table for table in rows if table in instance.tables]
-    requested_set = set(requested)
-    ordered: List[str] = []
-    visiting: Set[str] = set()
-    visited: Set[str] = set()
-
-    def visit(table_name: str) -> None:
-        if table_name in visited:
-            return
-        if table_name in visiting:
-            return
-        visiting.add(table_name)
-        try:
-            rel_id = instance.table_id(table_name)
-        except KeyError:
-            visiting.remove(table_name)
-            visited.add(table_name)
-            return
-        for fk_spec in instance.get_foreign_keys_by_relation_id(rel_id):
-            if fk_spec.target_table_id and fk_spec.target_table_id.name:
-                ref_table = fk_spec.target_table_id.name.normalized
-                if ref_table in requested_set:
-                    visit(ref_table)
-        visiting.remove(table_name)
-        visited.add(table_name)
-        ordered.append(table_name)
-
-    for table_name in requested:
-        visit(table_name)
-    return ordered
-
-
 def _materialize_rows(
     instance: Instance,
     rows: Dict[str, List[Dict[str, Any]]],
-) -> None:
-    """Write rows to instance in FK dependency order."""
-    for table_name in _gold_materialization_order(instance, rows):
-        for row in rows.get(table_name, []):
-            instance.create_row(table_name, values=row)
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Write rows to instance in FK dependency order.
+
+    Returns a dict mapping table_name → list of completed row dicts.
+    """
+    import time as _time
+    _t0 = _time.monotonic()
+    materialized = instance.create_rows(rows)
+    _t1 = _time.monotonic()
+    completed: Dict[str, List[Dict[str, Any]]] = {}
+    for table_name, table_rows in rows.items():
+        relation = instance.table_id(table_name)
+        created_rows = materialized.get(relation, [])
+        for row, created in zip(table_rows, created_rows):
+            if relation not in created.positions:
+                continue
+            completed_row = _row_value_dict(instance.get_row(relation, created.positions[relation]))
+            for column_name, value in completed_row.items():
+                row.setdefault(column_name, value)
+            completed.setdefault(table_name, []).append(row)
+    _t2 = _time.monotonic()
+    logger.debug(
+        "_materialize_rows: create_rows=%.3fs sync_return=%.3fs n_rows=%d total=%.3fs",
+        _t1 - _t0, _t2 - _t1, len(completed), _t2 - _t0,
+    )
+    return completed
 
 
 # ---------------------------------------------------------------------------
@@ -2758,266 +4768,6 @@ def _iter_all_plan_steps(plan: Plan):
         yield from _iter_steps_with_subplans(step)
 
 
-def _scalar_subquery_operand_expression(
-    subplan: Optional[SubPlan],
-) -> Optional[exp.Expression]:
-    """Extract the aggregate operand expression from a subplan."""
-    if subplan is None or subplan.inner is None:
-        return None
-    for step in _iter_steps_with_subplans(subplan.inner):
-        if not isinstance(step, Aggregate):
-            continue
-        for operand in getattr(step, "operands", ()) or ():
-            if isinstance(operand, exp.Alias):
-                return operand.this.copy()
-        for agg_expr in step.aggregations:
-            agg = agg_expr.this if isinstance(agg_expr, exp.Alias) else agg_expr
-            if isinstance(agg, (exp.Avg, exp.Sum, exp.Min, exp.Max)):
-                return agg.this.copy()
-    return None
-
-
-def _bindings_for_scalar_expression(
-    expression: exp.Expression,
-    instance: Instance,
-    row_index: int,
-) -> Dict[str, RowBinding]:
-    """Build row bindings for columns in a scalar expression."""
-    bindings: Dict[str, RowBinding] = {}
-    for col in expression.find_all(exp.Column):
-        raw_table = col.table or ""
-        # Column name from sqlglot AST is already usable directly.
-        physical = raw_table
-        if raw_table not in instance.tables:
-            # Search all tables for the column.
-            for table_name in instance.tables:
-                if col.name in instance.tables.get(table_name, {}):
-                    physical = table_name
-                    break
-        if physical not in instance.tables:
-            continue
-        relation = _relation_for_table(instance, physical)
-        binding = RowBinding(relation=relation, row=row_index)
-        bindings[_solver_table_key(binding)] = binding
-    return bindings
-
-
-def _merge_scalar_solver_assignments(
-    rows: Dict[str, List[Dict[str, Any]]],
-    assignments: Dict[SolverVar, Any],
-    _row_bindings: Dict[str, RowBinding],
-) -> Set[Tuple[str, int]]:
-    """Merge solver assignments into rows. Returns set of (table, row_index) touched.
-
-    Only sets values for columns not already present in the row, to avoid
-    clobbering values from the primary solver pass.
-    """
-    touched: Set[Tuple[str, int]] = set()
-    for var, value in assignments.items():
-        table_name = var.relation_id.name.normalized if var.relation_id.name else ""
-        column_name = var.column_id.name.normalized if var.column_id.name else ""
-        row_scope = var.row_scope or "r0"
-        if not row_scope.startswith("r"):
-            continue
-        try:
-            row_idx = int(row_scope[1:])
-        except ValueError:
-            continue
-        if not table_name or not column_name:
-            continue
-        table_rows = rows.setdefault(table_name, [])
-        while len(table_rows) <= row_idx:
-            table_rows.append({})
-        row = table_rows[row_idx]
-        if column_name not in row:
-            row[column_name] = value
-            touched.add((table_name, row_idx))
-    return touched
-
-
-def _solve_scalar_witness_values(
-    atom: exp.Expression,
-    outer_expr: exp.Expression,
-    inner_expr: exp.Expression,
-    rows: Dict[str, List[Dict[str, Any]]],
-    instance: Instance,
-    dialect: str,
-    inner_row_index: int,
-) -> Set[Tuple[str, int]]:
-    """Use the solver to find values satisfying a scalar subquery comparison."""
-    outer_scoped = outer_expr.copy()
-    inner_scoped = inner_expr.copy()
-
-    # Ensure columns have type annotations.
-    for expr in (outer_scoped, inner_scoped):
-        for col in expr.find_all(exp.Column):
-            if getattr(col, "type", None) is not None:
-                continue
-            table = col.table or ""
-            schema = instance.tables.get(table)
-            if schema:
-                dtype = schema.get(col.name)
-                if dtype:
-                    try:
-                        col.type = DataType.build(dtype)
-                    except Exception:
-                        pass
-
-    outer_bindings = _bindings_for_scalar_expression(outer_scoped, instance, row_index=0)
-    inner_bindings = _bindings_for_scalar_expression(inner_scoped, instance, row_index=inner_row_index)
-    all_bindings = {**outer_bindings, **inner_bindings}
-    if not all_bindings:
-        return set()
-
-    # Rewrite with row scopes.
-    for col in outer_scoped.find_all(exp.Column):
-        table = col.table or ""
-        binding = _find_binding_for_column(table, all_bindings)
-        if binding is None:
-            # Resolve alias: search for column name in all tables.
-            for table_name in instance.tables:
-                if col.name in instance.tables.get(table_name, {}):
-                    binding = _find_binding_for_column(table_name, all_bindings)
-                    break
-        if binding is None:
-            continue
-        new_col = _solver_column(instance, physical_column(col.name, binding.relation), row_scope=f"r{binding.row}")
-        set_solver_var(col, solver_var(new_col))
-        if hasattr(new_col, "type") and new_col.type is not None:
-            col.type = new_col.type
-
-    for col in inner_scoped.find_all(exp.Column):
-        table = col.table or ""
-        binding = _find_binding_for_column(table, all_bindings)
-        if binding is None:
-            # Resolve alias: search for column name in all tables.
-            for table_name in instance.tables:
-                if col.name in instance.tables.get(table_name, {}):
-                    binding = _find_binding_for_column(table_name, all_bindings)
-                    break
-        if binding is None:
-            continue
-        new_col = _solver_column(instance, physical_column(col.name, binding.relation), row_scope=f"r{binding.row}")
-        set_solver_var(col, solver_var(new_col))
-        if hasattr(new_col, "type") and new_col.type is not None:
-            col.type = new_col.type
-
-    # Build the comparison expression.
-    if isinstance(atom.this, exp.Subquery) or (atom.this and atom.this.find(exp.Subquery)):
-        constraint_expr = type(atom)(this=inner_scoped, expression=outer_scoped)
-    else:
-        constraint_expr = type(atom)(this=outer_scoped, expression=inner_scoped)
-
-    # Collect target relations.
-    target_relations: Set[RelationId] = set()
-    for binding in all_bindings.values():
-        target_relations.add(binding.relation)
-
-    result = Solver(dialect=dialect).solve(
-        SolverConstraint(
-            target_relations=tuple(target_relations),
-            constraints=[constraint_expr],
-        ),
-    )
-    if result.sat:
-        return _merge_scalar_solver_assignments(rows, result.assignments, all_bindings)
-    return set()
-
-def _split_conjuncts_static(expr: exp.Expression) -> list:
-    """Split a conjunction into its top-level conjuncts (static version)."""
-    parts = []
-    if isinstance(expr, exp.And):
-        parts.extend(_split_conjuncts_static(expr.left))
-        parts.extend(_split_conjuncts_static(expr.right))
-    elif isinstance(expr, exp.Paren):
-        parts.extend(_split_conjuncts_static(expr.this))
-    else:
-        parts.append(expr)
-    return parts
-
-
-def _satisfy_gold_scalar_subqueries(
-    spec: BranchSpec,
-    plan: Plan,
-    rows: Dict[str, List[Dict[str, Any]]],
-    instance: Instance,
-    dialect: str,
-) -> None:
-    """Handle deferred scalar subquery atoms.
-
-    Uses the evaluator to compute scalar subquery values (which handles
-    alias-based contexts correctly), then updates rows to satisfy the
-    comparison when possible.
-    """
-    from parseval.symbolic.branch_tree import decompose_atoms
-    from parseval.symbolic.evaluator import PlanEvaluator
-    from parseval.plan.rex import concrete as _concrete, Environment, Variable
-
-    seen: Set[str] = set()
-    for atom in spec.deferred:
-        if not isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
-            continue
-        atom_key = atom.sql(dialect=dialect)
-        if atom_key in seen:
-            continue
-        seen.add(atom_key)
-
-        left, right = atom.this, atom.expression
-        if right and right.find(exp.Subquery):
-            outer_expr, subquery_expr = left, right
-        elif left and left.find(exp.Subquery):
-            outer_expr, subquery_expr = right, left
-        else:
-            continue
-        if outer_expr is None or subquery_expr is None:
-            continue
-
-        subquery = subquery_expr if isinstance(subquery_expr, exp.Subquery) else subquery_expr.find(exp.Subquery)
-        if subquery is None:
-            continue
-
-        # Use the evaluator to resolve the scalar subquery.
-        # The evaluator handles alias-based contexts correctly (t1 vs t3).
-        checkpoint = instance.checkpoint()
-        try:
-            _materialize_rows(instance, rows)
-            evaluator = PlanEvaluator(plan, instance, dialect)
-            tree = BranchTree()
-            ctx = evaluator.evaluate_context(tree)
-
-            # Find a row in the outer context to evaluate against.
-            outer_table = None
-            for table_name, table in ctx.tables.items():
-                if table.rows:
-                    outer_table = table_name
-                    break
-            if outer_table is None:
-                continue
-
-            # Resolve subquery predicates for the first outer row.
-            row = ctx.tables[outer_table].rows[0]
-            bindings = {}
-            for tname, table in ctx.tables.items():
-                for col_id in table.columns:
-                    val = row.get(col_id)
-                    if val is not None:
-                        bindings[col_id] = val
-            env = Environment(bindings)
-
-            resolved = evaluator._resolve_subquery_predicates(
-                atom, ctx.tables[outer_table].rows[0] if ctx.tables.get(outer_table) else (),
-                plan.root.subplan_dependencies if hasattr(plan.root, 'subplan_dependencies') else (),
-                bindings, env,
-            )
-            scalar_val = _concrete(resolved, env)
-            if scalar_val is not None:
-                logger.debug("Scalar subquery evaluated: %s = %s", atom.sql()[:60], scalar_val)
-        except Exception as exc:
-            logger.debug("Scalar subquery evaluation failed: %s", exc)
-        finally:
-            instance.rollback(checkpoint)
-
-
 # ---------------------------------------------------------------------------
 # Resolver class
 # ---------------------------------------------------------------------------
@@ -3043,37 +4793,39 @@ class Resolver:
         # Build global constraint.
         constraint, row_bindings = self._build_global_constraint(spec)
 
-        # Solve.
-        if self.solver is not None:
-            result = self.solver.solve(constraint)
-            if result.sat:
-                rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
-            else:
-                logger.debug(
-                    "Solver failed for spec=%s reason=%s",
-                    spec.branch, result.reason,
-                )
-                rows = {}
-        else:
-            rows = {}
+        # Solve. Unsatisfied constraints mean this branch cannot produce a witness.
+        if self.solver is None:
+            return {}
+        result = self.solver.solve(constraint)
+        if not result.sat:
+            logger.debug(
+                "Solver failed for spec=%s reason=%s",
+                spec.branch, result.reason,
+            )
+            return {}
+        rows = _rows_from_solver_result(result.assignments, row_bindings, self.instance)
+        _enforce_join_equalities_on_rows(
+            rows, constraint.join_equalities, row_bindings, self.instance,
+        )
 
-        # Complete missing columns (generates rows from min_rows even when solver output is empty).
-        rows = _complete_gold_rows(rows, row_bindings, spec, self.instance)
+        # Complete missing columns for satisfiable row bindings.
+        # This also handles materialization and join equality enforcement.
+        try:
+            rows = _complete_gold_rows(
+                rows, row_bindings, spec, self.instance,
+                join_equalities=constraint.join_equalities,
+            )
+        except ConstraintViolationError as exc:
+            logger.debug(
+                "materialization failed for spec=%s reason=%s",
+                spec.branch,
+                exc,
+            )
+            return {}
 
         if not rows:
             return {}
 
-        # Satisfy scalar subqueries (post-solve fixup for comparison subqueries).
-        _satisfy_gold_scalar_subqueries(
-            spec, self.plan, rows, self.instance, self.dialect,
-        )
-
-        # Materialize generated witness rows into the shared instance.  Do not
-        # validate here; speculate's contract is constraint-driven generation.
-        try:
-            _materialize_rows(self.instance, rows)
-        except Exception:
-            return {}
         return rows
 
     def _build_global_constraint(
@@ -3083,10 +4835,10 @@ class Resolver:
         """Build a single SolverConstraint for ALL tables in the spec."""
         row_bindings = _build_gold_row_bindings(spec)
         constraints: List[exp.Expression] = []
-        # Shared scoped-variable map: keyed by (table, col_name) -> SolverVar.
+        # Shared scoped-variable map: keyed by row binding and storage column.
         # Populated by annotated constraints (WHERE), reused by unscoped ones
         # (IS NOT NULL from _add_schema_constraints).
-        scoped_vars: Dict[Tuple[str, str], SolverVar] = {}
+        scoped_vars: PathVariableIndex = {}
 
         # Two-pass: annotated constraints first (to populate scoped_vars),
         # then unscoped ones (IS NOT NULL from _add_schema_constraints).
@@ -3100,6 +4852,10 @@ class Resolver:
         for pass_annotated in (True, False):
             for relation, req, req_bindings in all_constraint_items:
                 for constraint_expr in req.constraints:
+                    if _has_explicit_row_scope(constraint_expr):
+                        if pass_annotated:
+                            constraints.append(constraint_expr.copy())
+                        continue
                     has_annotated = any(
                         solver_var(col) is not None
                         for col in constraint_expr.find_all(exp.Column)
@@ -3123,13 +4879,58 @@ class Resolver:
                     for binding in req_bindings:
                         rewritten = _rewrite_constraint_for_binding(
                             constraint_expr, binding, self.instance,
+                            row_bindings=row_bindings,
                             scoped_vars=scoped_vars,
                         )
                         if rewritten is not None:
                             constraints.append(rewritten)
 
+        path_variables = _path_variable_index_for_constraints(
+            constraints,
+            row_bindings,
+        )
+        for _relation, _req, req_bindings in all_constraint_items:
+            for binding in req_bindings:
+                constraints.extend(
+                    _database_not_null_constraints_for_binding(
+                        self.instance,
+                        binding,
+                        path_variables=path_variables,
+                    )
+                )
+                constraints.extend(
+                    _database_check_constraints_for_binding(
+                        self.instance,
+                        binding,
+                        path_variables=path_variables,
+                    )
+                )
+
+        for _relation, req, req_bindings in all_constraint_items:
+            constraints.extend(
+                _duplicate_column_constraints(
+                    self.instance,
+                    req,
+                    req_bindings,
+                )
+            )
+            constraints.extend(
+                _contrast_column_constraints(
+                    self.instance,
+                    req,
+                    req_bindings,
+                )
+            )
+            constraints.extend(
+                _distinct_column_constraints(
+                    self.instance,
+                    req,
+                    req_bindings,
+                )
+            )
+
         # Build join equalities.
-        join_equalities = _build_join_equalities(spec, row_bindings, self.instance)
+        join_equalities = _build_join_equalities(spec, row_bindings)
 
         # Add IS NOT NULL for join equality columns.
         seen_not_null: Set[str] = set()
@@ -3213,19 +5014,20 @@ def speculate(
     resolver = Resolver(plan, instance, dialect, solver=solver)
 
     branch_specs = propagator.propagate()
+    branch_specs = sorted(
+        branch_specs,
+        key=lambda spec: 1 if spec.branch == "positive_seed_deferred" else 0,
+    )
     logger.info("Generated %d branch specs", len(branch_specs))
 
     results = []
     for spec in branch_specs:
         if not spec.requirements:
             continue
-        try:
-            rows = resolver.resolve(spec)
-        except Exception as exc:
-            logger.debug("spec %s failed: %s", spec.branch, exc)
-            rows = {}
+        rows = resolver.resolve(spec)
         if rows:
             results.append((spec.branch, rows))
+
     return results
 
 

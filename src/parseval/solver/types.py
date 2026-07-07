@@ -1,7 +1,7 @@
 """Shared types for the solver module."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from sqlglot import exp
 
@@ -35,18 +35,48 @@ class SolverVar:
     column_id: ColumnId
     relation_id: RelationId
     row_scope: str | None = None
+    _binding_key: tuple = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        relation = self.relation_id
+        source = self.column_id.source_column_id
+        source_key = None
+        if source is not None:
+            source_relation = source.relation
+            source_key = (
+                source.kind.value,
+                source_relation.kind.value if source_relation is not None else None,
+                source_relation.name.normalized
+                if source_relation is not None and source_relation.name is not None
+                else None,
+                source_relation.alias.normalized
+                if source_relation is not None and source_relation.alias is not None
+                else None,
+                source_relation.scope_id if source_relation is not None else None,
+                source.name.normalized,
+                source.scope_id,
+                source.ordinal,
+            )
+        object.__setattr__(
+            self,
+            "_binding_key",
+            (
+                relation.kind.value,
+                relation.name.normalized if relation.name is not None else None,
+                relation.alias.normalized if relation.alias is not None else None,
+                relation.scope_id,
+                self.column_id.kind.value,
+                self.column_id.name.normalized,
+                self.column_id.scope_id,
+                self.column_id.ordinal,
+                source_key,
+                self.row_scope,
+            ),
+        )
 
     @property
     def binding_key(self) -> tuple:
-        relation = self.relation_id
-        return (
-            relation.kind.value,
-            relation.name.normalized if relation.name is not None else None,
-            relation.alias.normalized if relation.alias is not None else None,
-            relation.scope_id,
-            self.column_id.name.normalized,
-            self.row_scope,
-        )
+        return self._binding_key
 
     def __hash__(self) -> int:
         return hash(self.binding_key)

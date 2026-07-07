@@ -61,7 +61,6 @@ import math
 import re
 from datetime import date, datetime
 from decimal import Decimal
-from functools import wraps
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 from dateutil import parser as date_parser
@@ -301,35 +300,9 @@ class Variable(Symbol):
         self.set("concrete", None)
 
 
-class ITE(Symbol):
-    """Symbolic if-then-else (``CASE WHEN cond THEN a ELSE b END``).
-
-    Kept as an explicit node because downstream branch analysis wants to
-    treat each arm of a conditional as a first-class decision site.
-    """
-
-    arg_types = {
-        "this": True,
-        "true_branch": True,
-        "false_branch": True,
-    }
-
-    @property
-    def condition(self) -> Symbol:
-        return self.this
-
-    @property
-    def true_branch(self) -> Symbol:
-        return self.args.get("true_branch")
-
-    @property
-    def false_branch(self) -> Symbol:
-        return self.args.get("false_branch")
-
-
 # Register generator transforms so ``Symbol`` et al. pretty-print when a
 # sqlglot ``Generator`` runs over an AST containing them.
-for _klass in [Symbol, Const, Variable, ITE, Row]:
+for _klass in [Symbol, Const, Variable, Row]:
     generator.Generator.TRANSFORMS[_klass] = (
         lambda self, expression: expression.sql(dialect=self.dialect)
     )
@@ -597,18 +570,6 @@ def tvl_not(a: Any) -> Optional[bool]:
     if a is None:
         return None
     return not a
-
-
-def _null_aware(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Binary-op decorator: NULL in → NULL out."""
-
-    @wraps(func)
-    def wrapper(a: Any, b: Any) -> Any:
-        if a is None or b is None:
-            return None
-        return func(a, b)
-
-    return wrapper
 
 
 # =============================================================================
@@ -1395,17 +1356,6 @@ def _eval_paren(node: exp.Paren, env: Environment) -> Any:
     return _eval(node.this, env)
 
 
-# ----- ITE -----
-
-
-@handler(ITE)
-def _eval_ite(node: ITE, env: Environment) -> Any:
-    cond = _eval(node.condition, env)
-    if cond is None:
-        return None
-    return _eval(node.true_branch if cond else node.false_branch, env)
-
-
 # =============================================================================
 # negate_predicate
 # =============================================================================
@@ -1455,65 +1405,18 @@ def set_column_meta(col: exp.Column, meta: dict) -> None:
     col.set("_parseval_meta", frozenset(meta.items()))
 
 
-# =============================================================================
-# Compatibility shims (to be removed once consumers migrate)
-# =============================================================================
-
-
-def _concrete_shim(self: exp.Expression) -> Any:
-    """``expr.concrete`` — legacy property wrapper around :func:`concrete`.
-
-    Provided for consumers that still read ``expression.concrete`` as a
-    property. Does one evaluation under an empty :class:`Environment`
-    each call; callers that need repeated evaluation under a real
-    environment should migrate to the function form.
-    """
-    return _eval(self, Environment())
-
-
-def _datatype_shim(self: exp.Expression) -> Optional[DataType]:
-    """``expr.datatype`` — legacy property resolving the expression's type."""
-    if self.type is not None:
-        return self.type
-    raw = self.args.get("_type")
-    if raw is None:
-        return None
-    return DataType.build(raw)
-
-
-def _column_ref_shim(self: exp.Column) -> int:
-    """``column.ref`` — legacy positional reference slot."""
-    return self.args.get("ref", 0)
-
-
-exp.Expression.concrete = property(_concrete_shim)  # type: ignore[attr-defined]
-exp.Expression.datatype = property(_datatype_shim)  # type: ignore[attr-defined]
-exp.Column.ref = property(_column_ref_shim)  # type: ignore[attr-defined]
-
-
 __all__ = [
     # Symbol vocabulary
     "Symbol",
     "Const",
     "Variable",
-    "ITE",
     # Environment + evaluator
     "Environment",
     "concrete",
-    "handler",
-    # 3VL
-    "tvl_and",
-    "tvl_or",
-    "tvl_not",
     # Re-exports
     "Row",
     "DataType",
     # Utilities
-    "make_is_null",
-    "make_is_not_null",
-    "is_null_predicate",
-    "is_not_null_predicate",
-    "null_predicate_parts",
     "negate_predicate",
     "column_meta",
     "set_column_meta",

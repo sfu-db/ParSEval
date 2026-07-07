@@ -128,6 +128,8 @@ class TypeService:
             self._profile_cache[key] = adapter.profile(datatype, dialect)
         return self._profile_cache[key]
 
+class StorageLiteral(str):
+    """String value that should be stored without type coercion."""
 
 def type_family(dtype: DataType) -> TypeFamily:
     """Map a SQL DataType to a neutral ParSEval type family."""

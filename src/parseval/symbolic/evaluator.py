@@ -390,6 +390,7 @@ class PlanEvaluator:
         # before the first context is built or any expression is evaluated.
         self.plan.annotations
         self._uncorrelated_scalar_cache: Dict[int, Any] = {}
+        self._uncorrelated_predicate_cache: Dict[int, exp.Expression] = {}
         self._coverage_recorder: Optional[BranchCoverageRecorder] = None
 
     def evaluate(self, tree: Optional[BranchTree] = None) -> BranchTree:
@@ -403,6 +404,7 @@ class PlanEvaluator:
             tree = BranchTreeBuilder(self.plan, self.instance).build()
         self._coverage_recorder = BranchCoverageRecorder(tree)
         self._uncorrelated_scalar_cache = {}
+        self._uncorrelated_predicate_cache = {}
         ctx = build_context_from_instance(self.instance)
         output = self._walk(self.plan.root, ctx, tree)
         self._record_root_result(output, tree)
@@ -425,7 +427,27 @@ class PlanEvaluator:
         rows: List[Row] = []
         for table in output.tables.values():
             rows.extend(table.rows)
+        seen_values: dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
         for row in rows:
+            output_values = tuple(_symbol_value(symbol) for _column, symbol in row.items())
+            previous_row_ids = seen_values.get(output_values)
+            if previous_row_ids is None:
+                seen_values[output_values] = _row_ids(row)
+            else:
+                self._observe(
+                    root_node,
+                    AtomObservation(
+                        atom_id=0,
+                        outcome=BranchType.DUPLICATE,
+                        row_ids=_row_ids(row),
+                    ),
+                )
+                tree.record_operator_trace(
+                    root_node,
+                    outcome=BranchType.DUPLICATE,
+                    input_row_ids=(previous_row_ids, _row_ids(row)),
+                    output_row_ids=(previous_row_ids, _row_ids(row)),
+                )
             self._observe(
                 root_node,
                 AtomObservation(
@@ -662,6 +684,50 @@ class PlanEvaluator:
             return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
 
         table_name = step.source.name
+        cte_subplan = next(
+            (
+                subplan
+                for subplan in step.subplan_dependencies
+                if subplan.kind is SubPlanKind.CTE
+            ),
+            None,
+        )
+        if cte_subplan is not None:
+            inner_ctx = self._evaluate_subtree(cte_subplan.inner)
+            inner_rows = []
+            for _name, table in inner_ctx.tables.items():
+                inner_rows.extend(table.rows)
+            output_columns = tuple(getattr(step, "output_column_ids", ()) or ())
+            if not output_columns and inner_rows:
+                output_columns = tuple(inner_rows[0].columns)
+            rows = [
+                Row(
+                    this=row.rowid,
+                    columns={
+                        column: _materialize_column_from_row(column, row)
+                        for column in output_columns
+                    },
+                )
+                for row in inner_rows
+            ]
+            if observe:
+                for row in rows:
+                    self._record_row_flow(
+                        tree,
+                        step,
+                        "cte_scan",
+                        row,
+                        sources=(_row_ids(row),),
+                        relations=(step.relation_id,) if step.relation_id is not None else (),
+                    )
+            return Context(
+                tables={
+                    output_key: DerivedSchema(
+                        columns=output_columns,
+                        rows=rows,
+                    )
+                }
+            )
         if table_name not in ctx.tables:
             return Context(tables={output_key: DerivedSchema(columns=(), rows=[])})
         table = ctx.tables[table_name]
@@ -1960,6 +2026,14 @@ class PlanEvaluator:
             or predicate.find(exp.In)
         ):
             return predicate
+        cacheable = all(
+            subplan.kind is SubPlanKind.SCALAR and not subplan.correlated
+            for subplan in subplans
+        )
+        if cacheable:
+            cached = self._uncorrelated_predicate_cache.get(id(predicate))
+            if cached is not None:
+                return cached
 
         scalar_values: Dict[int, Any] = {}
         scalar_values_by_sql: Dict[str, Any] = {}
@@ -2008,7 +2082,10 @@ class PlanEvaluator:
                 return exp.true() if predicate_values[key] else exp.false()
             return node
 
-        return predicate.copy().transform(replace_subquery)
+        resolved = predicate.copy().transform(replace_subquery)
+        if cacheable:
+            self._uncorrelated_predicate_cache[id(predicate)] = resolved
+        return resolved
 
     def _eval_inner_plan(
         self,
