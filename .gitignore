@@ -184,6 +184,4 @@ results/
 
 data/mysql
 
-tests/experiment/test_mysql.py
-
 docs/superpowers
