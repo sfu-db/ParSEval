@@ -122,6 +122,8 @@ class Solver:
         Returns :class:`SolveResult` with ``sat=True`` and assignments
         on success, or ``sat=False`` with a reason on failure.
         """
+        import time as _time
+
         if not constraint.constraints and not constraint.join_equalities:
             return SolveResult(sat=True, assignments={})
 
@@ -131,29 +133,49 @@ class Solver:
             return SolveResult(sat=False, reason=reason)
         constraint = normalize_constraint(constraint)
 
+        domain_time = 0.0
+        smt_time = 0.0
         assignments: Dict[SolverVar, Any] = {}
         for component in self._components(constraint):
+            t_d0 = _time.monotonic()
             domain_result = self._try_domain(component)
+            t_d1 = _time.monotonic()
+            domain_time += t_d1 - t_d0
             if domain_result.status == "sat":
                 assignments.update(domain_result.assignments or {})
                 continue
             if domain_result.status == "unsat":
-                return SolveResult(
+                result = SolveResult(
                     sat=False,
                     reason=domain_result.reason or "unsat",
                 )
+                result._domain_time = domain_time
+                result._smt_time = smt_time
+                return result
             if domain_result.status != "unknown":
-                return SolveResult(
+                result = SolveResult(
                     sat=False,
                     reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",
                 )
+                result._domain_time = domain_time
+                result._smt_time = smt_time
+                return result
 
+            t_s0 = _time.monotonic()
             smt_result, smt_reason = self._try_smt(component)
+            t_s1 = _time.monotonic()
+            smt_time += t_s1 - t_s0
             if smt_result is None:
-                return SolveResult(sat=False, reason=smt_reason)
+                result = SolveResult(sat=False, reason=smt_reason)
+                result._domain_time = domain_time
+                result._smt_time = smt_time
+                return result
             assignments.update(smt_result)
 
-        return SolveResult(sat=True, assignments=assignments)
+        result = SolveResult(sat=True, assignments=assignments)
+        result._domain_time = domain_time
+        result._smt_time = smt_time
+        return result
 
     # ── Validation ──────────────────────────────────────────────
 
