@@ -27,7 +27,7 @@ class InstanceLoader:
                 is_mysql = target.dialect == "mysql"
                 if is_mysql:
                     conn.execute("SET FOREIGN_KEY_CHECKS = 0", fetch=None)
-                for table in snapshot.tables:
+                for table in reversed(snapshot.tables):
                     conn.drop_table(table.table_name)
                 if is_mysql:
                     conn.execute("SET FOREIGN_KEY_CHECKS = 1", fetch=None)

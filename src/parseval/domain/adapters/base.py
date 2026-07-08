@@ -24,6 +24,12 @@ class TypeAdapter(ABC):
     def coerce_out(self, value: Any, profile: TypeProfile) -> Any:
         return self.coerce_in(value, profile)
 
+    def storage_key(self, value: Any, profile: TypeProfile) -> Any:
+        return self.coerce_in(value, profile)
+
+    def validate_storage_value(self, value: Any, profile: TypeProfile) -> None:
+        self.coerce_in(value, profile)
+
     def equivalent(
         self,
         left: Any,

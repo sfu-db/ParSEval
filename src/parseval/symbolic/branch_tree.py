@@ -23,6 +23,7 @@ from parseval.identity import (
 )
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
+from parseval.plan.rex import column_meta
 from parseval.plan.planner import (
     Aggregate,
     Filter,
@@ -328,11 +329,17 @@ def coverage_obligations_for_site(
             )
     elif site == "project_output":
         for atom_id, atom in enumerate(atoms):
+            expression = atom.this if isinstance(atom, exp.Alias) else atom
+            outcomes = (BranchType.PROJECT_NULL, BranchType.PROJECT_NON_NULL)
+            if isinstance(expression, exp.Column):
+                meta = column_meta(expression)
+                if meta is not None and not meta["nullable"]:
+                    outcomes = (BranchType.PROJECT_NON_NULL,)
             add(
                 "project_output",
                 atom_id,
                 atom,
-                (BranchType.PROJECT_NULL, BranchType.PROJECT_NON_NULL),
+                outcomes,
             )
     elif site == "distinct":
         expression = atoms[0] if atoms else exp.Literal.string("DISTINCT")
@@ -1414,21 +1421,30 @@ def _build_branch_tree(
         join_facts: list[JoinFact] = []
         visited: set[int] = set()
 
-        def walk(step: Step) -> None:
+        def walk(step: Step, *, include_having: bool = False) -> None:
             if id(step) in visited:
                 return
             visited.add(id(step))
             condition = getattr(step, "condition", None)
-            if isinstance(condition, exp.Expression) and not isinstance(step, Having):
+            if (
+                isinstance(condition, exp.Expression)
+                and (include_having or not isinstance(step, Having))
+            ):
                 predicates.append(condition)
             if isinstance(step, Join):
                 join_facts.extend(_join_facts_for_step(plan, step))
             for subplan in getattr(step, "subplan_dependencies", ()) or ():
-                walk(subplan)
+                walk(subplan, include_having=include_having)
                 if subplan.inner is not None:
-                    walk(subplan.inner)
+                    walk(
+                        subplan.inner,
+                        include_having=(
+                            include_having
+                            or subplan.kind in {SubPlanKind.TABLE, SubPlanKind.CTE}
+                        ),
+                    )
             for dep in step.chain_dependencies:
-                walk(dep)
+                walk(dep, include_having=include_having)
 
         for dep in root.chain_dependencies:
             walk(dep)

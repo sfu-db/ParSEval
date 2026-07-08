@@ -15,6 +15,7 @@ from sqlglot import exp
 
 from parseval.constants import PlausibleBit
 from parseval.identity import ColumnId, RelationId
+from parseval.plan.rex import column_meta
 
 
 # =============================================================================
@@ -639,8 +640,14 @@ class BranchTree:
             return specs
 
         if node.site == "project_output":
-            for atom_id in range(len(node.atoms)):
-                add(atom_id, BranchType.PROJECT_NULL, self.thresholds.project_null)
+            for atom_id, atom in enumerate(node.atoms):
+                expression = atom.this if isinstance(atom, exp.Alias) else atom
+                if not isinstance(expression, exp.Column):
+                    add(atom_id, BranchType.PROJECT_NULL, self.thresholds.project_null)
+                else:
+                    meta = column_meta(expression)
+                    if meta is None or meta["nullable"]:
+                        add(atom_id, BranchType.PROJECT_NULL, self.thresholds.project_null)
                 add(atom_id, BranchType.PROJECT_NON_NULL, self.thresholds.project_non_null)
             return specs
 

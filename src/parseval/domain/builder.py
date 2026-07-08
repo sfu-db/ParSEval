@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from parseval.coercion import coerce_value, values_equivalent
+from parseval.coercion import coerce_value, storage_key, values_equivalent
 from parseval.dtype import DataType, TypeFamily, TypeProfile, type_family
 from parseval.identity import ColumnId, RelationId
 from .compiler import ConstraintCompiler
@@ -258,7 +258,7 @@ class DatabaseBuilder:
             return coerce_value(value, column.datatype, dialect=column.dialect)
         except Exception as exc:
             raise TypeCoercionError(
-                f"Failed to coerce value for {column.qualified_name}: {value!r}"
+                f"Failed to coerce value for {column.qualified_name}: {value!r}: {exc}"
             ) from exc
 
     def _validate_explicit_uniqueness_and_fk(self, column, value) -> None:
@@ -273,7 +273,7 @@ class DatabaseBuilder:
         """
         if value is not None and self._enforces_single_column_uniqueness(column):
             state = self.runtime.column_state(column.id)
-            if value in state.used_values:
+            if self._storage_key(column, value) in state.used_values:
                 raise UniqueConflictError(
                     f"Duplicate value for unique column {column.qualified_name}: {value!r}"
                 )
@@ -320,7 +320,7 @@ class DatabaseBuilder:
                 )
         if value is not None and self._enforces_single_column_uniqueness(column):
             state = self.runtime.column_state(column.id)
-            if value in state.used_values:
+            if self._storage_key(column, value) in state.used_values:
                  raise UniqueConflictError(
                     f"Generated duplicate value for unique column {column.qualified_name}: {value!r}"
                 )
@@ -348,7 +348,10 @@ class DatabaseBuilder:
         target_column = self.schema.get_table(foreign_key.target_table_id).get_column(
             foreign_key.target_column_ids[0]
         )
+        value_key = self._storage_key(column, value)
         for referenced in referenced_values:
+            if value_key == self._storage_key(target_column, referenced):
+                return True
             if values_equivalent(
                 value,
                 column.datatype,
@@ -474,11 +477,16 @@ class DatabaseBuilder:
 
         state = self.runtime.column_state(column.id)
         for candidate in plan.allowed_values:
-            if candidate not in state.used_values and candidate not in plan.excluded_values:
+            candidate_key = self._storage_key(column, candidate)
+            if candidate_key not in state.used_values and candidate not in plan.excluded_values:
                 return candidate
         raise UniqueConflictError(
             f"No allowed values remain for unique column {column.qualified_name}"
         )
+
+    @staticmethod
+    def _storage_key(column, value):
+        return storage_key(value, column.datatype, dialect=column.dialect)
 
     def _enforces_single_column_uniqueness(self, column) -> bool:
         """Check whether a column requires single-column uniqueness enforcement.

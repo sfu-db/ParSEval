@@ -40,6 +40,7 @@ class Verdict(Enum):
     EQ = "eq"              # Queries are equivalent on generated instance
     NEQ = "neq"            # Queries produce different results
     SYNTAX_ERROR = "syntax_error"  # One or both queries have syntax errors
+    RUNTIME_ERROR = "runtime_error"  # Query execution failed (division by zero, FK violation, etc.)
     TIMEOUT = "timeout"    # Generation or execution timed out
     UNKNOWN = "unknown"    # Could not determine
 
@@ -90,6 +91,7 @@ class GenerationResult:
     coverage: float = 0.0
     error_msg: str = ""
     elapsed_time: float = 0.0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
@@ -97,6 +99,7 @@ class GenerationResult:
             "coverage": self.coverage,
             "error_msg": self.error_msg,
             "elapsed_time": self.elapsed_time,
+            "generation_coverage": self.coverage,
         }
 
 
@@ -151,7 +154,9 @@ def compare_results(
 ) -> Verdict:
     """Compare two execution results and return a verdict."""
     if r1.is_error or r2.is_error:
-        return Verdict.SYNTAX_ERROR
+        if r1.is_syntax_error or r2.is_syntax_error:
+            return Verdict.SYNTAX_ERROR
+        return Verdict.RUNTIME_ERROR
 
     rows1 = [normalize_row(row) for row in r1.rows]
     rows2 = [normalize_row(row) for row in r2.rows]

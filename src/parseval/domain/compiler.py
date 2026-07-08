@@ -6,7 +6,7 @@ from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.dtype import DataType, type_family
+from parseval.dtype import DataType, TypeService, type_family
 from .value_space import ValueSpace
 
 from .constraints import (
@@ -157,8 +157,11 @@ class ConstraintCompiler:
         residual_predicates = []
 
         # 1. Handle Datatype-derived constraints
-        if spec.datatype.is_type(DataType.Type.ENUM):
-            
+        profile = TypeService().profile(spec)
+        profile_allowed_values = profile.metadata.get("allowed_values")
+        if profile_allowed_values is not None:
+            allowed_values = tuple(profile_allowed_values)
+        elif spec.datatype.is_type(DataType.Type.ENUM):
             enum_values = []
             for e in spec.datatype.args.get("expressions", []):
                 val = e.this if isinstance(e, exp.Literal) else str(e)
