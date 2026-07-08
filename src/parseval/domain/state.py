@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import random
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
+from parseval.coercion import storage_key
 from parseval.identity import ColumnId, RelationId
 from .spec import ColumnSpec, ForeignKeySpec, SchemaSpec, TableSpec
 
@@ -24,13 +25,13 @@ class ColumnState:
     used_values: Set[Any] = field(default_factory=set)
     null_count: int = 0
 
-    def remember(self, value: Any) -> None:
+    def remember(self, value: Any, storage_value: Any = None) -> None:
         """Record a generated value, updating used_values and null_count."""
         self.generated_values.append(value)
         if value is None:
             self.null_count += 1
         else:
-            self.used_values.add(value)
+            self.used_values.add(value if storage_value is None else storage_value)
 
 
 @dataclass
@@ -149,7 +150,7 @@ class SchemaRuntime:
             return None
         target_column = foreign_key.target_column_ids[0]
         target_state = self.column_state(target_column)
-        return list(target_state.used_values)
+        return [value for value in target_state.generated_values if value is not None]
 
     def referenced_key_tuples(
         self, foreign_key: ForeignKeySpec
@@ -181,7 +182,15 @@ class SchemaRuntime:
         }
         self.table_state(table_spec.id).add_row(stored_row)
         for column in table_spec.columns:
-            self.column_state(column.id).remember(stored_row.get(column.id))
+            value = stored_row.get(column.id)
+            self.column_state(column.id).remember(
+                value,
+                None if value is None else self.column_storage_key(column, value),
+            )
+
+    def column_storage_key(self, column: ColumnSpec | ColumnId, value: Any) -> Any:
+        column_spec = column if isinstance(column, ColumnSpec) else self.column_state(column).spec
+        return storage_key(value, column_spec.datatype, dialect=column_spec.dialect)
 
 
 __all__ = ["ColumnState", "TableState", "SchemaRuntime", "RowContext"]

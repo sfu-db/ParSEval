@@ -18,7 +18,7 @@ everything simultaneously — no post-hoc FK fixup needed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
@@ -86,6 +86,26 @@ class _AggregateAliasInfo:
     kind: str
     source: exp.Column | None
     distinct: bool = False
+
+
+@dataclass(frozen=True)
+class _AggregateLineage:
+    function: str
+    distinct: bool
+    argument: ColumnId | None
+    group_keys: Tuple[ColumnId, ...]
+    step: Aggregate | None = None
+    source_relations: Tuple[RelationId, ...] = ()
+    join_facts: Tuple[JoinFact, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RelationalDivisionMatch:
+    outer_key: ColumnId
+    domain_key: ColumnId
+    group_keys: Tuple[ColumnId, ...]
+    join_facts: Tuple[JoinFact, ...] = ()
+    domain_relations: Tuple[RelationId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -480,6 +500,7 @@ class ConstraintGenerator:
             for obligation in path.obligations
             if obligation.kind == "row_set" and obligation.row_set is not None
         )
+        relational_division_domain_relations: Set[RelationId] = set()
         for predicate in path.predicates:
             if (
                 row_sets
@@ -487,11 +508,32 @@ class ConstraintGenerator:
                 and predicate.expression.find(exp.In)
             ):
                 continue
+            if (
+                row_sets
+                and predicate.node.site == "having"
+                and predicate.outcome in _POSITIVE_BITS
+            ):
+                relational_division = self._relational_division_constraints(
+                    predicate.expression,
+                    tables,
+                )
+                if relational_division:
+                    constraints.extend(relational_division)
+                    relational_division_domain_relations.update(
+                        self._relational_division_domain_relations_for_expression(
+                            predicate.expression,
+                            tables,
+                        )
+                    )
+                    continue
             if self._row_sets_cover_having_predicate(predicate, row_sets):
                 continue
             constraints.extend(self._constraints_for_path_predicate(predicate))
-        constraints.extend(self._constraints_for_row_set_obligations(path.obligations))
-        obligations = path.obligations
+        obligations = self._obligations_without_relations(
+            path.obligations,
+            relational_division_domain_relations,
+        )
+        constraints.extend(self._constraints_for_row_set_obligations(obligations))
         if any(obligation.kind == "row_set" for obligation in obligations):
             obligations = tuple(
                 obligation
@@ -638,6 +680,12 @@ class ConstraintGenerator:
         self,
         predicate: PathPredicate,
     ) -> List[exp.Expression]:
+        relational_division = self._relational_division_constraints(
+            predicate.expression,
+            predicate.node.tables,
+        )
+        if relational_division:
+            return relational_division
         constraints = self._positive_predicate_constraints(
             predicate.expression,
             predicate.node.subqueries,
@@ -713,14 +761,22 @@ class ConstraintGenerator:
             predicate.node.tables,
             "r0",
         )
+        group_cols = self._group_columns_for_node(predicate.node)
+        existing_keys = self._existing_group_keys(group_cols)
+        avoid_existing = self._avoid_existing_group_keys(
+            group_cols,
+            existing_keys,
+            "r0",
+        )
         group_constraints = self._same_group_constraints(predicate.node, ("r0", "r1"))
         if predicate.outcome == PlausibleBit.AGG_DISTINCT_NULL_IGNORED:
             return [
                 exp.Is(this=left, expression=exp.Null()),
                 *self._group_key_not_null_constraints(
-                    self._group_columns_for_node(predicate.node),
+                    group_cols,
                     ("r0",),
                 ),
+                *avoid_existing,
             ]
 
         right = self._scoped_expression(
@@ -739,7 +795,7 @@ class ConstraintGenerator:
             exp.Is(this=right, expression=exp.Not(this=exp.Null())),
         ]
 
-        return constraints + group_constraints
+        return constraints + group_constraints + avoid_existing
 
     def _aggregate_input_constraints(
         self,
@@ -958,6 +1014,12 @@ class ConstraintGenerator:
         self,
         predicate: PathPredicate,
     ) -> List[exp.Expression]:
+        constraints = self._relational_division_constraints(
+            predicate.expression,
+            predicate.node.tables,
+        )
+        if constraints:
+            return constraints
         constraints = self._aggregate_alias_comparison_constraints(
             predicate.expression,
             predicate.node,
@@ -968,6 +1030,497 @@ class ConstraintGenerator:
             predicate.expression,
             predicate.node,
         )
+
+    def _relational_division_constraints(
+        self,
+        expression: exp.Expression,
+        outer_relations: Tuple[RelationId, ...],
+    ) -> List[exp.Expression]:
+        match = self._relational_division_match(expression, outer_relations)
+        if match is None:
+            return []
+        outer_key = match.outer_key
+        domain_key = match.domain_key
+        group_keys = match.group_keys
+        if not group_keys:
+            return []
+
+        constraints: List[exp.Expression] = []
+        outer_key_cols: List[exp.Column] = []
+        domain_key_values = self._relational_division_existing_domain_values(domain_key)
+        domain_key_cols: List[exp.Expression] = []
+        first_group_cols = [
+            self._constraint_column(group_key, row_scope="division_outer0")
+            for group_key in group_keys
+        ]
+        for group_col in first_group_cols:
+            constraints.append(
+                exp.Is(this=group_col.copy(), expression=exp.Not(this=exp.Null()))
+            )
+        constraints.extend(
+            self._avoid_existing_group_keys(
+                group_keys,
+                self._existing_group_keys(group_keys),
+                "division_outer0",
+            )
+        )
+
+        for index in range(2):
+            outer_scope = f"division_outer{index}"
+            domain_scope = f"division_domain{index}"
+            outer_col = self._constraint_column(outer_key, row_scope=outer_scope)
+            if len(domain_key_values) >= 2:
+                domain_col = self._literal_for_value(domain_key_values[index])
+            else:
+                domain_col = self._constraint_column(domain_key, row_scope=domain_scope)
+            outer_key_cols.append(outer_col)
+            domain_key_cols.append(domain_col)
+            constraints.append(
+                exp.Is(this=outer_col.copy(), expression=exp.Not(this=exp.Null()))
+            )
+            if isinstance(domain_col, exp.Column):
+                constraints.append(
+                    exp.Is(this=domain_col.copy(), expression=exp.Not(this=exp.Null()))
+                )
+            constraints.append(exp.EQ(this=outer_col.copy(), expression=domain_col.copy()))
+            constraints.extend(
+                self._relational_division_join_constraints(
+                    match.join_facts,
+                    domain_key=domain_key,
+                    domain_value=domain_col,
+                    outer_scope=outer_scope,
+                    domain_scope=domain_scope,
+                )
+            )
+            if index == 0:
+                continue
+            for group_key, first_group_col in zip(group_keys, first_group_cols):
+                constraints.append(
+                    exp.EQ(
+                        this=self._constraint_column(
+                            group_key,
+                            row_scope=outer_scope,
+                        ),
+                        expression=first_group_col.copy(),
+                    )
+                )
+
+        constraints.extend(
+            [
+                exp.NEQ(
+                    this=outer_key_cols[0].copy(),
+                    expression=outer_key_cols[1].copy(),
+                ),
+                exp.NEQ(
+                    this=domain_key_cols[0].copy(),
+                    expression=domain_key_cols[1].copy(),
+                ),
+            ]
+        )
+        constraints.extend(
+            self._relational_division_outer_reuse_constraints(
+                outer_key,
+                outer_key_cols[0],
+                group_keys,
+                first_group_cols,
+                predicate_relations=outer_relations,
+            )
+        )
+        return constraints
+
+    def _relational_division_existing_domain_values(
+        self,
+        domain_key: ColumnId,
+    ) -> List[Any]:
+        values: List[Any] = []
+        seen: Set[Any] = set()
+        for value in self._existing_values_for_column(domain_key):
+            if value is None or value in seen:
+                continue
+            seen.add(value)
+            values.append(value)
+            if len(values) == 2:
+                break
+        return values
+
+    def _relational_division_match(
+        self,
+        expression: exp.Expression,
+        outer_relations: Tuple[RelationId, ...],
+    ) -> _RelationalDivisionMatch | None:
+        if not isinstance(expression, exp.EQ):
+            return None
+        left = expression.this
+        right = expression.expression
+        if left is None or right is None:
+            return None
+        if right.find(exp.Subquery):
+            outer_expr = left
+            subquery_anchor = right
+        elif left.find(exp.Subquery):
+            outer_expr = right
+            subquery_anchor = left
+        else:
+            return None
+
+        outer_lineage = self._relational_division_outer_lineage(
+            outer_expr,
+            outer_relations,
+        )
+        if (
+            outer_lineage is None
+            or outer_lineage.argument is None
+            or outer_lineage.argument.relation is None
+        ):
+            return None
+        outer_key = outer_lineage.argument
+
+        subquery = (
+            subquery_anchor
+            if isinstance(subquery_anchor, exp.Subquery)
+            else subquery_anchor.find(exp.Subquery)
+        )
+        if subquery is None:
+            return None
+        subplan = self._find_subplan_for_anchor(subquery)
+        if subplan is None:
+            subplans = self._subplans_for_predicate(expression)
+            subplan = subplans[0] if len(subplans) == 1 else None
+        if subplan is None or subplan.inner is None:
+            return None
+        domain_relations = self._plan_relations(subplan.inner)
+        if len(domain_relations) != 1:
+            return None
+
+        domain_key = self._relational_division_domain_key(
+            subplan.inner,
+            domain_relations,
+        )
+        if domain_key is None or domain_key.relation is None:
+            return None
+        domain_key = self._storage_backed_column(domain_key, domain_relations)
+        if domain_key is None:
+            return None
+        domain_storage = self._storage_relation_for_column_id(domain_key)
+        outer_key = self._storage_backed_column(
+            outer_key,
+            outer_relations,
+            exclude_storage=domain_storage,
+        )
+        if outer_key is None:
+            return None
+
+        group_keys = []
+        candidate_group_keys = outer_lineage.group_keys
+        if not candidate_group_keys:
+            candidate_group_keys = self._aggregate_group_columns_for_relations(
+                outer_relations
+            )
+        for group_key in candidate_group_keys:
+            backed = self._storage_backed_column(
+                group_key,
+                outer_lineage.source_relations or outer_relations,
+                exclude_storage=domain_storage,
+            )
+            if backed is None and outer_lineage.source_relations:
+                backed = self._storage_backed_column(
+                    group_key,
+                    outer_relations,
+                    exclude_storage=domain_storage,
+                )
+            if backed is not None and backed.relation == outer_key.relation:
+                group_keys.append(backed)
+        return _RelationalDivisionMatch(
+            outer_key=outer_key,
+            domain_key=domain_key,
+            group_keys=tuple(group_keys),
+            join_facts=outer_lineage.join_facts,
+            domain_relations=domain_relations,
+        )
+
+    def _relational_division_outer_lineage(
+        self,
+        expression: exp.Expression,
+        outer_relations: Tuple[RelationId, ...],
+    ) -> _AggregateLineage | None:
+        outer_count = self._count_function(expression)
+        if outer_count is not None:
+            outer_key_expr = self._count_distinct_column(outer_count)
+            if outer_key_expr is None:
+                return None
+            argument = self._column_id_for_expr(outer_key_expr, outer_relations)
+            if argument is None:
+                return None
+            return _AggregateLineage(
+                function="count",
+                distinct=True,
+                argument=argument,
+                group_keys=self._aggregate_group_columns_for_relations(outer_relations),
+                source_relations=outer_relations,
+            )
+
+        outer_sum = self._sum_key_expression(expression)
+        if outer_sum is not None:
+            argument = self._column_id_for_expr(outer_sum, outer_relations)
+            if argument is None:
+                return None
+            sum_function = (
+                expression
+                if isinstance(expression, exp.Sum)
+                else next(expression.find_all(exp.Sum), None)
+            )
+            return _AggregateLineage(
+                function="sum",
+                distinct=bool(
+                    sum_function is not None
+                    and isinstance(sum_function.this, exp.Distinct)
+                ),
+                argument=argument,
+                group_keys=self._aggregate_group_columns_for_relations(outer_relations),
+                source_relations=outer_relations,
+            )
+
+        if not isinstance(expression, exp.Column):
+            return None
+        pseudo_node = BranchNode(
+            step_id="relational_division",
+            step_type="Having",
+            site="having",
+            predicate=expression,
+            atoms=(expression,),
+            tables=outer_relations,
+        )
+        resolved = self._aggregate_alias_info_for_column(expression, pseudo_node)
+        if resolved is None:
+            return None
+        info, relation = resolved
+        if info.kind == "count" and not info.distinct:
+            return None
+        if info.kind not in {"count", "sum"} or info.source is None:
+            return None
+        argument = self._column_id_for_source(info.source, relation)
+        group_keys = self._aggregate_group_keys_for_step(info.step)
+        source_relations = tuple(self.plan.annotation_for(info.step).source_relations)
+        return _AggregateLineage(
+            function=info.kind,
+            distinct=info.distinct,
+            argument=argument,
+            group_keys=group_keys,
+            step=info.step,
+            source_relations=source_relations,
+            join_facts=self._join_facts_for_step_tree(info.step),
+        )
+
+    def _relational_division_join_constraints(
+        self,
+        join_facts: Tuple[JoinFact, ...],
+        domain_key: ColumnId,
+        domain_value: exp.Expression,
+        outer_scope: str,
+        domain_scope: str,
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        domain_storage = self._storage_relation_for_column_id(domain_key)
+        for fact in join_facts:
+            for left, right in fact.equalities:
+                left_scope = outer_scope
+                right_scope = outer_scope
+                if (
+                    domain_storage is not None
+                    and self._storage_relation_for_column_id(left) == domain_storage
+                ):
+                    left_expr = domain_value.copy()
+                else:
+                    left_expr = self._constraint_column(left, row_scope=left_scope)
+                if (
+                    domain_storage is not None
+                    and self._storage_relation_for_column_id(right) == domain_storage
+                ):
+                    right_expr = domain_value.copy()
+                else:
+                    right_expr = self._constraint_column(right, row_scope=right_scope)
+                constraints.append(
+                    exp.EQ(
+                        this=left_expr,
+                        expression=right_expr,
+                    )
+                )
+        return constraints
+
+    def _aggregate_group_keys_for_step(self, step: Aggregate) -> Tuple[ColumnId, ...]:
+        metadata = self.plan.annotation_for(step).metadata.get("aggregation", {})
+        return tuple(metadata.get("group_keys", ()))
+
+    def _join_facts_for_step_tree(self, step: Step) -> Tuple[JoinFact, ...]:
+        from .branch_tree import _join_facts_for_step
+
+        facts: List[JoinFact] = []
+        for inner in self._iter_steps_with_subplans(step):
+            if isinstance(inner, Join):
+                facts.extend(_join_facts_for_step(self.plan, inner))
+        return tuple(facts)
+
+    def _storage_backed_column(
+        self,
+        column: ColumnId,
+        relations: Tuple[RelationId, ...],
+        exclude_storage: RelationId | None = None,
+    ) -> ColumnId | None:
+        candidates = [column]
+        physical = self._physical_lineage_for_visible_column(column)
+        if physical is not None:
+            candidates.append(physical)
+        for candidate in candidates:
+            storage = self._storage_relation_for_column_id(candidate)
+            if storage is not None and storage != exclude_storage:
+                return candidate
+
+        source = column.source_column_id or column
+        target_name = source.name.normalized
+        for relation in relations:
+            storage = self._storage_relation_for_relation(relation)
+            if storage is None or storage == exclude_storage:
+                continue
+            table_name = _relation_table_name(storage)
+            for column_name in self.instance.tables.get(table_name, {}):
+                normalized = identifier_name(
+                    column_name,
+                    dialect=self.dialect,
+                ).normalized
+                if normalized == target_name:
+                    return self._scoped_physical_column(column_name, relation)
+        return None
+
+    def _relational_division_domain_key(
+        self,
+        inner_root: Step,
+        domain_relations: Tuple[RelationId, ...],
+    ) -> ColumnId | None:
+        domain_relation = domain_relations[0]
+        for step in self._iter_steps_with_subplans(inner_root):
+            if not isinstance(step, Aggregate):
+                continue
+            for lineage in self._aggregate_lineages_for_step(step):
+                if lineage.function in {"count", "sum"} and lineage.argument is not None:
+                    return lineage.argument
+            return self._first_relation_column(domain_relation)
+        return None
+
+    def _aggregate_lineages_for_step(
+        self,
+        step: Aggregate,
+    ) -> Tuple[_AggregateLineage, ...]:
+        annotation = self.plan.annotation_for(step)
+        metadata = annotation.metadata.get("aggregation", {})
+        group_keys = tuple(metadata.get("group_keys", ()))
+        source_relations = tuple(annotation.source_relations)
+        lineages: List[_AggregateLineage] = []
+        for info in metadata.get("aggregate_outputs", {}).values():
+            function = info.get("function")
+            if function not in {"count", "sum"}:
+                continue
+            argument = info.get("argument")
+            distinct = bool(info.get("distinct"))
+            if not isinstance(argument, ColumnId) and function == "count":
+                argument = self._rewritten_distinct_argument_for_aggregate(step)
+                if argument is not None:
+                    distinct = True
+            lineages.append(
+                _AggregateLineage(
+                    function=function,
+                    distinct=distinct,
+                    argument=argument if isinstance(argument, ColumnId) else None,
+                    group_keys=group_keys,
+                    step=step,
+                    source_relations=source_relations,
+                    join_facts=self._join_facts_for_step_tree(step),
+                )
+            )
+        return tuple(lineages)
+
+    def _count_function(self, expression: exp.Expression | None) -> exp.Count | None:
+        if expression is None:
+            return None
+        if isinstance(expression, exp.Count):
+            return expression
+        return next(expression.find_all(exp.Count), None)
+
+    def _count_distinct_column(self, function: exp.Count) -> exp.Column | None:
+        argument = function.this
+        if not isinstance(argument, exp.Distinct) or not argument.expressions:
+            return None
+        expression = argument.expressions[0]
+        return expression if isinstance(expression, exp.Column) else None
+
+    def _sum_key_expression(self, expression: exp.Expression) -> exp.Column | None:
+        function = expression if isinstance(expression, exp.Sum) else None
+        if function is None:
+            function = next(expression.find_all(exp.Sum), None)
+        if function is None:
+            return None
+        argument = function.this
+        if isinstance(argument, exp.Distinct) and argument.expressions:
+            argument = argument.expressions[0]
+        return argument if isinstance(argument, exp.Column) else None
+
+    def _first_relation_column(self, relation: RelationId) -> ColumnId | None:
+        columns = self._row_set_relation_columns(relation)
+        return columns[0] if columns else None
+
+    def _aggregate_group_columns_for_relations(
+        self,
+        relations: Tuple[RelationId, ...],
+    ) -> Tuple[ColumnId, ...]:
+        relation_set = set(relations)
+        for step in self._iter_steps_with_subplans(self.plan.root):
+            if not isinstance(step, Aggregate):
+                continue
+            annotation = self.plan.annotation_for(step)
+            if not set(annotation.source_relations).issubset(relation_set):
+                continue
+            metadata = annotation.metadata.get("aggregation", {})
+            group_keys = tuple(metadata.get("group_keys", ()))
+            if group_keys:
+                return group_keys
+        return ()
+
+    def _relational_division_outer_reuse_constraints(
+        self,
+        outer_key: ColumnId,
+        reusable_outer_value: exp.Column,
+        group_keys: Tuple[ColumnId, ...],
+        reusable_group_values: List[exp.Column],
+        predicate_relations: Tuple[RelationId, ...],
+    ) -> List[exp.Expression]:
+        constraints: List[exp.Expression] = []
+        outer_storage = self._storage_relation_for_column_id(outer_key)
+        if outer_storage is None:
+            return constraints
+        for relation in predicate_relations:
+            if self._storage_relation_for_relation(relation) != outer_storage:
+                continue
+            scoped_key = self._scoped_physical_column(outer_key.name.raw, relation)
+            constraints.append(
+                exp.EQ(
+                    this=self._constraint_column(scoped_key, row_scope="out0"),
+                    expression=reusable_outer_value.copy(),
+                )
+            )
+            for group_key, reusable_group_value in zip(
+                group_keys,
+                reusable_group_values,
+            ):
+                scoped_group = self._scoped_physical_column(
+                    (group_key.source_column_id or group_key).name.raw,
+                    relation,
+                )
+                constraints.append(
+                    exp.EQ(
+                        this=self._constraint_column(scoped_group, row_scope="out0"),
+                        expression=reusable_group_value.copy(),
+                    )
+                )
+        return constraints
 
     def _aggregate_function_comparison_constraints(
         self,
@@ -1222,19 +1775,44 @@ class ConstraintGenerator:
                 continue
             argument = info["argument"]  # ColumnId
             if expected_source is not None:
-                if argument is None:
-                    continue
-                source = argument.source_column_id or argument
                 expected = expected_source.source_column_id or expected_source
-                if not self._same_column_identity(source, expected):
-                    continue
+                if expected.kind is ColumnKind.AGGREGATE:
+                    expected_name = expected.name.normalized
+                    alias_name = identifier_name(alias, dialect=self.dialect).normalized
+                    if expected_name != alias_name:
+                        continue
+                else:
+                    if argument is None:
+                        continue
+                    source = argument.source_column_id or argument
+                    if not self._same_column_identity(source, expected):
+                        continue
             kind = info["function"]
             distinct = bool(info.get("distinct"))
+            if argument is None and kind == "count":
+                argument = self._rewritten_distinct_argument_for_aggregate(step)
+                if argument is not None:
+                    distinct = True
             if argument is not None:
                 source_col = _column_expr_from_id(argument)
                 return _AggregateAliasInfo(step, kind, source_col, distinct)
             # COUNT(*) has no argument column.
             return _AggregateAliasInfo(step, kind, None, distinct)
+        return None
+
+    def _rewritten_distinct_argument_for_aggregate(
+        self,
+        step: Aggregate,
+    ) -> ColumnId | None:
+        for operand in getattr(step, "operands", ()) or ():
+            expression = operand.this if isinstance(operand, exp.Alias) else operand
+            if not isinstance(expression, exp.Distinct) or not expression.expressions:
+                continue
+            distinct_expr = expression.expressions[0]
+            if not isinstance(distinct_expr, exp.Column):
+                continue
+            relations = tuple(self.plan.annotation_for(step).source_relations)
+            return self._column_id_for_expr(distinct_expr, relations)
         return None
 
     def _relation_for_aggregate_info(
@@ -2253,6 +2831,32 @@ class ConstraintGenerator:
             constraints.extend(self._constraints_for_row_set(obligation.row_set))
         return constraints
 
+    def _obligations_without_relations(
+        self,
+        obligations: Tuple[OperatorObligation, ...],
+        skipped_relations: Set[RelationId],
+    ) -> Tuple[OperatorObligation, ...]:
+        if not skipped_relations:
+            return obligations
+        rewritten: List[OperatorObligation] = []
+        for obligation in obligations:
+            row_set = obligation.row_set
+            if obligation.kind != "row_set" or row_set is None:
+                rewritten.append(obligation)
+                continue
+            relations = tuple(
+                relation
+                for relation in row_set.relations
+                if relation not in skipped_relations
+            )
+            rewritten.append(
+                replace(
+                    obligation,
+                    row_set=replace(row_set, relations=relations),
+                )
+            )
+        return tuple(rewritten)
+
     def _row_sets_cover_having_predicate(
         self,
         predicate: PathPredicate,
@@ -2312,6 +2916,9 @@ class ConstraintGenerator:
             return constraints
 
         anti_inner_relations = self._anti_subquery_inner_relations(row_set)
+        anti_inner_relations.update(
+            self._relational_division_domain_relations(row_set)
+        )
         fixed_rels = self._row_set_fixed_relations(row_set)
         first_scope = row_set.row_scopes[0]
 
@@ -2387,6 +2994,55 @@ class ConstraintGenerator:
                     if subplan.inner is not None:
                         relations.update(self._plan_relations(subplan.inner))
         return relations
+
+    def _relational_division_domain_relations(
+        self,
+        row_set: RowSetObligation,
+    ) -> Set[RelationId]:
+        relations: Set[RelationId] = set()
+        for predicate in row_set.path_predicates:
+            for conjunct in self._split_conjuncts(predicate):
+                relations.update(
+                    self._relational_division_domain_relations_for_expression(
+                        conjunct,
+                        row_set.relations,
+                    )
+                )
+        return relations
+
+    def _relational_division_domain_relations_for_expression(
+        self,
+        expression: exp.Expression,
+        relations: Tuple[RelationId, ...],
+    ) -> Set[RelationId]:
+        match = self._relational_division_match(expression, relations)
+        if match is not None:
+            matched = {
+                relation for relation in match.domain_relations if relation in relations
+            }
+            domain_storage = self._storage_relation_for_column_id(match.domain_key)
+            joined_relations = {
+                relation
+                for fact in match.join_facts
+                for relation in (fact.source_relation, fact.target_relation)
+            }
+            if domain_storage is not None:
+                matched.update(
+                    relation
+                    for relation in relations
+                    if relation not in joined_relations
+                    and self._storage_relation_for_relation(relation) == domain_storage
+                )
+            if matched:
+                return matched
+        domain_relations: Set[RelationId] = set()
+        for subplan in self._subplans_for_predicate(expression):
+            if subplan.inner is None:
+                continue
+            for relation in self._plan_relations(subplan.inner):
+                if relation in relations:
+                    domain_relations.add(relation)
+        return domain_relations
 
     def _row_set_relation_columns(self, relation: RelationId) -> Tuple[ColumnId, ...]:
         table_name = _relation_table_name(
@@ -2671,6 +3327,12 @@ class ConstraintGenerator:
                 fixed_rels,
                 first_scope,
             )
+        relational_division = self._relational_division_constraints(
+            predicate,
+            row_set.relations,
+        )
+        if relational_division:
+            return relational_division
         scalar_constraints = self._row_set_scalar_subquery_constraints(
             predicate,
             row_set,
@@ -2888,7 +3550,7 @@ class ConstraintGenerator:
 
     def _find_subplan_for_anchor(self, anchor: exp.Expression) -> SubPlan | None:
         target_sql = anchor.sql(dialect=self.dialect)
-        for step in self.plan.ordered_steps:
+        for step in self._iter_steps_with_subplans(self.plan.root):
             if not isinstance(step, SubPlan):
                 continue
             step_anchor = getattr(step, "anchor", None)
@@ -2904,7 +3566,7 @@ class ConstraintGenerator:
     def _subplans_for_predicate(self, predicate: exp.Expression) -> Tuple[SubPlan, ...]:
         predicate_sql = predicate.sql(dialect=self.dialect)
         matches: List[SubPlan] = []
-        for step in self.plan.ordered_steps:
+        for step in self._iter_steps_with_subplans(self.plan.root):
             if not isinstance(step, SubPlan):
                 continue
             anchor = getattr(step, "anchor", None)

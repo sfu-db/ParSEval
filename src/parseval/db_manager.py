@@ -156,7 +156,9 @@ class Connect:
             )
             try:
                 if parameters is None:
-                    cursor_result = conn.exec_driver_sql(stmt)
+                    cursor_result = conn.exec_driver_sql(
+                        stmt, execution_options={"no_parameters": True}
+                    )
                 else:
                     cursor_result = conn.exec_driver_sql(stmt, parameters)
                 if (

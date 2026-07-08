@@ -1364,6 +1364,8 @@ class Propagator:
             if isinstance(step, Filter)
         ):
             spec.branch = "positive_semantic_count_zero"
+        elif self._has_positive_subquery(kind="in"):
+            spec.branch = "positive_semantic_in"
         else:
             spec.branch = "positive_seed_deferred"
 
@@ -1373,6 +1375,15 @@ class Propagator:
                 continue
             metadata = self.plan.annotation_for(step).metadata.get("subquery", {})
             if metadata.get("kind") == kind and metadata.get("polarity") == "negative":
+                return True
+        return False
+
+    def _has_positive_subquery(self, *, kind: str) -> bool:
+        for step in _iter_all_plan_steps(self.plan):
+            if not isinstance(step, SubPlan):
+                continue
+            metadata = self.plan.annotation_for(step).metadata.get("subquery", {})
+            if metadata.get("kind") == kind and metadata.get("polarity") == "positive":
                 return True
         return False
 
@@ -1975,6 +1986,24 @@ class Propagator:
                                     matched
                                 )
 
+            if isinstance(step, Filter) and step.condition is not None:
+                for col in step.condition.find_all(exp.Column):
+                    col_id = column_identity(col)
+                    if col_id is None or col_id.relation is None:
+                        continue
+                    tname = (
+                        col_id.relation.name.normalized
+                        if col_id.relation.name
+                        else ""
+                    )
+                    matched = col_id.name.normalized
+                    if (
+                        matched
+                        and tname
+                        and tname in self.instance.tables
+                    ):
+                        targets.setdefault(tname, set()).add(matched)
+
             # 3. Columns in aggregate function arguments.
             if isinstance(step, Aggregate):
                 for agg_expr in step.aggregations:
@@ -2468,12 +2497,83 @@ class Propagator:
             if constraint.get("function") not in {"sum", "avg", "min", "max"}:
                 continue
             row_count = max(spec.requirements[relation].min_rows, 1)
+            if self._append_min_max_having_constraints(
+                spec.requirements[relation],
+                argument,
+                constraint,
+                row_count,
+            ):
+                continue
             self._append_having_value_constraint(
                 spec.requirements[relation],
                 argument,
                 constraint,
                 row_count,
             )
+
+    def _append_min_max_having_constraints(
+        self,
+        req: TableConstraint,
+        argument: ColumnId,
+        constraint: dict,
+        row_count: int,
+    ) -> bool:
+        function = constraint.get("function")
+        operator = constraint.get("operator")
+        if function not in {"min", "max"}:
+            return False
+        if not (
+            operator == "eq"
+            or (function == "min" and operator in {"gt", "gte"})
+            or (function == "max" and operator in {"lt", "lte"})
+        ):
+            return False
+
+        nullable = self._column_is_nullable(argument)
+        if nullable:
+            row_count = max(row_count, 2)
+            req.min_rows = max(req.min_rows, row_count)
+            req.constraints.append(
+                _make_is_null(
+                    self._solver_col(argument, row_scope=f"r{row_count - 1}")
+                )
+            )
+
+        literal = to_literal(constraint["value"])
+        bounded_rows = row_count - 1 if nullable else row_count
+        for row in range(max(bounded_rows, 1)):
+            row_col = self._solver_col(argument, row_scope=f"r{row}")
+            if operator == "gt":
+                expr = exp.GT(this=row_col, expression=literal.copy())
+            elif operator == "gte":
+                expr = exp.GTE(this=row_col, expression=literal.copy())
+            elif operator == "lt":
+                expr = exp.LT(this=row_col, expression=literal.copy())
+            elif operator == "lte":
+                expr = exp.LTE(this=row_col, expression=literal.copy())
+            elif operator == "eq":
+                expr = exp.EQ(this=row_col, expression=literal.copy())
+            else:
+                return False
+            req.constraints.append(expr)
+        return True
+
+    def _column_is_nullable(self, column: ColumnId) -> bool:
+        current: Optional[ColumnId] = column
+        for _ in range(10):
+            if current is None:
+                break
+            relation = current.relation
+            if relation is not None and relation.name is not None:
+                table = relation.name.normalized
+                col_name = current.name.normalized
+                if (
+                    table in self.instance.tables
+                    and col_name in self.instance.tables[table]
+                ):
+                    return self.instance.nullable(table, col_name)
+            current = current.source_column_id
+        return False
 
     def _append_having_value_constraint(
         self,
@@ -4701,6 +4801,42 @@ def _complete_gold_rows(
     return completed
 
 
+def _finite_domain_constraints_for_bindings(
+    instance: Instance,
+    row_bindings: Dict[str, RowBinding],
+) -> List[exp.Expression]:
+    constraints: List[exp.Expression] = []
+    seen: Set[Tuple[SolverVar, Tuple[Any, ...]]] = set()
+    for binding in row_bindings.values():
+        try:
+            table = instance.schema_spec.get_table(binding.table)
+        except KeyError:
+            continue
+        for column in table.columns:
+            allowed_values = instance.builder.compiler.compile(column).allowed_values
+            if not allowed_values:
+                continue
+            col_node = _solver_column(
+                instance,
+                _row_bound_column_id(column.id, binding),
+                row_scope=f"r{binding.row}",
+            )
+            variable = solver_var(col_node)
+            if variable is None:
+                continue
+            key = (variable, tuple(allowed_values))
+            if key in seen:
+                continue
+            seen.add(key)
+            constraints.append(
+                exp.In(
+                    this=col_node,
+                    expressions=[to_literal(value) for value in allowed_values],
+                )
+            )
+    return constraints
+
+
 # ---------------------------------------------------------------------------
 # Materialization
 # ---------------------------------------------------------------------------
@@ -4946,6 +5082,13 @@ class Resolver:
                     row_scope=var.row_scope,
                 )
                 constraints.append(_make_is_not_null(col_node))
+
+        constraints.extend(
+            _finite_domain_constraints_for_bindings(
+                self.instance,
+                row_bindings,
+            )
+        )
 
         # Collect variables.
         variables: Dict[SolverVar, DataType] = {}

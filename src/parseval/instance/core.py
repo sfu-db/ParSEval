@@ -16,7 +16,7 @@ from sqlglot.schema import (
     nested_set,
 )
 
-from parseval.coercion import coerce_value
+from parseval.coercion import coerce_value, storage_key
 from parseval.domain import DatabaseBuilder
 from parseval.domain.exceptions import (
     ConstraintViolationError,
@@ -1658,7 +1658,7 @@ class Instance(Catalog):
                 )
             except UniqueConflictError:
                 raise
-            except Exception:
+            except ForeignKeyResolutionError:
                 if relation in self._bootstrapping:
                     return self._create_row_circular_fk(relation, concretes, tuple_index)
                 raise
@@ -2119,8 +2119,8 @@ class Instance(Catalog):
             cache_key = None
         try:
             spec = self.schema_spec.get_table(table_key).get_column(column_name)
-            coerced = coerce_value(value, spec.datatype, dialect=self.dialect)
-        except Exception:
+            coerced = storage_key(value, spec.datatype, dialect=self.dialect)
+        except KeyError:
             coerced = value
         if cache_key is not None:
             self._column_storage_value_cache[cache_key] = coerced
@@ -2469,7 +2469,8 @@ class Instance(Catalog):
 
     def snapshot(self) -> InstanceSnapshot:
         tables: list[TableBatch] = []
-        for table_name in self.tables:
+        table_order = self._fk_safe_table_order()
+        for table_name in table_order:
             rows = self._row_dicts(table_name)
             # Derive column names from the Row's ColumnId objects so that
             # quoted identifiers preserve their original casing (matching
@@ -2478,7 +2479,8 @@ class Instance(Catalog):
             instance_rows = self.get_rows(table_name)
             if instance_rows:
                 columns = tuple(
-                    cid.name.normalized for cid in instance_rows[0].columns
+                    cid.name.normalized if hasattr(cid, "name") else str(cid)
+                    for cid in instance_rows[0].columns
                 )
             else:
                 columns = tuple(self.column_names(table_name))
@@ -2492,10 +2494,77 @@ class Instance(Catalog):
                 )
             )
         return InstanceSnapshot(
-            schema_ddl=self.ddls,
+            schema_ddl=self._fk_safe_schema_ddl(table_order),
             dialect=self.dialect,
             tables=tuple(tables),
         )
+
+    def _fk_safe_table_order(self) -> tuple[str, ...]:
+        original_order = tuple((self._ddl_columns or self.tables).keys())
+        position = {table: index for index, table in enumerate(original_order)}
+        children_by_parent: dict[str, list[str]] = {
+            table: [] for table in original_order
+        }
+        indegree = {table: 0 for table in original_order}
+
+        for table in self.schema_spec.tables:
+            source = table.name
+            if source not in indegree:
+                continue
+            for fk in table.foreign_keys:
+                target = fk.target_table
+                if target not in indegree or target == source:
+                    continue
+                children_by_parent.setdefault(target, []).append(source)
+                indegree[source] += 1
+
+        ready = sorted(
+            (table for table, count in indegree.items() if count == 0),
+            key=position.__getitem__,
+        )
+        ordered: list[str] = []
+        while ready:
+            table = ready.pop(0)
+            ordered.append(table)
+            for child in sorted(
+                children_by_parent.get(table, ()),
+                key=position.__getitem__,
+            ):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+                    ready.sort(key=position.__getitem__)
+
+        if len(ordered) < len(original_order):
+            ordered_set = set(ordered)
+            ordered.extend(table for table in original_order if table not in ordered_set)
+        return tuple(ordered)
+
+    def _fk_safe_schema_ddl(self, table_order: tuple[str, ...]) -> str:
+        statements = [
+            statement.strip() for statement in self.ddls.split(";") if statement.strip()
+        ]
+        if len(statements) <= 1:
+            return self.ddls
+
+        by_table: dict[str, str] = {}
+        for statement in statements:
+            try:
+                parsed = parse(statement, dialect=self.dialect)
+            except Exception:
+                return self.ddls
+            if len(parsed) != 1 or not isinstance(parsed[0], exp.Create):
+                return self.ddls
+            create = parsed[0]
+            schema = create.this if isinstance(create.this, exp.Schema) else None
+            table_node = schema.this if schema is not None else create.this
+            table_key = self._resolve_declared_table_key(table_node)
+            by_table[table_key] = statement
+
+        if set(by_table) != set(table_order):
+            return self.ddls
+
+        return "; ".join(by_table[table] for table in table_order) + ";"
 
     def _row_dicts(self, table_name: str) -> list[dict[str, Any]]:
         rows = []

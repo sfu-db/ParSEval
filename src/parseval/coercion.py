@@ -25,6 +25,15 @@ def coerce_value(value: Any, datatype: DataType, dialect: str | None = None) -> 
     return adapter.coerce_in(value, profile)
 
 
+def storage_key(value: Any, datatype: DataType, dialect: str | None = None) -> Any:
+    """Project a concrete value to the database's storage/index equivalence key."""
+    if isinstance(value, StorageLiteral):
+        value = str(value)
+    profile = _TYPE_SERVICE.profile_datatype(DataType.build(datatype), dialect=dialect)
+    adapter = _TYPE_SERVICE.registry.resolve(profile.datatype, profile.dialect)
+    return adapter.storage_key(value, profile)
+
+
 def coerce_literal_value(
     value: Any,
     datatype: DataType | None,
@@ -122,5 +131,6 @@ __all__ = [
     "coerce_literal_value",
     "coerce_reference_value",
     "coerce_value",
+    "storage_key",
     "values_equivalent",
 ]

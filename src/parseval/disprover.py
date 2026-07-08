@@ -27,6 +27,8 @@ from parseval.states import (
     DisproveResult,
     ExecutionResult,
     GenerationResult,
+    SchemaException,
+    SyntaxException,
     Verdict,
     compare_results,
 )
@@ -115,6 +117,45 @@ class Disprover:
         # Pick the best non-NEQ result: prefer EQ over UNKNOWN over errors
         return self._pick_best(r1, r2)
 
+    def check_syntax(self, sql1: str, sql2: str) -> DisproveResult:
+        """Check both queries for syntax errors against the DDL schema.
+
+        Creates the database tables from the schema, then executes both
+        queries.  Returns SYNTAX_ERROR if either query fails (parse error,
+        unknown column, etc.) or if the schema itself cannot be loaded.
+        """
+        t0 = time.time()
+
+        try:
+            instance = Instance(
+                ddls=self.schema, name="syntax_check", dialect=self.dialect
+            )
+        except Exception as e:
+            return self._make_result(
+                Verdict.SYNTAX_ERROR, t0,
+                error_msg=f"Schema parsing failed: {e}",
+            )
+
+        try:
+            to_db(instance, self.connection_string, dialect=self.dialect)
+        except Exception as e:
+            return self._make_result(
+                Verdict.SYNTAX_ERROR, t0,
+                error_msg=f"DB write failed: {e}",
+            )
+
+        q1 = execute_query(sql1, self.connection_string, self.dialect, self.timeout)
+        q2 = execute_query(sql2, self.connection_string, self.dialect, self.timeout)
+
+        verdict = compare_results(q1, q2, self.semantics)
+        if verdict in (Verdict.SYNTAX_ERROR, Verdict.RUNTIME_ERROR):
+            return self._make_result(
+                verdict, t0, q1=q1, q2=q2,
+                error_msg=q1.error_msg or q2.error_msg,
+            )
+
+        return self._make_result(Verdict.EQ, t0, q1=q1, q2=q2)
+
     def _try_generate_and_compare(
         self, target_sql: str, t0: float
     ) -> DisproveResult:
@@ -132,8 +173,9 @@ class Disprover:
             gen_result = engine.generate(thresholds=self.thresholds)
         except Exception as e:
             logger.debug("disprove: generation failed: %s", e)
+            verdict = _verdict_for_generation_exception(e)
             return self._make_result(
-                Verdict.UNKNOWN,
+                verdict,
                 t0,
                 gen_result=gen_result,
                 generation_error_msg=str(e),
@@ -162,8 +204,28 @@ class Disprover:
                 error_msg=q1.error_msg or q2.error_msg,
             )
 
+        if verdict == Verdict.RUNTIME_ERROR:
+            return self._make_result(
+                verdict,
+                t0,
+                gen_result=gen_result,
+                q1=q1,
+                q2=q2,
+                error_msg=q1.error_msg or q2.error_msg,
+            )
+
         if verdict == Verdict.NEQ:
             return self._make_result(Verdict.NEQ, t0, gen_result=gen_result, q1=q1, q2=q2)
+
+        if verdict == Verdict.UNKNOWN and (q1.is_error or q2.is_error):
+            return self._make_result(
+                Verdict.UNKNOWN,
+                t0,
+                gen_result=gen_result,
+                q1=q1,
+                q2=q2,
+                error_msg=q1.error_msg or q2.error_msg,
+            )
 
         # Both empty — can't prove equivalence
         if not q1.rows and not q2.rows:
@@ -204,8 +266,8 @@ class Disprover:
 
     @staticmethod
     def _pick_best(r1: DisproveResult, r2: DisproveResult) -> DisproveResult:
-        """Pick the better of two non-NEQ results: EQ > UNKNOWN > errors."""
-        priority = {Verdict.EQ: 0, Verdict.UNKNOWN: 1, Verdict.SYNTAX_ERROR: 2}
+        """Pick the better of two non-NEQ results: EQ > syntax/schema errors > UNKNOWN."""
+        priority = {Verdict.EQ: 0, Verdict.RUNTIME_ERROR: 1, Verdict.SYNTAX_ERROR: 1, Verdict.UNKNOWN: 2}
         p1 = priority.get(r1.verdict, 9)
         p2 = priority.get(r2.verdict, 9)
         return r1 if p1 <= p2 else r2
@@ -232,6 +294,20 @@ def _normalize_sql(sql: str) -> str:
     s = sql.strip().rstrip(";").strip()
     s = re.sub(r"\s+", " ", s)
     return s.lower()
+
+
+def _verdict_for_generation_exception(exc: Exception) -> Verdict:
+    if isinstance(exc, (SyntaxException, SchemaException)):
+        return Verdict.SYNTAX_ERROR
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        if (
+            message.startswith("Unresolved column:")
+            or message.startswith("Ambiguous column:")
+            or "could not be resolved" in message
+        ):
+            return Verdict.SYNTAX_ERROR
+    return Verdict.UNKNOWN
 
 
 def _preprocess_sql_pair(sql1: str, sql2: str, dialect: str = "sqlite") -> tuple[str, str]:
