@@ -16,7 +16,7 @@ from sqlglot.schema import (
     nested_set,
 )
 
-from parseval.coercion import coerce_value, storage_key
+from parseval.coercion import coerce_literal_value, coerce_value, storage_key
 from parseval.domain import DatabaseBuilder
 from parseval.domain.exceptions import (
     ConstraintViolationError,
@@ -1108,6 +1108,11 @@ class Catalog(MappingSchema):
                 )
                 is_pk = column_pk or column_id in pk_column_ids
                 datatype_node = self._datatype_node_for(column_name, type_sql)
+                checks = self._domain_checks_for_column(
+                    table_id,
+                    column_id,
+                    datatype_node,
+                )
                 column_specs.append(
                     ColumnSpec(
                         table=table_name,
@@ -1123,6 +1128,7 @@ class Catalog(MappingSchema):
                         length=getattr(datatype_node, "length", None),
                         precision=getattr(datatype_node, "precision", None),
                         scale=getattr(datatype_node, "scale", None),
+                        checks=checks,
                         id=column_id,
                         table_id=table_id,
                     )
@@ -1143,6 +1149,109 @@ class Catalog(MappingSchema):
             )
 
         return SchemaSpec(tables=tuple(table_specs), dialect=self.dialect)
+
+    def _domain_checks_for_column(
+        self,
+        table_id: RelationId,
+        column_id: ColumnId,
+        datatype: exp.DataType,
+    ) -> Tuple[Any, ...]:
+        checks = []
+        for check in self.database_constraints(table_id).checks:
+            if not check.supported or check.referenced_columns != (column_id,):
+                continue
+            translated = self._domain_check_from_expression(
+                check.expression,
+                column_id,
+                datatype,
+            )
+            if translated is not None:
+                checks.append(translated)
+        return tuple(checks)
+
+    def _domain_check_from_expression(
+        self,
+        expression: exp.Expression,
+        column_id: ColumnId,
+        datatype: exp.DataType,
+    ) -> Any | None:
+        from parseval.domain.constraints import ChoicesConstraint, RangeConstraint
+
+        if isinstance(expression, exp.Between) and self._is_column_ref(
+            expression.this,
+            column_id,
+        ):
+            return RangeConstraint(
+                minimum=self._domain_literal(expression.args.get("low"), datatype),
+                maximum=self._domain_literal(expression.args.get("high"), datatype),
+            )
+        if isinstance(expression, exp.In) and self._is_column_ref(
+            expression.this,
+            column_id,
+        ):
+            values = []
+            for literal in expression.expressions:
+                if not self._is_literal(literal):
+                    return None
+                values.append(self._domain_literal(literal, datatype))
+            return ChoicesConstraint(values=tuple(values))
+
+        range_types = {
+            exp.GT: (None, False, None, True),
+            exp.GTE: (None, True, None, True),
+            exp.LT: (None, True, None, False),
+            exp.LTE: (None, True, None, True),
+        }
+        for expr_type, (
+            minimum,
+            minimum_inclusive,
+            maximum,
+            maximum_inclusive,
+        ) in range_types.items():
+            if not isinstance(expression, expr_type):
+                continue
+            lhs = expression.this
+            rhs = expression.expression
+            if not self._is_column_ref(lhs, column_id) or not self._is_literal(rhs):
+                return None
+            value = self._domain_literal(rhs, datatype)
+            if expr_type in (exp.GT, exp.GTE):
+                minimum = value
+            else:
+                maximum = value
+            return RangeConstraint(
+                minimum=minimum,
+                maximum=maximum,
+                minimum_inclusive=minimum_inclusive,
+                maximum_inclusive=maximum_inclusive,
+            )
+        return None
+
+    def _is_literal(self, expression: exp.Expression) -> bool:
+        if isinstance(expression, exp.Literal):
+            return True
+        return isinstance(expression, exp.Neg) and isinstance(expression.this, exp.Literal)
+
+    def _is_column_ref(self, expression: exp.Expression, column_id: ColumnId) -> bool:
+        if not isinstance(expression, exp.Column):
+            return False
+        column_name = identifier_name(expression.name, dialect=self.dialect).normalized
+        return column_name == column_id.name.normalized
+
+    def _domain_literal(self, expression: exp.Expression, datatype: exp.DataType) -> Any:
+        sign = -1 if isinstance(expression, exp.Neg) else 1
+        if isinstance(expression, exp.Neg):
+            expression = expression.this
+        if isinstance(expression, exp.Literal):
+            if expression.is_string:
+                value: Any = expression.this
+            elif "." in expression.this:
+                value = sign * float(expression.this)
+            else:
+                value = sign * int(expression.this)
+        else:
+            value = expression
+        return coerce_literal_value(value, datatype, dialect=self.dialect)
 
     @staticmethod
     def _datatype_node_for(column_name: str, type_sql: str) -> exp.DataType:

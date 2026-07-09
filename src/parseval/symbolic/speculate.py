@@ -579,6 +579,7 @@ class Propagator:
 
     def _derive_join(self, step: Join, spec: BranchSpec) -> None:
         """Link join keys via equivalences and store join equalities."""
+        residual_conditions = []
         for join_rel, join_data in (step.joins or {}).items():
             source_keys = join_data.get("source_key", [])
             join_keys = join_data.get("join_key", [])
@@ -603,6 +604,14 @@ class Propagator:
                 req_jk = spec.require(jk_rel)
                 if jk_id not in req_jk.group_key_columns:
                     req_jk.group_key_columns.append(jk_id)
+            # Forward residual ON-clause literals (e.g. S.ACTIVITY_TYPE='START')
+            # to the per-alias table constraints so the solver produces rows
+            # that actually satisfy the join predicate.
+            condition = join_data.get("condition")
+            if condition is not None and isinstance(condition, exp.Expression):
+                residual_conditions.append(condition)
+        for condition in residual_conditions:
+            self._store_expression(condition, spec)
 
     def _derive_expression_join_key(
         self, expr: exp.Expression,
@@ -819,6 +828,13 @@ class Propagator:
                 if outer_id.relation is not None:
                     req = spec.require(outer_id.relation)
                     req.constraints.append(_make_is_not_null(self._solver_col(outer_id)))
+            if metadata.get("polarity") == "negative":
+                if metadata["cardinality"] != "zero" and sub.inner is not None:
+                    self._walk_step(sub.inner, spec)
+                for output_id in metadata.get("output_columns", ()):
+                    source_id = _physical_source_id(output_id)
+                    if source_id.relation and _relation_is_materializable(self.instance, source_id.relation):
+                        spec.require(source_id.relation)
             return
 
         if metadata["cardinality"] != "zero" and sub.inner is not None:

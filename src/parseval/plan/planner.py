@@ -77,6 +77,8 @@ from parseval.identity import (
 if t.TYPE_CHECKING:
     from parseval.instance import Instance
 
+_PARSEVAL_AGGREGATE_ORDINAL = "parseval_aggregate_ordinal"
+
 class Plan:
     def __init__(self, expression: exp.Expression, instance: Instance | None = None) -> None:
         """Build a plan for ``expression``.
@@ -430,7 +432,7 @@ class Step:
 
         if isinstance(expression, exp.Select) and from_:
             step = Scan.from_expression(from_.this, ctes, correlations=correlations)
-        elif isinstance(expression, exp.Union):
+        elif isinstance(expression, (exp.Union, exp.Intersect, exp.Except)):
             step = SetOperation.from_expression(expression, ctes, correlations=correlations)
         else:
             step = Scan()
@@ -460,30 +462,39 @@ class Step:
             if agg_funcs and expr not in aggregations:
                 aggregations.append(expr)
 
+            replace_agg_operands(expr)
+            return bool(agg_funcs)
+
+        def replace_agg_operands(expr: exp.Expression) -> None:
+            agg_funcs = tuple(_iter_outer_agg_funcs(expr))
             for agg in agg_funcs:
                 for operand in agg.unnest_operands():
-                    if isinstance(operand, exp.Column):
+                    if isinstance(operand, (exp.Column, exp.Distinct)):
                         continue
                     if operand not in operands:
                         operands[operand] = next_operand_name()
 
                     operand.replace(exp.column(operands[operand], quoted=True))
 
-            return bool(agg_funcs)
-
-        def _aggregate_alias_for_having(agg_func: exp.AggFunc) -> str:
+        def _aggregate_alias_for_having(agg_func: exp.AggFunc) -> t.Tuple[str, int | None]:
             agg_name = _aggregate_function_name(agg_func)
             agg_argument = _aggregate_argument_id(agg_func)
-            for aggregation in aggregations:
+            agg_sql = agg_func.sql()
+            for index, aggregation in enumerate(aggregations):
                 existing = _direct_aggregate_function(aggregation)
+                if existing is not None and existing.sql() == agg_sql:
+                    alias_name = aggregation.alias_or_name
+                    if alias_name:
+                        return alias_name, index
                 if (
                     existing is not None
+                    and agg_argument is not None
                     and _aggregate_function_name(existing) == agg_name
                     and _aggregate_argument_id(existing) == agg_argument
                 ):
                     alias_name = aggregation.alias_or_name
                     if alias_name:
-                        return alias_name
+                        return alias_name, index
 
             base_name = agg_name
             existing_aliases = {
@@ -496,7 +507,7 @@ class Step:
             while alias_name in existing_aliases:
                 alias_name = f"{base_name}_{suffix}"
                 suffix += 1
-            return alias_name
+            return alias_name, None
 
         def set_ops_and_aggs(agg_step: "Aggregate") -> None:
             agg_step.operands = tuple(
@@ -535,12 +546,17 @@ class Step:
             if having:
                 aggregate.condition = having.this
                 for agg_func in _iter_outer_agg_funcs(having.this):
-                    alias_name = _aggregate_alias_for_having(agg_func)
+                    replace_agg_operands(agg_func)
+                    alias_name, aggregate_ordinal = _aggregate_alias_for_having(agg_func)
                     alias_expr = exp.alias_(agg_func.copy(), alias_name, quoted=True)
-                    if alias_expr not in aggregations:
+                    if aggregate_ordinal is None and alias_expr not in aggregations:
                         aggregations.append(alias_expr)
+                        aggregate_ordinal = len(aggregations) - 1
+                    alias_column = exp.column(alias_name, step.name, quoted=True)
+                    if aggregate_ordinal is not None:
+                        alias_column.meta[_PARSEVAL_AGGREGATE_ORDINAL] = aggregate_ordinal
                     agg_func.replace(
-                        exp.column(alias_name, step.name, quoted=True)
+                        alias_column
                     )
 
             set_ops_and_aggs(aggregate)
@@ -988,7 +1004,7 @@ class SetOperation(Step):
         ctes: t.Optional[t.Dict[str, "SubPlan"]] = None,
         correlations: t.Optional[t.Dict[int, t.Tuple[exp.Column, ...]]] = None,
     ) -> "SetOperation":
-        assert isinstance(expression, exp.Union)
+        assert isinstance(expression, (exp.Union, exp.Intersect, exp.Except))
 
         left = Step.from_expression(expression.left, ctes, correlations=correlations)
         # SELECT 1 UNION SELECT 2  <-- these subqueries don't have names
@@ -1753,6 +1769,18 @@ def _prepare_step_identity(step: "Step", instance: t.Any, *, plan: "Plan | None"
         step.output_column_ids = _build_aggregate_output_columns(step, instance, plan=plan)
     elif isinstance(step, Project):
         step.output_column_ids = _build_project_output_columns(step, instance)
+    elif isinstance(step, SetOperation):
+        left = next(
+            (
+                dep
+                for dep in step.chain_dependencies
+                if dep.name == step.left
+            ),
+            None,
+        )
+        if left is None:
+            left = next(iter(step.chain_dependencies), None)
+        step.output_column_ids = tuple(getattr(left, "output_column_ids", ()))
     else:
         if isinstance(step, Join):
             _prepare_join_identity(step, instance)
@@ -2049,15 +2077,14 @@ def _build_aggregate_output_columns(step: "Aggregate", instance: t.Any, *, plan:
             )
         )
 
-    seen = {column.name.normalized for column in result}
+    seen_group_names = {column.name.normalized for column in result}
     for aggregation in step.aggregations:
         alias_name = aggregation.alias_or_name
         if not alias_name:
             continue
         name = identifier_name(alias_name, dialect=dialect)
-        if name.normalized in seen:
+        if name.normalized in seen_group_names:
             continue
-        seen.add(name.normalized)
         source = _first_resolved_column_id(aggregation, step, instance, plan=plan)
         result.append(
             column_id(
@@ -2360,17 +2387,22 @@ def _aggregation_metadata(step: "Aggregate", instance: t.Any, *, plan: "Plan | N
         if column.name.normalized in step.group
     }
     outputs: t.Dict[ColumnId, t.Dict[str, t.Any]] = {}
-    for aggregation in step.aggregations:
+    aggregate_columns = [
+        column
+        for column in getattr(step, "output_column_ids", ())
+        if column.kind is ColumnKind.AGGREGATE
+    ]
+    for aggregation, output_column in zip(step.aggregations, aggregate_columns):
         alias_name = aggregation.alias_or_name
         if not alias_name:
             continue
-        output_column = _output_column_by_name(step, alias_name)
         aggregate_function = _direct_aggregate_function(aggregation)
         if output_column is None or aggregate_function is None:
             continue
         argument = _aggregate_argument_id(aggregate_function)
         outputs[output_column] = {
             "alias": alias_name,
+            "output_column": output_column,
             "function": _aggregate_function_name(aggregate_function),
             "argument": argument,
             "distinct": _aggregate_is_distinct(aggregate_function),
@@ -2393,31 +2425,70 @@ def _having_constraints(step: "Having") -> t.Tuple[t.Dict[str, t.Any], ...]:
     )
     if aggregate is None or step.condition is None:
         return ()
-    aggregate_aliases = {
-        aggregation.alias_or_name: _direct_aggregate_function(aggregation)
-        for aggregation in aggregate.aggregations
-        if isinstance(aggregation, exp.Alias)
-        and aggregation.alias_or_name
-        and _direct_aggregate_function(aggregation) is not None
-    }
+    aggregate_columns = [
+        column
+        for column in getattr(aggregate, "output_column_ids", ())
+        if column.kind is ColumnKind.AGGREGATE
+    ]
+    aggregate_bindings = []
+    for index, aggregation in enumerate(aggregate.aggregations):
+        if not (
+            isinstance(aggregation, exp.Alias)
+            and aggregation.alias_or_name
+            and index < len(aggregate_columns)
+        ):
+            continue
+        aggregate_function = _direct_aggregate_function(aggregation)
+        if aggregate_function is None:
+            continue
+        aggregate_bindings.append(
+            (index, aggregation.alias_or_name, aggregate_function, aggregate_columns[index])
+        )
     constraints: t.List[t.Dict[str, t.Any]] = []
     for comparison in step.condition.walk():
         if not isinstance(comparison, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
             continue
         rewritten = comparison.copy()
         matched = False
+        matched_output_column = None
         for column in rewritten.find_all(exp.Column):
-            aggregate_function = aggregate_aliases.get(column.name)
-            if aggregate_function is None:
+            aggregate_binding = _aggregate_binding_for_column(
+                column,
+                aggregate_bindings,
+            )
+            if aggregate_binding is None:
                 continue
+            _, _, aggregate_function, matched_output_column = aggregate_binding
             column.replace(aggregate_function.copy())
             matched = True
         if not matched and _aggregate_comparison_constraint(rewritten) is None:
             continue
         constraint = _aggregate_comparison_constraint(rewritten)
         if constraint is not None:
+            if matched_output_column is not None:
+                constraint["output_column"] = matched_output_column
             constraints.append(constraint)
     return tuple(constraints)
+
+
+def _aggregate_binding_for_column(
+    column: exp.Column,
+    bindings: t.Sequence[t.Tuple[int, str, exp.AggFunc, ColumnId]],
+) -> t.Tuple[int, str, exp.AggFunc, ColumnId] | None:
+    ordinal = column.meta.get(_PARSEVAL_AGGREGATE_ORDINAL)
+    if isinstance(ordinal, int):
+        for binding in bindings:
+            if binding[0] == ordinal:
+                return binding
+    alias_matches = [binding for binding in bindings if binding[1] == column.name]
+    if len(alias_matches) == 1:
+        return alias_matches[0]
+    cid = column_identity(column)
+    if cid is not None:
+        for binding in bindings:
+            if binding[3] == cid:
+                return binding
+    return None
 
 
 def _condition_column_names(expression: exp.Expression) -> t.Set[str]:

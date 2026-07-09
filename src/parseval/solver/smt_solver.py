@@ -272,7 +272,7 @@ class SMTSolver:
             z3_var = self.context.get("variable_to_z3", {}).get(var_name)
             if z3_var is None:
                 continue
-            z3_val = model.evaluate(z3_var, model_completion=True)
+            z3_val = model.evaluate(z3_var, model_completion=False)
             python_val = self._z3_to_python(z3_val, var_name)
             if python_val is not None:
                 solution[var_name] = python_val
@@ -1080,7 +1080,7 @@ class SMTSolver:
         """
         result = {}
         for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-            concrete = self._z3_to_python(model.evaluate(z3var, model_completion=True), var_name)
+            concrete = self._z3_to_python(model.evaluate(z3var, model_completion=False), var_name)
             variable = self.context["z3_to_variable"][var_name]
             if concrete == "":
                 continue
@@ -1163,7 +1163,10 @@ class SMTSolver:
             return True
         if z3.is_false(payload):
             return False
-        return str(payload)
+        # Unassigned/intermediate Z3 variables are not concrete values;
+        # returning their name would leak solver-internal identifiers into
+        # materialized data. Treat them as NULL instead.
+        return None
 
     def _z3_to_python(self, value: z3.ExprRef, var_name: Optional[str] = None) -> Any:
         """Convert a Z3 expression to a Python value, handling Option wrappers.

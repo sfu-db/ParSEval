@@ -637,6 +637,7 @@ def _unit_name(expression: exp.Expression) -> str:
 
 register_special_function("ABS", _translate_abs, return_type=_return_same_type)
 register_special_function("LENGTH", _translate_length, return_type=_return_int)
+register_special_function("CHAR_LENGTH", _translate_length, return_type=_return_int)
 register_special_function("SUBSTR", _translate_substr, return_type=_return_text)
 register_special_function("INSTR", _translate_instr, return_type=_return_int)
 register_special_function("STRFTIME", _translate_strftime, return_type=_return_text)
