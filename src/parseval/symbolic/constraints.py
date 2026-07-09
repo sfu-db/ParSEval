@@ -1065,11 +1065,12 @@ class ConstraintGenerator:
             )
         )
 
-        for index in range(2):
+        domain_witness_count = max(2, len(domain_key_values))
+        for index in range(domain_witness_count):
             outer_scope = f"division_outer{index}"
             domain_scope = f"division_domain{index}"
             outer_col = self._constraint_column(outer_key, row_scope=outer_scope)
-            if len(domain_key_values) >= 2:
+            if index < len(domain_key_values):
                 domain_col = self._literal_for_value(domain_key_values[index])
             else:
                 domain_col = self._constraint_column(domain_key, row_scope=domain_scope)
@@ -1759,6 +1760,8 @@ class ConstraintGenerator:
                 continue
             if output_col.name.normalized != normalized:
                 continue
+            if output_col.kind is ColumnKind.AGGREGATE:
+                return output_col
             return output_col.source_column_id or output_col
         return None
 
@@ -4523,7 +4526,7 @@ class ConstraintGenerator:
         atom: exp.In,
         subplan: SubPlan,
     ) -> SolverConstraint | None:
-        if target.target_outcome != PlausibleBit.IN_MATCH:
+        if target.target_outcome not in (PlausibleBit.IN_MATCH, PlausibleBit.IN_NO_MATCH):
             return None
         if not isinstance(atom.this, exp.Column) or subplan.inner is None:
             return None
@@ -4549,7 +4552,10 @@ class ConstraintGenerator:
         if inner_value is None:
             return None
         self._scope_expression_columns(inner_value, inner_scope, inner_relations)
-        constraints.append(exp.EQ(this=outer_value, expression=inner_value))
+        if target.target_outcome == PlausibleBit.IN_NO_MATCH:
+            constraints.append(exp.NEQ(this=outer_value, expression=inner_value))
+        else:
+            constraints.append(exp.EQ(this=outer_value, expression=inner_value))
 
         constraints.extend(
             self._in_outer_predicate_constraints(

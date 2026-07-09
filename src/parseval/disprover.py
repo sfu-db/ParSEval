@@ -187,7 +187,13 @@ class Disprover:
             to_db(instance, self.connection_string, dialect=self.dialect)
         except Exception as e:
             logger.debug("disprove: DB write failed: %s", e)
-            return self._make_result(Verdict.SYNTAX_ERROR, t0, gen_result=gen_result, error_msg=f"DB write failed: {e}")
+            verdict = _verdict_for_db_write_exception(e)
+            return self._make_result(
+                verdict,
+                t0,
+                gen_result=gen_result,
+                error_msg=f"DB write failed: {e}",
+            )
 
         # Execute both queries
         q1 = execute_query(self.sql1, self.connection_string, self.dialect, self.timeout)
@@ -308,6 +314,13 @@ def _verdict_for_generation_exception(exc: Exception) -> Verdict:
         ):
             return Verdict.SYNTAX_ERROR
     return Verdict.UNKNOWN
+
+
+def _verdict_for_db_write_exception(exc: Exception) -> Verdict:
+    message = str(exc).lower()
+    if "sql syntax" in message or "syntax error" in message:
+        return Verdict.SYNTAX_ERROR
+    return Verdict.RUNTIME_ERROR
 
 
 def _preprocess_sql_pair(sql1: str, sql2: str, dialect: str = "sqlite") -> tuple[str, str]:

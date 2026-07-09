@@ -1316,6 +1316,7 @@ _ANONYMOUS_HANDLERS = {
     "IFNULL": lambda a, b: a if a is not None else b,
     "NULLIF": lambda a, b: None if a == b else a,
     "LENGTH": lambda s: len(str(s)) if s is not None else None,
+    "CHAR_LENGTH": lambda s: len(str(s)) if s is not None else None,
 }
 
 

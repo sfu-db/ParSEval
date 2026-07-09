@@ -6,7 +6,15 @@ from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.dtype import DataType, TypeService, type_family
+from parseval.dtype import (
+    DataType,
+    TypeFamily,
+    TypeService,
+    parse_date,
+    parse_datetime,
+    parse_time,
+    type_family,
+)
 from .value_space import ValueSpace
 
 from .constraints import (
@@ -315,6 +323,19 @@ class ConstraintCompiler:
         return tuple(value for value in current if value in incoming_set)
 
 
+def _normalize_range_value(value: Any, datatype: Any) -> Any:
+    if value is None:
+        return None
+    family = type_family(datatype)
+    if family == TypeFamily.DATE:
+        return parse_date(value) or value
+    if family == TypeFamily.DATETIME:
+        return parse_datetime(value) or value
+    if family == TypeFamily.TIME:
+        return parse_time(value) or value
+    return value
+
+
 class ConstraintValidator:
     """Validates concrete values against a compiled ColumnDomainPlan.
 
@@ -348,20 +369,23 @@ class ConstraintValidator:
             )
 
         # 3. Range
+        compare_value = _normalize_range_value(value, plan.datatype)
+        compare_minimum = _normalize_range_value(plan.minimum, plan.datatype)
+        compare_maximum = _normalize_range_value(plan.maximum, plan.datatype)
         if plan.minimum is not None:
             if plan.minimum_inclusive:
-                if value < plan.minimum:
+                if compare_value < compare_minimum:
                     raise ConstraintViolationError(f"Value {value!r} for {column_name} is below minimum {plan.minimum}")
             else:
-                if value <= plan.minimum:
+                if compare_value <= compare_minimum:
                     raise ConstraintViolationError(f"Value {value!r} for {column_name} must be strictly greater than {plan.minimum}")
 
         if plan.maximum is not None:
             if plan.maximum_inclusive:
-                if value > plan.maximum:
+                if compare_value > compare_maximum:
                     raise ConstraintViolationError(f"Value {value!r} for {column_name} is above maximum {plan.maximum}")
             else:
-                if value >= plan.maximum:
+                if compare_value >= compare_maximum:
                     raise ConstraintViolationError(f"Value {value!r} for {column_name} must be strictly less than {plan.maximum}")
 
         # 4. Length

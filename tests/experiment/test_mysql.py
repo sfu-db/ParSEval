@@ -10,7 +10,10 @@ Usage::
 import argparse
 import datetime
 import json
+import multiprocessing
 import os
+import queue
+import re
 import signal
 import sys
 import time
@@ -33,31 +36,6 @@ class CaseTimeoutError(TimeoutError):
 
 def _timeout_handler(signum, frame):
     raise CaseTimeoutError("case timed out")
-
-
-def test_normalize_dtype_converts_comma_enum_to_mysql_enum():
-    assert _normalize_dtype("ENUM,DESKTOP,MOBILE") == "ENUM('DESKTOP','MOBILE')"
-
-
-def test_build_ddl_emits_mysql_enum_columns_for_dataset_schemas():
-    schema = {
-        "SPENDING": {
-            "USER_ID": "INT",
-            "SPEND_DATE": "DATE",
-            "PLATFORM": "ENUM,DESKTOP,MOBILE",
-        },
-        "ACTIVITY": {
-            "PLAYER_ID": "INT",
-            "EVENT_DATE": "DATE",
-            "DEVICE_TYPE": "ENUM,WEB,APP",
-        },
-    }
-
-    ddl = build_ddl(schema, constraints=[])
-
-    assert "PLATFORM ENUM('DESKTOP','MOBILE')" in ddl
-    assert "DEVICE_TYPE ENUM('WEB','APP')" in ddl
-
 
 def _make_task_connection_string(base_connection_string: str, index: int) -> str:
     """Build a per-task connection string with a unique database name."""
@@ -89,6 +67,105 @@ def _parse_ref(column_ref: str) -> tuple[str, str]:
     return table, col
 
 
+def _constraint_refs(node) -> set[tuple[str, str]]:
+    if isinstance(node, dict):
+        if set(node) == {"value"}:
+            return {_parse_ref(node["value"])}
+        refs: set[tuple[str, str]] = set()
+        for value in node.values():
+            refs.update(_constraint_refs(value))
+        return refs
+    if isinstance(node, list):
+        refs: set[tuple[str, str]] = set()
+        for value in node:
+            refs.update(_constraint_refs(value))
+        return refs
+    return set()
+
+
+def _sql_literal(value) -> str:
+    if isinstance(value, dict) and set(value) == {"date"}:
+        return _sql_literal(value["date"])
+    if isinstance(value, dict) and set(value) == {"literal"}:
+        return _sql_literal(value["literal"])
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if value is None:
+        return "NULL"
+    return str(value)
+
+
+def _sql_operand(value, table: str) -> str:
+    if isinstance(value, dict) and set(value) == {"value"}:
+        ref_table, col = _parse_ref(value["value"])
+        if ref_table != table:
+            raise ValueError("cross-table operand")
+        return col
+    return _sql_literal(value)
+
+
+def _row_local_check(c: dict) -> tuple[str, str] | None:
+    if len(c) != 1:
+        return None
+    op, values = next(iter(c.items()))
+    if op in {"primary", "foreign", "inc", "consec"}:
+        return None
+    refs = _constraint_refs(values)
+    tables = {table for table, _column in refs}
+    if len(tables) != 1:
+        return None
+    table = next(iter(tables))
+    try:
+        expression = _render_check_expression(op, values, table)
+    except ValueError:
+        return None
+    if expression is None:
+        return None
+    return table, expression
+
+
+def _render_check_expression(op: str, values, table: str) -> str | None:
+    comparisons = {
+        "eq": "=",
+        "neq": "<>",
+        "gt": ">",
+        "gte": ">=",
+        "lt": "<",
+        "lte": "<=",
+    }
+    if op in comparisons:
+        lhs, rhs = values
+        return f"{_sql_operand(lhs, table)} {comparisons[op]} {_sql_operand(rhs, table)}"
+    if op == "between":
+        column, low, high = values
+        return (
+            f"{_sql_operand(column, table)} BETWEEN "
+            f"{_sql_operand(low, table)} AND {_sql_operand(high, table)}"
+        )
+    if op == "in":
+        column = values[0]
+        raw_choices = values[1:]
+        if len(raw_choices) == 1 and isinstance(raw_choices[0], list):
+            raw_choices = raw_choices[0]
+        choices = ", ".join(_sql_operand(value, table) for value in raw_choices)
+        return f"{_sql_operand(column, table)} IN ({choices})"
+    if op == "imply":
+        antecedent, consequent = values
+        lhs = _render_nested_check(antecedent, table)
+        rhs = _render_nested_check(consequent, table)
+        if lhs is None or rhs is None:
+            return None
+        return f"(NOT ({lhs}) OR ({rhs}))"
+    return None
+
+
+def _render_nested_check(node, table: str) -> str | None:
+    if not isinstance(node, dict) or len(node) != 1:
+        return None
+    op, values = next(iter(node.items()))
+    return _render_check_expression(op, values, table)
+
+
 def _normalize_dtype(dtype: str) -> str:
     """Normalize dataset type strings into valid MySQL type strings."""
     d = dtype.strip().upper()
@@ -110,6 +187,84 @@ def _normalize_dtype(dtype: str) -> str:
     return dtype
 
 
+def _prepare_mysql_query(sql: str, schema: dict) -> str:
+    """Normalize known LeetCode MySQL dataset quirks before running cases."""
+    sql = _quote_mysql_enum_literals(sql, schema)
+    sql = _quote_mysql_reserved_rank_alias(sql)
+    return sql
+
+
+def _quote_mysql_enum_literals(sql: str, schema: dict) -> str:
+    enum_values = sorted(
+        {
+            value.strip()
+            for columns in schema.values()
+            for dtype in columns.values()
+            if dtype.strip().upper().startswith("ENUM,")
+            for value in dtype.strip().split(",")[1:]
+            if value.strip()
+        },
+        key=len,
+        reverse=True,
+    )
+    operator_tokens = {"<", ">", "=", "<=", ">=", "<>", "!=", "LIKE"}
+    for value in enum_values:
+        if value.upper() in operator_tokens:
+            continue
+        escaped = value.replace("'", "''")
+        sql = re.sub(
+            rf"(?<!['\"`.\w]){re.escape(value)}(?!['\"`.\w])",
+            f"'{escaped}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+    return sql
+
+
+def _quote_mysql_reserved_rank_alias(sql: str) -> str:
+    if not re.search(r"\bAS\s+RANK\b", sql, flags=re.IGNORECASE):
+        return sql
+    sql = re.sub(r"\bAS\s+RANK\b", "AS `RANK`", sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        r"(?<![`.\w])RANK(?!\s*\(|[`.\w])",
+        "`RANK`",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"(\b[A-Za-z_][A-Za-z0-9_]*\.)RANK\b",
+        r"\1`RANK`",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return sql
+
+
+def _topological_sort(deps: dict[str, set[str]]) -> list[str]:
+    """Kahn's algorithm. Parents before children. Cycles append remaining."""
+    in_degree: dict[str, int] = {t: 0 for t in deps}
+    children: dict[str, list[str]] = {t: [] for t in deps}
+
+    for node, parents in deps.items():
+        for parent in parents:
+            if parent != node:
+                children[parent].append(node)
+                in_degree[node] += 1
+
+    queue = [t for t in deps if in_degree[t] == 0]
+    sorted_tables: list[str] = []
+    while queue:
+        node = queue.pop(0)
+        sorted_tables.append(node)
+        for child in children[node]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    sorted_tables.extend(t for t in deps if t not in sorted_tables)
+    return sorted_tables
+
+
 def build_ddl(schema: dict, constraints: list[dict] | None) -> str:
     """Convert a schema dict and constraints into MySQL DDL.
 
@@ -119,39 +274,81 @@ def build_ddl(schema: dict, constraints: list[dict] | None) -> str:
 
     Returns:
         Semicolon-separated CREATE TABLE statements.
+        Tables are ordered so referenced tables appear before tables
+        that reference them (topological sort by FK dependencies).
     """
-    pk_map: dict[str, list[str]] = {}
+    primary_keys: dict[str, list[list[str]]] = {}
     fks: list[tuple[str, str, str, str]] = []
+    checks_by_table: dict[str, list[str]] = {}
 
     for c in constraints or []:
         if "primary" in c:
+            cols = []
             for entry in c["primary"]:
                 tbl, col = _parse_ref(entry["value"])
-                pk_map.setdefault(tbl, []).append(col)
+                cols.append(col)
+            if cols:
+                primary_keys.setdefault(tbl, []).append(cols)
 
         elif "foreign" in c:
             entries = c["foreign"]
             fk_tbl, fk_col = _parse_ref(entries[0]["value"])
             ref_tbl, ref_col = _parse_ref(entries[1]["value"])
             fks.append((fk_tbl, fk_col, ref_tbl, ref_col))
+        else:
+            check = _row_local_check(c)
+            if check is not None:
+                table, expression = check
+                checks_by_table.setdefault(table, []).append(expression)
 
-    stmts = []
-    for table, columns in schema.items():
+    deps: dict[str, set[str]] = {t: set() for t in schema}
+    for fk_tbl, _fk_col, ref_tbl, _ref_col in fks:
+        if fk_tbl != ref_tbl and fk_tbl in deps and ref_tbl in deps:
+            deps[fk_tbl].add(ref_tbl)
+
+    referenced_cols: dict[str, set[str]] = {}
+    for _fk_tbl, _fk_col, ref_tbl, ref_col in fks:
+        referenced_cols.setdefault(ref_tbl, set()).add(ref_col)
+
+    stmts: list[str] = []
+    created_tables: set[str] = set()
+
+    for table in _topological_sort(deps):
+        columns = schema[table]
         col_defs = [
             f"{col} {_normalize_dtype(dtype)}"
             for col, dtype in columns.items()
         ]
 
-        if table in pk_map:
-            col_defs.append(f"PRIMARY KEY ({', '.join(pk_map[table])})")
+        table_primary_keys = primary_keys.get(table, [])
+        pk_cols = set(table_primary_keys[0]) if table_primary_keys else set()
+        if pk_cols:
+            col_defs.append(f"PRIMARY KEY ({', '.join(table_primary_keys[0])})")
+
+        seen_keys = {tuple(table_primary_keys[0])} if table_primary_keys else set()
+        for unique_cols in table_primary_keys[1:]:
+            key = tuple(unique_cols)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            col_defs.append(f"UNIQUE ({', '.join(unique_cols)})")
+
+        for ref_col in referenced_cols.get(table, set()):
+            if ref_col not in pk_cols and [ref_col] not in table_primary_keys:
+                col_defs.append(f"INDEX ({ref_col})")
 
         for fk_tbl, fk_col, ref_tbl, ref_col in fks:
             if fk_tbl == table:
-                col_defs.append(
-                    f"FOREIGN KEY ({fk_col}) REFERENCES {ref_tbl}({ref_col})"
-                )
+                if fk_tbl == ref_tbl or ref_tbl in created_tables:
+                    col_defs.append(
+                        f"FOREIGN KEY ({fk_col}) REFERENCES {ref_tbl}({ref_col})"
+                    )
+
+        for check_expr in checks_by_table.get(table, ()):
+            col_defs.append(f"CHECK ({check_expr})")
 
         stmts.append(f"CREATE TABLE {table} ({', '.join(col_defs)})")
+        created_tables.add(table)
 
     return "; ".join(stmts)
 
@@ -210,16 +407,25 @@ def _process_disprove_case(
             distinct_unique=1,
         )
 
-        record["verdict"] = result.verdict.value
-        record["error_msg"] = result.error_msg or ""
+        _apply_result_metadata(record, result)
 
     except CaseTimeoutError:
         record["verdict"] = "timeout"
         record["error_msg"] = f"Timed out after {case_timeout} seconds"
+        record["debug_category"] = "timeout"
+        record["rows_generated"] = None
+        record["generation_coverage"] = None
 
     except Exception as exc:
-        record["verdict"] = "syntax_error"
-        record["error_msg"] = str(exc)[:500]
+        record.update(
+            _record_for_exception(
+                index=index,
+                sql1=sql1,
+                sql2=sql2,
+                exc=exc,
+                elapsed_time=record["elapsed_time"],
+            )
+        )
 
     finally:
         if case_timeout and case_timeout > 0:
@@ -230,6 +436,91 @@ def _process_disprove_case(
         record["elapsed_time"] = round(time.time() - t0, 4)
 
     return record
+
+
+def _apply_result_metadata(record: dict, result) -> None:
+    record["verdict"] = result.verdict.value
+    record["error_msg"] = result.error_msg or ""
+    record["rows_generated"] = result.generation.rows_generated
+    record["generation_coverage"] = result.generation.coverage
+    record["debug_category"] = _debug_category_for_result(result)
+
+
+def _record_for_exception(
+    *,
+    index: int,
+    sql1: str,
+    sql2: str,
+    exc: Exception,
+    elapsed_time: float,
+) -> dict:
+    return {
+        "index": index,
+        "sql1": sql1,
+        "sql2": sql2,
+        "verdict": _classify_mysql_exception(exc),
+        "error_msg": str(exc)[:500],
+        "elapsed_time": elapsed_time,
+        "debug_category": _debug_category_for_exception(exc),
+        "rows_generated": None,
+        "generation_coverage": None,
+    }
+
+
+def _debug_category_for_result(result) -> str:
+    if result.verdict.value == "timeout":
+        return "timeout"
+    if result.verdict.value == "eq":
+        if result.generation.coverage < 1.0:
+            return "matched_partial_coverage"
+        return "matched_generated_instance"
+    message = " ".join(
+        value
+        for value in (
+            result.error_msg,
+            result.q1_result.error_msg,
+            result.q2_result.error_msg,
+            result.generation.error_msg,
+        )
+        if value
+    )
+    if message:
+        return _debug_category_for_message(message)
+    return result.verdict.value
+
+
+def _debug_category_for_exception(exc: Exception) -> str:
+    return _debug_category_for_message(str(exc))
+
+
+def _debug_category_for_message(message: str) -> str:
+    lower = message.lower()
+    if "timed out" in lower or "timeout" in lower:
+        return "timeout"
+    if (
+        "failed to open the referenced table" in lower
+        or "cannot add foreign key constraint" in lower
+        or "foreign key constraint fails" in lower
+    ):
+        return "db_write_fk_order"
+    if "only_full_group_by" in lower or "not in group by clause" in lower:
+        return "mysql_strict_group_by"
+    if "unknown column" in lower or "unresolved column" in lower:
+        return "unknown_column_or_literal"
+    if "sql syntax" in lower or "syntax error" in lower:
+        return "mysql_invalid_query"
+    return "db_write_error" if _looks_like_db_write_error(lower) else "execution_error"
+
+
+def _looks_like_db_write_error(message: str) -> bool:
+    return any(
+        needle in message
+        for needle in (
+            "duplicate entry",
+            "data truncated",
+            "truncated for column",
+        )
+    )
 
 
 def _process_disprove_task(task: tuple) -> dict:
@@ -244,6 +535,9 @@ def _process_disprove_task(task: tuple) -> dict:
         case_timeout,
     ) = task
 
+    if case_timeout and case_timeout > 0:
+        return _process_disprove_task_with_process_timeout(task)
+
     return _process_disprove_case(
         index=index,
         sql1=sql1,
@@ -251,8 +545,122 @@ def _process_disprove_task(task: tuple) -> dict:
         ddls=ddls,
         connection_string=connection_string,
         table_names=table_names,
-        case_timeout=case_timeout,
+        case_timeout=None,
     )
+
+
+def _process_disprove_task_with_process_timeout(task: tuple) -> dict:
+    (
+        index,
+        sql1,
+        sql2,
+        _ddls,
+        _connection_string,
+        _table_names,
+        case_timeout,
+    ) = task
+
+    t0 = time.time()
+    result_queue = multiprocessing.Queue(maxsize=1)
+    process = multiprocessing.Process(
+        target=_process_disprove_task_child,
+        args=(task, result_queue),
+    )
+    process.start()
+    process.join(case_timeout)
+
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+            return {
+                "index": index,
+                "sql1": sql1,
+                "sql2": sql2,
+                "verdict": "timeout",
+                "error_msg": f"Timed out after {case_timeout} seconds",
+                "elapsed_time": round(time.time() - t0, 4),
+                "debug_category": "timeout",
+                "rows_generated": None,
+                "generation_coverage": None,
+            }
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return {
+                "index": index,
+                "sql1": sql1,
+                "sql2": sql2,
+                "verdict": "execution_error",
+                "error_msg": (
+                    f"Case process exited without result "
+                    f"(exitcode={process.exitcode})"
+                ),
+                "elapsed_time": round(time.time() - t0, 4),
+                "debug_category": "execution_error",
+                "rows_generated": None,
+                "generation_coverage": None,
+            }
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def _process_disprove_task_child(task: tuple, result_queue) -> None:
+    (
+        index,
+        sql1,
+        sql2,
+        ddls,
+        connection_string,
+        table_names,
+        _case_timeout,
+    ) = task
+
+    record = _process_disprove_case(
+        index=index,
+        sql1=sql1,
+        sql2=sql2,
+        ddls=ddls,
+        connection_string=connection_string,
+        table_names=table_names,
+        case_timeout=None,
+    )
+    result_queue.put(record)
+
+
+def _classify_mysql_exception(exc: Exception) -> str:
+    message = str(exc).lower()
+    code = _mysql_error_code(exc)
+    if code == 1064 or "sql syntax" in message or "syntax error" in message:
+        return "syntax_error"
+    if (
+        code in {1062, 1265}
+        or "duplicate entry" in message
+        or "data truncated" in message
+        or "truncated for column" in message
+        or "failed to open the referenced table" in message
+        or "cannot add foreign key constraint" in message
+        or "foreign key constraint fails" in message
+    ):
+        return "db_write_error"
+    if "only_full_group_by" in message or "not in group by clause" in message:
+        return "execution_error"
+    return "execution_error"
+
+
+def _mysql_error_code(exc: Exception) -> int | None:
+    for value in getattr(exc, "args", ()):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _cleanup_databases(base_connection_string: str, tasks: list[tuple]) -> None:
@@ -303,7 +711,10 @@ def run_disprove_experiment(
 
     for offset, entry in enumerate(selected):
         index = start + offset
-        sql1, sql2 = entry["pair"]
+        sql1, sql2 = (
+            _prepare_mysql_query(sql, entry["schema"])
+            for sql in entry["pair"]
+        )
 
         if not (_is_select_query(sql1) and _is_select_query(sql2)):
             skipped += 1

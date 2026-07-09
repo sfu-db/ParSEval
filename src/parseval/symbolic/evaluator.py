@@ -363,8 +363,75 @@ def _aggregate_output_col_id(
     step: Aggregate,
     alias: str,
     relation_id: Optional[RelationId],
+    aggregate_index: int | None = None,
 ) -> ColumnId:
+    if aggregate_index is not None:
+        aggregate_columns = [
+            col_id
+            for col_id in getattr(step, "output_column_ids", ()) or ()
+            if isinstance(col_id, ColumnId) and col_id.kind is ColumnKind.AGGREGATE
+        ]
+        if aggregate_index < len(aggregate_columns):
+            return aggregate_columns[aggregate_index]
     return _output_column_by_name(step, alias) or _aggregate_col_id(alias, relation_id)
+
+
+def _row_value_tuple(row: Row, columns: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    return tuple(_symbol_value(row[column]) for column in columns)
+
+
+def _set_output_row(
+    row: Row,
+    source_columns: Tuple[Any, ...],
+    output_columns: Tuple[Any, ...],
+    row_prefix: str,
+) -> Row:
+    row_id = (row_prefix,) + _row_ids(row)
+    values = _row_value_tuple(row, source_columns)
+    return Row(
+        this=row_id,
+        columns={
+            output_column: _derived_variable(
+                (
+                    output_column.name.normalized
+                    if isinstance(output_column, ColumnId)
+                    else str(output_column)
+                ),
+                values[index] if index < len(values) else None,
+                row_id,
+                output_column.relation if isinstance(output_column, ColumnId) else None,
+                column_id_override=output_column if isinstance(output_column, ColumnId) else None,
+            )
+            for index, output_column in enumerate(output_columns)
+        },
+    )
+
+
+def _sql_tuple_membership(
+    outer_value: Tuple[Any, ...],
+    inner_values: Tuple[Tuple[Any, ...], ...],
+) -> Optional[bool]:
+    if any(value is None for value in outer_value):
+        return None
+    saw_unknown = False
+    for inner_value in inner_values:
+        if len(inner_value) != len(outer_value):
+            continue
+        candidate_unknown = False
+        candidate_false = False
+        for left, right in zip(outer_value, inner_value):
+            if right is None:
+                candidate_unknown = True
+            elif left != right:
+                candidate_false = True
+                break
+        if candidate_false:
+            continue
+        if candidate_unknown:
+            saw_unknown = True
+            continue
+        return True
+    return None if saw_unknown else False
 
 
 # =============================================================================
@@ -525,6 +592,27 @@ class PlanEvaluator:
         outer_bindings: Optional[Dict[ColumnId, Any]] = None,
     ) -> Context:
         """Recursively evaluate the plan bottom-up."""
+        if isinstance(step, SetOperation):
+            dep_contexts = [
+                (
+                    dep,
+                    self._walk(
+                        dep,
+                        ctx,
+                        tree,
+                        observe=observe,
+                        outer_bindings=outer_bindings,
+                    ),
+                )
+                for dep in step.chain_dependencies
+            ]
+            return self._eval_set_operation(
+                step,
+                dep_contexts,
+                tree,
+                observe=observe,
+            )
+
         dep_contexts: Dict[str, DerivedSchema] = {}
         for dep in step.chain_dependencies:
             dep_ctx = self._walk(
@@ -575,8 +663,6 @@ class PlanEvaluator:
             return self._eval_sort(step, input_ctx, tree, observe=observe)
         elif isinstance(step, Limit):
             return self._eval_limit(step, input_ctx, tree, observe=observe)
-        elif isinstance(step, SetOperation):
-            return input_ctx
         return input_ctx
 
     def _step_id(self, step: Step) -> str:
@@ -1261,6 +1347,7 @@ class PlanEvaluator:
         aggregate_node = None
         aggregate_input_node = None
         distinct_input_node = None
+        case_arm_nodes = []
         if observe:
             annotation = self.plan.annotation_for(step)
             parent_node = self._find_upstream_branch_node(step, tree)
@@ -1340,6 +1427,30 @@ class PlanEvaluator:
                         annotation_metadata=annotation.metadata,
                     )
 
+            for aggregation in aggregate_expressions:
+                for case_expr in aggregation.find_all(exp.Case):
+                    ifs = case_expr.args.get("ifs") or []
+                    for arm in ifs:
+                        raw_arm_pred = arm.args.get("this")
+                        if not isinstance(raw_arm_pred, exp.Expression):
+                            continue
+                        arm_pred = _case_arm_condition(case_expr, raw_arm_pred)
+                        atoms = decompose_atoms(arm_pred)
+                        case_node = self._runtime_node(
+                            step_id=annotation.step_id,
+                            step_type="Aggregate",
+                            site="case_arm",
+                            predicate=arm_pred,
+                            atoms=atoms,
+                            tables=_annotation_relation_ids(annotation),
+                            step_obj=step,
+                            parent=parent_node,
+                            path_predicates=path_preds,
+                            join_equalities=join_eqs,
+                            annotation_metadata=annotation.metadata,
+                        )
+                        case_arm_nodes.append((case_node, arm_pred, atoms))
+
         for table_name, table in ctx.tables.items():
             groups: Dict[tuple, int] = {}
             self._aggregation_metadata(step)
@@ -1366,9 +1477,14 @@ class PlanEvaluator:
                 relation_id = _step_relation_id(step)
                 output_columns = self._aggregate_columns(step)
                 subplans = getattr(step, "subplan_dependencies", ()) or ()
-                for aggregate in step.aggregations:
+                for aggregate_index, aggregate in enumerate(step.aggregations):
                     alias = aggregate.alias_or_name
-                    col_id = _aggregate_output_col_id(step, alias, relation_id)
+                    col_id = _aggregate_output_col_id(
+                        step,
+                        alias,
+                        relation_id,
+                        aggregate_index,
+                    )
                     value = self._aggregate_expression_value(
                         aggregate,
                         group_schema.range_reader,
@@ -1543,6 +1659,45 @@ class PlanEvaluator:
                                         row_ids=(*output_row_id, outcome.name),
                                     ),
                                 )
+                    if case_arm_nodes:
+                        arm_source_rows = [
+                            rows_by_id[row_id]
+                            for row_id in group.source_row_ids
+                            if row_id in rows_by_id
+                        ]
+                        for case_node, arm_pred, atoms in case_arm_nodes:
+                            arm_was_taken = False
+                            for row in arm_source_rows:
+                                env = _env_from_row(row)
+                                arm_value = concrete(arm_pred, env)
+                                if arm_value is True:
+                                    arm_was_taken = True
+                                for atom_id, atom in enumerate(atoms):
+                                    outcome = _try_early_classify(atom)
+                                    if outcome is None:
+                                        value = concrete(atom, env)
+                                        outcome = _classify_outcome(value)
+                                    self._observe(
+                                        case_node,
+                                        AtomObservation(
+                                            atom_id=atom_id,
+                                            outcome=outcome,
+                                            row_ids=_row_ids(row),
+                                            concrete_values=_concrete_values(atom, env),
+                                        ),
+                                    )
+                            self._observe(
+                                case_node,
+                                AtomObservation(
+                                    atom_id=-1,
+                                    outcome=(
+                                        BranchType.CASE_ARM_TAKEN
+                                        if arm_was_taken
+                                        else BranchType.CASE_ARM_SKIPPED
+                                    ),
+                                    row_ids=output_row_id,
+                                ),
+                            )
 
             return Context(
                 tables={
@@ -1799,6 +1954,97 @@ class PlanEvaluator:
                 self._observe(distinct_node, AtomObservation(atom_id=0, outcome=outcome))
 
         return self._materialize_project(step, ctx, tree, observe=observe)
+
+    def _eval_set_operation(
+        self,
+        step: SetOperation,
+        dep_contexts: List[Tuple[Step, Context]],
+        tree: BranchTree,
+        *,
+        observe: bool = True,
+    ) -> Context:
+        def table_for(branch_name: Optional[str]) -> Optional[DerivedSchema]:
+            for dep, dep_ctx in dep_contexts:
+                if branch_name is not None and dep.name != branch_name:
+                    continue
+                if dep_ctx.tables:
+                    return next(iter(dep_ctx.tables.values()))
+            return None
+
+        left_table = table_for(step.left)
+        right_table = table_for(step.right)
+        if left_table is None and dep_contexts:
+            left_table = next(iter(dep_contexts[0][1].tables.values()), None)
+        if right_table is None and len(dep_contexts) > 1:
+            right_table = next(iter(dep_contexts[1][1].tables.values()), None)
+        if left_table is None:
+            return Context(tables={step.name or "set_operation": DerivedSchema(columns=(), rows=[])})
+
+        output_columns = tuple(getattr(step, "output_column_ids", ()) or left_table.columns)
+        left_rows = [
+            _set_output_row(row, left_table.columns, output_columns, "set_left")
+            for row in left_table.rows
+        ]
+        right_rows = (
+            [
+                _set_output_row(row, right_table.columns, output_columns, "set_right")
+                for row in right_table.rows
+            ]
+            if right_table is not None
+            else []
+        )
+
+        def row_key(row: Row) -> Tuple[Any, ...]:
+            return _row_value_tuple(row, output_columns)
+
+        def distinct_rows(rows: List[Row]) -> List[Row]:
+            seen: set[Tuple[Any, ...]] = set()
+            result: List[Row] = []
+            for row in rows:
+                key = row_key(row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(row)
+            return result
+
+        if issubclass(step.op, exp.Intersect):
+            right_keys = {row_key(row) for row in right_rows}
+            rows = [row for row in left_rows if row_key(row) in right_keys]
+            if step.distinct:
+                rows = distinct_rows(rows)
+        elif issubclass(step.op, exp.Except):
+            right_keys = {row_key(row) for row in right_rows}
+            rows = [row for row in left_rows if row_key(row) not in right_keys]
+            if step.distinct:
+                rows = distinct_rows(rows)
+        elif issubclass(step.op, exp.Union):
+            rows = left_rows + right_rows
+            if step.distinct:
+                rows = distinct_rows(rows)
+        else:
+            rows = left_rows
+
+        if observe:
+            for row in rows:
+                tree.record_row_lineage(
+                    step_id=self._step_id(step),
+                    site="set_operation",
+                    output_row_ids=_row_ids(row),
+                    source_row_ids=(_row_ids(row),),
+                )
+
+        return Context(
+            tables={
+                step.name or "set_operation": DerivedSchema(
+                    columns=output_columns,
+                    rows=rows,
+                    datatypes=left_table.datatypes,
+                    nullables=left_table.nullables,
+                    uniqueness=left_table.uniqueness,
+                )
+            }
+        )
 
     def _eval_sort(
         self,
@@ -2058,15 +2304,12 @@ class PlanEvaluator:
             elif subplan.kind is SubPlanKind.EXISTS:
                 predicate_values[key] = self._inner_plan_has_rows(subplan.inner, outer_bindings)
             elif subplan.kind is SubPlanKind.IN and isinstance(subplan.anchor, exp.In):
-                outer_value = concrete(subplan.anchor.this, outer_env)
-                inner_values = {
-                    value
-                    for value, _row_id in self._inner_plan_value_rows(
-                        subplan.inner,
-                        outer_bindings,
-                    )
-                }
-                predicate_values[key] = outer_value in inner_values
+                predicate_values[key] = self._subquery_membership_value(
+                    subplan.anchor,
+                    subplan.inner,
+                    outer_bindings,
+                    outer_env,
+                )
         if not scalar_values and not predicate_values:
             return predicate
 
@@ -2079,7 +2322,10 @@ class PlanEvaluator:
                 if scalar_sql in scalar_values_by_sql:
                     return exp.convert(scalar_values_by_sql[scalar_sql])
             if isinstance(node, (exp.Exists, exp.In)) and key in predicate_values:
-                return exp.true() if predicate_values[key] else exp.false()
+                value = predicate_values[key]
+                if value is None:
+                    return exp.Null()
+                return exp.true() if value else exp.false()
             return node
 
         resolved = predicate.copy().transform(replace_subquery)
@@ -2186,7 +2432,7 @@ class PlanEvaluator:
                 )
             aggregate_values: Dict[Any, Any] = {}
             subplans = getattr(step, "subplan_dependencies", ()) or ()
-            for aggregate in step.aggregations:
+            for aggregate_index, aggregate in enumerate(step.aggregations):
                 alias = aggregate.alias_or_name
                 value = self._aggregate_expression_value(
                     aggregate,
@@ -2198,7 +2444,12 @@ class PlanEvaluator:
                     subplans=subplans,
                 )
                 aggregate_values[alias] = value
-                col_id = _aggregate_output_col_id(step, alias, relation_id)
+                col_id = _aggregate_output_col_id(
+                    step,
+                    alias,
+                    relation_id,
+                    aggregate_index,
+                )
                 columns[col_id] = _derived_variable(
                     alias,
                     value,
@@ -2401,6 +2652,38 @@ class PlanEvaluator:
             for value, _row_id in self._inner_plan_value_rows(root, outer_bindings)
         }
 
+    def _expression_tuple_value(
+        self,
+        expression: exp.Expression,
+        env: Environment,
+    ) -> Tuple[Any, ...]:
+        if isinstance(expression, exp.Tuple):
+            return tuple(concrete(item, env) for item in expression.expressions)
+        return (concrete(expression, env),)
+
+    def _inner_plan_tuple_rows(
+        self,
+        root: Step,
+        outer_bindings: Optional[Dict[ColumnId, Any]] = None,
+    ) -> List[Tuple[Tuple[Any, ...], Tuple[Any, ...]]]:
+        rows, _table_name, _projects = self._eval_inner_plan(root, outer_bindings)
+        return [
+            (_row_value_tuple(row, row.columns), _row_ids(row))
+            for row in rows
+        ]
+
+    def _subquery_membership_value(
+        self,
+        anchor: exp.In,
+        inner: Step,
+        outer_bindings: Optional[Dict[ColumnId, Any]],
+        outer_env: Environment,
+    ) -> Optional[bool]:
+        outer_value = self._expression_tuple_value(anchor.this, outer_env)
+        inner_value_rows = self._inner_plan_tuple_rows(inner, outer_bindings)
+        inner_values = tuple(value for value, _row_id in inner_value_rows)
+        return _sql_tuple_membership(outer_value, inner_values)
+
     def _inner_plan_value_rows(
         self,
         root: Step,
@@ -2463,37 +2746,41 @@ class PlanEvaluator:
 
         # Check each outer row against the inner result set.
         if isinstance(step.anchor, exp.In):
-            outer_col = step.anchor.this
-            if isinstance(outer_col, exp.Column):
-                for table_name, table in ctx.tables.items():
-                    for row in table.rows:
-                        env = _env_from_row(row)
-                        inner_value_rows = self._inner_plan_value_rows(step.inner, env)
-                        inner_values = {value for value, _row_id in inner_value_rows}
-                        outer_val = _symbol_value(row[outer_col])
-
-                        outcome = BranchType.IN_MATCH if outer_val in inner_values else BranchType.IN_NO_MATCH
-                        self._observe(
-                            node,
-                            AtomObservation(
-                                atom_id=0,
-                                outcome=outcome,
-                                row_ids=_row_ids(row),
-                                concrete_values=_concrete_values(step.anchor, env),
-                            ),
-                        )
-                        matching_inner_rows = tuple(
-                            inner_row_id
-                            for value, inner_row_id in inner_value_rows
-                            if value == outer_val
-                        )
-                        tree.record_operator_trace(
-                            node,
+            for table_name, table in ctx.tables.items():
+                for row in table.rows:
+                    env = _env_from_row(row)
+                    outer_value = self._expression_tuple_value(step.anchor.this, env)
+                    inner_value_rows = self._inner_plan_tuple_rows(step.inner, env)
+                    membership = _sql_tuple_membership(
+                        outer_value,
+                        tuple(value for value, _row_id in inner_value_rows),
+                    )
+                    outcome = (
+                        BranchType.IN_MATCH
+                        if membership is True
+                        else BranchType.IN_NO_MATCH
+                    )
+                    self._observe(
+                        node,
+                        AtomObservation(
+                            atom_id=0,
                             outcome=outcome,
-                            input_row_ids=(_row_ids(row),) + matching_inner_rows,
-                            output_row_ids=(_row_ids(row),) if outcome == BranchType.IN_MATCH else (),
+                            row_ids=_row_ids(row),
                             concrete_values=_concrete_values(step.anchor, env),
-                        )
+                        ),
+                    )
+                    matching_inner_rows = tuple(
+                        inner_row_id
+                        for value, inner_row_id in inner_value_rows
+                        if _sql_tuple_membership(outer_value, (value,)) is True
+                    )
+                    tree.record_operator_trace(
+                        node,
+                        outcome=outcome,
+                        input_row_ids=(_row_ids(row),) + matching_inner_rows,
+                        output_row_ids=(_row_ids(row),) if outcome == BranchType.IN_MATCH else (),
+                        concrete_values=_concrete_values(step.anchor, env),
+                    )
 
         return ctx
 
