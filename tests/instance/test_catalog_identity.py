@@ -466,6 +466,129 @@ def test_database_constraints_exposes_normalized_relation_constraints():
     assert all(check.supported for check in child.checks)
 
 
+def test_mysql_schema_spec_preserves_enum_and_simple_checks_for_domains():
+    inst = Instance(
+        """
+        CREATE TABLE activity (
+            status ENUM('OPEN','CLOSED') NOT NULL,
+            score INT CHECK (score BETWEEN 10 AND 20),
+            device_id INT CHECK (device_id IN (1, 2, 3))
+        );
+        """,
+        name="db",
+        dialect="mysql",
+    )
+
+    table = inst.schema_spec.get_table("activity")
+    status = table.get_column("status")
+    score = table.get_column("score")
+    device_id = table.get_column("device_id")
+
+    assert status.datatype.is_type(exp.DataType.Type.ENUM)
+    assert inst.builder._get_plan(status).allowed_values == ("OPEN", "CLOSED")
+    assert inst.builder._get_plan(score).minimum == 10
+    assert inst.builder._get_plan(score).maximum == 20
+    assert inst.builder._get_plan(device_id).allowed_values == (1, 2, 3)
+
+    row = inst.builder.complete_row("activity")
+
+    assert row["status"] in {"OPEN", "CLOSED"}
+    assert 10 <= row["score"] <= 20
+    assert row["device_id"] in {1, 2, 3}
+
+    try:
+        inst.builder.complete_row("activity", {"score": 9})
+    except Exception as exc:
+        assert "minimum" in str(exc)
+    else:
+        raise AssertionError("CHECK-violating generated row was accepted")
+
+
+def test_create_row_rejects_mysql_row_local_table_check_after_completion():
+    inst = Instance(
+        """
+        CREATE TABLE follow (
+            followee INT,
+            follower INT,
+            CONSTRAINT check_follow CHECK (followee <> follower)
+        );
+        """,
+        name="db",
+        dialect="mysql",
+    )
+
+    try:
+        inst.create_row("follow", {"followee": 1, "follower": 1})
+    except Exception as exc:
+        assert "check_constraint_failed" in str(exc)
+    else:
+        raise AssertionError("CHECK-violating row was accepted")
+
+
+def test_create_rows_fills_missing_mysql_check_column_from_domain_constraints():
+    inst = Instance(
+        """
+        CREATE TABLE activity (
+            player_id INT,
+            games_played INT,
+            CHECK (games_played >= 0)
+        );
+        """,
+        name="db",
+        dialect="mysql",
+    )
+
+    created = inst.create_rows({"activity": {"player_id": [1]}})
+    row = created[inst.table_id("activity")][0].created[inst.table_id("activity")][0]
+    values = {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+
+    assert values["player_id"] == 1
+    assert values["games_played"] >= 0
+
+
+def test_create_rows_fills_missing_row_local_check_partner_after_completion():
+    inst = Instance(
+        """
+        CREATE TABLE follow (
+            followee INT,
+            follower INT,
+            CONSTRAINT check_follow CHECK (followee <> follower)
+        );
+        """,
+        name="db",
+        dialect="sqlite",
+    )
+
+    created = inst.create_rows({"follow": {"followee": [1]}})
+    row = created[inst.table_id("follow")][0].created[inst.table_id("follow")][0]
+    values = {column.name.normalized: symbol.concrete for column, symbol in row.items()}
+
+    assert values["followee"] == 1
+    assert values["follower"] != values["followee"]
+
+
+def test_mysql_database_constraints_exposes_normalized_check_column_ids():
+    inst = Instance(
+        """
+        CREATE TABLE activity (
+            player_id INT,
+            games_played INT CHECK (games_played >= 0)
+        );
+        """,
+        name="db",
+        dialect="mysql",
+    )
+
+    constraints = inst.database_constraints(inst.table_id("activity"))
+
+    assert [check.expression.sql(dialect="mysql") for check in constraints.checks] == [
+        "games_played >= 0"
+    ]
+    assert constraints.checks[0].referenced_columns == (
+        inst.column_id("activity", "games_played"),
+    )
+
+
 def test_foreign_keys_are_resolved_by_relation_ids():
     ddl = """
     CREATE TABLE main.users (id INT PRIMARY KEY);

@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from parseval.instance import Instance
+from parseval.instance.loader import InstanceLoader
+from parseval.instance.types import DatabaseTarget, InstanceSnapshot, TableBatch
 from parseval.domain.exceptions import ConstraintViolationError, UniqueConflictError
 
 
@@ -19,6 +21,69 @@ CREATE TABLE users (
 
 
 class InstanceLoaderTests(unittest.TestCase):
+    def test_loader_creates_and_inserts_parents_before_children_and_drops_children_first(self):
+        events = []
+
+        class FakeConnection:
+            metadata = None
+
+            def drop_table(self, table_name):
+                events.append(("drop", table_name))
+
+            def create_tables(self, *ddls):
+                for ddl in ddls:
+                    events.append(("create", ddl))
+
+            def insert(self, statement, payload):
+                events.append(("insert", statement))
+
+        class FakeConnectionContext:
+            def __enter__(self):
+                return FakeConnection()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeDBManager:
+            def get_connection(self, *args, **kwargs):
+                return FakeConnectionContext()
+
+        class FakeSerializer:
+            def serialize_row(self, table_name, row):
+                return row
+
+        snapshot = InstanceSnapshot(
+            schema_ddl=(
+                "CREATE TABLE parent (id INT PRIMARY KEY); "
+                "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT)"
+            ),
+            dialect="sqlite",
+            tables=(
+                TableBatch("parent", ("id",), ({"id": 1},)),
+                TableBatch("child", ("id", "parent_id"), ({"id": 2, "parent_id": 1},)),
+            ),
+        )
+
+        with patch("parseval.instance.loader.DBManager", return_value=FakeDBManager()):
+            InstanceLoader().load(
+                snapshot,
+                DatabaseTarget("sqlite:///:memory:", "sqlite"),
+                FakeSerializer(),
+            )
+
+        self.assertEqual(
+            [event for event in events if event[0] == "drop"],
+            [("drop", "child"), ("drop", "parent")],
+        )
+        self.assertEqual(
+            [event[0] for event in events],
+            ["drop", "drop", "create", "create", "insert", "insert"],
+        )
+        self.assertIn("parent", events[2][1])
+        self.assertIn("child", events[3][1])
+        self.assertIn('"parent"', events[4][1])
+        self.assertIn('"child"', events[5][1])
+
     def test_create_row_rejects_explicit_null_for_non_nullable_column(self):
         instance = Instance(ddls=SCHEMA, name="nonnull_case", dialect="sqlite")
 

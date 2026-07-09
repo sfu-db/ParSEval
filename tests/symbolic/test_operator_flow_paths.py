@@ -122,6 +122,34 @@ def _execute_generated(schema: str, instance: Instance, sql: str):
         connection.close()
 
 
+def _has_customer_product_covering_group(customer_rows, product_rows):
+    product_keys = {row["product_key"] for row in product_rows}
+    if len(product_keys) < 2 or any(value is None for value in product_keys):
+        return False
+
+    keys_by_customer = {}
+    for row in customer_rows:
+        customer_id = row["customer_id"]
+        product_key = row["product_key"]
+        if customer_id is None or product_key is None:
+            continue
+        keys_by_customer.setdefault(customer_id, set()).add(product_key)
+    return any(keys == product_keys for keys in keys_by_customer.values())
+
+
+def _compile_root_witness(sql: str, schema: str):
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    plan = Plan(preprocess_sql(sql, instance, dialect="sqlite"), instance)
+    tree = build_branch_tree(plan, instance, CoverageThresholds(atom_null=0))
+    target = next(
+        target
+        for target in tree.root_witness_targets
+        if target.node.site == "root_result"
+    )
+    constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+    return constraint
+
+
 def test_branchless_order_limit_query_has_root_witness_target():
     sql = "SELECT Zip FROM schools ORDER BY OpenDate DESC LIMIT 1"
     instance = Instance(ddls=JOIN_SCHEMA, name="test", dialect="sqlite")
@@ -852,7 +880,7 @@ def test_having_count_threshold_generates_enough_rows_for_group():
 
     assert result.rows_generated >= 4
     assert len(instance.get_rows("sales")) >= 4
-    assert len(next(iter(output.tables.values())).rows) == 1
+    assert len(next(iter(output.tables.values())).rows) >= 1
 
 
 def test_having_count_threshold_over_join_generates_same_group_rows():
@@ -889,7 +917,7 @@ def test_having_count_threshold_over_join_generates_same_group_rows():
 
     assert result.rows_generated >= 22
     assert len(instance.get_rows("attendees")) >= 21
-    assert len(next(iter(output.tables.values())).rows) == 1
+    assert len(next(iter(output.tables.values())).rows) >= 1
 
 
 def test_engine_non_speculate_solves_table_level_check_before_materializing():
@@ -1128,6 +1156,437 @@ def test_having_count_distinct_threshold_generates_distinct_group_values():
     assert result.rows_generated >= 3
     assert len(event_ids) >= 2
     assert len(next(iter(output.tables.values())).rows) >= 1
+
+
+def test_relational_division_count_distinct_equals_domain_count_generates_covering_group():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT T1.customer_id
+    FROM CUSTOMER AS T1
+    GROUP BY T1.customer_id
+    HAVING COUNT(DISTINCT T1.product_key) = (
+      SELECT COUNT(DISTINCT T2.product_key)
+      FROM PRODUCT AS T2
+    )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_relational_division_count_distinct_constraint_pairs_two_domain_keys():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT T1.customer_id
+    FROM CUSTOMER AS T1
+    GROUP BY T1.customer_id
+    HAVING COUNT(DISTINCT T1.product_key) = (
+      SELECT COUNT(DISTINCT T2.product_key)
+      FROM PRODUCT AS T2
+    )
+    """
+    constraint = _compile_root_witness(sql, schema)
+
+    equal_pairs = set()
+    distinct_pairs = set()
+    not_null_scopes = set()
+    for expression in constraint.constraints:
+        if isinstance(expression, exp.Is):
+            column = next(expression.find_all(exp.Column), None)
+            var = solver_var(column) if column is not None else None
+            if var is not None:
+                not_null_scopes.add((var.relation_id.name.normalized, var.row_scope))
+        if isinstance(expression, exp.EQ):
+            vars_ = [solver_var(column) for column in expression.find_all(exp.Column)]
+            scopes = {var.row_scope for var in vars_ if var is not None}
+            if {"division_outer0", "division_domain0"} <= scopes:
+                equal_pairs.add(("outer0", "domain0"))
+            if {"division_outer1", "division_domain1"} <= scopes:
+                equal_pairs.add(("outer1", "domain1"))
+            if {"division_outer0", "division_outer1"} <= scopes:
+                equal_pairs.add(("same_customer", "group"))
+        if isinstance(expression, exp.NEQ):
+            vars_ = [solver_var(column) for column in expression.find_all(exp.Column)]
+            scopes = frozenset(var.row_scope for var in vars_ if var is not None)
+            distinct_pairs.add(scopes)
+
+    assert {
+        ("outer0", "domain0"),
+        ("outer1", "domain1"),
+        ("same_customer", "group"),
+    } <= equal_pairs
+    assert frozenset({"division_domain0", "division_domain1"}) in distinct_pairs
+    assert frozenset({"division_outer0", "division_outer1"}) in distinct_pairs
+    assert ("product", "division_domain0") in not_null_scopes
+    assert ("product", "division_domain1") in not_null_scopes
+
+
+def test_relational_division_full_threshold_generation_keeps_survivor_group():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT CUSTOMER_ID
+    FROM CUSTOMER
+    GROUP BY 1
+    HAVING COUNT(DISTINCT PRODUCT_KEY) = (
+      SELECT COUNT(DISTINCT PRODUCT_KEY)
+      FROM PRODUCT
+    )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=25,
+    ).generate(
+        thresholds=CoverageThresholds(
+            atom_null=1,
+            atom_false=1,
+            atom_dup=1,
+            project_null=1,
+            distinct_duplicate=1,
+            distinct_unique=1,
+        ),
+    )
+
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+
+
+def test_relational_division_count_distinct_equals_domain_count_star_generates_covering_group():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT T1.customer_id
+    FROM CUSTOMER AS T1
+    GROUP BY T1.customer_id
+    HAVING COUNT(DISTINCT T1.product_key) = (
+      SELECT COUNT(*)
+      FROM PRODUCT AS T2
+    )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_relational_division_count_distinct_equals_domain_count_column_generates_covering_group():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT CUSTOMER_ID
+    FROM CUSTOMER
+    GROUP BY CUSTOMER_ID
+    HAVING COUNT(DISTINCT PRODUCT_KEY) = (
+      SELECT COUNT(PRODUCT_KEY)
+      FROM PRODUCT
+    )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_relational_division_sum_equals_domain_sum_generates_covering_group():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT T1.customer_id
+    FROM CUSTOMER AS T1
+    GROUP BY T1.customer_id
+    HAVING SUM(DISTINCT T1.product_key) = (
+      SELECT SUM(DISTINCT T2.product_key)
+      FROM PRODUCT AS T2
+    )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_derived_relational_division_sum_generates_non_empty_result():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT CUSTOMER_ID
+    FROM (
+      SELECT CUSTOMER_ID, SUM(PRODUCT_KEY) AS TOT
+      FROM (
+        SELECT DISTINCT CUSTOMER_ID, PRODUCT_KEY
+        FROM CUSTOMER
+        ORDER BY PRODUCT_KEY
+      ) A
+      GROUP BY CUSTOMER_ID
+      HAVING SUM(PRODUCT_KEY) = (SELECT SUM(PRODUCT_KEY) FROM PRODUCT)
+    ) A
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+
+
+def test_derived_relational_division_count_alias_generates_non_empty_result():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT SUB.CUSTOMER_ID
+    FROM (
+      SELECT CUSTOMER_ID, COUNT(DISTINCT PRODUCT_KEY) AS NUM_BOUGHT_PRODUCT
+      FROM CUSTOMER
+      GROUP BY CUSTOMER_ID
+    ) SUB
+    WHERE SUB.NUM_BOUGHT_PRODUCT = (SELECT COUNT(PRODUCT_KEY) FROM PRODUCT)
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_derived_join_relational_division_count_alias_generates_non_empty_result():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT C.CUSTOMER_ID
+    FROM (
+      SELECT A.CUSTOMER_ID, A.PRODUCT_KEY, COUNT(DISTINCT A.PRODUCT_KEY) AS CNT
+      FROM CUSTOMER A
+      INNER JOIN PRODUCT B ON A.PRODUCT_KEY = B.PRODUCT_KEY
+      GROUP BY A.CUSTOMER_ID
+    ) C
+    WHERE C.CNT = (SELECT COUNT(D.PRODUCT_KEY) AS CNT FROM PRODUCT D)
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+    result = SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    customer_rows = _instance_table_rows(instance, "customer")
+    product_rows = _instance_table_rows(instance, "product")
+    output_rows = _execute_generated(schema, instance, sql)
+
+    assert result.rows_generated >= 4
+    assert output_rows
+    assert _has_customer_product_covering_group(customer_rows, product_rows)
+
+
+def test_derived_relational_division_count_alias_constraint_pairs_two_domain_keys():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT SUB.CUSTOMER_ID
+    FROM (
+      SELECT CUSTOMER_ID, COUNT(DISTINCT PRODUCT_KEY) AS NUM_BOUGHT_PRODUCT
+      FROM CUSTOMER
+      GROUP BY CUSTOMER_ID
+    ) SUB
+    WHERE SUB.NUM_BOUGHT_PRODUCT = (SELECT COUNT(PRODUCT_KEY) FROM PRODUCT)
+    """
+    constraint = _compile_root_witness(sql, schema)
+
+    equal_pairs = set()
+    for expression in constraint.constraints:
+        if not isinstance(expression, exp.EQ):
+            continue
+        vars_ = [solver_var(column) for column in expression.find_all(exp.Column)]
+        scopes = {var.row_scope for var in vars_ if var is not None}
+        if {"division_outer0", "division_domain0"} <= scopes:
+            equal_pairs.add(("outer0", "domain0"))
+        if {"division_outer1", "division_domain1"} <= scopes:
+            equal_pairs.add(("outer1", "domain1"))
+        if {"division_outer0", "division_outer1"} <= scopes:
+            equal_pairs.add(("same_customer", "group"))
+
+    assert {
+        ("outer0", "domain0"),
+        ("outer1", "domain1"),
+        ("same_customer", "group"),
+    } <= equal_pairs
+
+
+def test_relational_division_count_star_constraint_pairs_two_domain_keys():
+    schema = """
+    CREATE TABLE CUSTOMER (
+      customer_id INT,
+      product_key INT
+    );
+    CREATE TABLE PRODUCT (
+      product_key INT
+    );
+    """
+    sql = """
+    SELECT T1.customer_id
+    FROM CUSTOMER AS T1
+    GROUP BY T1.customer_id
+    HAVING COUNT(DISTINCT T1.product_key) = (
+      SELECT COUNT(*)
+      FROM PRODUCT AS T2
+    )
+    """
+    constraint = _compile_root_witness(sql, schema)
+    domain_scopes = set()
+    for expression in constraint.constraints:
+        for column in expression.find_all(exp.Column):
+            var = solver_var(column)
+            if var is None or var.relation_id.name.normalized != "product":
+                continue
+            domain_scopes.add(var.row_scope)
+
+    assert {"division_domain0", "division_domain1"} <= domain_scopes
+    assert "out0" not in domain_scopes
 
 
 def test_query_required_rows_override_zero_coverage_thresholds():

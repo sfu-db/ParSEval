@@ -511,5 +511,57 @@ def test_materialization_failure_reports_original_constraint_reason():
     assert not instance.get_rows("t")
 
 
+def test_mysql_1440_generation_uses_valid_enum_and_text_storage_keys():
+    schema = """
+    CREATE TABLE VARIABLES (
+        NAME VARCHAR(10) PRIMARY KEY,
+        VALUE INT
+    );
+    CREATE TABLE EXPRESSIONS (
+        LEFT_OPERAND VARCHAR(10) NOT NULL,
+        OPERATOR ENUM('<','>','=') NOT NULL,
+        RIGHT_OPERAND VARCHAR(10) NOT NULL,
+        PRIMARY KEY (LEFT_OPERAND, OPERATOR, RIGHT_OPERAND),
+        FOREIGN KEY (LEFT_OPERAND) REFERENCES VARIABLES(NAME),
+        FOREIGN KEY (RIGHT_OPERAND) REFERENCES VARIABLES(NAME)
+    );
+    """
+    query = (
+        "SELECT A.*, CASE WHEN "
+        "((B.VALUE < C.VALUE AND A.OPERATOR = '<') "
+        "OR (B.VALUE = C.VALUE AND A.OPERATOR = '=') "
+        "OR (B.VALUE > C.VALUE AND A.OPERATOR = '>')) "
+        "THEN TRUE ELSE FALSE END AS VALUE "
+        "FROM EXPRESSIONS AS A "
+        "JOIN VARIABLES AS B ON A.LEFT_OPERAND = B.NAME "
+        "JOIN VARIABLES AS C ON A.RIGHT_OPERAND = C.NAME"
+    )
+    instance = Instance(schema, name="lc1440", dialect="mysql")
+    engine = SymbolicEngine(instance, query, dialect="mysql", max_iterations=1)
+
+    result = engine.generate(
+        thresholds=CoverageThresholds(
+            atom_null=0,
+            atom_false=1,
+            atom_dup=1,
+            project_null=0,
+            distinct_duplicate=0,
+            distinct_unique=0,
+        )
+    )
+
+    expressions_id = instance.table_id("EXPRESSIONS")
+    variables_id = instance.table_id("VARIABLES")
+    expressions = instance.get_rows(expressions_id)
+    variables = instance.get_rows(variables_id)
+    name = instance.column_id(variables_id, "NAME")
+    operator = instance.column_id(expressions_id, "OPERATOR")
+    assert result.rows_generated > 0
+    assert expressions
+    assert {row[operator].concrete for row in expressions} <= {"<", ">", "="}
+    names = [row[name].concrete for row in variables]
+    assert len({value.casefold() for value in names}) == len(names)
+
+
 if __name__ == "__main__":
     unittest.main()

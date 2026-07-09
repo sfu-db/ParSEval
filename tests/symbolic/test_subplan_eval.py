@@ -16,6 +16,14 @@ CREATE TABLE t2 (id INT, x INT, y INT);
 """
 
 
+def _output_values(output):
+    table = next(iter(output.tables.values()))
+    return [
+        tuple(symbol.concrete for _column, symbol in row.items())
+        for row in table.rows
+    ]
+
+
 class TestExistsEvaluation(unittest.TestCase):
     def test_exists_records_true_when_inner_has_rows(self):
         """EXISTS should record EXISTS_TRUE when inner query returns rows."""
@@ -104,6 +112,163 @@ class TestInEvaluation(unittest.TestCase):
         in_node = in_nodes[0]
         outcomes = in_node.observed_outcomes(0)
         self.assertIn(BranchType.IN_NO_MATCH, outcomes)
+
+    def test_tuple_in_filter_uses_full_projected_inner_tuple(self):
+        """Tuple IN should compare the full projected tuple from the subquery."""
+        schema = """
+        CREATE TABLE points (id INT, lat INT, lon INT);
+        CREATE TABLE allowed (id INT, lat INT, lon INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("points", values={"id": 1, "lat": 10, "lon": 20})
+        instance.create_row("points", values={"id": 2, "lat": 10, "lon": 99})
+        instance.create_row("allowed", values={"id": 1, "lat": 10, "lon": 20})
+        instance.create_row("allowed", values={"id": 2, "lat": 10, "lon": 30})
+
+        sql = """
+        SELECT id
+        FROM points
+        WHERE (lat, lon) IN (SELECT lat, lon FROM allowed)
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [(1,)])
+
+    def test_not_in_with_inner_null_filters_outer_row(self):
+        """NOT IN should follow SQL three-valued logic when inner rows contain NULL."""
+        schema = """
+        CREATE TABLE outer_values (id INT, value INT);
+        CREATE TABLE inner_values (id INT, value INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("outer_values", values={"id": 1, "value": 7})
+        instance.create_row("inner_values", values={"id": 1, "value": None})
+
+        sql = """
+        SELECT id
+        FROM outer_values
+        WHERE value NOT IN (SELECT value FROM inner_values)
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [])
+
+
+class TestSetOperationEvaluation(unittest.TestCase):
+    def test_union_distinct_materializes_single_output_schema(self):
+        schema = """
+        CREATE TABLE left_values (id INT, value INT);
+        CREATE TABLE right_values (id INT, value INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("left_values", values={"id": 1, "value": 1})
+        instance.create_row("left_values", values={"id": 2, "value": 2})
+        instance.create_row("right_values", values={"id": 1, "value": 2})
+        instance.create_row("right_values", values={"id": 2, "value": 3})
+
+        sql = """
+        SELECT value FROM left_values
+        UNION
+        SELECT value FROM right_values
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(len(output.tables), 1)
+        self.assertEqual(_output_values(output), [(1,), (2,), (3,)])
+
+    def test_union_all_preserves_duplicates(self):
+        schema = """
+        CREATE TABLE left_values (id INT, value INT);
+        CREATE TABLE right_values (id INT, value INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("left_values", values={"id": 1, "value": 2})
+        instance.create_row("right_values", values={"id": 1, "value": 2})
+
+        sql = """
+        SELECT value FROM left_values
+        UNION ALL
+        SELECT value FROM right_values
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [(2,), (2,)])
+
+    def test_intersect_keeps_values_present_on_both_sides(self):
+        schema = """
+        CREATE TABLE left_values (id INT, value INT);
+        CREATE TABLE right_values (id INT, value INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("left_values", values={"id": 1, "value": 1})
+        instance.create_row("left_values", values={"id": 2, "value": 2})
+        instance.create_row("right_values", values={"id": 1, "value": 2})
+        instance.create_row("right_values", values={"id": 2, "value": 3})
+
+        sql = """
+        SELECT value FROM left_values
+        INTERSECT
+        SELECT value FROM right_values
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [(2,)])
+
+    def test_except_removes_values_present_on_right_side(self):
+        schema = """
+        CREATE TABLE left_values (id INT, value INT);
+        CREATE TABLE right_values (id INT, value INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("left_values", values={"id": 1, "value": 1})
+        instance.create_row("left_values", values={"id": 2, "value": 2})
+        instance.create_row("right_values", values={"id": 1, "value": 2})
+
+        sql = """
+        SELECT value FROM left_values
+        EXCEPT
+        SELECT value FROM right_values
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [(1,)])
+
+
+class TestCaseProjectionEvaluation(unittest.TestCase):
+    def test_case_projection_can_feed_join_key(self):
+        schema = """
+        CREATE TABLE friends (id INT, user1 INT, user2 INT);
+        CREATE TABLE likes (id INT, user_id INT, page_id INT);
+        """
+        instance = Instance(ddls=schema, name="test", dialect="sqlite")
+        instance.create_row("friends", values={"id": 1, "user1": 1, "user2": 2})
+        instance.create_row("likes", values={"id": 1, "user_id": 2, "page_id": 99})
+
+        sql = """
+        SELECT liked.page_id
+        FROM (
+          SELECT CASE WHEN user1 = 1 THEN user2 ELSE user1 END AS friend_id
+          FROM friends
+        ) AS friend_edges
+        JOIN likes AS liked ON friend_edges.friend_id = liked.user_id
+        """
+        expr = preprocess_sql(sql, instance, dialect="sqlite")
+        plan = Plan(expr, instance)
+        output = PlanEvaluator(plan, instance, "sqlite").evaluate_context()
+
+        self.assertEqual(_output_values(output), [(99,)])
 
 
 class TestCTEEvaluation(unittest.TestCase):

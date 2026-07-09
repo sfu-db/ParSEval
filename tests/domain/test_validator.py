@@ -1,4 +1,7 @@
 import unittest
+from datetime import datetime
+
+from parseval.dtype import DataType, StorageLiteral
 from parseval.domain.compiler import ColumnDomainPlan, ConstraintValidator
 from parseval.domain.exceptions import ConstraintViolationError
 
@@ -37,6 +40,15 @@ class TestValidator(unittest.TestCase):
             self.validator.validate(plan, 10)
         with self.assertRaises(ConstraintViolationError):
             self.validator.validate(plan, 20)
+
+    def test_validate_temporal_storage_literal_against_python_bounds(self):
+        plan = ColumnDomainPlan(
+            datatype=DataType.build("DATETIME"),
+            minimum=datetime(2010, 1, 1),
+            maximum=datetime(2010, 12, 31, 23, 59, 59),
+        )
+
+        self.validator.validate(plan, StorageLiteral("2010-07-19 19:39:08.0"))
 
     def test_validate_length(self):
         plan = ColumnDomainPlan(minimum_length=3, maximum_length=5)

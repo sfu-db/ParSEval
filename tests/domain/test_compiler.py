@@ -34,6 +34,18 @@ class TestCompiler(unittest.TestCase):
         plan = self.compiler.compile(spec)
         self.assertEqual(plan.allowed_values, ("B",))
 
+    def test_compile_mysql_enum_uses_profile_allowed_values(self):
+        spec = ColumnSpec(
+            table="t",
+            column="op",
+            datatype=DataType.build("ENUM('<','>','=')", dialect="mysql"),
+            dialect="mysql",
+        )
+
+        plan = self.compiler.compile(spec)
+
+        self.assertEqual(plan.allowed_values, ("<", ">", "="))
+
     def test_compile_empty_choices_conflict(self):
         spec = ColumnSpec(
             table="t", column="c", datatype=DataType.build("ENUM('A', 'B')"),

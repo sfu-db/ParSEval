@@ -72,6 +72,43 @@ class DomainModuleTests(unittest.TestCase):
         child_values = {row["parent_id"] for row in result["children"]}
         self.assertTrue(child_values.issubset(parent_values))
 
+    def test_mysql_text_foreign_key_matches_storage_equivalent_parent(self):
+        parent_id = ColumnSpec(
+            table="parents",
+            column="id",
+            datatype=DataType.build("VARCHAR(10)", dialect="mysql"),
+            dialect="mysql",
+            nullable=False,
+            unique=True,
+            primary_key=True,
+        )
+        child_parent_id = ColumnSpec(
+            table="children",
+            column="parent_id",
+            datatype=DataType.build("VARCHAR(10)", dialect="mysql"),
+            dialect="mysql",
+            nullable=False,
+            foreign_key=ForeignKeySpec(
+                source_table="children",
+                source_columns=("parent_id",),
+                target_table="parents",
+                target_columns=("id",),
+            ),
+        )
+        schema = SchemaSpec(
+            tables=(
+                TableSpec(name="parents", columns=(parent_id,), primary_key=("id",), dialect="mysql"),
+                TableSpec(name="children", columns=(child_parent_id,), dialect="mysql"),
+            ),
+            dialect="mysql",
+        )
+        builder = DatabaseBuilder(schema)
+        builder.complete_row("parents", {"id": "C"})
+
+        row = builder.complete_row("children", {"parent_id": "c"})
+
+        self.assertEqual(row["parent_id"], "c")
+
     def test_build_rejects_child_before_parent_order_for_foreign_key_generation(self):
         parent_id = ColumnSpec(
             table="parents",

@@ -15,6 +15,8 @@ Public API::
 from __future__ import annotations
 
 import logging
+import sqlite3
+from datetime import date, datetime, time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -326,6 +328,8 @@ class BranchSpec:
     requirements: Dict[RelationId, TableConstraint] = field(default_factory=dict)
     equivalences: ColumnUnionFind = field(default_factory=ColumnUnionFind)
     deferred: List[exp.Expression] = field(default_factory=list)
+    unsupported_reason: Optional[str] = None
+    validation_expectation: Optional[str] = None
 
     def has_goal(self, goal: str) -> bool:
         return goal in self.goals
@@ -828,6 +832,7 @@ class Propagator:
                 if outer_id.relation is not None:
                     req = spec.require(outer_id.relation)
                     req.constraints.append(_make_is_not_null(self._solver_col(outer_id)))
+                    return
             if metadata.get("polarity") == "negative":
                 if metadata["cardinality"] != "zero" and sub.inner is not None:
                     self._walk_step(sub.inner, spec)
@@ -1384,6 +1389,7 @@ class Propagator:
             spec.branch = "positive_semantic_in"
         else:
             spec.branch = "positive_seed_deferred"
+            spec.unsupported_reason = "unsupported_lowering"
 
     def _has_negative_subquery(self, *, kind: str) -> bool:
         for step in _iter_all_plan_steps(self.plan):
@@ -3340,6 +3346,8 @@ def _row_value_dict(row) -> Dict[str, Any]:
         concrete_value = value.concrete if hasattr(value, "concrete") else value
         if isinstance(concrete_value, Decimal):
             concrete_value = float(concrete_value)
+        if isinstance(concrete_value, (date, datetime, time)):
+            concrete_value = concrete_value.isoformat()
         values[key] = concrete_value
     return values
 
@@ -4942,6 +4950,14 @@ class Resolver:
 
     def resolve(self, spec: BranchSpec) -> Dict[str, List[Dict[str, Any]]]:
         """Produce concrete rows for each table in the spec."""
+        if spec.unsupported_reason is not None:
+            logger.debug(
+                "unsupported lowering for spec=%s reason=%s",
+                spec.branch,
+                spec.unsupported_reason,
+            )
+            return {}
+
         # Build global constraint.
         constraint, row_bindings = self._build_global_constraint(spec)
 
@@ -5004,6 +5020,8 @@ class Resolver:
         for pass_annotated in (True, False):
             for relation, req, req_bindings in all_constraint_items:
                 for constraint_expr in req.constraints:
+                    if _unsupported_solver_constraint_expression(constraint_expr):
+                        continue
                     if _has_explicit_row_scope(constraint_expr):
                         if pass_annotated:
                             constraints.append(constraint_expr.copy())
@@ -5134,6 +5152,74 @@ class Resolver:
         return solver_constraint, row_bindings
 
 
+def _unsupported_solver_constraint_expression(expr: exp.Expression) -> bool:
+    return expr.find(exp.Subquery) is not None or expr.find(exp.Exists) is not None
+
+
+def _branch_objective_observed(
+    plan: Plan,
+    instance: Instance,
+    dialect: str,
+    spec: BranchSpec,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> bool:
+    if spec.validation_expectation is None:
+        return True
+    if spec.validation_expectation != "query_non_empty":
+        return False
+    if dialect != "sqlite":
+        return True
+    return _sqlite_query_returns_rows(plan, instance, rows)
+
+
+def _sqlite_query_returns_rows(
+    plan: Plan,
+    instance: Instance,
+    rows: Dict[str, List[Dict[str, Any]]],
+) -> bool:
+    try:
+        with sqlite3.connect(":memory:") as connection:
+            for ddl in instance.ddls.split(";"):
+                ddl = ddl.strip()
+                if ddl:
+                    connection.execute(ddl)
+            for table_name in instance.data:
+                table_rows = rows.get(table_name, [])
+                for row in table_rows:
+                    columns = [
+                        column
+                        for column in row
+                        if column in instance.tables.get(table_name, {})
+                    ]
+                    if not columns:
+                        continue
+                    quoted = ", ".join(f'"{column}"' for column in columns)
+                    placeholders = ", ".join("?" for _column in columns)
+                    statement = (
+                        f'INSERT INTO "{table_name}" ({quoted}) '
+                        f"VALUES ({placeholders})"
+                    )
+                    values = [
+                        _sqlite_validation_value(row[column])
+                        for column in columns
+                    ]
+                    connection.execute(statement, values)
+            connection.commit()
+            sql = plan.expression.sql(dialect="sqlite")
+            return bool(connection.execute(sql).fetchone())
+    except Exception as exc:
+        logger.debug("branch validation failed: %s", exc)
+        return False
+
+
+def _sqlite_validation_value(value: Any) -> Any:
+    if isinstance(value, StorageLiteral):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -5185,6 +5271,14 @@ def speculate(
             continue
         rows = resolver.resolve(spec)
         if rows:
+            if not _branch_objective_observed(
+                plan, instance, dialect, spec, rows,
+            ):
+                logger.debug(
+                    "generated rows did not observe branch objective: %s",
+                    spec.branch,
+                )
+                continue
             results.append((spec.branch, rows))
 
     return results
