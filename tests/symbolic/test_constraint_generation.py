@@ -608,8 +608,7 @@ class TestDatabaseConstraintGeneration(unittest.TestCase):
             target
             for target in tree.uncovered_targets
             if target.node.site == "filter"
-            and target.atom_outcomes
-            and all(outcome == BranchType.TRUE for _atom, outcome in target.atom_outcomes)
+            and target.target_outcome == BranchType.TRUE
         )
 
         constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
@@ -661,6 +660,74 @@ class TestDatabaseConstraintGeneration(unittest.TestCase):
             and isinstance(item.expression, exp.Column)
             and item.this.name == "followee"
             and item.expression.name == "follower"
+        ]
+        self.assertEqual(check_constraints, [])
+
+    def test_mysql_check_constraint_uses_existing_path_variable(self):
+        instance = Instance(
+            ddls=(
+                "CREATE TABLE activity ("
+                "player_id INT, games_played INT, "
+                "CHECK (games_played >= 0)"
+                ");"
+            ),
+            name="test",
+            dialect="mysql",
+        )
+
+        sql = "SELECT player_id FROM activity WHERE games_played = 1"
+        expr = preprocess_sql(sql, instance, dialect="mysql")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == "filter"
+            and target.target_outcome == BranchType.TRUE
+        )
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        check_constraints = [
+            item
+            for item in constraint.constraints
+            if isinstance(item, exp.GTE)
+            and solver_var(item.this) is not None
+            and solver_var(item.this).column_id.name.normalized == "games_played"
+        ]
+        self.assertEqual(len(check_constraints), 1)
+
+    def test_mysql_check_constraint_skips_missing_path_variable(self):
+        instance = Instance(
+            ddls=(
+                "CREATE TABLE activity ("
+                "player_id INT, games_played INT, "
+                "CHECK (games_played >= 0)"
+                ");"
+            ),
+            name="test",
+            dialect="mysql",
+        )
+
+        sql = "SELECT player_id FROM activity WHERE player_id = 1"
+        expr = preprocess_sql(sql, instance, dialect="mysql")
+        plan = Plan(expr, instance)
+        tree = build_branch_tree(plan, instance)
+        target = next(
+            target
+            for target in tree.uncovered_targets
+            if target.node.site == "filter"
+            and target.target_outcome == BranchType.TRUE
+        )
+
+        constraint = ConstraintGenerator(plan, instance, instance.dialect).compile_target(target)
+
+        check_constraints = [
+            item
+            for item in constraint.constraints
+            if isinstance(item, exp.GTE)
+            and isinstance(item.this, exp.Column)
+            and item.this.name == "games_played"
         ]
         self.assertEqual(check_constraints, [])
 

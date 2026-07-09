@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from sqlglot import exp
+from sqlglot import exp, parse_one
 
 from parseval.instance import Instance
 from parseval.instance.io import to_db
@@ -121,7 +121,7 @@ def test_gold_witness_keeps_literal_filtered_join_key_on_materialized_row(tmp_pa
     assert output
 
 
-def test_resolver_handles_deferred_scalar_subquery_without_fixup():
+def test_resolver_rejects_unlowered_deferred_scalar_subquery():
     ddl = """
     CREATE TABLE scores (
       id INTEGER PRIMARY KEY,
@@ -156,7 +156,44 @@ def test_resolver_handles_deferred_scalar_subquery_without_fixup():
         plan, instance, "sqlite", solver=Solver(dialect="sqlite")
     ).resolve(spec)
 
-    assert rows
+    assert spec.unsupported_reason == "unsupported_lowering"
+    assert rows == {}
+
+
+def test_global_constraint_does_not_include_raw_subquery_even_when_scoped():
+    ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);"
+    instance = Instance(ddls=ddl, name="speculate_no_raw_subquery", dialect="sqlite")
+    expr = preprocess_sql("SELECT id FROM t", instance, dialect="sqlite")
+    plan = Plan(expr, instance)
+    relation = instance.table_id("t")
+    id_column = instance.column_id(relation, "id")
+    constraint = parse_one(
+        "id IN (SELECT id FROM t)",
+        into=exp.Condition,
+        dialect="sqlite",
+    )
+    set_solver_var(
+        next(constraint.find_all(exp.Column)),
+        SolverVar(id_column, relation, "r0"),
+    )
+    spec = BranchSpec(
+        branch="positive",
+        requirements={
+            relation: TableConstraint(
+                relation=relation,
+                constraints=[constraint],
+            )
+        },
+    )
+
+    solver_constraint, _row_bindings = Resolver(
+        plan, instance
+    )._build_global_constraint(spec)
+
+    assert not any(
+        item.find(exp.Subquery) or item.find(exp.Exists)
+        for item in solver_constraint.constraints
+    )
 
 
 def _execute_rows(ddl: str, rows_per_table: dict, sql: str):
@@ -315,6 +352,93 @@ def test_speculate_scalar_subquery_or_emits_adjacent_free_seat_witness():
     assert _execute_rows(ddl, rows, sql)
 
 
+def test_speculate_tuple_in_emits_first_login_witness():
+    ddl = """
+    CREATE TABLE activity (
+      player_id INT,
+      device_id INT,
+      event_date DATE,
+      games_played INT
+    );
+    """
+    sql = """
+    SELECT player_id, device_id
+    FROM activity
+    WHERE (player_id, event_date) IN (
+      SELECT player_id, MIN(event_date)
+      FROM activity
+      GROUP BY player_id
+    )
+    """
+
+    _instance, results = _speculate_rows(sql, ddl)
+
+    rows = dict(results).get("positive_semantic_in")
+    assert rows is not None
+    assert rows["activity"]
+    assert _execute_rows(ddl, rows, sql)
+
+
+def test_speculate_tuple_in_and_antimatch_emit_insurance_witness():
+    ddl = """
+    CREATE TABLE insurance (
+      pid INT PRIMARY KEY,
+      tiv_2015 FLOAT,
+      tiv_2016 FLOAT,
+      lat FLOAT,
+      lon FLOAT
+    );
+    """
+    sql = """
+    SELECT SUM(tiv_2016) AS tiv_2016
+    FROM insurance
+    WHERE tiv_2015 IN (
+      SELECT tiv_2015
+      FROM insurance
+      GROUP BY tiv_2015
+      HAVING COUNT(*) > 1
+    )
+    AND (lat, lon) IN (
+      SELECT lat, lon
+      FROM insurance
+      GROUP BY lat, lon
+      HAVING COUNT(*) = 1
+    )
+    """
+
+    _instance, results = _speculate_rows(sql, ddl)
+
+    rows = dict(results).get("positive_semantic_in")
+    assert rows is not None
+    assert len(rows["insurance"]) >= 2
+    assert _execute_rows(ddl, rows, sql)
+
+
+def test_speculate_grouped_in_emits_followee_witness():
+    ddl = """
+    CREATE TABLE follow (
+      followee INT,
+      follower INT
+    );
+    """
+    sql = """
+    SELECT followee, COUNT(*) AS num
+    FROM follow
+    WHERE followee IN (
+      SELECT follower
+      FROM follow
+    )
+    GROUP BY followee
+    """
+
+    _instance, results = _speculate_rows(sql, ddl)
+
+    rows = dict(results).get("positive_semantic_in")
+    assert rows is not None
+    assert rows["follow"]
+    assert _execute_rows(ddl, rows, sql)
+
+
 def test_scalar_subquery_semantic_specs_match_atoms_by_subplan_identity():
     ddl = """
     CREATE TABLE outer_t (id INT PRIMARY KEY, marker INT);
@@ -351,7 +475,7 @@ def test_scalar_subquery_semantic_specs_match_atoms_by_subplan_identity():
     )
 
 
-def test_speculate_unsupported_deferred_predicate_returns_named_seed_rows():
+def test_speculate_unsupported_deferred_predicate_is_not_reported_as_witness():
     ddl = "CREATE TABLE t (id INT PRIMARY KEY, value INT);"
     sql = """
     SELECT id
@@ -367,9 +491,56 @@ def test_speculate_unsupported_deferred_predicate_returns_named_seed_rows():
     _instance, results = _speculate_rows(sql, ddl)
 
     by_branch = dict(results)
-    assert "positive_seed_deferred" in by_branch
+    assert "positive_seed_deferred" not in by_branch
     assert "positive_semantic_scalar_subquery_0" not in by_branch
-    assert by_branch["positive_seed_deferred"]["t"]
+
+
+def test_speculate_drops_value_branch_when_generated_rows_do_not_observe_objective(monkeypatch):
+    ddl = "CREATE TABLE t (id INT PRIMARY KEY, value INT);"
+    sql = "SELECT id FROM t WHERE value = 5"
+    instance = Instance(ddls=ddl, name="speculate_unobserved_branch", dialect="sqlite")
+    expr = preprocess_sql(sql, instance, dialect="sqlite")
+    plan = Plan(expr, instance)
+    relation = instance.table_id("t")
+
+    def unobserved_rows(self, spec):
+        return {"t": [{"id": 1, "value": 4}]}
+
+    def validation_spec(self):
+        return [
+            BranchSpec(
+                branch="positive",
+                goals={"value"},
+                requirements={relation: TableConstraint(relation=relation)},
+                validation_expectation="query_non_empty",
+            )
+        ]
+
+    monkeypatch.setattr(Propagator, "propagate", validation_spec)
+    monkeypatch.setattr(Resolver, "resolve", unobserved_rows)
+
+    results = speculate(
+        plan,
+        instance,
+        dialect="sqlite",
+        config=SpeculateConfig(
+            positive=1,
+            negative=0,
+            null=0,
+            left_unmatched=0,
+            right_unmatched=0,
+            having_fail=0,
+            case_else=0,
+            boundary=0,
+            join_antimatch=0,
+            join_fanout=0,
+            aggregate_contrast=0,
+            rank_contrast=0,
+            project_duplicate=0,
+        ),
+    )
+
+    assert results == []
 
 
 def test_gold_witness_expands_count_group_without_changing_group_key(tmp_path):
@@ -493,6 +664,140 @@ def test_gold_witness_date_range_anti_subquery_returns_product(tmp_path):
         output = connection.execute(sql).fetchall()
 
     assert output
+
+
+def test_gold_witness_1084_having_min_max_date_range_returns_product(tmp_path):
+    ddl = """
+    CREATE TABLE product (
+      product_id INT PRIMARY KEY,
+      product_name TEXT,
+      unit_price INT
+    );
+    CREATE TABLE sales (
+      seller_id INT,
+      product_id INT,
+      buyer_id INT,
+      sale_date DATE,
+      quantity INT,
+      price INT,
+      FOREIGN KEY (product_id) REFERENCES product(product_id)
+    );
+    """
+    sql = """
+    SELECT p.product_id
+    FROM product AS p
+    JOIN sales AS s ON p.product_id = s.product_id
+    GROUP BY p.product_id
+    HAVING MIN(s.sale_date) >= '2019-01-01'
+       AND MAX(s.sale_date) <= '2019-03-31'
+    """
+
+    instance, results = _speculate_rows(sql, ddl)
+
+    assert results
+    rows = results[0][1]
+    assert rows["product"]
+    assert rows["sales"]
+    assert any(
+        row["sale_date"] is not None
+        and "2019-01-01" <= str(row["sale_date"]) <= "2019-03-31"
+        for row in rows["sales"]
+    )
+
+    db_path = tmp_path / "product_sales_1084_having.sqlite"
+    to_db(instance, f"sqlite:///{db_path}", dialect="sqlite")
+    with sqlite3.connect(db_path) as connection:
+        output = connection.execute(sql).fetchall()
+
+    assert output
+
+
+def test_gold_witness_1084_having_nullable_min_max_keeps_null_input(tmp_path):
+    ddl = """
+    CREATE TABLE product (
+      product_id INT PRIMARY KEY,
+      product_name TEXT,
+      unit_price INT
+    );
+    CREATE TABLE sales (
+      seller_id INT,
+      product_id INT,
+      buyer_id INT,
+      sale_date DATE,
+      quantity INT,
+      price INT,
+      FOREIGN KEY (product_id) REFERENCES product(product_id)
+    );
+    """
+    sql = """
+    SELECT p.product_id
+    FROM product AS p
+    JOIN sales AS s ON p.product_id = s.product_id
+    GROUP BY p.product_id
+    HAVING MIN(s.sale_date) >= '2019-01-01'
+       AND MAX(s.sale_date) <= '2019-03-31'
+    """
+
+    instance, results = _speculate_rows(sql, ddl)
+
+    assert results
+    rows = results[0][1]
+    product_id = rows["product"][0]["product_id"]
+    group_sales = [
+        row for row in rows["sales"] if row["product_id"] == product_id
+    ]
+    assert any(
+        row["sale_date"] is not None
+        and "2019-01-01" <= str(row["sale_date"]) <= "2019-03-31"
+        for row in group_sales
+    )
+    assert any(row["sale_date"] is None for row in group_sales)
+
+    db_path = tmp_path / "product_sales_1084_having_null.sqlite"
+    to_db(instance, f"sqlite:///{db_path}", dialect="sqlite")
+    with sqlite3.connect(db_path) as connection:
+        output = connection.execute(sql).fetchall()
+
+    assert (product_id,) in output
+
+
+def test_gold_witness_date_range_anti_subquery_can_return_null_sale_date():
+    ddl = """
+    CREATE TABLE product (
+      product_id INT PRIMARY KEY,
+      product_name TEXT,
+      unit_price INT
+    );
+    CREATE TABLE sales (
+      seller_id INT,
+      product_id INT,
+      buyer_id INT,
+      sale_date DATE,
+      quantity INT,
+      price INT,
+      FOREIGN KEY (product_id) REFERENCES product(product_id)
+    );
+    """
+    sql = """
+    SELECT p.product_id, p.product_name
+    FROM product AS p
+    JOIN sales AS s ON p.product_id = s.product_id
+    WHERE p.product_id NOT IN (
+      SELECT product_id
+      FROM sales
+      WHERE sale_date < '2019-01-01' OR sale_date > '2019-03-31'
+    )
+    """
+
+    _instance, results = _speculate_rows(sql, ddl)
+
+    null_rows = [
+        rows
+        for _branch, rows in results
+        if any(row["sale_date"] is None for row in rows.get("sales", []))
+    ]
+    assert null_rows
+    assert any(_execute_rows(ddl, rows, sql) for rows in null_rows)
 
 
 def test_speculate_materializes_constraint_rows_into_instance():
@@ -857,6 +1162,129 @@ def test_resolver_global_constraint_includes_table_level_check_per_row():
         and solver_var(item.expression).column_id.name.normalized == "follower"
     }
     assert check_scopes == {("r0", "r0")}
+
+
+def test_resolver_global_constraint_includes_mysql_check_for_mentioned_column():
+    ddl = """
+    CREATE TABLE activity (
+      player_id INT,
+      games_played INT,
+      CHECK (games_played >= 0)
+    );
+    """
+    sql = "SELECT player_id FROM activity WHERE games_played = 1"
+
+    instance = Instance(ddls=ddl, name="speculate_mysql_check", dialect="mysql")
+    expr = preprocess_sql(sql, instance, dialect="mysql")
+    plan = Plan(expr, instance)
+    config = SpeculateConfig(
+        positive=1,
+        negative=0,
+        null=0,
+        left_unmatched=0,
+        right_unmatched=0,
+        having_fail=0,
+        case_else=0,
+        boundary=0,
+    )
+    spec = Propagator(plan, instance, "mysql", config=config).propagate()[0]
+
+    constraint, _row_bindings = Resolver(
+        plan,
+        instance,
+        dialect="mysql",
+    )._build_global_constraint(spec)
+
+    check_constraints = [
+        item
+        for item in constraint.constraints
+        if isinstance(item, exp.GTE)
+        and solver_var(item.this) is not None
+        and solver_var(item.this).column_id.name.normalized == "games_played"
+    ]
+    assert len(check_constraints) == 1
+    assert solver_var(check_constraints[0].this).row_scope == "r0"
+    assert solver_var(check_constraints[0].this) in constraint.variables
+
+
+def test_resolver_global_constraint_leaves_unmentioned_check_columns_to_instance():
+    ddl = """
+    CREATE TABLE activity (
+      player_id INT,
+      games_played INT,
+      CHECK (games_played >= 0)
+    );
+    """
+    sql = "SELECT player_id FROM activity WHERE player_id = 1"
+
+    instance = Instance(ddls=ddl, name="speculate_mysql_unmentioned_check", dialect="mysql")
+    expr = preprocess_sql(sql, instance, dialect="mysql")
+    plan = Plan(expr, instance)
+    config = SpeculateConfig(
+        positive=1,
+        negative=0,
+        null=0,
+        left_unmatched=0,
+        right_unmatched=0,
+        having_fail=0,
+        case_else=0,
+        boundary=0,
+    )
+    spec = Propagator(plan, instance, "mysql", config=config).propagate()[0]
+
+    constraint, _row_bindings = Resolver(
+        plan,
+        instance,
+        dialect="mysql",
+    )._build_global_constraint(spec)
+
+    check_constraints = [
+        item
+        for item in constraint.constraints
+        if isinstance(item, exp.GTE)
+        and isinstance(item.this, exp.Column)
+        and item.this.name == "games_played"
+    ]
+    assert check_constraints == []
+
+
+def test_resolver_global_constraint_includes_mysql_enum_domain():
+    ddl = """
+    CREATE TABLE EXPRESSIONS (
+        LEFT_OPERAND VARCHAR(10) NOT NULL,
+        OPERATOR ENUM('<','>','=') NOT NULL,
+        RIGHT_OPERAND VARCHAR(10) NOT NULL,
+        PRIMARY KEY (LEFT_OPERAND, OPERATOR, RIGHT_OPERAND)
+    );
+    """
+    sql = "SELECT * FROM EXPRESSIONS WHERE LEFT_OPERAND = 'a'"
+
+    instance = Instance(ddls=ddl, name="speculate_enum_domain", dialect="mysql")
+    expr = preprocess_sql(sql, instance, dialect="mysql")
+    plan = Plan(expr, instance)
+    config = SpeculateConfig(
+        positive=1,
+        negative=0,
+        null=0,
+        left_unmatched=0,
+        right_unmatched=0,
+        having_fail=0,
+        case_else=0,
+        boundary=0,
+    )
+    spec = Propagator(plan, instance, "mysql", config=config).propagate()[0]
+
+    constraint, _row_bindings = Resolver(plan, instance, "mysql")._build_global_constraint(spec)
+
+    enum_domains = [
+        tuple(item.this for item in in_expr.expressions)
+        for in_expr in constraint.constraints
+        if isinstance(in_expr, exp.In)
+        and isinstance(in_expr.this, exp.Column)
+        and solver_var(in_expr.this) is not None
+        and solver_var(in_expr.this).column_id.name.normalized == "OPERATOR"
+    ]
+    assert enum_domains == [("<", ">", "=")]
 
 
 def test_rewrite_constraint_scopes_correlated_column_to_existing_relation_row():

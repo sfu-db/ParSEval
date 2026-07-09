@@ -369,6 +369,41 @@ class TestAggregationMetadata(unittest.TestCase):
         self.assertEqual(sum_output["argument"].source_column_id.name.normalized, "amount")
         self.assertTrue(sum_output["semantic_datatype"].is_type(*DataType.REAL_TYPES))
 
+    def test_duplicate_aggregate_aliases_keep_distinct_output_identities(self):
+        plan = _plan(
+            "SELECT buyer, "
+            "SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) AS sum, "
+            "SUM(CASE WHEN label = 'beta' THEN 1 ELSE 0 END) AS sum "
+            "FROM purchases "
+            "GROUP BY buyer "
+            "HAVING SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) > 0 "
+            "AND SUM(CASE WHEN label = 'beta' THEN 1 ELSE 0 END) = 0",
+            "CREATE TABLE purchases (buyer TEXT, label TEXT);",
+        )
+
+        aggregate = _first_step_of_type(plan, Aggregate)
+        outputs = plan.annotation_for(aggregate).metadata["aggregation"]["aggregate_outputs"]
+        sum_outputs = [
+            output for output in outputs.values()
+            if output["function"] == "sum" and output["alias"] == "sum"
+        ]
+        self.assertEqual(len(sum_outputs), 2)
+        self.assertNotEqual(
+            sum_outputs[0]["output_column"],
+            sum_outputs[1]["output_column"],
+        )
+
+        having = _first_step_of_type(plan, Having)
+        constraints = plan.annotation_for(having).metadata["having_constraints"]
+        self.assertEqual(
+            [(constraint["function"], constraint["operator"], constraint["value"]) for constraint in constraints],
+            [("sum", "gt", 0), ("sum", "eq", 0)],
+        )
+        self.assertNotEqual(
+            constraints[0]["output_column"],
+            constraints[1]["output_column"],
+        )
+
     def test_min_metadata_preserves_argument_datatype(self):
         plan = _plan(
             "SELECT dept, MIN(created_at) AS first_seen FROM sales GROUP BY dept",

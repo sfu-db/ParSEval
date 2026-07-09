@@ -276,3 +276,69 @@ def test_composite_primary_key_lookup_uses_storage_equivalent_values():
     assert first.positions[relation] == second.positions[relation]
     assert len(inst.get_rows(relation)) == 1
     assert inst.get_rows(relation)[0][date].concrete == "1"
+
+
+def test_mysql_text_primary_key_lookup_is_case_insensitive():
+    inst = Instance("CREATE TABLE variables (name VARCHAR(10) PRIMARY KEY);", name="db", dialect="mysql")
+    relation = inst.table_id("variables")
+    name = inst.column_id(relation, "name")
+
+    first = inst.create_row(relation, {name: "C"})
+    second = inst.create_row(relation, {name: "c"})
+
+    assert first.positions[relation] == second.positions[relation]
+    assert len(inst.get_rows(relation)) == 1
+
+
+def test_create_rows_rejects_invalid_mysql_enum_before_materialization():
+    inst = Instance(
+        "CREATE TABLE expressions (operator ENUM('<','>','=') NOT NULL);",
+        name="db",
+        dialect="mysql",
+    )
+    relation = inst.table_id("expressions")
+
+    try:
+        inst.create_rows({relation: [{"operator": "x"}]})
+    except Exception as exc:
+        assert "allowed" in str(exc).lower() or "enum" in str(exc).lower()
+    else:
+        raise AssertionError("invalid enum value was accepted")
+
+
+def test_mysql_enum_storage_value_rejects_invalid_value():
+    inst = Instance(
+        "CREATE TABLE expressions (operator ENUM('<','>','=') NOT NULL);",
+        name="db",
+        dialect="mysql",
+    )
+    relation = inst.table_id("expressions")
+    operator = inst.column_id(relation, "operator")
+
+    try:
+        inst._column_storage_value(relation, operator, "x")
+    except ValueError as exc:
+        assert "not allowed" in str(exc)
+    else:
+        raise AssertionError("invalid enum storage value was accepted")
+
+
+def test_composite_primary_key_containing_enum_validates_and_uses_storage_key():
+    inst = Instance(
+        """
+        CREATE TABLE expressions (
+            name VARCHAR(10) NOT NULL,
+            operator ENUM('<','>','=') NOT NULL,
+            PRIMARY KEY (name, operator)
+        );
+        """,
+        name="db",
+        dialect="mysql",
+    )
+    relation = inst.table_id("expressions")
+
+    first = inst.create_row(relation, {"name": "C", "operator": "<"})
+    second = inst.create_row(relation, {"name": "c", "operator": "<"})
+
+    assert first.positions[relation] == second.positions[relation]
+    assert len(inst.get_rows(relation)) == 1

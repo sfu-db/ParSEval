@@ -23,6 +23,36 @@ class DomainTypeTests(unittest.TestCase):
         self.assertEqual(profile.exact_type, "TINYINT")
         self.assertEqual(profile.length, 1)
 
+    def test_mysql_enum_profile_exposes_allowed_values(self):
+        spec = ColumnSpec(
+            table="t",
+            column="op",
+            datatype=DataType.build("ENUM('<','>','=')", dialect="mysql"),
+            dialect="mysql",
+        )
+
+        profile = TypeService().profile(spec)
+
+        self.assertEqual(profile.metadata["allowed_values"], ("<", ">", "="))
+
+    def test_mysql_enum_coercion_rejects_invalid_values(self):
+        datatype = DataType.build("ENUM('<','>','=')", dialect="mysql")
+
+        with self.assertRaises(ValueError):
+            coerce_value("x", datatype, dialect="mysql")
+
+    def test_mysql_text_storage_key_is_case_insensitive(self):
+        spec = ColumnSpec(
+            table="t",
+            column="name",
+            datatype=DataType.build("VARCHAR(10)", dialect="mysql"),
+            dialect="mysql",
+        )
+        profile = TypeService().profile(spec)
+        adapter = TypeService().registry.resolve(profile.datatype, profile.dialect)
+
+        self.assertEqual(adapter.storage_key("C", profile), adapter.storage_key("c", profile))
+
     def test_mysql_tinyint_4_profiles_as_integer(self):
         spec = ColumnSpec(
             table="t",

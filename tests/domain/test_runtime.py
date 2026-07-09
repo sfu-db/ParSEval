@@ -57,6 +57,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.table_state(table.id).rows[0][column.id], 1)
         self.assertEqual(runtime.column_state(column.id).used_values, {1})
 
+    def test_mysql_text_used_values_are_storage_keys(self):
+        user_id = ColumnSpec(
+            table="users",
+            column="name",
+            datatype=DataType.build("VARCHAR(10)", dialect="mysql"),
+            dialect="mysql",
+            primary_key=True,
+        )
+        schema = SchemaSpec(
+            tables=(TableSpec(name="users", columns=(user_id,), primary_key=("name",)),),
+            dialect="mysql",
+        )
+        table = schema.get_table("users")
+        column = table.get_column("name")
+        runtime = SchemaRuntime(schema=schema)
+
+        runtime.remember_row(table, {column.id: "C"})
+
+        self.assertIn("c", runtime.column_state(column.id).used_values)
+
 
 if __name__ == "__main__":
     unittest.main()

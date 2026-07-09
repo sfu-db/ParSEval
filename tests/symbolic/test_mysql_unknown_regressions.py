@@ -145,6 +145,67 @@ def test_count_zero_anti_subquery_generates_surviving_salesperson_row():
     assert _execute_generated(schema, instance, sql)
 
 
+def test_generic_label_not_in_generates_alpha_without_beta_buyer():
+    schema = """
+    CREATE TABLE purchases (id INT PRIMARY KEY, buyer TEXT, label TEXT);
+    """
+    sql = """
+    SELECT buyer
+    FROM purchases
+    WHERE label = 'alpha'
+      AND buyer NOT IN (
+        SELECT buyer FROM purchases WHERE label = 'beta'
+      )
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=8,
+        max_rows_per_table=8,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    output_rows = _execute_generated(schema, instance, sql)
+    assert output_rows
+    beta_buyers = {
+        row[0]
+        for row in _execute_generated(
+            schema,
+            instance,
+            "SELECT buyer FROM purchases WHERE label = 'beta'",
+        )
+    }
+    assert any(row[0] not in beta_buyers for row in output_rows)
+
+
+def test_duplicate_sum_case_having_aliases_generate_non_empty_group():
+    schema = """
+    CREATE TABLE purchases (id INT PRIMARY KEY, buyer TEXT, label TEXT);
+    """
+    sql = """
+    SELECT buyer,
+           SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) AS sum,
+           SUM(CASE WHEN label = 'beta' THEN 1 ELSE 0 END) AS sum
+    FROM purchases
+    GROUP BY buyer
+    HAVING SUM(CASE WHEN label = 'alpha' THEN 1 ELSE 0 END) > 0
+       AND SUM(CASE WHEN label = 'beta' THEN 1 ELSE 0 END) = 0
+    """
+    instance = Instance(ddls=schema, name="test", dialect="sqlite")
+
+    SymbolicEngine(
+        instance,
+        sql,
+        dialect="sqlite",
+        max_iterations=10,
+        max_rows_per_table=10,
+    ).generate(thresholds=CoverageThresholds(atom_null=0), speculate_first=False)
+
+    assert _execute_generated(schema, instance, sql)
+
+
 def test_scalar_subquery_or_generates_root_output_row():
     schema = """
     CREATE TABLE cinema (seat_id INT PRIMARY KEY, free INT);
