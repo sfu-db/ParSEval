@@ -78,7 +78,11 @@ def instantiate_db(
             distinct_unique=distinct_unique,
         )
         engine = SymbolicEngine(
-            instance, sql, dialect=dialect, max_iterations=max_iterations,
+            instance,
+            sql,
+            dialect=dialect,
+            max_iterations=max_iterations,
+            connection_string=connection_string,
         )
         gen_result = engine.generate(thresholds=thresholds)
         generation = GenerationResult(

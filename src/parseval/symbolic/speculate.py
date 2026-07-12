@@ -60,7 +60,8 @@ from parseval.plan.planner import (
     SubPlan,
     _step_expressions,
 )
-from parseval.plan.rex import column_meta, concrete, negate_predicate
+from parseval.plan.meta import column_meta
+from parseval.plan.rex import concrete, negate_predicate
 from parseval.solver import Solver, SolverConstraint, SolverVar, set_solver_var, solver_var
 from parseval.solver.types import col_type
 from .types import CoverageThresholds

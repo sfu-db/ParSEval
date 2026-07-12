@@ -16,7 +16,28 @@ from sqlglot import exp
 
 from parseval.dtype import DataType
 
-from .types import col_type, solver_var
+from .types import Problem, SolverVar, node_dtype
+
+
+def unwrap_planning_temporal_arg(node: exp.Expression) -> exp.Expression:
+    """Peel planning wrappers (CAST / ts-or-ds coercions) around a temporal arg.
+
+    DataFusion's Utf8 ``strftime`` stub inserts ``CAST(... AS TEXT)`` around
+    DATE/DATETIME columns. Those casts are planning noise for witness
+    generation — peel them so solvers constrain the base temporal variable.
+    """
+    while isinstance(node, (exp.Cast, exp.TsOrDsToTimestamp, exp.TsOrDsToDate)):
+        node = node.this
+    return node
+
+
+def normalize_problem(problem: Problem) -> Problem:
+    """Return a Problem with each constraint expression normalized."""
+    return Problem(
+        constraints=[normalize_expression(expr) for expr in problem.constraints],
+        equalities=list(problem.equalities),
+        variables=set(problem.variables),
+    )
 
 
 def normalize_constraint(constraint):
@@ -24,6 +45,9 @@ def normalize_constraint(constraint):
 
     The input object and its expression list are left untouched. Metadata on
     copied sqlglot nodes is preserved by sqlglot's ``copy()`` behavior.
+
+    Legacy Constraint objects expose ``join_equalities`` / ``storage_relations``.
+    Prefer :func:`normalize_problem` for the current :class:`Problem` API.
     """
     return replace(
         constraint,
@@ -120,7 +144,7 @@ def _lower_temporal_projection_comparison(
     return predicates[0] if len(predicates) == 1 else exp.and_(*predicates)
 
 
-def _bound_literal(col: exp.Column, bound: _date, *, is_high: bool) -> exp.Literal:
+def _bound_literal(col: SolverVar, bound: _date, *, is_high: bool) -> exp.Literal:
     is_date, is_datetime = _is_temporal_column(col)
     if is_date:
         return exp.Literal.string(bound.isoformat())
@@ -171,16 +195,15 @@ def _call_args(expr: exp.Expression) -> List[exp.Expression]:
     ]
 
 
-def _unwrap_temporal_column(expr: exp.Expression) -> Optional[exp.Column]:
-    if isinstance(expr, (exp.TsOrDsToTimestamp, exp.TsOrDsToDate)):
-        expr = expr.this
-    return expr if isinstance(expr, exp.Column) else None
+def _unwrap_temporal_column(expr: exp.Expression) -> Optional[SolverVar]:
+    expr = unwrap_planning_temporal_arg(expr)
+    return expr if isinstance(expr, SolverVar) else None
 
 
-def _temporal_projection(expr: exp.Expression) -> Optional[Tuple[exp.Column, int]]:
+def _temporal_projection(expr: exp.Expression) -> Optional[Tuple[SolverVar, int]]:
     if isinstance(expr, exp.Date):
         inner = expr.this
-        if isinstance(inner, exp.Column):
+        if isinstance(inner, SolverVar):
             return inner, 10
         projection = _temporal_prefix_projection(inner)
         if projection is not None and projection[1] == 10:
@@ -189,7 +212,7 @@ def _temporal_projection(expr: exp.Expression) -> Optional[Tuple[exp.Column, int
     return _temporal_prefix_projection(expr)
 
 
-def _temporal_prefix_projection(expr: exp.Expression) -> Optional[Tuple[exp.Column, int]]:
+def _temporal_prefix_projection(expr: exp.Expression) -> Optional[Tuple[SolverVar, int]]:
     supported_formats = {
         "%Y": 4,
         "%Y-%m": 7,
@@ -270,8 +293,8 @@ def _prefix_date_bounds(value: str, prefix_length: int):
     return None
 
 
-def _is_temporal_column(col: exp.Column) -> Tuple[bool, bool]:
-    dtype = col_type(col) or DataType.build("TEXT")
+def _is_temporal_column(col: SolverVar) -> Tuple[bool, bool]:
+    dtype = node_dtype(col) or DataType.build("TEXT")
     is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(DataType.Type.DATE32)
     is_datetime = dtype.is_type(
         DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
@@ -321,14 +344,14 @@ def _rewrite_time_substr_arithmetic_predicate(
     return exp.EQ(this=col.copy(), expression=exp.Literal.string(_format_mmss_time(seconds)))
 
 
-def _time_substr_arithmetic_column(expr: exp.Expression) -> Optional[exp.Column]:
-    columns: List[exp.Column] = []
+def _time_substr_arithmetic_column(expr: exp.Expression) -> Optional[SolverVar]:
+    columns: List[SolverVar] = []
     starts: set[int] = set()
     for node in expr.walk():
         if _call_name(node) not in {"SUBSTR", "SUBSTRING"}:
             continue
         args = _call_args(node)
-        if len(args) < 3 or not isinstance(args[0], exp.Column):
+        if len(args) < 3 or not isinstance(args[0], SolverVar):
             continue
         start = _literal_int(args[1])
         length = _literal_int(args[2])
@@ -338,12 +361,10 @@ def _time_substr_arithmetic_column(expr: exp.Expression) -> Optional[exp.Column]
         starts.add(start)
     if not {1, 4}.issubset(starts) or not columns:
         return None
-    first_var = solver_var(columns[0])
-    if first_var is None:
+    first = columns[0]
+    if any(col != first for col in columns):
         return None
-    if any(solver_var(col) != first_var for col in columns):
-        return None
-    return columns[0]
+    return first
 
 
 def _format_mmss_time(total_seconds: int) -> str:
@@ -357,4 +378,6 @@ __all__ = [
     "lower_temporal_projection_bounds",
     "normalize_constraint",
     "normalize_expression",
+    "normalize_problem",
+    "unwrap_planning_temporal_arg",
 ]

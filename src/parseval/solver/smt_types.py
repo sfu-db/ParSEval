@@ -10,7 +10,7 @@ import z3
 from sqlglot import exp
 from sqlglot.expressions import DataType
 
-from parseval.solver.types import (
+from parseval.dtype import (
     parse_date,
     parse_time,
     parse_datetime,
@@ -107,7 +107,7 @@ class SpecialFunctionModel:
 
     name: str
     translator: Callable[
-        ["SMTSolver", exp.Expression, List[Union["SMTValue", z3.BoolRef]]],
+        ["Z3SmtSession", exp.Expression, List[Union["SMTValue", z3.BoolRef]]],
         Union["SMTValue", z3.BoolRef],
     ]
     return_type: Optional[Callable[[exp.Expression, Sequence[SMTTypeInfo]], DataType]] = None
@@ -119,7 +119,7 @@ _SPECIAL_FUNCTION_MODELS: Dict[str, SpecialFunctionModel] = {}
 def register_special_function(
     name: str,
     translator: Callable[
-        ["SMTSolver", exp.Expression, List[Union[SMTValue, z3.BoolRef]]],
+        ["Z3SmtSession", exp.Expression, List[Union[SMTValue, z3.BoolRef]]],
         Union[SMTValue, z3.BoolRef],
     ],
     return_type: Optional[Callable[[exp.Expression, Sequence[SMTTypeInfo]], DataType]] = None,

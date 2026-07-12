@@ -46,7 +46,8 @@ from parseval.plan.context import (
     RowReader,
     build_context_from_instance,
 )
-from parseval.plan.rex import Const, Environment, Variable, concrete, column_meta
+from parseval.plan.rex import Const, Environment, Variable, concrete
+from parseval.plan.meta import column_meta
 from parseval.instance import Instance
 
 from .branch_tree import (

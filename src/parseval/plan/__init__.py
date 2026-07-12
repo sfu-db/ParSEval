@@ -25,66 +25,66 @@ from .context import (
     WindowFrame,
     build_context_from_instance,
 )
-from .planner import (
-    Aggregate,
-    Filter,
-    Having,
-    Join,
-    Limit,
-    Plan,
-    Project,
-    Scan,
-    SetOperation,
-    Sort,
-    Step,
-    StepAnnotations,
-    SubPlan,
-    SubPlanKind,
-    correlation_columns,
-    scope_columns,
-)
+# from .planner import (
+#     Aggregate,
+#     Filter,
+#     Having,
+#     Join,
+#     Limit,
+#     Plan,
+#     Project,
+#     Scan,
+#     SetOperation,
+#     Sort,
+#     Step,
+#     StepAnnotations,
+#     SubPlan,
+#     SubPlanKind,
+#     correlation_columns,
+#     scope_columns,
+# )
 
 
-def _symbolic_scope_encoder():
-    """Lazy resolver for :class:`parseval.symbolic.encoder.SymbolicScopeEncoder`.
+# def _symbolic_scope_encoder():
+#     """Lazy resolver for :class:`parseval.symbolic.encoder.SymbolicScopeEncoder`.
 
-    The encoder class lives under :mod:`parseval.symbolic.encoder` but
-    downstream code has historically imported it as
-    ``parseval.plan.SymbolicScopeEncoder``. We defer the import to
-    attribute-access time so the plan module stays free of symbolic-layer
-    dependencies and no import cycle is introduced.
-    """
-    from parseval.symbolic.encoder import SymbolicScopeEncoder
+#     The encoder class lives under :mod:`parseval.symbolic.encoder` but
+#     downstream code has historically imported it as
+#     ``parseval.plan.SymbolicScopeEncoder``. We defer the import to
+#     attribute-access time so the plan module stays free of symbolic-layer
+#     dependencies and no import cycle is introduced.
+#     """
+#     from parseval.symbolic.encoder import SymbolicScopeEncoder
 
-    return SymbolicScopeEncoder
-
-
-def __getattr__(name):
-    if name in ("SymbolicScopeEncoder", "Planner"):
-        return _symbolic_scope_encoder()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+#     return SymbolicScopeEncoder
 
 
-__all__ = [
-    "Aggregate",
-    "AggregateGroup",
-    "Context",
-    "DerivedSchema",
-    "Filter",
-    "Having",
-    "Join",
-    "Limit",
-    "Plan",
-    "Project",
-    "Scan",
-    "SetOperation",
-    "Sort",
-    "Step",
-    "StepAnnotations",
-    "SubPlan",
-    "SubPlanKind",
-    "WindowFrame",
-    "build_context_from_instance",
-    "correlation_columns",
-    "scope_columns",
-]
+# def __getattr__(name):
+#     if name in ("SymbolicScopeEncoder", "Planner"):
+#         return _symbolic_scope_encoder()
+#     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# __all__ = [
+#     "Aggregate",
+#     "AggregateGroup",
+#     "Context",
+#     "DerivedSchema",
+#     "Filter",
+#     "Having",
+#     "Join",
+#     "Limit",
+#     "Plan",
+#     "Project",
+#     "Scan",
+#     "SetOperation",
+#     "Sort",
+#     "Step",
+#     "StepAnnotations",
+#     "SubPlan",
+#     "SubPlanKind",
+#     "WindowFrame",
+#     "build_context_from_instance",
+#     "correlation_columns",
+#     "scope_columns",
+# ]

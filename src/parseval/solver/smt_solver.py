@@ -27,7 +27,7 @@ from .smt_types import (
     unwrap_option,
     encode_literal,
 )
-from .types import (
+from parseval.dtype import (
     date_to_epoch_day,
     time_to_seconds,
     datetime_to_epoch_second,
@@ -37,8 +37,8 @@ from .types import (
     parse_date,
     parse_time,
     parse_datetime,
-    solver_var,
 )
+from .types import SolverVar
 from .smt_translate import (
     _coerce_numeric_sort,
     declare_column,
@@ -67,12 +67,6 @@ def _string_to_temporal_epoch(s: str, family: str) -> Optional[int]:
     return None
 
 
-try:
-    from z3.z3util import get_vars
-except Exception:
-    get_vars = None
-
-
 @contextmanager
 def checkpoint(z3solver):
     """Context manager that pushes/pops an SMT solver checkpoint.
@@ -86,8 +80,8 @@ def checkpoint(z3solver):
         z3solver.pop()
 
 
-class SMTSolver:
-    """Full Z3-backed SMT solver for complex SQL constraint satisfaction.
+class Z3SmtSession:
+    """Internal Z3 encoder/session for SMT-backed Problem solving.
 
     Translates SQL expressions (via sqlglot AST) into Z3 constraints using
     a discriminated-union (Option type) encoding for SQL NULL semantics.
@@ -127,15 +121,11 @@ class SMTSolver:
         self.z3ctx = z3ctx
         self.solver = z3.Solver(ctx=self.z3ctx)
         if timeout_ms is not None and timeout_ms > 0:
-            try:
-                self.solver.set("timeout", int(timeout_ms))
-            except Exception:
-                pass
+            self.solver.set("timeout", int(timeout_ms))
         self.timeout_ms = timeout_ms
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
         self._domain_constraints_applied = False
-        self.constrained_var_names = set()
         self._translate_ctx = None
         self.function_models = self._build_function_models(function_models)
         self.core_registry = self._build_core_registry()
@@ -218,12 +208,13 @@ class SMTSolver:
 
     def translate(
         self, expr: exp.Expression, ctx: Optional[Dict[str, z3.ExprRef]] = None
-    ) -> Optional[z3.BoolRef]:
+    ) -> z3.BoolRef:
         """Translate a sqlglot AST expression to Z3.
 
         If ctx is provided, Column nodes are resolved from ctx (keyed as
         "normalized_table.normalized_name") before the solver's default context.
-        Returns a raw z3.BoolRef, or None on failure.
+        Returns a raw z3.BoolRef. Unsupported expressions raise
+        UnsupportedSMTError.
         """
         prev_ctx = self._translate_ctx
         self._translate_ctx = ctx
@@ -232,9 +223,6 @@ class SMTSolver:
             if isinstance(result, SMTValue):
                 return self._as_predicate(result)
             return result
-        except Exception as e:
-            logger.debug("translate failed: %s", e)
-            return None
         finally:
             self._translate_ctx = prev_ctx
 
@@ -242,83 +230,33 @@ class SMTSolver:
         """Add a raw Z3 boolean expression directly to the solver.
 
         Unlike add(), this does not convert SMTValue or track variables
-        via get_vars. Use for constraints built outside translate()
-        (e.g., JOIN equalities between declared variables).
+        via expression translation. Use for constraints built outside
+        translate() (e.g., JOIN equalities between declared variables).
         """
         self.solver.add(constraint)
 
-    def solve_raw(
-        self, var_symbols: Dict[str, Any]
-    ) -> Tuple[str, Dict[str, Any]]:
-        """Solve and extract values for variables declared via declare_variable.
-
-        Args:
-            var_symbols: Maps variable name (str) to Variable symbol.
-                Only variables in this dict are extracted from the model.
-
-        Returns:
-            ("sat", {var_name: python_value}) or ("unsat", {})
-        """
-        self._apply_domain_constraints()
-
-        status = self.solver.check()
-        if status != z3.sat:
-            return ("unsat", {})
-
-        model = self.solver.model()
-        self.model = model
-        solution = {}
-        for var_name in var_symbols:
-            z3_var = self.context.get("variable_to_z3", {}).get(var_name)
-            if z3_var is None:
-                continue
-            z3_val = model.evaluate(z3_var, model_completion=False)
-            python_val = self._z3_to_python(z3_val, var_name)
-            if python_val is not None:
-                solution[var_name] = python_val
-        return ("sat", solution)
-
-    @staticmethod
-    def apply_solution(
-        var_symbols: Dict[str, Any], solution: Dict[str, Any]
-    ) -> None:
-        """Write solution values back into Variable symbols.
-
-        Args:
-            var_symbols: Maps variable name -> Variable symbol (has .set method).
-            solution: Maps variable name -> Python value (from solve_raw).
-        """
-        for var_name, value in solution.items():
-            sym = var_symbols.get(var_name)
-            if sym is not None and value is not None:
-                sym.set("concrete", value)
-                sym.set("is_bound", True)
-                sym.set("is_null", False)
-
-    def _infer_type_info(self, col: exp.Column) -> SMTTypeInfo:
-        """Infer SMTTypeInfo for a Column from its .type attribute."""
-        dtype = getattr(col, "type", None)
+    def _infer_type_info(self, col: exp.Expression) -> SMTTypeInfo:
+        """Infer SMTTypeInfo from a SolverVar or typed expression."""
+        if isinstance(col, SolverVar):
+            dtype = col.dtype
+        else:
+            dtype = getattr(col, "type", None)
         if dtype is None or str(dtype) in ("", "UNKNOWN"):
             dtype = DataType.build("TEXT")
         return normalize_dtype(dtype, self.z3ctx)
 
-    def add(self, constraint, track_vars: bool = True):
+    def add(self, constraint):
         """Add a constraint expression to the Z3 solver.
 
         Args:
             constraint: A Z3 boolean expression or an SMTValue (which gets
                 converted to a predicate via ``_as_predicate``).
-            track_vars: If True, extract and track Z3 variables for later
-                solution extraction.
         """
         if isinstance(constraint, SMTValue):
             constraint = self._as_predicate(constraint)
         if z3.is_bool(constraint):
             if self.verbose:
                 logger.info(constraint)
-            if track_vars and get_vars is not None:
-                for var in get_vars(constraint):
-                    self.constrained_var_names.add(str(var))
             self.solver.add(constraint)
 
     def solve(self):
@@ -326,7 +264,8 @@ class SMTSolver:
 
         Applies domain constraints (temporal bounds, string character limits)
         on the first call, then invokes the Z3 solver. Returns a tuple of
-        ``("sat", {var_name: python_value})`` or ``("unsat", {})``.
+        ``("sat", {var_name: python_value})``, ``("unsat", {})``, or
+        ``("unknown", {})``.
 
         The returned dict keys are ``"table.column"`` strings. Only variables
         referenced in the added constraints are included.
@@ -334,38 +273,34 @@ class SMTSolver:
         self._apply_domain_constraints()
 
         status = self.solver.check()
-        if status != z3.sat:
+        if status == z3.unsat:
             return "unsat", {}
+        if status != z3.sat:
+            return "unknown", {}
         self.model = self.solver.model()
         solutions = self.z3_to_python(self.model) or {}
         logger.info(f"SMT solver found solution: {solutions}")
         return "sat", solutions
 
-    def _declare_or_get_column(self, condition: exp.Column) -> SMTValue:
-        """Look up or create a Z3 variable for a column reference.
-
-        Maintains a bidirectional mapping between column names
-        and Z3 expressions in ``self.context``.
-
-        Args:
-            condition: A sqlglot Column expression.
-
-        Returns:
-            An SMTValue wrapping the Z3 variable with its type info.
-        """
+    def _declare_or_get_column(self, condition: exp.Expression) -> SMTValue:
+        """Look up or create a Z3 variable for a SolverVar / column reference."""
         col_key = self._column_key(condition)
+        dtype = (
+            condition.dtype
+            if isinstance(condition, SolverVar)
+            else getattr(condition, "type", None)
+        )
         if col_key not in self.context.get("variable_to_z3", {}):
-            self.declare_variable(col_key, condition.type)
+            self.declare_variable(col_key, dtype)
         expr = self.context["variable_to_z3"][col_key]
-        return SMTValue(expr, normalize_dtype(condition.type, self.z3ctx))
+        return SMTValue(expr, normalize_dtype(dtype, self.z3ctx))
 
-    def _column_key(self, condition: exp.Column) -> str:
-        variable = solver_var(condition)
-        if variable is not None:
-            encoded = self.context.get("solver_var_to_name", {}).get(variable)
+    def _column_key(self, condition: exp.Expression) -> str:
+        if isinstance(condition, SolverVar):
+            encoded = self.context.get("solver_var_to_name", {}).get(condition)
             if encoded is not None:
                 return encoded
-            return variable.display
+            return condition.var_key
         return f"{condition.table}.{condition.name}"
 
     def _as_value(self, item) -> SMTValue:
@@ -547,9 +482,6 @@ class SMTSolver:
             return z3.BoolVal(False, ctx=self.z3ctx)
         raw_left, raw_right, _ = _coerce_pair(left, right)
         return z3.And(_value_some(left), _value_some(right), op(raw_left, raw_right))
-
-    def _translate_children(self, expression: exp.Expression):
-        return [self._to_z3_expr(child) for child in expression.iter_expressions() if not isinstance(child, exp.DataType)]
 
     def _translate_arithmetic(self, expression: exp.Expression, op: Callable) -> SMTValue:
         """Translate a binary arithmetic operation with NULL propagation."""
@@ -959,6 +891,12 @@ class SMTSolver:
         effective_ctx = ctx if ctx is not None else getattr(self, '_translate_ctx', None)
         if isinstance(condition, exp.Paren):
             return self._to_z3_expr(condition.this, ctx=effective_ctx)
+        if isinstance(condition, SolverVar):
+            if effective_ctx is not None and condition.var_key in effective_ctx:
+                raw = effective_ctx[condition.var_key]
+                type_info = self._infer_type_info(condition)
+                return SMTValue(raw, type_info)
+            return self._declare_or_get_column(condition)
         if isinstance(condition, exp.Column):
             # Check caller's context first
             if effective_ctx is not None:
@@ -1032,7 +970,7 @@ class SMTSolver:
         if is_option_expr(expr) and option_of(expr).value(expr).sort() == z3.StringSort():
             raw = unwrap_option(expr)
             ascii_printable = z3.Range(chr(32), chr(126))
-            self.add(z3.InRe(raw, z3.Star(ascii_printable)), track_vars=False)
+            self.add(z3.InRe(raw, z3.Star(ascii_printable)))
 
     def _ensure_str_length(self, expr: z3.ExprRef, length: int):
         """Constrain string values to be non-empty and longer than ``length``."""
@@ -1047,11 +985,11 @@ class SMTSolver:
                             z3.Length(raw) > z3.IntVal(length, ctx=self.z3ctx),
                             z3.Or(
                                 z3.Length(raw) == 0,
-                                z3.SubString(raw, 0, 1) != z3.StringVal(" ", ctx=self.z3ctx),
+                                z3.SubString(raw, 0, 1)
+                                != z3.StringVal(" ", ctx=self.z3ctx),
                             ),
                         ),
-                    ),
-                    track_vars=False,
+                    )
                 )
 
     def _ensure_temporal_bounds(self, expr: z3.ExprRef, typeinfo: SMTTypeInfo):
@@ -1066,8 +1004,8 @@ class SMTSolver:
         else:
             lower = datetime_to_epoch_second(datetime(1900, 1, 1, 0, 0, 0))
             upper = datetime_to_epoch_second(datetime(2100, 1, 1, 0, 0, 0))
-        self.add(z3.Implies(opt.is_Some(expr), value > lower), track_vars=False)
-        self.add(z3.Implies(opt.is_Some(expr), value < upper), track_vars=False)
+        self.add(z3.Implies(opt.is_Some(expr), value > lower))
+        self.add(z3.Implies(opt.is_Some(expr), value < upper))
 
     def z3_to_python(self, model: z3.ModelRef):
         """Extract concrete Python values from a Z3 model for declared variables.
@@ -1080,7 +1018,10 @@ class SMTSolver:
         """
         result = {}
         for var_name, z3var in self.context.get("variable_to_z3", {}).items():
-            concrete = self._z3_to_python(model.evaluate(z3var, model_completion=False), var_name)
+            concrete = self._z3_to_python(
+                model.evaluate(z3var, model_completion=False),
+                var_name,
+            )
             variable = self.context["z3_to_variable"][var_name]
             if concrete == "":
                 continue

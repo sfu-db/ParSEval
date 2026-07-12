@@ -175,10 +175,11 @@ def parse_date(value: Any) -> Optional[date]:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     if isinstance(value, str):
+        normalized = _normalize_temporal_text(value)
         try:
-            if "T" in value or " " in value:
-                return datetime.fromisoformat(value.replace(" ", "T")).date()
-            return date.fromisoformat(value)
+            if "T" in normalized or " " in normalized:
+                return datetime.fromisoformat(normalized.replace(" ", "T")).date()
+            return date.fromisoformat(normalized)
         except ValueError:
             return None
     return None
@@ -191,12 +192,13 @@ def parse_time(value: Any) -> Optional[dt_time]:
     if isinstance(value, dt_time):
         return value.replace(microsecond=0)
     if isinstance(value, str):
+        normalized = _normalize_temporal_text(value)
         try:
-            if "T" in value or " " in value:
-                return datetime.fromisoformat(value.replace(" ", "T")).time().replace(
+            if "T" in normalized or " " in normalized:
+                return datetime.fromisoformat(normalized.replace(" ", "T")).time().replace(
                     microsecond=0
                 )
-            return dt_time.fromisoformat(value[:8])
+            return dt_time.fromisoformat(normalized[:8])
         except ValueError:
             return None
     return None
@@ -209,17 +211,27 @@ def parse_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-        # Strip single-digit fractional seconds (.0, .1, etc.) that Python 3.10
-        # rejects.  Multi-digit fractions (.000) are valid ISO-8601.
-        if re.search(r"\.\d{1}$", normalized):
-            normalized = normalized[:-2]
+        normalized = _normalize_temporal_text(value)
         for candidate in (normalized.replace(" ", "T"), normalized):
             try:
                 return _normalize_datetime(datetime.fromisoformat(candidate))
             except ValueError:
                 continue
     return None
+
+
+def _normalize_temporal_text(value: str) -> str:
+    normalized = value.strip()
+    normalized = normalized[:-1] + "+00:00" if normalized.endswith("Z") else normalized
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(.*)$", normalized)
+    if match:
+        year, month, day, rest = match.groups()
+        normalized = f"{year}-{int(month):02d}-{int(day):02d}{rest}"
+    # Strip single-digit fractional seconds (.0, .1, etc.) that Python 3.10
+    # rejects.  Multi-digit fractions (.000) are valid ISO-8601.
+    if re.search(r"\.\d{1}($|[+-]\d{2}:?\d{2}$)", normalized):
+        normalized = re.sub(r"\.\d{1}($|[+-]\d{2}:?\d{2}$)", r"\1", normalized)
+    return normalized
 
 
 def _normalize_datetime(value: datetime) -> datetime:

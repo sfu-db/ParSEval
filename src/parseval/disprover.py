@@ -169,6 +169,7 @@ class Disprover:
                 instance, target_sql,
                 dialect=self.dialect,
                 max_iterations=self.max_iterations,
+                connection_string=self.connection_string,
             )
             gen_result = engine.generate(thresholds=self.thresholds)
         except Exception as e:
