@@ -23,7 +23,7 @@ from parseval.identity import (
 )
 from parseval.instance import Instance
 from parseval.plan import Plan, Step
-from parseval.plan.rex import column_meta
+from parseval.plan.meta import column_meta
 from parseval.plan.planner import (
     Aggregate,
     Filter,

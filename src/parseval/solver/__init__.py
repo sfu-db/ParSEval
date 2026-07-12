@@ -1,27 +1,40 @@
 """ParSEval constraint solver.
 
-The public ``Solver`` is a pure, two-tier solver. It first asks the
-``DomainSolver`` for a sound tri-state result: ``sat`` is trusted,
-``unsat`` short-circuits, and ``unknown`` falls back to the full SMT solver.
-The SMT fallback is strict and fails closed when any expression cannot be
-translated.
-
 Public API::
 
-    from parseval.solver import Solver, SolveResult, SolverConstraint, SolverVar
+    from parseval.solver import Solver, Problem, Result, SolverVar
 
+    age = SolverVar(key="t.age", dtype=DataType.build("INT"))
     solver = Solver(dialect="sqlite")
-    result = solver.solve(constraint)
+    result = solver.solve(Problem(constraints=[exp.GT(this=age, expression=...)]))
 """
 
-from .types import SolverVar, set_solver_var, solver_var
-from .unified import Solver, SolveResult, SolverConstraint
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from .types import (
+    Problem,
+    Result,
+    SolverVar,
+    collect_problem_variables,
+)
+
+if TYPE_CHECKING:
+    from .api import Solver as Solver
 
 __all__ = [
+    "Problem",
+    "Result",
     "Solver",
-    "SolveResult",
-    "SolverConstraint",
     "SolverVar",
-    "set_solver_var",
-    "solver_var",
+    "collect_problem_variables",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "Solver":
+        from .api import Solver
+
+        return Solver
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

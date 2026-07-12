@@ -35,7 +35,8 @@ from parseval.identity import (
 )
 from parseval.plan import Plan, Step
 from parseval.plan.planner import Filter, Having, Join, Aggregate, Project, Scan, Sort, SubPlan
-from parseval.plan.rex import negate_predicate, column_meta
+from parseval.plan.rex import negate_predicate
+from parseval.plan.meta import column_meta
 from parseval.dtype import DataType
 from parseval.instance import Instance
 from parseval.solver import SolverConstraint

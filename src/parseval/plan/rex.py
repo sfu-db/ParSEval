@@ -1,88 +1,32 @@
-"""Concrete evaluation of sqlglot expressions under a ParSEval Symbol env.
+"""Concrete evaluation of sqlglot expressions under a ParSEval Environment.
 
-The rex module provides the vocabulary ParSEval uses to reason about SQL
-expressions at the value level. It sits between the AST layer (where
-sqlglot expression trees describe query structure) and the solver layer
-(where variables get concrete values assigned): sitting in the middle, it
-offers a *single* path from an AST node plus an :class:`Environment` to a
-Python primitive, and a single vocabulary of :class:`Symbol` objects that
-travel through the Instance, through the encoder's expression trees, and
-into / out of the solver.
+Single path from an AST node plus :class:`Environment` to a Python value.
+Used by Domain CHECK, CSP constraint checking, and Instance cell vocabulary.
 
-Design
-------
-
-* **Tri-state Symbol**. Every ParSEval symbolic value has three states:
-
-    +----------+------------+----------+---------------------+-------------------+
-    | State    | is_bound   | is_null  | ``.concrete``       | Meaning           |
-    +==========+============+==========+=====================+===================+
-    | Unbound  | False      | False    | ``None``            | Free, solver to   |
-    |          |            |          |                     | choose            |
-    +----------+------------+----------+---------------------+-------------------+
-    | NULL     | True       | True     | ``None``            | SQL NULL          |
-    +----------+------------+----------+---------------------+-------------------+
-    | Bound    | True       | False    | the Python value    | committed value   |
-    +----------+------------+----------+---------------------+-------------------+
-
-  The evaluator treats both "unbound" and "NULL" as ``None`` for the
-  purposes of value-level arithmetic (SQL-style propagation). Solvers
-  that need to distinguish the two cases read the ``is_bound`` flag on
-  the :class:`Variable` directly.
-
-* **Class-dispatched handlers**. Each sqlglot expression class has a
-  registered handler that produces the Python value of that expression
-  under an :class:`Environment`. Handlers are composable: ``x + 1`` calls
-  the evaluator recursively for ``x``, gets its value, adds 1. Unknown
-  classes fall back to sqlglot's ``executor.env`` for broad built-in
-  coverage.
-
-* **Uniform three-valued logic**. The three logical helpers
-  (:func:`tvl_and`, :func:`tvl_or`, :func:`tvl_not`) implement SQL's 3VL
-  truth tables, and comparison handlers propagate NULL through any
-  NULL operand. This is one place — handlers that need to see NULL
-  (``IS NULL``, ``COALESCE``, ``IS NOT DISTINCT FROM``) do so explicitly.
-
-* **Type coercion on Const**. :meth:`Const.coerce_to` is the one place
-  type conversions live. Handlers that compare or combine values across
-  types route through coercion so the rest of the evaluator stays
-  type-agnostic.
-
-* **Environment for column resolution**. The encoder builds an
-  :class:`Environment` per row (or per outer-correlation key) and hands
-  it to :func:`concrete`. The environment supports scope chaining so a
-  correlated subquery's inner evaluation can look up outer columns
-  naturally, without the AST being mutated.
+* **Tri-state Symbol** (``Variable`` / ``Const``): unbound / NULL / bound.
+* **Environment**: Identifier-keyed row maps and/or ``SolverVar`` assignments.
+* **Class-dispatched handlers** with SQL 3VL; CSP-aligned ``=`` / ``!=`` on NULL.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, Union
 
 from dateutil import parser as date_parser
 from sqlglot import exp, generator
 from sqlglot.executor.env import ENV as _SQLGLOT_ENV
 from sqlglot.optimizer.simplify import simplify
 
-import functools
-
-from parseval.dtype import DataType
+from parseval.coercion import coerce_literal_value
+from parseval.dtype import DataType, StorageLiteral, parse_date, parse_datetime, parse_time
 from parseval.helper import like_to_pattern
-from parseval.identity import (
-    PARSEVAL_COLUMN_ID,
-    ColumnId,
-    ColumnKind,
-    RelationId,
-    RelationKind,
-    column_id,
-    column_identity,
-    identifier_name,
-    relation_id,
-)
+from parseval.solver.types import SolverVar
+from parseval.solver.normalization import unwrap_planning_temporal_arg
 
 from .context import Row  # noqa: F401
 
@@ -200,12 +144,7 @@ class Const(Symbol):
 class Variable(Symbol):
     """A cell identity: one column-value in one row of one table.
 
-    A ``Variable`` is the bridge between the ``Instance`` (which stores
-    it in rows), the AST (in which it appears as a leaf of expressions),
-    and the solver (which chooses its value). It carries the usual
-    tri-state slots plus identity back-pointers (``relation_id`` /
-    ``column_id`` / ``rowid``) and solver hints (``nullable`` / ``unique`` /
-    ``domain``).
+    Requires sqlglot ``table`` / ``column`` / ``rowid`` identity back-pointers.
     """
 
     arg_types = {
@@ -214,11 +153,9 @@ class Variable(Symbol):
         "concrete": False,
         "is_bound": False,
         "is_null": False,
-        # --- Instance identity back-pointers ---
-        "relation_id": False,
-        "column_id": False,
+        "table": False,
+        "column": False,
         "rowid": False,
-        # --- solver hints ---
         "nullable": False,
         "unique": False,
         "domain": False,
@@ -228,17 +165,16 @@ class Variable(Symbol):
     def __init__(self, *args, **kwargs):
         if "_type" in kwargs:
             kwargs["type"] = kwargs.pop("_type")
-        if "table" in kwargs or "column" in kwargs:
-            raise ValueError(
-                "Variable identity must use column_id/relation_id, "
-                "not table/column strings"
-            )
-        col_id = kwargs.get("column_id")
-        if not isinstance(col_id, ColumnId):
-            raise ValueError("Variable requires column_id")
+        table = kwargs.get("table")
+        column = kwargs.get("column")
+        if table is None or column is None:
+            raise ValueError("Variable requires sqlglot table+column")
+        if isinstance(table, str):
+            kwargs["table"] = exp.to_table(table)
+        if isinstance(column, str):
+            kwargs["column"] = exp.to_identifier(column)
         if kwargs.get("rowid") is None:
             raise ValueError("Variable requires rowid")
-        kwargs.setdefault("relation_id", col_id.relation)
         super().__init__(*args, **kwargs)
 
     @property
@@ -246,12 +182,12 @@ class Variable(Symbol):
         return self.text("this")
 
     @property
-    def column_id(self) -> ColumnId:
-        return self.args["column_id"]
+    def table(self) -> exp.Table | None:
+        return self.args.get("table")
 
     @property
-    def relation_id(self) -> RelationId | None:
-        return self.args.get("relation_id") or self.column_id.relation
+    def column(self) -> exp.Identifier | None:
+        return self.args.get("column")
 
     @property
     def rowid(self) -> Any:
@@ -259,22 +195,20 @@ class Variable(Symbol):
 
     @property
     def table_name(self) -> Optional[str]:
-        relation = self.relation_id
-        return (
-            relation.name.normalized
-            if relation is not None and relation.name
-            else None
-        )
+        table = self.table
+        if table is not None and table.this is not None:
+            return table.this.name
+        return None
 
     @property
     def column_name(self) -> str:
-        return self.column_id.name.normalized
+        column = self.column
+        if column is not None:
+            return column.name
+        return ""
 
     @property
     def concrete(self) -> Any:
-        # If the Variable has been explicitly bound we honour that; otherwise
-        # we return whatever value was stored at construction time (so legacy
-        # callers that pass ``Variable(this=..., concrete=v)`` still work).
         if self.args.get("is_bound"):
             if self.args.get("is_null"):
                 return None
@@ -312,88 +246,132 @@ for _klass in [Symbol, Const, Variable, Row]:
 # =============================================================================
 
 
+_MISSING = object()
+
+_STRFTIME_COMPONENTS = {
+    "%Y": "year",
+    "%m": "month",
+    "%d": "day",
+    "%H": "hour",
+    "%M": "minute",
+    "%S": "second",
+}
+_FIXED_INTERVAL_SECONDS = {
+    "SECOND": 1,
+    "MINUTE": 60,
+    "HOUR": 3600,
+    "DAY": 86400,
+    "WEEK": 7 * 86400,
+}
+_TEMPORAL_COMPONENT_CLASSES = tuple(
+    (getattr(exp, class_name), component)
+    for class_name, component in (
+        ("Year", "year"),
+        ("Month", "month"),
+        ("Day", "day"),
+        ("DayOfMonth", "day"),
+        ("Hour", "hour"),
+        ("Minute", "minute"),
+        ("Second", "second"),
+    )
+    if hasattr(exp, class_name)
+)
+_CMP_OPS = {
+    exp.EQ: "=",
+    exp.NEQ: "!=",
+    exp.GT: ">",
+    exp.GTE: ">=",
+    exp.LT: "<",
+    exp.LTE: "<=",
+}
+
+
+def _identifier_name(value: object) -> str:
+    if isinstance(value, exp.Identifier):
+        return value.name
+    if isinstance(value, exp.Column):
+        return value.name
+    return str(value)
+
+
 class Environment:
-    """Column → value resolver with scope chaining for correlated subqueries.
+    """Column / SolverVar → value resolver with optional outer scope chaining.
 
-    Construct with a dict of bindings keyed by :class:`ColumnId`. Resolution
-    uses ``PARSEVAL_COLUMN_ID`` metadata on :class:`exp.Column` nodes for
-    direct :class:`ColumnId` lookup. No name-based fallback — columns must
-    carry identity metadata.
-
-    Environments are immutable in intent: to extend with new bindings for
-    a nested scope, call :meth:`extend`, which returns a child
-    environment rather than mutating the parent.
+    Construct via :meth:`from_row` (Identifier-keyed cells) or
+    :meth:`from_assignments` (CSP ``SolverVar`` map). No ``ColumnId``.
     """
 
-    __slots__ = ("_bindings", "_readers", "_outer")
+    __slots__ = ("_row", "_assignments", "_outer")
 
     def __init__(
         self,
-        bindings: Optional[Dict[ColumnId, Any]] = None,
+        *,
+        row: Optional[Mapping[exp.Identifier, Any]] = None,
+        assignments: Optional[Mapping[SolverVar, Any]] = None,
         outer: Optional["Environment"] = None,
-        readers: Optional[Dict[Any, Any]] = None,
     ) -> None:
-        self._bindings: Dict[ColumnId, Any] = dict(bindings) if bindings else {}
-        self._readers: Dict[Any, Any] = dict(readers) if readers else {}
+        self._row: Dict[str, Any] = {
+            _identifier_name(key): value for key, value in (row or {}).items()
+        }
+        self._assignments: Dict[str, Any] = {}
+        for key, value in (assignments or {}).items():
+            if isinstance(key, SolverVar):
+                self._assignments[key.var_key] = value
+            else:
+                self._assignments[str(key)] = value
         self._outer: Optional[Environment] = outer
 
     @classmethod
-    def from_readers(
+    def from_row(
         cls,
-        row_readers: Dict[Any, Any],
+        row: Mapping[exp.Identifier, Any],
         outer: Optional["Environment"] = None,
     ) -> "Environment":
-        return cls(readers=row_readers, outer=outer)
+        return cls(row=row, outer=outer)
 
-    def _resolve_by_id(self, col_id: ColumnId) -> Any:
-        """Direct ColumnId lookup."""
-        if col_id in self._bindings:
-            return self._bindings[col_id]
-        for reader in self._readers.values():
-            try:
-                return reader.resolve(col_id)
-            except KeyError:
-                continue
-        return _MISSING
+    @classmethod
+    def from_assignments(
+        cls,
+        assignments: Mapping[SolverVar, Any],
+        outer: Optional["Environment"] = None,
+    ) -> "Environment":
+        return cls(assignments=assignments, outer=outer)
 
-    def resolve(self, column: Union[exp.Column, ColumnId]) -> Any:
+    def resolve(self, column: exp.Column) -> Any:
         """Return the value bound to ``column``, or ``None`` if unresolved."""
-        if isinstance(column, ColumnId):
-            result = self._resolve_by_id(column)
-            if result is not _MISSING:
-                return result
-        elif isinstance(column, exp.Column):
-            col_id = column_identity(column)
-            if col_id is not None:
-                result = self._resolve_by_id(col_id)
-                if result is not _MISSING:
-                    return result
-
+        name = _identifier_name(column.this if column.this is not None else column)
+        if name in self._row:
+            return self._row[name]
         if self._outer is not None:
             return self._outer.resolve(column)
         return None
 
-    def bind(self, column: ColumnId, value: Any) -> None:
+    def assignment(self, var: SolverVar) -> Any:
+        """Return the assigned value for ``var``, or ``_MISSING`` if absent."""
+        if var.var_key in self._assignments:
+            return self._assignments[var.var_key]
+        if self._outer is not None:
+            return self._outer.assignment(var)
+        return _MISSING
+
+    def bind(self, column: exp.Identifier | str, value: Any) -> None:
         """Bind ``column`` to ``value`` in this environment."""
-        self._bindings[column] = value
+        self._row[_identifier_name(column)] = value
 
-    def extend(self, bindings: Dict[ColumnId, Any]) -> "Environment":
-        """Return a child environment layering ``bindings`` on top of this one."""
-        return Environment(bindings=bindings, outer=self)
+    def extend(
+        self,
+        row: Optional[Mapping[exp.Identifier, Any]] = None,
+        assignments: Optional[Mapping[SolverVar, Any]] = None,
+    ) -> "Environment":
+        """Return a child environment layering new bindings on this one."""
+        return Environment(row=row, assignments=assignments, outer=self)
 
-    def contains(self, column: Union[exp.Column, ColumnId]) -> bool:
+    def contains(self, column: exp.Column) -> bool:
         """Return True if ``column`` resolves in this or any outer env."""
-        if isinstance(column, ColumnId):
-            if self._resolve_by_id(column) is not _MISSING:
-                return True
-        elif isinstance(column, exp.Column):
-            col_id = column_identity(column)
-            if col_id is not None and self._resolve_by_id(col_id) is not _MISSING:
-                return True
+        name = _identifier_name(column.this if column.this is not None else column)
+        if name in self._row:
+            return True
         return self._outer.contains(column) if self._outer is not None else False
-
-
-_MISSING = object()
 
 
 # =============================================================================
@@ -423,8 +401,8 @@ def concrete(
 
     This is the single entry point for concrete evaluation. ``env`` may
     be omitted for expressions that don't reference columns (e.g.
-    literal arithmetic). Columns that don't resolve in ``env`` produce
-    ``None`` — which the SQL 3VL propagation then spreads upward.
+    literal arithmetic). Columns / SolverVars that don't resolve produce
+    ``None``.
     """
     if env is None:
         env = Environment()
@@ -434,8 +412,6 @@ def concrete(
 def _eval(node: Any, env: Environment) -> Any:
     if node is None:
         return None
-    # Walk MRO so subclasses inherit their parent's handler if none is
-    # registered for the specific type.
     for cls in type(node).__mro__:
         fn = _HANDLERS.get(cls)
         if fn is not None:
@@ -444,12 +420,7 @@ def _eval(node: Any, env: Environment) -> Any:
 
 
 def _eval_via_sqlglot_env(node: exp.Expression, env: Environment) -> Any:
-    """Fallback for sqlglot nodes we haven't explicitly handled.
-
-    Routes through :data:`sqlglot.executor.env.ENV` with operand values
-    obtained by recursive evaluation. Returns ``None`` on lookup miss or
-    evaluation error — safer than raising, given the breadth of SQL.
-    """
+    """Fallback for sqlglot nodes we haven't explicitly handled."""
     op_key = getattr(node, "key", None)
     if op_key is None:
         return None
@@ -794,15 +765,6 @@ def _eval_boolean(node: exp.Boolean, env: Environment) -> bool:
 
 @handler(exp.Column)
 def _eval_column(node: exp.Column, env: Environment) -> Any:
-    # Legacy / encoder convention: columns may be stamped with a concrete
-    # value via ``column.set("concrete", ...)`` during row-by-row
-    # evaluation. Honor that first so existing callers keep working, then
-    # fall back to the Environment for Clean-API callers.
-    if "concrete" in node.args:
-        stamped = node.args["concrete"]
-        if isinstance(stamped, Symbol):
-            return stamped.concrete
-        return stamped
     value = env.resolve(node)
     if isinstance(value, Symbol):
         return value.concrete
@@ -818,13 +780,16 @@ def _eval_const(node: Const, env: Environment) -> Any:
 def _eval_variable(node: Variable, env: Environment) -> Any:
     if node.is_bound:
         return None if node.is_null else node.args.get("concrete")
-    # For unbound variables, try the environment by ColumnId.
-    resolved = env.resolve(node.column_id)
-    if isinstance(resolved, Symbol):
-        return resolved.concrete
-    if resolved is not None:
-        return resolved
+    # Unbound: prefer stored construction-time concrete, else None.
     return node.args.get("concrete")
+
+
+@handler(SolverVar)
+def _eval_solver_var(node: SolverVar, env: Environment) -> Any:
+    resolved = env.assignment(node)
+    if resolved is _MISSING:
+        return None
+    return resolved
 
 
 # ----- arithmetic -----
@@ -900,28 +865,239 @@ def _eval_neg(node: exp.Neg, env: Environment) -> Any:
 # ----- comparison -----
 
 
-def _compare(op: Callable[[Any, Any], bool]) -> _Handler:
-    """Build a NULL-propagating comparison handler from a Python binary op."""
+def unit_name(node: Any) -> Optional[str]:
+    if node is None:
+        return None
+    value = getattr(node, "this", node)
+    return str(value).upper()
 
-    def fn(node: exp.Expression, env: Environment) -> Any:
-        l, r = _eval(node.left, env), _eval(node.right, env)
-        if l is None or r is None:
+
+def integer_literal(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value)
+    return None
+
+
+def literal_value(node: exp.Expression) -> Any:
+    """Extract a Python value from a literal-ish AST leaf (no Environment)."""
+    if isinstance(node, exp.Literal):
+        if node.is_int:
+            return int(node.this)
+        if node.is_number:
+            return float(node.this)
+        return str(node.this)
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Null):
+        return None
+    if isinstance(node, exp.Neg):
+        inner = literal_value(node.this)
+        if isinstance(inner, (int, float)):
+            return -inner
+        return None
+    if isinstance(node, exp.Cast):
+        return literal_value(node.this)
+    return None
+
+
+def fixed_interval_delta(node: exp.Expression) -> Optional[timedelta]:
+    """Parse a fixed DateAdd/DateSub interval into a ``timedelta``, or ``None``."""
+    interval_expr = node.expression
+    unit_node = node.args.get("unit")
+    if isinstance(interval_expr, exp.Interval):
+        unit_node = interval_expr.args.get("unit") or unit_node
+        raw = literal_value(interval_expr.this)
+    else:
+        raw = literal_value(interval_expr) if isinstance(interval_expr, exp.Expression) else None
+    unit = unit_name(unit_node)
+    if unit not in _FIXED_INTERVAL_SECONDS:
+        return None
+    count = integer_literal(raw)
+    if count is None:
+        return None
+    return timedelta(seconds=count * _FIXED_INTERVAL_SECONDS[unit])
+
+
+# Private aliases for in-module handlers.
+_unit_name = unit_name
+_integer_literal = integer_literal
+_literal_leaf = literal_value
+_fixed_interval_delta = fixed_interval_delta
+
+
+def _ordered_comparison(left: Any, op: str, right: Any) -> Optional[bool]:
+    if op == "=":
+        return left == right
+    if op == "!=":
+        return left != right
+    if isinstance(left, bool) or isinstance(right, bool):
+        return None
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        comparable = (left, right)
+    elif isinstance(left, datetime) and isinstance(right, datetime):
+        comparable = (left, right)
+    elif (
+        isinstance(left, date)
+        and not isinstance(left, datetime)
+        and isinstance(right, date)
+        and not isinstance(right, datetime)
+    ):
+        comparable = (left, right)
+    elif isinstance(left, dt_time) and isinstance(right, dt_time):
+        comparable = (left, right)
+    elif isinstance(left, str) and isinstance(right, str):
+        comparable = (left, right)
+    else:
+        return None
+    lhs, rhs = comparable
+    if op == ">":
+        return lhs > rhs
+    if op == ">=":
+        return lhs >= rhs
+    if op == "<":
+        return lhs < rhs
+    if op == "<=":
+        return lhs <= rhs
+    return None
+
+
+def _date_shift_value(node: exp.Expression, env: Environment) -> Any:
+    if not isinstance(node, (exp.DateAdd, exp.DateSub)):
+        return _MISSING
+    inner = unwrap_planning_temporal_arg(node.this)
+    interval = _fixed_interval_delta(node)
+    if interval is None:
+        return _MISSING
+    if isinstance(node, exp.DateSub):
+        interval = -interval
+    raw_value = _eval(inner, env)
+    value = raw_value if isinstance(raw_value, datetime) else parse_datetime(raw_value)
+    if value is None:
+        parsed_date = parse_date(raw_value)
+        if parsed_date is None:
             return None
-        l, r = _coerce_comparable(l, r)
+        value = datetime(parsed_date.year, parsed_date.month, parsed_date.day)
+    return value + interval
+
+
+def _temporal_component_value(value: Any, component: str) -> Optional[int]:
+    if value is None:
+        return None
+    if not isinstance(value, (date, datetime, dt_time)):
+        parsed = parse_datetime(value) or parse_time(value)
+        if parsed is None:
+            return None
+        value = parsed
+    if component == "year" and isinstance(value, (date, datetime)):
+        return value.year
+    if component == "month" and isinstance(value, (date, datetime)):
+        return value.month
+    if component == "day" and isinstance(value, (date, datetime)):
+        return value.day
+    if component == "hour" and isinstance(value, (datetime, dt_time)):
+        return value.hour
+    if component == "minute" and isinstance(value, (datetime, dt_time)):
+        return value.minute
+    if component == "second" and isinstance(value, (datetime, dt_time)):
+        return value.second
+    return None
+
+
+def _strftime_component(node: exp.Expression) -> Optional[str]:
+    if isinstance(node, exp.TimeToStr):
+        fmt = node.args.get("format")
+        if isinstance(fmt, exp.Expression):
+            fmt_value = _eval(fmt, Environment())
+        else:
+            fmt_value = fmt
+        return _STRFTIME_COMPONENTS.get(fmt_value) if isinstance(fmt_value, str) else None
+    if isinstance(node, exp.Anonymous) and str(node.name).upper() == "STRFTIME":
+        args = list(node.expressions)
+        if len(args) >= 1 and isinstance(args[0], exp.Literal):
+            return _STRFTIME_COMPONENTS.get(str(args[0].this))
+    return None
+
+
+def _eval_comparison(node: exp.Expression, env: Environment) -> Any:
+    op = _CMP_OPS[type(node)]
+    left_node, right_node = node.this, node.expression
+
+    shift_left = _date_shift_value(left_node, env)
+    if shift_left is not _MISSING:
+        left = shift_left
+    else:
+        left = _eval(left_node, env)
+
+    shift_right = _date_shift_value(right_node, env)
+    if shift_right is not _MISSING:
+        right = shift_right
+    else:
+        right = _eval(right_node, env)
+
+    if left is None or right is None:
+        if op == "=":
+            return left is None and right is None
+        if op == "!=":
+            return left is not None or right is not None
+        return None
+
+    if isinstance(left_node, exp.Date):
+        right = parse_date(right)
+    elif isinstance(right_node, exp.Date):
+        left = parse_date(left)
+    elif isinstance(left_node, (exp.DateAdd, exp.DateSub)):
+        right = parse_datetime(right) or (
+            datetime(parse_date(right).year, parse_date(right).month, parse_date(right).day)
+            if parse_date(right) is not None
+            else right
+        )
+    elif isinstance(right_node, (exp.DateAdd, exp.DateSub)):
+        left = parse_datetime(left) or (
+            datetime(parse_date(left).year, parse_date(left).month, parse_date(left).day)
+            if parse_date(left) is not None
+            else left
+        )
+
+    if isinstance(left_node, SolverVar) and not isinstance(right_node, SolverVar):
+        if not isinstance(left, StorageLiteral) or op not in {"=", "!="}:
+            right = coerce_literal_value(right, left_node.dtype)
+    elif isinstance(right_node, SolverVar) and not isinstance(left_node, SolverVar):
+        if not isinstance(right, StorageLiteral) or op not in {"=", "!="}:
+            left = coerce_literal_value(left, right_node.dtype)
+
+    if isinstance(left, StorageLiteral) or isinstance(right, StorageLiteral):
+        if op == "=":
+            return str(left) == str(right)
+        if op == "!=":
+            return str(left) != str(right)
+        if isinstance(left, StorageLiteral) and isinstance(left_node, SolverVar):
+            left = coerce_literal_value(str(left), left_node.dtype)
+        if isinstance(right, StorageLiteral) and isinstance(right_node, SolverVar):
+            right = coerce_literal_value(str(right), right_node.dtype)
+
+    # Generic column/literal path: also try soft numeric coercion.
+    if not isinstance(left_node, SolverVar) and not isinstance(right_node, SolverVar):
         try:
-            return op(l, r)
-        except TypeError:
-            return None
+            left, right = _coerce_comparable(left, right)
+        except Exception:
+            pass
 
-    return fn
+    result = _ordered_comparison(left, op, right)
+    return False if result is None else result
 
 
-_HANDLERS[exp.EQ] = _compare(lambda a, b: a == b)
-_HANDLERS[exp.NEQ] = _compare(lambda a, b: a != b)
-_HANDLERS[exp.GT] = _compare(lambda a, b: a > b)
-_HANDLERS[exp.GTE] = _compare(lambda a, b: a >= b)
-_HANDLERS[exp.LT] = _compare(lambda a, b: a < b)
-_HANDLERS[exp.LTE] = _compare(lambda a, b: a <= b)
+_HANDLERS[exp.EQ] = _eval_comparison
+_HANDLERS[exp.NEQ] = _eval_comparison
+_HANDLERS[exp.GT] = _eval_comparison
+_HANDLERS[exp.GTE] = _eval_comparison
+_HANDLERS[exp.LT] = _eval_comparison
+_HANDLERS[exp.LTE] = _eval_comparison
 
 
 # ----- logical -----
@@ -1034,6 +1210,12 @@ def _eval_between(node: exp.Between, env: Environment) -> Optional[bool]:
     high = _eval(node.args.get("high"), env)
     if value is None or low is None or high is None:
         return None
+    if isinstance(node.this, SolverVar):
+        lower = _ordered_comparison(low, "<=", value)
+        upper = _ordered_comparison(value, "<=", high)
+        if lower is None or upper is None:
+            return False
+        return lower and upper
     value, low = _coerce_comparable(value, low)
     value, high = _coerce_comparable(value, high)
     low, high = _coerce_comparable(low, high)
@@ -1046,9 +1228,21 @@ def _eval_between(node: exp.Between, env: Environment) -> Optional[bool]:
 @handler(exp.In)
 def _eval_in(node: exp.In, env: Environment) -> Optional[bool]:
     value = _eval(node.this, env)
+    expressions = node.args.get("expressions") or []
+    if isinstance(node.this, SolverVar):
+        dtype = node.this.dtype
+        values = []
+        for candidate_node in expressions:
+            if isinstance(candidate_node, exp.Null):
+                values.append(None)
+                continue
+            candidate = _eval(candidate_node, env)
+            if candidate is not None:
+                candidate = coerce_literal_value(candidate, dtype)
+            values.append(candidate)
+        return value in values
     if value is None:
         return None
-    expressions = node.args.get("expressions") or []
     saw_null = False
     for candidate_node in expressions:
         candidate = _eval(candidate_node, env)
@@ -1195,6 +1389,30 @@ def _eval_ts_or_ds_to_timestamp(node: exp.TsOrDsToTimestamp, env: Environment) -
     return parsed
 
 
+@handler(exp.Date)
+def _eval_date(node: exp.Date, env: Environment) -> Any:
+    return parse_date(_eval(unwrap_planning_temporal_arg(node.this), env))
+
+
+@handler(exp.DateAdd, exp.DateSub)
+def _eval_date_shift(node: exp.Expression, env: Environment) -> Any:
+    value = _date_shift_value(node, env)
+    return None if value is _MISSING else value
+
+
+def _eval_temporal_component(node: exp.Expression, env: Environment, component: str) -> Any:
+    inner = unwrap_planning_temporal_arg(node.this)
+    return _temporal_component_value(_eval(inner, env), component)
+
+
+for _cls, _component in _TEMPORAL_COMPONENT_CLASSES:
+    _HANDLERS[_cls] = (
+        lambda node, env, component=_component: _eval_temporal_component(
+            node, env, component
+        )
+    )
+
+
 # ----- ordered (pass-through used inside ORDER BY) -----
 
 
@@ -1206,8 +1424,50 @@ def _eval_ordered(node: exp.Ordered, env: Environment) -> Any:
 # ----- dialect functions (Anonymous dispatch) -----
 
 
+@handler(exp.TimeToStr)
+def _eval_time_to_str(node: exp.TimeToStr, env: Environment) -> Any:
+    component = _strftime_component(node)
+    if component is not None:
+        inner = unwrap_planning_temporal_arg(node.this)
+        value = _temporal_component_value(_eval(inner, env), component)
+        if value is None:
+            return None
+        return f"{value:04d}" if component == "year" else f"{value:02d}"
+    value = _eval(node.this, env)
+    fmt = node.args.get("format")
+    if value is None and isinstance(node.this, (exp.Cast, exp.TsOrDsToTimestamp)):
+        inner = node.this.this
+        if isinstance(inner, exp.Literal) and str(inner.this).lower() == "now":
+            value = datetime.utcnow()
+    if value is None or fmt is None:
+        return None
+    fmt_str = fmt if isinstance(fmt, str) else _eval(fmt, env)
+    if fmt_str is None:
+        return None
+    d = _parse_temporal(value) if isinstance(value, str) else value
+    if d is None:
+        d = _parse_temporal(str(value))
+    if d is None:
+        return None
+    if isinstance(d, date) and not isinstance(d, datetime):
+        d = datetime(d.year, d.month, d.day)
+    try:
+        return d.strftime(fmt_str)
+    except (ValueError, AttributeError):
+        return None
+
+
 @handler(exp.Anonymous)
 def _eval_anonymous(node: exp.Anonymous, env: Environment) -> Any:
+    if str(node.name).upper() == "STRFTIME":
+        component = _strftime_component(node)
+        args = list(node.expressions)
+        if component is not None and len(args) >= 2:
+            inner = unwrap_planning_temporal_arg(args[1])
+            value = _temporal_component_value(_eval(inner, env), component)
+            if value is None:
+                return None
+            return f"{value:04d}" if component == "year" else f"{value:02d}"
     name = node.name.upper()
     args = [_eval(arg, env) for arg in node.expressions]
     fn = _ANONYMOUS_HANDLERS.get(name)
@@ -1320,35 +1580,6 @@ _ANONYMOUS_HANDLERS = {
 }
 
 
-# ----- TimeToStr (STRFTIME) -----
-
-
-@handler(exp.TimeToStr)
-def _eval_time_to_str(node: exp.TimeToStr, env: Environment) -> Any:
-    value = _eval(node.this, env)
-    fmt = node.args.get("format")
-    if value is None and isinstance(node.this, (exp.Cast, exp.TsOrDsToTimestamp)):
-        inner = node.this.this
-        if isinstance(inner, exp.Literal) and str(inner.this).lower() == "now":
-            value = datetime.utcnow()
-    if value is None or fmt is None:
-        return None
-    fmt_str = fmt if isinstance(fmt, str) else _eval(fmt, env)
-    if fmt_str is None:
-        return None
-    d = _parse_temporal(value) if isinstance(value, str) else value
-    if d is None:
-        d = _parse_temporal(str(value))
-    if d is None:
-        return None
-    if isinstance(d, date) and not isinstance(d, datetime):
-        d = datetime(d.year, d.month, d.day)
-    try:
-        return d.strftime(fmt_str)
-    except (ValueError, AttributeError):
-        return None
-
-
 # ----- paren -----
 
 
@@ -1378,47 +1609,20 @@ def negate_predicate(expr: exp.Expression) -> exp.Expression:
     return simplify(expr.not_())
 
 
-# =============================================================================
-# Column metadata (schema hints stamped on exp.Column nodes)
-# =============================================================================
-
-
-def column_meta(col: exp.Column) -> Optional[dict]:
-    """Read schema hints stamped on a Column by :meth:`Plan._annotate`.
-
-    Returns a dict with keys ``table``, ``nullable``, ``unique``, ``domain``
-    (a :class:`DataType`), or ``None`` if the column was not enriched.
-    """
-    raw = col.args.get("_parseval_meta")
-    if raw is None:
-        return None
-    # Stored as a frozenset of (key, value) pairs for hashability.
-    return dict(raw)
-
-
-def set_column_meta(col: exp.Column, meta: dict) -> None:
-    """Stamp schema hints onto a Column node.
-
-    Internally stored as a frozenset of ``(key, value)`` pairs so the
-    Column remains hashable (required by sqlglot's ``simplify`` and other
-    passes that hash expression nodes).
-    """
-    col.set("_parseval_meta", frozenset(meta.items()))
-
-
 __all__ = [
-    # Symbol vocabulary
     "Symbol",
     "Const",
     "Variable",
-    # Environment + evaluator
     "Environment",
     "concrete",
-    # Re-exports
     "Row",
     "DataType",
-    # Utilities
     "negate_predicate",
-    "column_meta",
-    "set_column_meta",
+    "tvl_and",
+    "tvl_or",
+    "tvl_not",
+    "literal_value",
+    "integer_literal",
+    "unit_name",
+    "fixed_interval_delta",
 ]

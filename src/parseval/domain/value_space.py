@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 import hashlib
 import re
-from typing import Any, Optional, Set
+from typing import Any, Dict, Optional, Set
 
-from parseval.dtype import TypeFamily
+from parseval.dtype import TypeFamily, parse_date, parse_datetime, parse_time
 
 
 @dataclass
@@ -16,6 +16,8 @@ class ValueSpace:
     family: TypeFamily = TypeFamily.TEXT
     min_val: Optional[Any] = None
     max_val: Optional[Any] = None
+    min_inclusive: bool = True
+    max_inclusive: bool = True
     equals: Optional[Any] = None
     not_equals: Set[Any] = field(default_factory=set)
     allowed: Optional[Set[Any]] = None
@@ -23,6 +25,7 @@ class ValueSpace:
     not_null: bool = False
     like_pattern: Optional[str] = None
     max_length: Optional[int] = None
+    temporal_components: Dict[str, "ValueSpace"] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         if self.must_null and self.not_null:
@@ -32,11 +35,16 @@ class ValueSpace:
         if self.equals is not None:
             return not self._candidate_valid(self.equals)
         if self.min_val is not None and self.max_val is not None:
-            try:
-                if self.min_val > self.max_val:
-                    return True
-            except TypeError:
-                pass
+            bounds = _comparable_pair(self.min_val, self.max_val)
+            if bounds is None:
+                return True
+            min_val, max_val = bounds
+            if min_val > max_val:
+                return True
+            if min_val == max_val and (
+                not self.min_inclusive or not self.max_inclusive
+            ):
+                return True
         if self.allowed is not None:
             valid = {value for value in self.allowed if self._candidate_valid(value)}
             if not valid:
@@ -47,6 +55,8 @@ class ValueSpace:
                 candidates &= self.allowed
             if not candidates - self.not_equals:
                 return True
+        if any(space.is_empty() for space in self.temporal_components.values()):
+            return True
         return False
 
     def pick(self, hint: Any = None) -> Any:
@@ -81,18 +91,72 @@ class ValueSpace:
             return False
         if self.allowed is not None and value not in self.allowed:
             return False
-        try:
-            if self.min_val is not None and value < self.min_val:
+        bounded_value = self._bounded_value(value)
+        if self.min_val is not None:
+            comparable = _comparable_pair(bounded_value, self.min_val)
+            if comparable is None:
                 return False
-            if self.max_val is not None and value > self.max_val:
+            candidate, minimum = comparable
+            if candidate < minimum:
                 return False
-        except TypeError:
-            pass
+            if candidate == minimum and not self.min_inclusive:
+                return False
+        if self.max_val is not None:
+            comparable = _comparable_pair(bounded_value, self.max_val)
+            if comparable is None:
+                return False
+            candidate, maximum = comparable
+            if candidate > maximum:
+                return False
+            if candidate == maximum and not self.max_inclusive:
+                return False
         if self.max_length is not None and isinstance(value, str):
             if len(value) > self.max_length:
                 return False
         if self.like_pattern is not None and not _matches_like(str(value), self.like_pattern):
             return False
+        if not self._temporal_components_valid(value):
+            return False
+        return True
+
+    def component(self, name: str) -> "ValueSpace":
+        return self.temporal_components.setdefault(
+            name,
+            ValueSpace(family=TypeFamily.INTEGER),
+        )
+
+    def _bounded_value(self, value: Any) -> Any:
+        if self.family == TypeFamily.DATETIME:
+            if isinstance(value, datetime):
+                return value
+            return parse_datetime(value) or value
+        if self.family == TypeFamily.DATE:
+            if isinstance(value, date) and not isinstance(value, datetime):
+                return value
+            return parse_date(value) or value
+        if self.family == TypeFamily.TIME:
+            if isinstance(value, dt_time):
+                return value
+            return parse_time(value) or value
+        if self.family == TypeFamily.TEXT and self._has_temporal_bound():
+            if isinstance(self.min_val, datetime) or isinstance(self.max_val, datetime):
+                return parse_datetime(value) or value
+            if isinstance(self.min_val, date) or isinstance(self.max_val, date):
+                return parse_date(value) or value
+            if isinstance(self.min_val, dt_time) or isinstance(self.max_val, dt_time):
+                return parse_time(value) or value
+        return value
+
+    def _temporal_components_valid(self, value: Any) -> bool:
+        if not self.temporal_components:
+            return True
+        parsed = self._bounded_value(value)
+        if not isinstance(parsed, (date, datetime, dt_time)):
+            return True
+        for name, space in self.temporal_components.items():
+            component = _temporal_component(parsed, name)
+            if component is None or not space._candidate_valid(component):
+                return False
         return True
 
     def _first_valid(self, candidates) -> Any:
@@ -109,6 +173,10 @@ class ValueSpace:
         if self.family == TypeFamily.INTEGER:
             lo = int(lo)
             hi = int(hi)
+            if self.min_val is not None and not self.min_inclusive:
+                lo += 1
+            if self.max_val is not None and not self.max_inclusive:
+                hi -= 1
             candidates = []
             if self.min_val is not None:
                 candidates.append(lo)
@@ -130,11 +198,19 @@ class ValueSpace:
                 candidates.append(self.min_val)
             if self.max_val is not None and self.max_val != self.min_val:
                 candidates.append(self.max_val)
+            if _numeric_like(self.min_val) and _numeric_like(self.max_val):
+                candidates.append((float(self.min_val) + float(self.max_val)) / 2)
             if not candidates:
                 candidates = [lo, hi]
             for candidate in candidates:
                 if self._candidate_valid(candidate):
                     return candidate
+            base = float(candidates[0])
+            lo_f, hi_f = float(lo), float(hi)
+            for offset in range(1, int(hi_f - lo_f) + 1):
+                for try_val in (base + offset, base - offset):
+                    if lo_f <= try_val <= hi_f and self._candidate_valid(try_val):
+                        return try_val
         return None
 
     def _pick_text(self, hint: Any = None) -> Optional[str]:
@@ -220,10 +296,21 @@ class ValueSpace:
                     except (ValueError, OverflowError):
                         continue
         candidates = []
+        component_candidate = self._pick_temporal_from_components()
+        if component_candidate is not None:
+            candidates.append(component_candidate)
         if self.min_val is not None:
             candidates.append(self.min_val)
+            if not self.min_inclusive:
+                shifted = _next_temporal(self.min_val)
+                if shifted is not None:
+                    candidates.append(shifted)
         if self.max_val is not None and self.max_val != self.min_val:
             candidates.append(self.max_val)
+            if not self.max_inclusive:
+                shifted = _previous_temporal(self.max_val)
+                if shifted is not None:
+                    candidates.append(shifted)
         for candidate in candidates:
             if isinstance(candidate, datetime):
                 if self._candidate_valid(candidate):
@@ -248,18 +335,49 @@ class ValueSpace:
                     return candidate
         return None
 
+    def _pick_temporal_from_components(self) -> Any:
+        if not self.temporal_components:
+            return None
+        year = self._component_pick("year", 2024)
+        month = self._component_pick("month", 1)
+        day = self._component_pick("day", 1)
+        hour = self._component_pick("hour", 0)
+        minute = self._component_pick("minute", 0)
+        second = self._component_pick("second", 0)
+        try:
+            if self.family == TypeFamily.TIME:
+                return dt_time(hour, minute, second)
+            if self.family == TypeFamily.DATE:
+                return date(year, month, day)
+            return datetime(year, month, day, hour, minute, second)
+        except ValueError:
+            return None
+
+    def _component_pick(self, name: str, default: int) -> int:
+        space = self.temporal_components.get(name)
+        if space is None:
+            return default
+        value = space.pick()
+        return default if value is None else int(value)
+
     def _has_temporal_bound(self) -> bool:
         return isinstance(self.min_val, (date, datetime, dt_time)) or isinstance(
             self.max_val, (date, datetime, dt_time)
         )
 
-    def narrow_min(self, val: Any) -> None:
+    def narrow_min(self, val: Any, inclusive: bool = True) -> None:
         if self.min_val is None or val > self.min_val:
             self.min_val = val
+            self.min_inclusive = inclusive
+        elif val == self.min_val and not inclusive:
+            self.min_inclusive = False
 
-    def narrow_max(self, val: Any) -> None:
+    def narrow_max(self, val: Any, inclusive: bool = True) -> None:
         if self.max_val is None or val < self.max_val:
             self.max_val = val
+            self.max_inclusive = inclusive
+        elif val == self.max_val and not inclusive:
+            self.max_inclusive = False
 
     def narrow_eq(self, val: Any) -> None:
         self.equals = val
@@ -280,6 +398,37 @@ __all__ = ["ValueSpace"]
 def _matches_like(value: str, pattern: str) -> bool:
     regex = "^" + re.escape(pattern).replace("%", ".*").replace("_", ".") + "$"
     return re.match(regex, value) is not None
+
+
+def _numeric_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return re.fullmatch(r"-?\d+(?:\.\d+)?", value) is not None
+    return False
+
+
+def _comparable_pair(left: Any, right: Any) -> Optional[tuple[Any, Any]]:
+    if _numeric_like(left) and _numeric_like(right):
+        if isinstance(left, float) or isinstance(right, float):
+            return float(left), float(right)
+        return int(left), int(right)
+    if isinstance(left, datetime) and isinstance(right, datetime):
+        return left, right
+    if (
+        isinstance(left, date)
+        and not isinstance(left, datetime)
+        and isinstance(right, date)
+        and not isinstance(right, datetime)
+    ):
+        return left, right
+    if isinstance(left, dt_time) and isinstance(right, dt_time):
+        return left, right
+    if isinstance(left, str) and isinstance(right, str):
+        return left, right
+    return None
 
 
 def _text_hint(hint: Any, length: int) -> str:
@@ -307,6 +456,44 @@ def _like_candidates(pattern: str):
         percent_fill = "x" * i if has_percent else ""
         underscore_fill = chr(ord("a") + (i % 26))
         yield pattern.replace("%", percent_fill).replace("_", underscore_fill)
+
+
+def _next_temporal(value: Any) -> Optional[Any]:
+    if isinstance(value, datetime):
+        return value + timedelta(microseconds=1)
+    if isinstance(value, date):
+        return value + timedelta(days=1)
+    if isinstance(value, dt_time):
+        base = datetime.combine(date(2000, 1, 1), value)
+        return (base + timedelta(microseconds=1)).time()
+    return None
+
+
+def _previous_temporal(value: Any) -> Optional[Any]:
+    if isinstance(value, datetime):
+        return value - timedelta(microseconds=1)
+    if isinstance(value, date):
+        return value - timedelta(days=1)
+    if isinstance(value, dt_time):
+        base = datetime.combine(date(2000, 1, 1), value)
+        return (base - timedelta(microseconds=1)).time()
+    return None
+
+
+def _temporal_component(value: Any, name: str) -> Optional[int]:
+    if name == "year" and isinstance(value, (date, datetime)):
+        return value.year
+    if name == "month" and isinstance(value, (date, datetime)):
+        return value.month
+    if name == "day" and isinstance(value, (date, datetime)):
+        return value.day
+    if name == "hour" and isinstance(value, (datetime, dt_time)):
+        return value.hour
+    if name == "minute" and isinstance(value, (datetime, dt_time)):
+        return value.minute
+    if name == "second" and isinstance(value, (datetime, dt_time)):
+        return value.second
+    return None
 
 
 def _temporal_to_text(value: Any) -> Optional[str]:

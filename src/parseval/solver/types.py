@@ -1,138 +1,130 @@
 """Shared types for the solver module."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
-from sqlglot import exp
+from typing import Any, Dict, List, Literal, Mapping, Optional, Protocol, Set, Tuple
 
-from parseval.dtype import (
-    DataType,
-    TypeFamily,
-    date_to_epoch_day,
-    datetime_to_epoch_second,
-    epoch_day_to_date,
-    epoch_second_to_datetime,
-    infer_type_from_string,
-    infer_type_from_value,
-    parse_date,
-    parse_datetime,
-    parse_time,
-    seconds_to_time,
-    time_to_seconds,
-    type_family,
-)
-from parseval.identity import ColumnId, RelationId
+from sqlglot import exp
+from sqlglot.generator import Generator
+
+from parseval.dtype import DataType, TypeFamily, type_family
 from parseval.domain.value_space import ValueSpace
 
+Status = Literal["sat", "unsat", "unknown"]
 
-PARSEVAL_SOLVER_VAR = "parseval_solver_var"
 
+class SolverVar(exp.Expression):
+    """Opaque solver variable as a sqlglot AST leaf.
 
-@dataclass(frozen=True, eq=False)
-class SolverVar:
-    """A logical solver variable for one column binding."""
+    Construct with ``SolverVar(key=..., dtype=..., meta=...)``. Identity is the
+    ``key`` string stored in ``this`` (hash/eq), so ``copy()`` nodes with the
+    same key compare equal. sqlglot's node-kind ``Expression.key`` remains
+    ``"solvervar"``; use :attr:`var_key` (or the constructor kwarg ``key``) for
+    identity.
+    """
 
-    column_id: ColumnId
-    relation_id: RelationId
-    row_scope: str | None = None
-    _binding_key: tuple = field(init=False, repr=False)
+    arg_types = {
+        "this": True,  # identity key string
+        "type": False,  # DataType
+        "meta": False,
+    }
 
-    def __post_init__(self) -> None:
-        relation = self.relation_id
-        source = self.column_id.source_column_id
-        source_key = None
-        if source is not None:
-            source_relation = source.relation
-            source_key = (
-                source.kind.value,
-                source_relation.kind.value if source_relation is not None else None,
-                source_relation.name.normalized
-                if source_relation is not None and source_relation.name is not None
-                else None,
-                source_relation.alias.normalized
-                if source_relation is not None and source_relation.alias is not None
-                else None,
-                source_relation.scope_id if source_relation is not None else None,
-                source.name.normalized,
-                source.scope_id,
-                source.ordinal,
-            )
-        object.__setattr__(
-            self,
-            "_binding_key",
-            (
-                relation.kind.value,
-                relation.name.normalized if relation.name is not None else None,
-                relation.alias.normalized if relation.alias is not None else None,
-                relation.scope_id,
-                self.column_id.kind.value,
-                self.column_id.name.normalized,
-                self.column_id.scope_id,
-                self.column_id.ordinal,
-                source_key,
-                self.row_scope,
-            ),
-        )
+    def __init__(
+        self,
+        *args: Any,
+        key: str | None = None,
+        dtype: DataType | None = None,
+        meta: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if key is not None:
+            kwargs.setdefault("this", key)
+        if dtype is not None:
+            kwargs.setdefault("type", dtype)
+        if meta is not None:
+            kwargs["meta"] = dict(meta)
+        else:
+            kwargs.setdefault("meta", {})
+        if kwargs.get("type") is None:
+            kwargs["type"] = DataType.build("TEXT")
+        super().__init__(*args, **kwargs)
 
     @property
-    def binding_key(self) -> tuple:
-        return self._binding_key
+    def var_key(self) -> str:
+        """Opaque solver identity (constructor ``key=`` / ``this``)."""
+        this = self.this
+        return this if isinstance(this, str) else str(this)
 
-    def __hash__(self) -> int:
-        return hash(self.binding_key)
+    @property
+    def dtype(self) -> DataType:
+        value = self.args.get("type")
+        if isinstance(value, DataType):
+            return value
+        if value is None:
+            return DataType.build("TEXT")
+        return DataType.build(str(value))
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, SolverVar):
-            return NotImplemented
-        return self.binding_key == other.binding_key
+    @property
+    def meta(self) -> Mapping[str, Any]:
+        value = self.args.get("meta")
+        return value if isinstance(value, Mapping) else {}
 
     @property
     def display(self) -> str:
-        scope = f"#{self.row_scope}" if self.row_scope else ""
-        return f"{self.relation_id.binding_display}.{self.column_id.name.display}{scope}"
+        return self.var_key
+
+    def __hash__(self) -> int:
+        return hash(self.var_key)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SolverVar):
+            return self.var_key == other.var_key
+        return NotImplemented
+
+    def sql(self, dialect: Any = None, **opts: Any) -> str:
+        return f"SolverVar({self.var_key})"
 
 
-def set_solver_var(column: exp.Column, variable: SolverVar) -> exp.Column:
-    column.meta[PARSEVAL_SOLVER_VAR] = variable
-    return column
+def _generate_solver_var(self: Generator, expression: SolverVar) -> str:
+    return f"SolverVar({expression.var_key})"
 
 
-def solver_var(column: exp.Column) -> SolverVar | None:
-    value = column.meta.get(PARSEVAL_SOLVER_VAR)
-    return value if isinstance(value, SolverVar) else None
+# Ensure pretty-print / copy paths that go through the generator work.
+Generator.TRANSFORMS[SolverVar] = _generate_solver_var
 
 
 @dataclass
-class CSPVariable:
-    """A column variable in the CSP solver."""
-    variable: SolverVar
-    space: ValueSpace
-    assigned: Optional[Any] = None
+class Problem:
+    """Constraint problem for CSP/SMT backends."""
+
+    constraints: List[exp.Expression] = field(default_factory=list)
+    equalities: List[Tuple[SolverVar, SolverVar]] = field(default_factory=list)
+    variables: Set[SolverVar] = field(default_factory=set)
+
+
+@dataclass
+class Result:
+    """Outcome of a backend or orchestrator solve."""
+
+    status: Status
+    assignments: Dict[SolverVar, Any] = field(default_factory=dict)
+    reason: str = ""
 
     @property
-    def name(self) -> SolverVar:
-        return self.variable
+    def sat(self) -> bool:
+        return self.status == "sat"
 
 
-@dataclass
-class CSPConstraint:
-    """A relationship between two CSP variables."""
-    kind: str
-    left: SolverVar
-    right: SolverVar
+class Backend(Protocol):
+    def solve(self, problem: Problem) -> Result: ...
 
 
-@dataclass
-class ColumnPredicate:
-    """A lowered constraint on a single column."""
-    variable: SolverVar
-    op: str
-    value: Any
-
-
-def col_type(col: exp.Column) -> Optional[DataType]:
-    """Read the annotated type from a Column node, or None."""
-    dtype = getattr(col, "type", None)
+def node_dtype(node: exp.Expression) -> Optional[DataType]:
+    """Read dtype from a SolverVar leaf, else Expression.type if present."""
+    if isinstance(node, SolverVar):
+        return node.dtype
+    dtype = getattr(node, "type", None)
     if dtype is None:
         return None
     if isinstance(dtype, DataType):
@@ -143,27 +135,26 @@ def col_type(col: exp.Column) -> Optional[DataType]:
         return None
 
 
+def collect_problem_variables(problem: Problem) -> Tuple[SolverVar, ...]:
+    """Return every SolverVar referenced by a Problem in deterministic order."""
+    variables: Set[SolverVar] = set(problem.variables)
+    for expr in problem.constraints:
+        variables.update(expr.find_all(SolverVar))
+    for left, right in problem.equalities:
+        variables.add(left)
+        variables.add(right)
+    return tuple(sorted(variables, key=lambda variable: variable.var_key))
+
+
 __all__ = [
-    "PARSEVAL_SOLVER_VAR",
+    "Backend",
+    "Problem",
+    "Result",
     "SolverVar",
+    "Status",
     "TypeFamily",
     "ValueSpace",
-    "CSPVariable",
-    "CSPConstraint",
-    "ColumnPredicate",
-    "col_type",
+    "collect_problem_variables",
+    "node_dtype",
     "type_family",
-    "parse_date",
-    "parse_time",
-    "parse_datetime",
-    "date_to_epoch_day",
-    "time_to_seconds",
-    "datetime_to_epoch_second",
-    "epoch_day_to_date",
-    "seconds_to_time",
-    "epoch_second_to_datetime",
-    "infer_type_from_value",
-    "infer_type_from_string",
-    "set_solver_var",
-    "solver_var",
 ]

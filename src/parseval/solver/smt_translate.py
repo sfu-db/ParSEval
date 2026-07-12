@@ -22,7 +22,7 @@ from .smt_types import (
 )
 
 if TYPE_CHECKING:
-    from .smt_solver import SMTSolver
+    from .smt_solver import Z3SmtSession
 
 
 def _coerce_numeric_sort(expr: z3.ExprRef, target_sort: z3.SortRef) -> z3.ExprRef:
@@ -46,11 +46,17 @@ def _to_z3val(dtype: DataType, value, z3ctx: Optional[z3.Context] = None) -> z3.
     return encode_literal(dtype, value, z3ctx).expr
 
 
-def declare_column(variable: exp.Column, z3ctx: Optional[z3.Context] = None) -> SMTValue:
-    dtype = getattr(variable, "type", None) or DataType.build("UNKNOWN")
+def declare_column(variable: exp.Expression, z3ctx: Optional[z3.Context] = None) -> SMTValue:
+    from .types import SolverVar
+
+    if isinstance(variable, SolverVar):
+        dtype = variable.dtype
+        var_name = variable.var_key
+    else:
+        dtype = getattr(variable, "type", None) or DataType.build("UNKNOWN")
+        var_name = f"{variable.table}.{variable.name}"
     typeinfo = normalize_dtype(dtype, z3ctx)
     option_sort = OptionTypeRegistry.get(typeinfo.payload_sort, z3ctx)
-    var_name = f"{variable.table}.{variable.name}"
     return SMTValue(z3.Const(var_name, option_sort), typeinfo)
 
 
@@ -192,7 +198,7 @@ def _return_text(_expression: exp.Expression, _arg_types: Sequence[SMTTypeInfo])
 
 
 def _translate_abs(
-    solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
+    solver: Z3SmtSession, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``ABS(x)`` as ``If(x >= 0, x, -x)``."""
     arg = solver._as_value(args[0])
@@ -204,7 +210,7 @@ def _translate_abs(
 
 
 def _translate_length(
-    solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
+    solver: Z3SmtSession, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``LENGTH(s)`` as the Z3 ``Length`` string function."""
     arg = solver._as_value(args[0])
@@ -212,7 +218,7 @@ def _translate_length(
 
 
 def _translate_substr(
-    solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
+    solver: Z3SmtSession, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``SUBSTR(s, start[, length])`` into Z3 ``SubString``."""
     source = solver._coerce_value_to_type(
@@ -257,7 +263,7 @@ def _translate_substr(
 
 
 def _translate_instr(
-    solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
+    solver: Z3SmtSession, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``INSTR(haystack, needle)`` as ``IndexOf + 1`` (1-based)."""
     haystack = solver._as_value(args[0])
@@ -276,13 +282,18 @@ def _translate_instr(
     )
 
 
-def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
+def _ymd_hms_from_temporal(solver: Z3SmtSession, value: SMTValue):
     """Decompose a Z3 temporal payload into (year, month, day, hour, minute, second).
 
     Uses Hinnant's algorithm for exact (year, month, day) decomposition
     from epoch days. Time-of-day components use integer division on
     epoch seconds.
     """
+    if value.typeinfo.family not in {"date", "time", "datetime", "timestamp"}:
+        raise UnsupportedSMTError(
+            f"Cannot decompose non-temporal value {value.typeinfo.logical_name} "
+            f"(family={value.typeinfo.family})"
+        )
     raw = _value_payload(value)
     if value.typeinfo.family == "date":
         ts = raw * 86400
@@ -314,7 +325,7 @@ def _ymd_hms_from_temporal(solver: SMTSolver, value: SMTValue):
 
 
 def _format_temporal_payload(
-    solver: SMTSolver, temporal: SMTValue, fmt_value: str
+    solver: Z3SmtSession, temporal: SMTValue, fmt_value: str
 ) -> z3.ExprRef:
     """Build a Z3 string for a concrete temporal format string."""
     year, month, day, hour, minute, second = _ymd_hms_from_temporal(solver, temporal)
@@ -376,7 +387,7 @@ def _default_temporal_format(family: str) -> str:
 
 
 def format_temporal_value(
-    solver: SMTSolver, temporal: SMTValue, fmt_value: Optional[str] = None
+    solver: Z3SmtSession, temporal: SMTValue, fmt_value: Optional[str] = None
 ) -> SMTValue:
     """Format a temporal SMT value as SQL-facing TEXT."""
     if temporal.typeinfo.family not in {"date", "time", "datetime", "timestamp"}:
@@ -394,15 +405,33 @@ def format_temporal_value(
 
 
 def _translate_strftime(
-    solver: SMTSolver, _expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
+    solver: Z3SmtSession, expression: exp.Expression, args: List[Union[SMTValue, z3.BoolRef]]
 ) -> SMTValue:
     """Translate ``STRFTIME(fmt, temporal)`` into Z3 string construction.
 
     Supports concrete format strings composed from ``%Y``, ``%m``, ``%d``,
     ``%H``, ``%M``, ``%S``, ``%%``, and literal characters.
     """
+    from .normalization import unwrap_planning_temporal_arg
+
     fmt = solver._as_value(args[0])
-    temporal = solver._as_value(args[1])
+    temporal_node: Optional[exp.Expression] = None
+    if isinstance(expression, exp.TimeToStr):
+        temporal_node = expression.this
+    elif isinstance(expression, exp.Anonymous) and len(list(expression.expressions)) >= 2:
+        temporal_node = list(expression.expressions)[1]
+    if temporal_node is not None:
+        unwrapped = unwrap_planning_temporal_arg(temporal_node)
+        if unwrapped is not temporal_node:
+            temporal = solver._as_value(solver._to_z3_expr(unwrapped))
+        else:
+            temporal = solver._as_value(args[1])
+    else:
+        temporal = solver._as_value(args[1])
+    if temporal.typeinfo.family not in {"date", "time", "datetime", "timestamp"}:
+        raise UnsupportedSMTError(
+            f"STRFTIME requires a temporal argument, got {temporal.typeinfo.logical_name}"
+        )
     fmt_expr = z3.simplify(_value_payload(fmt))
     if not z3.is_string_value(fmt_expr):
         raise UnsupportedSMTError("STRFTIME requires a concrete format string")
@@ -459,7 +488,7 @@ def _int_typeinfo(z3ctx) -> SMTTypeInfo:
 
 
 def _translate_temporal_extractor(
-    solver: SMTSolver, expression: exp.Expression, args, *,
+    solver: Z3SmtSession, expression: exp.Expression, args, *,
     component: str,
 ) -> SMTValue:
     """Shared translator for ``YEAR/MONTH/DAY/EXTRACT(unit FROM col)``.

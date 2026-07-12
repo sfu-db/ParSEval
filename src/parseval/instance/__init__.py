@@ -1,25 +1,29 @@
-from .core import Catalog, Instance
-from .constraints import DatabaseCheckConstraint, DatabaseConstraints
-from .exporter import InstanceExporter
-from .loader import InstanceLoader
-from .types import (
-    DatabaseTarget,
-    InstanceSnapshot,
-    RowCreationResult,
-    TableBatch,
-    WriteResult,
+from .core import Instance, RowCreationResult
+from .exporter import InstanceExporter, InstanceSnapshot, TableBatch
+from .io import InstanceLoader, WriteResult, to_db
+from .schema import (
+    DatabaseCheckConstraint,
+    ForeignKeyConstraint,
+    InstanceSchema,
+    TableSchema,
+    normalize_identifier,
+    normalize_table,
+    table_key,
 )
 
 __all__ = [
-    "Catalog",
-    "DatabaseCheckConstraint",
-    "DatabaseConstraints",
-    "DatabaseTarget",
+    "DatabaseCheckConstraint",    
+    "ForeignKeyConstraint",
     "Instance",
     "InstanceExporter",
     "InstanceLoader",
+    "InstanceSchema",
     "InstanceSnapshot",
     "RowCreationResult",
     "TableBatch",
+    "TableSchema",
     "WriteResult",
+    "normalize_identifier",
+    "normalize_table",
+    "table_key",
 ]

@@ -4,35 +4,42 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .builder import BuildPolicy, DatabaseBuilder
     from .exceptions import (
+        ConstraintConflict,
         ConstraintViolationError,
         DomainError,
         ForeignKeyResolutionError,
         TypeCoercionError,
         UniqueConflictError,
     )
-    from .spec import ColumnSpec, ForeignKeySpec, SchemaSpec, TableSpec
-    from .state import ColumnState, RowContext, SchemaRuntime, TableState
+    from .generator import DomainGenerator
+    from .plan import (
+        CheckDescriptor,
+        ColumnDomainPlan,
+        ForeignKeyDescriptor,
+        TableConstraintDescriptors,
+        compile_column,
+        compile_table,
+        space_for_column,
+    )
     from .value_space import ValueSpace
 
 
 _EXPORTS = {
-    "BuildPolicy": (".builder", "BuildPolicy"),
-    "DatabaseBuilder": (".builder", "DatabaseBuilder"),
+    "DomainGenerator": (".generator", "DomainGenerator"),
+    "ColumnDomainPlan": (".plan", "ColumnDomainPlan"),
+    "CheckDescriptor": (".plan", "CheckDescriptor"),
+    "ForeignKeyDescriptor": (".plan", "ForeignKeyDescriptor"),
+    "TableConstraintDescriptors": (".plan", "TableConstraintDescriptors"),
+    "compile_column": (".plan", "compile_column"),
+    "compile_table": (".plan", "compile_table"),
+    "space_for_column": (".plan", "space_for_column"),
     "DomainError": (".exceptions", "DomainError"),
     "TypeCoercionError": (".exceptions", "TypeCoercionError"),
     "ConstraintViolationError": (".exceptions", "ConstraintViolationError"),
     "UniqueConflictError": (".exceptions", "UniqueConflictError"),
     "ForeignKeyResolutionError": (".exceptions", "ForeignKeyResolutionError"),
-    "SchemaSpec": (".spec", "SchemaSpec"),
-    "TableSpec": (".spec", "TableSpec"),
-    "ColumnSpec": (".spec", "ColumnSpec"),
-    "ForeignKeySpec": (".spec", "ForeignKeySpec"),
-    "SchemaRuntime": (".state", "SchemaRuntime"),
-    "TableState": (".state", "TableState"),
-    "ColumnState": (".state", "ColumnState"),
-    "RowContext": (".state", "RowContext"),
+    "ConstraintConflict": (".exceptions", "ConstraintConflict"),
     "ValueSpace": (".value_space", "ValueSpace"),
 }
 

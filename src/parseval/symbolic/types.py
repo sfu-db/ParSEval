@@ -15,7 +15,7 @@ from sqlglot import exp
 
 from parseval.constants import PlausibleBit
 from parseval.identity import ColumnId, RelationId
-from parseval.plan.rex import column_meta
+from parseval.plan.meta import column_meta
 
 
 # =============================================================================
