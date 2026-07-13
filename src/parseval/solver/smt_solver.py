@@ -39,15 +39,14 @@ from parseval.dtype import (
     parse_datetime,
 )
 from .types import SolverVar
+from .coercion import coerce_comparison_pair, coerce_smt_value
 from .smt_translate import (
     _coerce_numeric_sort,
-    declare_column,
     _value_some,
     _value_null,
     _value_payload,
     _coerce_pair,
     _null_value,
-    format_temporal_value,
     like_to_z3,
 )
 
@@ -108,6 +107,7 @@ class Z3SmtSession:
             Union[Sequence[SpecialFunctionModel], Dict[str, SpecialFunctionModel]]
         ] = None,
         timeout_ms: Optional[int] = None,
+        dialect: str = "sqlite",
     ):
         """Initialize the SMT solver.
 
@@ -116,9 +116,11 @@ class Z3SmtSession:
             verbose: If True, log each added constraint via the ``parseval.smt`` logger.
             function_models: Optional custom function translators (list or dict).
             timeout_ms: Optional solver timeout in milliseconds.
+            dialect: SQL dialect used for mixed-sort comparison coercion.
         """
         self.verbose = verbose
         self.z3ctx = z3ctx
+        self.dialect = dialect
         self.solver = z3.Solver(ctx=self.z3ctx)
         if timeout_ms is not None and timeout_ms > 0:
             self.solver.set("timeout", int(timeout_ms))
@@ -362,41 +364,8 @@ class Z3SmtSession:
         )
 
     def _coerce_value_to_type(self, value: SMTValue, target_dtype: DataType) -> SMTValue:
-        """Coerce an SMTValue to a different SQL DataType within Z3.
-
-        Supports int<->real, int/text/date/time/datetime/timestamp<->text,
-        and text->int conversions.  Raises UnsupportedSMTError for
-        unsupported type pairs.
-        """
-        target_type = normalize_dtype(target_dtype, self.z3ctx)
-        if value.typeinfo.family == target_type.family:
-            return SMTValue(value.expr, target_type, value.is_null_literal)
-        if value.is_null_literal:
-            return _null_value(target_type, self.z3ctx)
-        raw = _value_payload(value)
-        if target_type.family == "real" and value.typeinfo.family == "int":
-            return self._wrap_payload(z3.ToReal(raw), target_type.dtype)
-        if target_type.family == "int" and value.typeinfo.family == "real":
-            return self._wrap_payload(z3.ToInt(raw), target_type.dtype)
-        if target_type.family == "text":
-            if value.typeinfo.family in {"date", "time", "datetime", "timestamp"}:
-                return format_temporal_value(self, value)
-            if value.typeinfo.family == "int":
-                return self._wrap_payload(z3.IntToStr(raw), target_type.dtype)
-            if value.typeinfo.family == "bool":
-                return self._wrap_payload(
-                    z3.If(
-                        raw,
-                        z3.StringVal("TRUE", ctx=self.z3ctx),
-                        z3.StringVal("FALSE", ctx=self.z3ctx),
-                    ),
-                    target_type.dtype,
-                )
-        if target_type.family == "int" and value.typeinfo.family == "text":
-            return self._wrap_payload(z3.StrToInt(raw), target_type.dtype)
-        raise UnsupportedSMTError(
-            f"Unsupported conversion from {value.typeinfo.logical_name} to {target_type.logical_name}"
-        )
+        """Coerce an SMTValue to a different SQL DataType within Z3."""
+        return coerce_smt_value(value, target_dtype, self)
 
     def _common_case_dtype(self, expression: exp.Expression, branches: Sequence[SMTValue]) -> DataType:
         """Infer the common result DataType from a list of branch SMTValues.
@@ -519,26 +488,10 @@ class Z3SmtSession:
         right_expr = expression.expression
         left = self._as_value(self._to_z3_expr(left_expr))
         right = self._as_value(self._to_z3_expr(right_expr))
-        # Auto-coerce temporal column vs string literal.
-        left, right = self._coerce_temporal_pair(left, right, left_expr, right_expr)
+        left, right = coerce_comparison_pair(
+            left, right, left_expr, right_expr, self.dialect, self
+        )
         return self._compare_values(left, right, op)
-
-    _TEMPORAL_FAMILIES = {"date", "time", "datetime", "timestamp"}
-
-    def _coerce_temporal_pair(
-        self, left: SMTValue, right: SMTValue,
-        left_expr: exp.Expression, right_expr: exp.Expression,
-    ) -> Tuple[SMTValue, SMTValue]:
-        """If one side is temporal and the other is a string literal, coerce."""
-        if left.typeinfo.family in self._TEMPORAL_FAMILIES and isinstance(right_expr, exp.Literal) and right_expr.is_string:
-            coerced = self._encode_temporal_literal(str(right_expr.this), left.typeinfo)
-            if coerced is not None:
-                return left, coerced
-        if right.typeinfo.family in self._TEMPORAL_FAMILIES and isinstance(left_expr, exp.Literal) and left_expr.is_string:
-            coerced = self._encode_temporal_literal(str(left_expr.this), right.typeinfo)
-            if coerced is not None:
-                return coerced, right
-        return left, right
 
     def _encode_temporal_literal(self, s: str, target: SMTTypeInfo) -> Optional[SMTValue]:
         """Encode a string as a temporal epoch value wrapped in Option."""
@@ -609,36 +562,7 @@ class Z3SmtSession:
         """Translate a ``CAST(expr AS type)`` expression."""
         value = self._as_value(self._to_z3_expr(expression.this))
         to_dtype = expression.args.get("to") or value.typeinfo.dtype
-        to_type = normalize_dtype(to_dtype, self.z3ctx)
-        if to_type.family == value.typeinfo.family:
-            return SMTValue(value.expr, to_type, value.is_null_literal)
-        if value.is_null_literal:
-            return _null_value(to_type, self.z3ctx)
-        raw = _value_payload(value)
-        if value.typeinfo.family in {"date", "time", "datetime", "timestamp"} and to_type.family in {
-            "date",
-            "time",
-            "datetime",
-            "timestamp",
-        }:
-            if value.typeinfo.family == "date" and to_type.family in {"datetime", "timestamp"}:
-                return self._wrap_nullable_payload(value, raw * 86400, to_type.dtype)
-            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "date":
-                return self._wrap_nullable_payload(value, raw / 86400, to_type.dtype)
-            if value.typeinfo.family == "time" and to_type.family in {"datetime", "timestamp"}:
-                return self._wrap_nullable_payload(value, raw, to_type.dtype)
-            if value.typeinfo.family in {"datetime", "timestamp"} and to_type.family == "time":
-                return self._wrap_nullable_payload(value, raw % 86400, to_type.dtype)
-        if to_type.family == "text":
-            if value.typeinfo.family in {"date", "time", "datetime", "timestamp"}:
-                return format_temporal_value(self, value)
-            converted = z3.IntToStr(raw) if value.typeinfo.family == "int" else raw
-            return self._wrap_nullable_payload(value, converted, to_type.dtype)
-        if to_type.family == "int" and value.typeinfo.family == "text":
-            return self._wrap_nullable_payload(value, z3.StrToInt(raw), to_type.dtype)
-        raise UnsupportedSMTError(
-            f"Unsupported CAST from {value.typeinfo.logical_name} to {to_type.logical_name}"
-        )
+        return coerce_smt_value(value, to_dtype, self)
 
     def _translate_ts_or_ds_to_timestamp(self, expression: exp.Expression) -> SMTValue:
         """Translate ``TsOrDsToTimestamp(expr)`` — sqlglot's auto-inserted cast.
@@ -715,8 +639,12 @@ class Z3SmtSession:
         value = self._as_value(self._to_z3_expr(expression.this))
         low = self._as_value(self._to_z3_expr(low_expr))
         high = self._as_value(self._to_z3_expr(high_expr))
-        value, low = self._coerce_temporal_pair(value, low, value_expr, low_expr)
-        value, high = self._coerce_temporal_pair(value, high, value_expr, high_expr)
+        value, low = coerce_comparison_pair(
+            value, low, value_expr, low_expr, self.dialect, self
+        )
+        value, high = coerce_comparison_pair(
+            value, high, value_expr, high_expr, self.dialect, self
+        )
         if value.is_null_literal or low.is_null_literal or high.is_null_literal:
             return z3.BoolVal(False, ctx=self.z3ctx)
         raw_value = _value_payload(value)

@@ -255,7 +255,6 @@ def _translate_substr(
                 z3.And(_value_some(source), _value_some(start), _value_some(length)),
                 source_len >= min_len + length_val,
             ),
-            track_vars=False,
         )
         body = z3.SubString(raw_source, start_payload, length_val)
         some = z3.And(_value_some(source), _value_some(start), _value_some(length))

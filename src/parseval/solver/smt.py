@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Dict
 
+import z3
+
 from .smt_solver import Z3SmtSession
 from .smt_types import UnsupportedSMTError
 from .types import Problem, Result, SolverVar, collect_problem_variables
@@ -12,14 +14,15 @@ from .types import Problem, Result, SolverVar, collect_problem_variables
 class SmtBackend:
     """Z3-backed solver implementing the Backend protocol."""
 
-    def __init__(self, *, timeout_ms: int = 5000) -> None:
+    def __init__(self, *, timeout_ms: int = 5000, dialect: str = "sqlite") -> None:
         self.timeout_ms = timeout_ms
+        self.dialect = dialect
 
     def solve(self, problem: Problem) -> Result:
         if not problem.constraints and not problem.equalities:
             return Result(status="sat", assignments={})
 
-        smt = Z3SmtSession(timeout_ms=self.timeout_ms)
+        smt = Z3SmtSession(timeout_ms=self.timeout_ms, dialect=self.dialect)
         variables = collect_problem_variables(problem)
         encoded_names = {
             variable: f"sv_{index}_{variable.var_key}".replace(".", "_").replace(
@@ -36,15 +39,18 @@ class SmtBackend:
         try:
             for expr in problem.constraints:
                 smt.add(smt.translate(expr))
+
+            for left_var, right_var in problem.equalities:
+                left_z3 = smt.context["variable_to_z3"][encoded_names[left_var]]
+                right_z3 = smt.context["variable_to_z3"][encoded_names[right_var]]
+                smt.add_raw(left_z3 == right_z3)
+
+            status, solutions = smt.solve()
         except UnsupportedSMTError:
             return Result(status="unknown", reason="unsupported_smt_expression")
+        except z3.Z3Exception:
+            return Result(status="unknown", reason="unsupported_smt_expression")
 
-        for left_var, right_var in problem.equalities:
-            left_z3 = smt.context["variable_to_z3"][encoded_names[left_var]]
-            right_z3 = smt.context["variable_to_z3"][encoded_names[right_var]]
-            smt.add_raw(left_z3 == right_z3)
-
-        status, solutions = smt.solve()
         if status == "unsat":
             return Result(status="unsat", reason="unsat")
         if status != "sat":

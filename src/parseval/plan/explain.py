@@ -922,12 +922,21 @@ class _NodeLowerState:
     ctx: SessionContext
     dialect: str
     plan: Any
+    sql: str = ""
     _scalar_sql: Optional[Deque[str]] = field(default=None, repr=False)
 
     def pop_scalar_sql(self) -> str:
         if self._scalar_sql is None:
-            unparsed = Unparser(UNPARSER_DIALECTS[self.dialect]).plan_to_sql(self.plan)
-            fragments = _extract_scalar_subquery_sql(unparsed, self.dialect, self.plan)
+            source_sql = self.sql
+            if not source_sql:
+                source_sql = Unparser(UNPARSER_DIALECTS[self.dialect]).plan_to_sql(
+                    self.plan
+                )
+            fragments = _extract_scalar_subquery_sql(
+                source_sql,
+                self.dialect,
+                self.plan,
+            )
             self._scalar_sql = deque(fragments)
         if not self._scalar_sql:
             raise PlanError("ScalarSubquery SQL fragment queue is empty")
@@ -1638,14 +1647,15 @@ def _from_logical(
     *,
     ctx: SessionContext,
     dialect: str,
+    sql: str = "",
 ) -> Step:
-    state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=plan)
+    state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=plan, sql=sql)
     variant = plan.to_variant()
     op = type(variant).__name__
     display = plan.display()
     fields = _parse_plan_schema(plan)
     children = [
-        _from_logical(child, ctx=ctx, dialect=dialect)
+        _from_logical(child, ctx=ctx, dialect=dialect, sql=sql)
         for child in (plan.inputs() or [])
     ]
     builder = _VARIANT_BUILDERS.get(op)
@@ -1721,7 +1731,7 @@ def explain(
     df = ctx.sql(df_sql)
     logical = df.optimized_logical_plan()
     return Plan(
-        _from_logical(logical, ctx=ctx, dialect=dialect),
+        _from_logical(logical, ctx=ctx, dialect=dialect, sql=df_sql),
         sql=df_sql,
         dialect=dialect,
         logical_display=str(logical),

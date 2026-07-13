@@ -19,11 +19,11 @@ The public surface of the plan module is:
 """
 
 from .context import (
-    AggregateGroup,
     Context,
     DerivedSchema,
-    WindowFrame,
+    IndicatorVar,
     build_context_from_instance,
+    is_concrete_row,
 )
 # from .planner import (
 #     Aggregate,
