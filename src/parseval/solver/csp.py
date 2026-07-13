@@ -8,19 +8,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlglot import exp
 
-from parseval.coercion import coerce_literal_value
 from parseval.dtype import (
-    StorageLiteral,
     TypeFamily,
-    infer_type_from_string,
     parse_date,
     parse_datetime,
     type_family,
 )
+from parseval.literals import integer_literal, literal_value
+from parseval.coercion import CoercionError, coerce_literal_value
 from parseval.plan.rex import (
     fixed_interval_delta,
-    integer_literal,
-    literal_value,
 )
 
 from .normalization import unwrap_planning_temporal_arg
@@ -629,15 +626,12 @@ class CspBackend:
                 op = {"=": "=", "!=": "!=", ">": "<", ">=": "<=", "<": ">", "<=": ">="}[op]
             if variable is None:
                 return False, "unknown"
-            if (
-                op == "="
-                and isinstance(lit, str)
-                and type_family(variable.dtype) is TypeFamily.DATETIME
-                and "." in lit
-            ):
-                lit = StorageLiteral(lit)
-            else:
-                lit = coerce_literal_value(lit, variable.dtype)
+            try:
+                lit = coerce_literal_value(
+                    lit, variable.dtype, for_equality=(op == "=")
+                )
+            except CoercionError:
+                return False, "unknown"
             if not self._narrow(spaces[variable], op, lit):
                 return False, "contradictory_bounds"
             return True, ""
@@ -701,7 +695,10 @@ class CspBackend:
                     continue
                 val = literal_value(item)
                 if val is not None:
-                    values.append(coerce_literal_value(val, variable.dtype))
+                    try:
+                        values.append(coerce_literal_value(val, variable.dtype))
+                    except CoercionError:
+                        return False, "unknown"
             if not values:
                 return False, "unknown"
             if negated:
@@ -738,8 +735,15 @@ class CspBackend:
             if not isinstance(atom.this, SolverVar):
                 return False, "unknown"
             variable = atom.this
-            low = coerce_literal_value(literal_value(atom.args["low"]), variable.dtype)
-            high = coerce_literal_value(literal_value(atom.args["high"]), variable.dtype)
+            try:
+                low = coerce_literal_value(
+                    literal_value(atom.args["low"]), variable.dtype
+                )
+                high = coerce_literal_value(
+                    literal_value(atom.args["high"]), variable.dtype
+                )
+            except CoercionError:
+                return False, "unknown"
             spaces[variable].narrow_min(low)
             spaces[variable].narrow_max(high)
             return (False, "contradictory_bounds") if spaces[variable].is_empty() else (True, "")
@@ -833,15 +837,6 @@ class CspBackend:
         return self._narrow(spaces[variable], op, source_value), "contradictory_bounds"
 
     def _narrow(self, space: ValueSpace, op: str, val: Any) -> bool:
-        # TEXT columns compared with numeric-looking strings use numeric bounds.
-        if (
-            isinstance(val, str)
-            and space.family == TypeFamily.TEXT
-            and op not in {"=", "!=", "like"}
-        ):
-            inferred = infer_type_from_string(val)
-            if not isinstance(inferred, str):
-                val = inferred
         if op == "=":
             space.narrow_eq(val)
         elif op == "!=":

@@ -7,11 +7,14 @@ Instance to a live database or render SQL fixtures import from here.
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from .exporter import InstanceExporter, InstanceValueSerializer
 from dataclasses import dataclass
 from sqlglot import exp
+from sqlalchemy.engine import make_url
 from parseval.db_manager import DBManager
 from .exporter import InstanceSnapshot, InstanceValueSerializer, TableBatch
 if TYPE_CHECKING:
@@ -36,6 +39,14 @@ class InstanceLoader:
         truncate_first: bool = True,
         
     ) -> WriteResult:
+        if dialect == "sqlite":
+            return self._load_sqlite_fast(
+                snapshot,
+                connection_string,
+                serializer=serializer,
+                truncate_first=truncate_first,
+            )
+
         inserted_tables: list[str] = []
         inserted_rows = 0
 
@@ -117,11 +128,83 @@ class InstanceLoader:
         conn.insert(statement, payload)
         return len(payload)
 
+    def _load_sqlite_fast(
+        self,
+        snapshot: InstanceSnapshot,
+        connection_string: str,
+        *,
+        serializer: InstanceValueSerializer,
+        truncate_first: bool,
+    ) -> WriteResult:
+        database = make_url(connection_string).database
+        if not database:
+            raise ValueError(f"sqlite_database_missing:{connection_string!r}")
+        if database != ":memory:":
+            path = Path(database)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if truncate_first and path.exists():
+                path.unlink()
+
+        inserted_tables: list[str] = []
+        inserted_rows = 0
+        with sqlite3.connect(database) as conn:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            if truncate_first and database == ":memory:":
+                for table in reversed(snapshot.tables):
+                    conn.execute(f'DROP TABLE IF EXISTS "{_escape_sqlite_identifier(table.table_name)}"')
+            if snapshot.schema_ddl.strip():
+                conn.executescript(snapshot.schema_ddl)
+            for table in snapshot.tables:
+                inserted = self._insert_sqlite_table(
+                    conn,
+                    table,
+                    serializer=serializer,
+                )
+                if inserted:
+                    inserted_tables.append(table.table_name)
+                    inserted_rows += inserted
+            conn.execute("PRAGMA foreign_keys = ON")
+        return WriteResult(
+            inserted_tables=tuple(inserted_tables),
+            inserted_rows=inserted_rows,
+        )
+
+    def _insert_sqlite_table(
+        self,
+        conn: sqlite3.Connection,
+        table: TableBatch,
+        *,
+        serializer: InstanceValueSerializer,
+    ) -> int:
+        if not table.rows:
+            return 0
+        columns = list(table.columns)
+        col_sql = ", ".join(
+            f'"{_escape_sqlite_identifier(column)}"' for column in columns
+        )
+        placeholders = ", ".join("?" for _column in columns)
+        statement = (
+            f'INSERT INTO "{_escape_sqlite_identifier(table.table_name)}" '
+            f"({col_sql}) VALUES ({placeholders})"
+        )
+        payload = [
+            tuple(serialized_row.get(column) for column in columns)
+            for serialized_row in (
+                serializer.serialize_row(table.table_name, row) for row in table.rows
+            )
+        ]
+        conn.executemany(statement, payload)
+        return len(payload)
+
     def _quoted_table(self, table_name: str) -> exp.Table:
         return exp.Table(this=exp.Identifier(this=table_name, quoted=True))
 
     def _quoted_identifier(self, name: str) -> exp.Identifier:
         return exp.Identifier(this=name, quoted=True)
+
+
+def _escape_sqlite_identifier(name: str) -> str:
+    return name.replace('"', '""')
 
 
 def to_db(

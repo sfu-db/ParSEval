@@ -131,7 +131,7 @@ def node_dtype(node: exp.Expression) -> Optional[DataType]:
         return dtype
     try:
         return DataType.build(str(dtype))
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 

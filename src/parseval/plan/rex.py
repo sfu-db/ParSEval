@@ -22,9 +22,10 @@ from sqlglot import exp, generator
 from sqlglot.executor.env import ENV as _SQLGLOT_ENV
 from sqlglot.optimizer.simplify import simplify
 
-from parseval.coercion import coerce_literal_value
+from parseval.coercion import coerce_literal_value, CoercionError
 from parseval.dtype import DataType, StorageLiteral, parse_date, parse_datetime, parse_time
 from parseval.helper import like_to_pattern
+from parseval.literals import integer_literal, literal_value, unit_name
 from parseval.solver.types import SolverVar
 from parseval.solver.normalization import unwrap_planning_temporal_arg
 
@@ -297,22 +298,30 @@ def _identifier_name(value: object) -> str:
 class Environment:
     """Column / SolverVar → value resolver with optional outer scope chaining.
 
-    Construct via :meth:`from_row` (Identifier-keyed cells) or
-    :meth:`from_assignments` (CSP ``SolverVar`` map). No ``ColumnId``.
+    Accepts rows keyed by ``exp.Identifier`` (name-only) **or** ``exp.Column``
+    (qualified ``table.column``).  When a row key is an ``exp.Column`` with a
+    table qualifier, ``resolve()`` matches by *(table, column)* first, then
+    falls back to name-only.  This lets join outputs carry ``t.x`` and ``u.x``
+    without collision.
     """
 
-    __slots__ = ("_row", "_assignments", "_outer")
+    __slots__ = ("_row", "_qualified", "_assignments", "_outer")
 
     def __init__(
         self,
         *,
-        row: Optional[Mapping[exp.Identifier, Any]] = None,
+        row: Optional[Mapping[exp.Identifier | exp.Column, Any]] = None,
         assignments: Optional[Mapping[SolverVar, Any]] = None,
         outer: Optional["Environment"] = None,
     ) -> None:
-        self._row: Dict[str, Any] = {
-            _identifier_name(key): value for key, value in (row or {}).items()
-        }
+        self._row: Dict[str, Any] = {}
+        self._qualified: Dict[Tuple[Optional[str], str], Any] = {}
+        for key, value in (row or {}).items():
+            if isinstance(key, exp.Column) and key.table:
+                table_name = _identifier_name(key.table)
+                col_name = _identifier_name(key.this if key.this is not None else key)
+                self._qualified[(table_name, col_name)] = value
+            self._row[_identifier_name(key)] = value
         self._assignments: Dict[str, Any] = {}
         for key, value in (assignments or {}).items():
             if isinstance(key, SolverVar):
@@ -324,7 +333,7 @@ class Environment:
     @classmethod
     def from_row(
         cls,
-        row: Mapping[exp.Identifier, Any],
+        row: Mapping[exp.Identifier | exp.Column, Any],
         outer: Optional["Environment"] = None,
     ) -> "Environment":
         return cls(row=row, outer=outer)
@@ -338,8 +347,17 @@ class Environment:
         return cls(assignments=assignments, outer=outer)
 
     def resolve(self, column: exp.Column) -> Any:
-        """Return the value bound to ``column``, or ``None`` if unresolved."""
+        """Return the value bound to ``column``, or ``None`` if unresolved.
+
+        If *column* has a table qualifier, looks up *(table, name)* first
+        for exact qualified matching; falls back to name-only.
+        """
         name = _identifier_name(column.this if column.this is not None else column)
+        if column.table:
+            table_name = _identifier_name(column.table)
+            qualified = (table_name, name)
+            if qualified in self._qualified:
+                return self._qualified[qualified]
         if name in self._row:
             return self._row[name]
         if self._outer is not None:
@@ -356,11 +374,15 @@ class Environment:
 
     def bind(self, column: exp.Identifier | str, value: Any) -> None:
         """Bind ``column`` to ``value`` in this environment."""
-        self._row[_identifier_name(column)] = value
+        name = _identifier_name(column)
+        self._row[name] = value
+        if isinstance(column, exp.Column) and column.table:
+            table_name = _identifier_name(column.table)
+            self._qualified[(table_name, name)] = value
 
     def extend(
         self,
-        row: Optional[Mapping[exp.Identifier, Any]] = None,
+        row: Optional[Mapping[exp.Identifier | exp.Column, Any]] = None,
         assignments: Optional[Mapping[SolverVar, Any]] = None,
     ) -> "Environment":
         """Return a child environment layering new bindings on this one."""
@@ -369,6 +391,10 @@ class Environment:
     def contains(self, column: exp.Column) -> bool:
         """Return True if ``column`` resolves in this or any outer env."""
         name = _identifier_name(column.this if column.this is not None else column)
+        if column.table:
+            table_name = _identifier_name(column.table)
+            if (table_name, name) in self._qualified:
+                return True
         if name in self._row:
             return True
         return self._outer.contains(column) if self._outer is not None else False
@@ -865,47 +891,6 @@ def _eval_neg(node: exp.Neg, env: Environment) -> Any:
 # ----- comparison -----
 
 
-def unit_name(node: Any) -> Optional[str]:
-    if node is None:
-        return None
-    value = getattr(node, "this", node)
-    return str(value).upper()
-
-
-def integer_literal(value: Any) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else None
-    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
-        return int(value)
-    return None
-
-
-def literal_value(node: exp.Expression) -> Any:
-    """Extract a Python value from a literal-ish AST leaf (no Environment)."""
-    if isinstance(node, exp.Literal):
-        if node.is_int:
-            return int(node.this)
-        if node.is_number:
-            return float(node.this)
-        return str(node.this)
-    if isinstance(node, exp.Boolean):
-        return bool(node.this)
-    if isinstance(node, exp.Null):
-        return None
-    if isinstance(node, exp.Neg):
-        inner = literal_value(node.this)
-        if isinstance(inner, (int, float)):
-            return -inner
-        return None
-    if isinstance(node, exp.Cast):
-        return literal_value(node.this)
-    return None
-
-
 def fixed_interval_delta(node: exp.Expression) -> Optional[timedelta]:
     """Parse a fixed DateAdd/DateSub interval into a ``timedelta``, or ``None``."""
     interval_expr = node.expression
@@ -1041,10 +1026,6 @@ def _eval_comparison(node: exp.Expression, env: Environment) -> Any:
         right = _eval(right_node, env)
 
     if left is None or right is None:
-        if op == "=":
-            return left is None and right is None
-        if op == "!=":
-            return left is not None or right is not None
         return None
 
     if isinstance(left_node, exp.Date):
@@ -1066,10 +1047,16 @@ def _eval_comparison(node: exp.Expression, env: Environment) -> Any:
 
     if isinstance(left_node, SolverVar) and not isinstance(right_node, SolverVar):
         if not isinstance(left, StorageLiteral) or op not in {"=", "!="}:
-            right = coerce_literal_value(right, left_node.dtype)
+            try:
+                right = coerce_literal_value(right, left_node.dtype)
+            except CoercionError:
+                return False
     elif isinstance(right_node, SolverVar) and not isinstance(left_node, SolverVar):
         if not isinstance(right, StorageLiteral) or op not in {"=", "!="}:
-            left = coerce_literal_value(left, right_node.dtype)
+            try:
+                left = coerce_literal_value(left, right_node.dtype)
+            except CoercionError:
+                return False
 
     if isinstance(left, StorageLiteral) or isinstance(right, StorageLiteral):
         if op == "=":
@@ -1077,9 +1064,15 @@ def _eval_comparison(node: exp.Expression, env: Environment) -> Any:
         if op == "!=":
             return str(left) != str(right)
         if isinstance(left, StorageLiteral) and isinstance(left_node, SolverVar):
-            left = coerce_literal_value(str(left), left_node.dtype)
+            try:
+                left = coerce_literal_value(str(left), left_node.dtype)
+            except CoercionError:
+                return False
         if isinstance(right, StorageLiteral) and isinstance(right_node, SolverVar):
-            right = coerce_literal_value(str(right), right_node.dtype)
+            try:
+                right = coerce_literal_value(str(right), right_node.dtype)
+            except CoercionError:
+                return False
 
     # Generic column/literal path: also try soft numeric coercion.
     if not isinstance(left_node, SolverVar) and not isinstance(right_node, SolverVar):
@@ -1238,7 +1231,10 @@ def _eval_in(node: exp.In, env: Environment) -> Optional[bool]:
                 continue
             candidate = _eval(candidate_node, env)
             if candidate is not None:
-                candidate = coerce_literal_value(candidate, dtype)
+                try:
+                    candidate = coerce_literal_value(candidate, dtype)
+                except CoercionError:
+                    continue
             values.append(candidate)
         return value in values
     if value is None:
@@ -1621,8 +1617,5 @@ __all__ = [
     "tvl_and",
     "tvl_or",
     "tvl_not",
-    "literal_value",
-    "integer_literal",
-    "unit_name",
     "fixed_interval_delta",
 ]

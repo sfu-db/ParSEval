@@ -1,41 +1,33 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Tuple, Optional, List, TYPE_CHECKING
 from itertools import product
-
 from sqlglot import exp
 
-from parseval.identity import PARSEVAL_COLUMN_ID, ColumnId, column_identity
+from parseval.solver.types import SolverVar
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
     from parseval.dtype import DATATYPE
     from .rex import Symbol
 
+@dataclass
+class IndicatorVar:
+    """One boolean indicator for an atomic predicate.
 
-@dataclass(frozen=True)
-class AggregateGroup:
-    """Execution metadata for one SQL aggregate output row."""
+    For symbolic rows: ``var`` is a SolverVar; ``concrete_value`` is None.
+    For concrete rows: ``var`` is None; ``concrete_value`` is True/False.
 
-    output_row_id: Tuple[Any, ...]
-    group_key: Tuple[Any, ...]
-    source_row_ids: Tuple[Tuple[Any, ...], ...]
-    aggregate_values: Mapping[Any, Any]
-    group_expressions: Mapping[ColumnId, exp.Expression] = field(default_factory=dict)
-    group_sources: Mapping[ColumnId, Tuple[ColumnId, ...]] = field(default_factory=dict)
-    group_key_values: Mapping[ColumnId, Any] = field(default_factory=dict)
+    ``row_id`` ties the indicator to a specific row (by its ``rowid`` tuple)
+    so the materialization step can skip concrete rows that fail filters.
+    """
 
-
-@dataclass(frozen=True)
-class WindowFrame:
-    """Execution metadata for one window-derived value on one output row."""
-
-    column_id: ColumnId
-    source_row_id: Tuple[Any, ...]
-    partition_key: Tuple[Any, ...]
-    order_key: Tuple[Any, ...]
-    frame_row_ids: Tuple[Tuple[Any, ...], ...]
-    value: Any
+    step_id: str
+    atom_id: int
+    atom_expr: exp.Expression
+    var: Optional[SolverVar] = None
+    concrete_value: Optional[bool] = None
+    row_id: Optional[Tuple[str, ...]] = None
 
 
 class Row(exp.Expression):
@@ -56,22 +48,20 @@ class Row(exp.Expression):
     arg_types = {"this": True, "columns": True}
 
     @property
-    def column_values(self) -> Mapping[Any, "Symbol"]:
+    def column_values(self) -> Mapping[exp.Identifier, "Symbol"]:
         return self.args.get("columns", {})
 
     @property
-    def columns(self) -> Tuple[Any, ...]:
+    def columns(self) -> Tuple[exp.Identifier, ...]:
         return tuple(self.column_values.keys())
 
     @property
-    def rowid(self) -> Tuple[Any, ...]:
+    def rowid(self) -> Tuple[str, ...]:
         if isinstance(self.this, tuple):
             return self.this
         return (self.this,)
 
     def _key_name(self, key):
-        if isinstance(key, ColumnId):
-            return key.name.normalized
         if isinstance(key, exp.Expression):
             return key.alias_or_name or key.sql()
         return str(key)
@@ -96,18 +86,13 @@ class Row(exp.Expression):
         columns = self.column_values
         if key in columns:
             return columns[key]
-        if isinstance(key, exp.Column):
-            resolved = key.meta.get(PARSEVAL_COLUMN_ID)
-            if isinstance(resolved, ColumnId):
-                if resolved in columns:
-                    return columns[resolved]
         normalized = self._key_name(key)
         for column_name, value in columns.items():
             if self._key_name(column_name) == normalized:
                 return value
         raise KeyError(key)
 
-    def get(self, table, column):
+    def get(self, table: exp.Table | str, column):
         del table
         return self[column]
 
@@ -124,17 +109,34 @@ class Row(exp.Expression):
         return f"{self.key}({self.this})"
 
 
+def is_concrete_row(row: Row) -> bool:
+    """Return True if all column values in *row* are Python scalars."""
+    return not any(isinstance(v, SolverVar) for v in row.column_values.values())
+
+
 class DerivedSchema:
     def __init__(
         self,
-        columns,
+        columns: Tuple[exp.Identifier | str, ...],
         rows=None,
         column_range=None,
         datatypes: Optional[Dict[Any, DATATYPE]] = None,
         nullables: Optional[Dict[Any, bool]] = None,
         uniqueness: Optional[Dict[Any, bool]] = None,
-        aggregate_groups: Optional[Dict[Tuple[Any, ...], AggregateGroup]] = None,
-        window_frames: Optional[Dict[Tuple[Any, ...], Tuple[WindowFrame, ...]]] = None,
+        indicators: Optional[List[IndicatorVar]] = None,
+        constraints: Optional[List[exp.Expression]] = None,
+        equalities: Optional[List[Any]] = None,
+        obligations: Optional[List[Any]] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+        expression_bindings: Optional[Dict[str, exp.Expression]] = None,
+        row_provenance: Optional[Dict[Tuple[str, ...], Dict[str, Any]]] = None,
+        create_rows: Optional[Mapping[Any, Any]] = None,
+        problem: Optional[Any] = None,
+        assignments: Optional[Mapping[Any, Any]] = None,
+        bounds: Optional[Any] = None,
+        status: str = "sat",
+        reason: str = "",
+        coverage_ratio: float = 0.0,
     ):
         self.columns = tuple(columns)
         self.column_range = column_range
@@ -144,8 +146,20 @@ class DerivedSchema:
         self.datatypes = datatypes or {}
         self.nullables = nullables or {}
         self.uniqueness: Dict[Any, bool] = uniqueness or {}
-        self.aggregate_groups = aggregate_groups or {}
-        self.window_frames = window_frames or {}
+        self.indicators: List[IndicatorVar] = indicators or []
+        self.constraints: List[exp.Expression] = constraints or []
+        self.equalities: List[Any] = equalities or []
+        self.obligations: List[Any] = obligations or []
+        self.evidence: Dict[str, Any] = evidence or {}
+        self.expression_bindings: Dict[str, exp.Expression] = expression_bindings or {}
+        self.row_provenance: Dict[Tuple[str, ...], Dict[str, Any]] = row_provenance or {}
+        self.create_rows: Mapping[Any, Any] = create_rows or {}
+        self.problem = problem
+        self.assignments: Mapping[Any, Any] = assignments or {}
+        self.bounds = bounds
+        self.status = status
+        self.reason = reason
+        self.coverage_ratio = coverage_ratio
 
         if rows:
             assert len(rows[0]) == len(
@@ -162,7 +176,7 @@ class DerivedSchema:
     def get_column_type(self, column):
         return self.datatypes.get(column, None)
 
-    def add_columns(self, *columns: Any) -> None:
+    def add_columns(self, *columns: exp.Identifier | str) -> None:
         self.columns += columns
         if self.column_range:
             self.column_range = range(
@@ -178,9 +192,7 @@ class DerivedSchema:
         self.mask.append(True)
 
     def pop(self):
-        row = self.rows.pop()
-        self.aggregate_groups.pop(row.rowid, None)
-        self.window_frames.pop(row.rowid, None)
+        self.rows.pop()
 
     def with_rows(
         self,
@@ -197,16 +209,20 @@ class DerivedSchema:
             datatypes=self.datatypes,
             nullables=self.nullables,
             uniqueness=self.uniqueness,
-            aggregate_groups={
-                row_id: group
-                for row_id, group in self.aggregate_groups.items()
-                if row_id in row_ids
-            },
-            window_frames={
-                row_id: frames
-                for row_id, frames in self.window_frames.items()
-                if row_id in row_ids
-            },
+            indicators=list(self.indicators),
+            constraints=list(self.constraints),
+            equalities=list(self.equalities),
+            obligations=list(self.obligations),
+            evidence=dict(self.evidence),
+            expression_bindings=dict(self.expression_bindings),
+            row_provenance=dict(self.row_provenance),
+            create_rows=dict(self.create_rows),
+            problem=self.problem,
+            assignments=dict(self.assignments),
+            bounds=self.bounds,
+            status=self.status,
+            reason=self.reason,
+            coverage_ratio=self.coverage_ratio,
         )
 
     @property
@@ -284,35 +300,32 @@ class RowReader:
         if self.row is not None:
             return self.row.rowid
 
-    def _column_id(self, column):
-        if isinstance(column, ColumnId):
-            return column
-        if isinstance(column, exp.Column):
-            return column_identity(column)
-        return column if column in self.columns else None
+    def _key_name(self, key):
+        if isinstance(key, exp.Expression):
+            return key.alias_or_name or key.sql()
+        return str(key)
 
-    def _slot_for_column_id(self, col_id: ColumnId | None):
-        if col_id is None:
+    def _column_key(self, column):
+        if isinstance(column, exp.Column):
+            return column.this
+        return column
+
+    def _slot_for_column_key(self, col_key):
+        if col_key is None:
             return None
-        current = col_id
-        while current is not None:
-            if current in self.columns:
-                return self.columns[current]
-            current = current.source_column_id
-        requested_lineage = set(_column_lineage(col_id))
-        for row_column, slot in self.columns.items():
-            if (
-                isinstance(row_column, ColumnId)
-                and requested_lineage.intersection(_column_lineage(row_column))
-            ):
+        if col_key in self.columns:
+            return self.columns[col_key]
+        key_name = self._key_name(col_key)
+        for k, slot in self.columns.items():
+            if self._key_name(k) == key_name:
                 return slot
         return None
 
-    def resolve(self, column: exp.Column | ColumnId):
+    def resolve(self, column):
         if self.row is None:
             raise KeyError(column)
-        col_id = self._column_id(column)
-        slot = self._slot_for_column_id(col_id)
+        col_key = self._column_key(column)
+        slot = self._slot_for_column_key(col_key)
         if slot is None:
             raise KeyError(column)
         try:
@@ -337,15 +350,6 @@ class RowReader:
         return self.resolve(column)
 
 
-def _column_lineage(column_id: ColumnId) -> Tuple[ColumnId, ...]:
-    columns = []
-    current: ColumnId | None = column_id
-    while current is not None:
-        columns.append(current)
-        current = current.source_column_id
-    return tuple(columns)
-
-
 class ProductReader:
     def __init__(self, table_names, rows):
         self._names = table_names
@@ -355,6 +359,8 @@ class ProductReader:
         return sum((row.rowid for row in self._rows), ())
 
     def get(self, table, column):
+        if isinstance(table, str):
+            table = exp.to_table(table)
         idx = self._names.index(table)
         return self._rows[idx][column]
 
@@ -369,7 +375,7 @@ class Context:
     """
 
     def __init__(
-        self, tables: Dict[Any, DerivedSchema], external: Optional[Context] = None
+        self, tables: Dict[exp.Table | str, DerivedSchema], external: Optional[Context] = None
     ) -> None:
         """
         Args
@@ -386,14 +392,14 @@ class Context:
 
         self.external = external
         self.masks = set()
-
+        
     @property
     def table(self):
         if self._table is None:
             self._table = list(self.tables.values())[0]
         return self._table
 
-    def add_columns(self, *columns: str) -> None:
+    def add_columns(self, *columns: exp.Identifier | str) -> None:
         for table in self.tables.values():
             table.add_columns(*columns)
 
@@ -401,37 +407,38 @@ class Context:
     def columns(self) -> Tuple:
         return self.table.columns
 
-    def resolve_table(self, name: str) -> DerivedSchema:
-        """
-        Resolve table through lexical scope chain.
-        """
-        if name in self.tables:
-            return self.tables[name]
+    def resolve_table(self, table: exp.Table | str) -> DerivedSchema:
+        if isinstance(table, str):
+            table = exp.to_table(table)
+        if table in self.tables:
+            return self.tables[table]
         if self.external:
-            return self.external.resolve_table(name)
-        raise KeyError(f"Table '{name}' not found in scope chain.")
+            return self.external.resolve_table(table)
+        raise KeyError(f"Table '{table.sql()}' not found in scope chain.")
 
-    def resolve_reader(self, name: str):
-        """
-        Resolve row reader for correlated access.
-        """
-        if name in self.row_readers:
-            return self.row_readers[name]
+    def resolve_reader(self, table: exp.Table | str):
+        if isinstance(table, str):
+            table = exp.to_table(table)
+        if table in self.row_readers:
+            return self.row_readers[table]
         if self.external:
-            return self.external.resolve_reader(name)
-        raise KeyError(f"Reader '{name}' not found.")
+            return self.external.resolve_reader(table)
+        raise KeyError(f"Reader '{table.sql()}' not found.")
 
-    def __contains__(self, table: str) -> bool:
+    def __contains__(self, table: exp.Table | str) -> bool:
+        if isinstance(table, str):
+            table = exp.to_table(table)
         return table in self.tables
 
     def __iter__(self):
-        # self.env["scope"] = self.row_readers
         for i in range(len(self.table.rows)):
             for table in self.tables.values():
                 reader = table[i]
             yield reader, self
 
-    def table_iter(self, table: Any) -> TableIter:
+    def table_iter(self, table: exp.Table | str) -> TableIter:
+        if isinstance(table, str):
+            table = exp.to_table(table)
         return iter(self.tables[table])
 
     def set_mask(self, rowid) -> None:
@@ -450,22 +457,22 @@ class Context:
 def build_context_from_instance(instance: Instance) -> Context:
     tables = {}
     for table_name, columns in instance.tables.items():
-        rows = instance.get_rows(table_name)
-        relation = instance.table_id(table_name)
+        table_node = instance.resolve_table(table_name)
+        rows = instance.get_rows(table_node)
         derived_columns = []
         datatypes = {}
         uniques = {}
         nullables = {}
         for col_name in columns:
-            col_id = instance._stored_column_id(relation, col_name)
-            dtype = instance.get_column_type(table_name, col_name)
-            is_unique = instance.is_unique(relation, col_id)
-            nullable = instance.nullable(relation, col_id)
-            datatypes[col_id] = dtype
-            uniques[col_id] = is_unique
-            nullables[col_id] = nullable
-            derived_columns.append(col_id)
-        tables[table_name] = DerivedSchema(
+            col_ident = instance.resolve_column(table_node, col_name)
+            dtype = instance.get_column_type(table_node, col_ident)
+            is_unique = instance.is_unique(table_node, col_ident)
+            nullable = instance.nullable(table_node, col_ident)
+            datatypes[col_ident] = dtype
+            uniques[col_ident] = is_unique
+            nullables[col_ident] = nullable
+            derived_columns.append(col_ident)
+        tables[table_node] = DerivedSchema(
             columns=derived_columns,
             rows=rows,
             datatypes=datatypes,

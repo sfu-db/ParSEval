@@ -1,14 +1,13 @@
-"""Constraint normalization before domain/SMT solving.
+"""Constraint normalization before CSP/SMT solving.
 
 The public solver accepts SQL AST predicates. Some common SQL temporal
 projections are monotone and can be converted to direct column bounds before
-choosing between the domain solver and SMT. This module owns those rewrites so
-``unified.py`` can stay focused on solver orchestration.
+choosing between the CSP and SMT backends. This module owns those rewrites so
+``api.Solver`` can stay focused on orchestration.
 """
 from __future__ import annotations
 
 import calendar
-from dataclasses import replace
 from datetime import date as _date, datetime as _datetime, timedelta
 from typing import Any, List, Optional, Tuple
 
@@ -40,34 +39,24 @@ def normalize_problem(problem: Problem) -> Problem:
     )
 
 
-def normalize_constraint(constraint):
-    """Return a normalized copy of ``constraint``.
-
-    The input object and its expression list are left untouched. Metadata on
-    copied sqlglot nodes is preserved by sqlglot's ``copy()`` behavior.
-
-    Legacy Constraint objects expose ``join_equalities`` / ``storage_relations``.
-    Prefer :func:`normalize_problem` for the current :class:`Problem` API.
-    """
-    return replace(
-        constraint,
-        constraints=[
-            normalize_expression(expression)
-            for expression in constraint.constraints
-        ],
-        join_equalities=list(constraint.join_equalities),
-        variables=dict(constraint.variables),
-        storage_relations=dict(constraint.storage_relations),
-    )
-
-
 def normalize_expression(expression: exp.Expression) -> exp.Expression:
     """Normalize one predicate expression."""
-    expression = expression.copy()
+    expression = unwrap_transparent_aliases(expression)
     witness = lower_expression_witness(expression)
     if witness is not None:
         return witness
     return lower_temporal_projection_bounds(expression)
+
+
+def unwrap_transparent_aliases(expression: exp.Expression) -> exp.Expression:
+    """Return ``expression`` with solver-transparent Alias wrappers removed."""
+
+    def transform(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Alias):
+            return node.this.copy()
+        return node
+
+    return expression.copy().transform(transform)
 
 
 def lower_temporal_projection_bounds(expression: exp.Expression) -> exp.Expression:
@@ -376,8 +365,8 @@ def _format_mmss_time(total_seconds: int) -> str:
 __all__ = [
     "lower_expression_witness",
     "lower_temporal_projection_bounds",
-    "normalize_constraint",
     "normalize_expression",
     "normalize_problem",
+    "unwrap_transparent_aliases",
     "unwrap_planning_temporal_arg",
 ]

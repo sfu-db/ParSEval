@@ -34,12 +34,12 @@ class BmcBounds:
         return "bounded_unknown" if self.exhausted else ""
 
     def raise_table_rows(self, required: int) -> tuple["BmcBounds", str]:
-        raised = max(self.table_rows, required)
-        if raised > self.max_table_rows:
+        if required > self.max_table_rows:
             return (
                 self,
-                f"structural_exceeds_cap:required={raised},max={self.max_table_rows}",
+                f"structural_exceeds_cap:required={required},max={self.max_table_rows}",
             )
+        raised = max(self.table_rows, required)
         if raised == self.table_rows:
             return self, ""
         return replace(self, table_rows=raised), ""

@@ -6,7 +6,10 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 from sqlglot import exp
 
 from parseval.dtype import DataType
+from parseval.instance.schema import normalize_identifier
 from parseval.solver.types import SolverVar
+
+CellBinding = SolverVar | exp.Expression
 
 
 class ScopeResolutionError(ValueError):
@@ -16,11 +19,19 @@ class ScopeResolutionError(ValueError):
 def _identifier(value: object) -> exp.Identifier:
     if isinstance(value, exp.Identifier):
         return value
-    if isinstance(value, exp.Table):
-        return value.this
-    if isinstance(value, exp.Column):
+    if isinstance(value, (exp.Table, exp.Column)):
         return value.this
     return exp.to_identifier(str(value))
+
+
+def _same_identifier(left: object, right: object, dialect: str) -> bool:
+    return normalize_identifier(
+        _identifier(left).name,
+        dialect,
+    ) == normalize_identifier(
+        _identifier(right).name,
+        dialect,
+    )
 
 
 @dataclass(frozen=True)
@@ -28,9 +39,10 @@ class RowBinding:
     table: exp.Table
     alias: Optional[exp.Identifier]
     row_index: int
-    columns: Mapping[exp.Identifier, SolverVar]
+    columns: Mapping[exp.Identifier, CellBinding]
     scope_id: str
     source_step_type: str
+    provenance: str = "generated"
 
     @classmethod
     def for_table(
@@ -71,8 +83,17 @@ class RowBinding:
             source_step_type=step_type,
         )
 
-    def resolve(self, column: exp.Identifier | exp.Column | str) -> Optional[SolverVar]:
-        return self.columns.get(_identifier(column))
+    def resolve(
+        self,
+        column: exp.Identifier | exp.Column | str,
+        *,
+        dialect: str = "sqlite",
+    ) -> Optional[CellBinding]:
+        requested = _identifier(column)
+        for candidate, variable in self.columns.items():
+            if _same_identifier(candidate, requested, dialect):
+                return variable
+        return None
 
 
 @dataclass
@@ -85,7 +106,8 @@ class RelationBinding:
         found: Dict[str, SolverVar] = {}
         for row in self.rows:
             for var in row.columns.values():
-                found[var.var_key] = var
+                if isinstance(var, SolverVar):
+                    found[var.var_key] = var
         for expression in self.expressions.values():
             for var in expression.find_all(SolverVar):
                 found[var.var_key] = var
@@ -115,10 +137,16 @@ class Scope:
     query_id: int
     scope_id: str
     parent: Optional["Scope"] = None
+    dialect: str = "sqlite"
     _rows: List[RowBinding] = field(default_factory=list)
 
     def child(self, suffix: str) -> "Scope":
-        return Scope(query_id=self.query_id, scope_id=f"{self.scope_id}.{suffix}", parent=self)
+        return Scope(
+            query_id=self.query_id,
+            scope_id=f"{self.scope_id}.{suffix}",
+            parent=self,
+            dialect=self.dialect,
+        )
 
     def add_row(self, row: RowBinding) -> None:
         self._rows.append(row)
@@ -127,7 +155,7 @@ class Scope:
         for row in rows:
             self.add_row(row)
 
-    def resolve_column(self, column: exp.Column) -> SolverVar:
+    def resolve_column(self, column: exp.Column) -> CellBinding:
         table = column.args.get("table")
         name = column.this
         matches = self._local_matches(table, name)
@@ -135,22 +163,25 @@ class Scope:
             return self.parent.resolve_column(column)
         if not matches:
             raise ScopeResolutionError(f"unknown column {column.sql()}")
-        distinct = {match.var_key: match for match in matches}
+        distinct = {
+            match.var_key if isinstance(match, SolverVar) else match.sql(): match
+            for match in matches
+        }
         if len(distinct) > 1:
             raise ScopeResolutionError(f"ambiguous column {column.sql()}")
         return next(iter(distinct.values()))
 
     def _local_matches(
         self, table: Optional[exp.Identifier], column: exp.Identifier
-    ) -> List[SolverVar]:
-        matches: List[SolverVar] = []
+    ) -> List[CellBinding]:
+        matches: List[CellBinding] = []
         for row in self._rows:
-            if table is not None and table not in (
-                row.alias,
-                row.table.this,
+            if table is not None and not any(
+                candidate is not None and _same_identifier(table, candidate, self.dialect)
+                for candidate in (row.alias, row.table.this)
             ):
                 continue
-            resolved = row.resolve(column)
+            resolved = row.resolve(column, dialect=self.dialect)
             if resolved is not None:
                 matches.append(resolved)
         return matches
