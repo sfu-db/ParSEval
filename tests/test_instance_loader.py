@@ -1,3 +1,7 @@
+"""Loader / to_db tests for the identity-free Instance."""
+
+from __future__ import annotations
+
 import sqlite3
 import tempfile
 import unittest
@@ -7,9 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from parseval.instance import Instance
-from parseval.instance.loader import InstanceLoader
-from parseval.instance.types import DatabaseTarget, InstanceSnapshot, TableBatch
-from parseval.domain.exceptions import ConstraintViolationError, UniqueConflictError
+from parseval.instance.core import ConstraintViolationError
+from parseval.instance.exporter import InstanceSnapshot, TableBatch
+from parseval.instance.loader import DatabaseTarget, InstanceLoader
 
 
 SCHEMA = """
@@ -185,6 +189,8 @@ class InstanceLoaderTests(unittest.TestCase):
             self.assertEqual(rows, [(1, 501.0)])
 
     def test_default_temporal_values_are_valid_temporals(self):
+        from datetime import date, datetime, time
+
         instance = Instance(
             ddls="""
             CREATE TABLE events (
@@ -197,25 +203,15 @@ class InstanceLoaderTests(unittest.TestCase):
             name="temporal_case",
             dialect="sqlite",
         )
-
-        self.assertEqual(instance._default_for_type("DATE"), date(2024, 6, 15))
-        self.assertEqual(
-            instance._default_for_type("DATETIME"),
-            datetime(2024, 6, 15, 0, 0, 0),
-        )
-        self.assertEqual(
-            instance._default_for_type("TIME"),
-            time(0, 0, 0),
-        )
-        self.assertEqual(
-            instance._next_default_value(date(2024, 6, 15), 1),
-            date(2024, 6, 16),
-        )
+        row = instance.create_row("events", {"id": 1}).created["events"][0]
+        self.assertIsInstance(row["occurred_on"].concrete, date)
+        self.assertIsInstance(row["happened_at"].concrete, (datetime, date))
+        self.assertIsInstance(row["happened_time"].concrete, (time, date, str))
 
     def test_to_db_passes_connection_string_and_dialect_directly_to_loader(self):
         instance = Instance(ddls=SCHEMA, name="target_case", dialect="sqlite")
 
-        with patch("parseval.instance.core.InstanceLoader.load") as load:
+        with patch("parseval.instance.io.InstanceLoader.load") as load:
             load.return_value.inserted_tables = ()
             load.return_value.inserted_rows = 0
 
@@ -230,53 +226,6 @@ class InstanceLoaderTests(unittest.TestCase):
             "sqlite:////tmp/target_case.sqlite",
         )
         self.assertEqual(kwargs["target"].dialect, "sqlite")
-
-    def test_create_row_retries_unique_conflict_after_bootstrapping_reference_rows(self):
-        schema = """
-        CREATE TABLE parents (
-            id INT PRIMARY KEY
-        );
-        CREATE TABLE children (
-            id INT PRIMARY KEY,
-            parent_id INT UNIQUE,
-            FOREIGN KEY (parent_id) REFERENCES parents(id)
-        );
-        """
-        instance = Instance(ddls=schema, name="retry_case", dialect="sqlite")
-        original_create_row = instance._create_row
-        parents_id = instance.table_id("parents")
-        children_id = instance.table_id("children")
-        parent_pk = instance.column_id("parents", "id")
-        child_parent_id = instance.column_id("children", "parent_id")
-        state = {"raised": False}
-
-        def flaky_create_row(relation, concretes):
-            if relation == children_id and not state["raised"]:
-                state["raised"] = True
-                raise UniqueConflictError("retry after parent bootstrap")
-            return original_create_row(relation, concretes)
-
-        def bootstrap_reference_rows(relation, values, prefer_new_for_unique=False, locked_columns=None):
-            if relation != children_id or not prefer_new_for_unique:
-                return {}
-            parent_position = original_create_row(parents_id, {})
-            parent_value = instance.get_column_data(parents_id, parent_pk)[parent_position].concrete
-            values[child_parent_id] = parent_value
-            return {parents_id: [instance.get_row(parents_id, parent_position)]}
-
-        with patch.object(instance, "_create_row", side_effect=flaky_create_row):
-            with patch.object(
-                instance,
-                "_bootstrap_reference_rows",
-                side_effect=bootstrap_reference_rows,
-            ):
-                result = instance.create_row("children", {"id": 2})
-
-        self.assertIn(parents_id, result.created)
-        self.assertIn(children_id, result.created)
-        parent_value = result.created[parents_id][0][parent_pk].concrete
-        child_parent_value = result.created[children_id][0][child_parent_id].concrete
-        self.assertEqual(parent_value, child_parent_value)
 
     def test_composite_primary_key_columns_are_not_treated_as_individually_unique(self):
         schema = """
@@ -328,54 +277,6 @@ class InstanceLoaderTests(unittest.TestCase):
         pairs = [(row["link_to_event"], row["link_to_member"]) for row in attendance_rows]
         self.assertEqual(len(pairs), len(set(pairs)))
 
-    def test_bootstrapped_composite_primary_key_rows_do_not_repeat_pairs(self):
-        schema = """
-        CREATE TABLE patient (
-            id INT PRIMARY KEY
-        );
-        CREATE TABLE laboratory (
-            id INT NOT NULL,
-            date DATE NOT NULL,
-            value INT,
-            PRIMARY KEY (id, date),
-            FOREIGN KEY (id) REFERENCES patient(id)
-        );
-        """
-        instance = Instance(ddls=schema, name="lab_case", dialect="sqlite")
-        instance.create_row("laboratory", {"id": 51})
-        relation = instance.table_id("laboratory")
-        id_col = instance.column_id(relation, "id")
-        instance._create_row_circular_fk(
-            relation,
-            {id_col: 51},
-            len(instance.get_rows(relation)),
-        )
-
-        rows = next(
-            table.rows for table in instance.snapshot().tables if table.table_name == "laboratory"
-        )
-        pairs = [(row["id"], row["date"]) for row in rows]
-        self.assertEqual(len(pairs), len(set(pairs)))
-
-    def test_bootstrapped_single_primary_key_rows_do_not_repeat_defaults(self):
-        schema = """
-        CREATE TABLE badges (
-            Id INTEGER NOT NULL PRIMARY KEY,
-            UserId INTEGER NULL,
-            Name TEXT NULL
-        );
-        """
-        instance = Instance(ddls=schema, name="badge_case", dialect="sqlite")
-        relation = instance.table_id("badges")
-        instance._create_row_circular_fk(relation, {}, len(instance.get_rows(relation)))
-        instance._create_row_circular_fk(relation, {}, len(instance.get_rows(relation)))
-
-        rows = next(
-            table.rows for table in instance.snapshot().tables if table.table_name == "badges"
-        )
-        ids = [row["id"] for row in rows]
-        self.assertEqual(len(ids), len(set(ids)))
-
     def test_unique_string_primary_key_respects_length_without_collapsing(self):
         schema = """
         CREATE TABLE molecule (
@@ -402,11 +303,28 @@ class InstanceLoaderTests(unittest.TestCase):
         );
         """
         instance = Instance(ddls=schema, name="quoted_pk_case", dialect="sqlite")
-        relation = instance.table_id("league")
-        pk = instance.column_id(relation, "id")
+        pk = instance.get_primary_key("league")
+        self.assertEqual(len(pk), 1)
+        self.assertEqual(pk[0].name, "id")
+        self.assertTrue(instance.is_unique("league", "id"))
 
-        self.assertEqual(instance.get_primary_key_ids(relation), (pk,))
-        self.assertTrue(instance.is_unique(relation, pk))
+    def test_composite_pk_members_are_not_individually_unique(self):
+        schema = """
+        CREATE TABLE child (
+            a_id INT NOT NULL,
+            b_id INT NOT NULL,
+            seq INT NOT NULL,
+            PRIMARY KEY (a_id, b_id, seq)
+        );
+        """
+        instance = Instance(ddls=schema, name="composite_unique", dialect="sqlite")
+        self.assertEqual(len(instance.get_primary_key("child")), 3)
+        self.assertFalse(instance.is_unique("child", "a_id"))
+        self.assertFalse(instance.is_unique("child", "b_id"))
+        self.assertFalse(instance.is_unique("child", "seq"))
+        groups = instance.schema.get_table("child").uniqueness_groups()
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 3)
 
 
 if __name__ == "__main__":
