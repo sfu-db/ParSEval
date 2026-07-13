@@ -5,7 +5,7 @@ import z3
 from sqlglot import exp
 from sqlglot.expressions import DataType
 
-from parseval.solver.smt_solver import SMTSolver
+from parseval.solver.smt_solver import Z3SmtSession
 from parseval.solver.smt_translate import _to_z3val
 from parseval.solver.smt_types import (
     SMTValue,
@@ -47,9 +47,9 @@ def null() -> exp.Null:
     return node
 
 
-class SMTSolverTestCase(unittest.TestCase):
-    def make_solver(self, function_models=None) -> SMTSolver:
-        return SMTSolver(function_models=function_models)
+class Z3SmtSessionTestCase(unittest.TestCase):
+    def make_solver(self, function_models=None) -> Z3SmtSession:
+        return Z3SmtSession(function_models=function_models)
 
     def solve_expr(self, expression, function_models=None):
         solver = self.make_solver(function_models=function_models)
@@ -57,7 +57,7 @@ class SMTSolverTestCase(unittest.TestCase):
         return solver.solve()
 
 
-class TestSMTSolverSupportedConstraints(SMTSolverTestCase):
+class TestZ3SmtSessionSupportedConstraints(Z3SmtSessionTestCase):
     def test_integer_comparison_generates_model(self):
         sat, model = self.solve_expr(
             exp.GT(this=column("users", "age", "INT"), expression=number(18))
@@ -109,7 +109,7 @@ class TestSMTSolverSupportedConstraints(SMTSolverTestCase):
         self.assertLessEqual(model["users.age"], 5)
 
 
-class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
+class TestZ3SmtSessionExpandedCoverage(Z3SmtSessionTestCase):
     def test_case_can_drive_integer_model_generation(self):
         predicate = exp.EQ(
             this=exp.Case(
@@ -279,7 +279,7 @@ class TestSMTSolverExpandedCoverage(SMTSolverTestCase):
         self.assertGreater(model["events.opened_on"].year, 1991)
 
 
-class TestSMTSolverDatatypeBehavior(SMTSolverTestCase):
+class TestZ3SmtSessionDatatypeBehavior(Z3SmtSessionTestCase):
     def test_temporal_guardrails_are_enforced_in_final_model(self):
         sat, model = self.solve_expr(
             exp.GTE(
@@ -361,7 +361,7 @@ class TestSMTSolverDatatypeBehavior(SMTSolverTestCase):
         self.assertNotEqual(left.sort().ctx, right.sort().ctx)
 
 
-class TestSMTSolverExtensions(SMTSolverTestCase):
+class TestZ3SmtSessionExtensions(Z3SmtSessionTestCase):
     def test_global_custom_function_registration_works(self):
         def translate_doubleit(solver, _expression, args):
             arg = solver._as_value(args[0])
@@ -415,7 +415,7 @@ class TestSMTSolverExtensions(SMTSolverTestCase):
             solver._to_z3_expr(expr)
 
 
-class TestSMTSolverCurrentLimitations(SMTSolverTestCase):
+class TestZ3SmtSessionCurrentLimitations(Z3SmtSessionTestCase):
     def test_unconstrained_declared_variable_is_ignored_in_model_output(self):
         solver = self.make_solver()
         age = column("users", "age", "INT")
@@ -434,7 +434,7 @@ class TestSMTSolverCurrentLimitations(SMTSolverTestCase):
 
 def test_in_list_single_pass_evaluation():
     """IN-list heuristic should evaluate each element once, not twice."""
-    from parseval.solver.unified import Solver
+    from parseval.solver import Solver
 
     solver = Solver(dialect="sqlite")
     # The IN-list optimization is internal — just verify solver doesn't break
@@ -443,7 +443,7 @@ def test_in_list_single_pass_evaluation():
 
 def test_declare_variable_creates_option_wrapped_z3_var():
     """declare_variable returns an Option-wrapped Z3 variable stored in context."""
-    solver = SMTSolver(timeout_ms=1000)
+    solver = Z3SmtSession(timeout_ms=1000)
     var = solver.declare_variable("t1[0].id", DataType.build("INT"))
 
     # Should be Option-wrapped (DatatypeSortRef)
@@ -457,7 +457,7 @@ def test_declare_variable_creates_option_wrapped_z3_var():
 
 def test_translate_with_custom_context():
     """translate() uses caller-provided variable context for Column resolution."""
-    solver = SMTSolver(timeout_ms=1000)
+    solver = Z3SmtSession(timeout_ms=1000)
 
     # Declare variables with custom names
     var_a = solver.declare_variable("alias1[0].x", DataType.build("INT"))
@@ -476,47 +476,6 @@ def test_translate_with_custom_context():
     assert result is not None
     # Result should be a Z3 BoolRef
     assert z3.is_bool(result)
-
-
-def test_add_raw_and_solve_raw():
-    """add_raw adds constraints directly; solve_raw extracts solutions."""
-    solver = SMTSolver(timeout_ms=5000)
-
-    var_a = solver.declare_variable("t[0].x", DataType.build("INT"))
-    var_b = solver.declare_variable("t[0].y", DataType.build("INT"))
-
-    # Add constraint: t[0].x = 42 (Option-wrapped)
-    const_42 = encode_literal(DataType.build("INT"), 42).expr
-    solver.add_raw(var_a == const_42)
-
-    # Add constraint: t[0].y = t[0].x (Option equality)
-    solver.add_raw(var_b == var_a)
-
-    var_symbols = {"t[0].x": None, "t[0].y": None}
-    status, solution = solver.solve_raw(var_symbols)
-
-    assert status == "sat"
-    assert solution.get("t[0].x") == 42
-    assert solution.get("t[0].y") == 42
-
-
-def test_apply_solution():
-    """apply_solution writes values into Variable symbols."""
-    class FakeSymbol:
-        def __init__(self):
-            self.values = {}
-        def set(self, key, val):
-            self.values[key] = val
-
-    sym_x = FakeSymbol()
-    sym_y = FakeSymbol()
-    var_symbols = {"t[0].x": sym_x, "t[0].y": sym_y}
-    solution = {"t[0].x": 42, "t[0].y": 99}
-
-    SMTSolver.apply_solution(var_symbols, solution)
-
-    assert sym_x.values == {"concrete": 42, "is_bound": True, "is_null": False}
-    assert sym_y.values == {"concrete": 99, "is_bound": True, "is_null": False}
 
 
 if __name__ == "__main__":

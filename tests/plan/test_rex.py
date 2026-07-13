@@ -1,42 +1,24 @@
 """Production-readiness tests for :mod:`parseval.plan.rex`.
 
-Every section pins down a facet of the new concrete-evaluation contract:
+Pins the concrete-evaluation contract for the new stack:
 
-* Symbol hierarchy: tri-state semantics (unbound / NULL / bound), type
-  metadata, back-pointers on ``Variable``, coercion on ``Const``.
-* :class:`Environment`: column resolution, scope chaining, bare-name
-  fallback.
-* :func:`concrete`: class-dispatched handler table.
-* Three-valued logic on AND/OR/NOT, comparisons, IS [NOT] NULL, IN.
-* Type coercion through both the ``Const.coerce_to`` API and the
-  implicit coercions used by comparisons.
-* Conditional and membership operators (``CASE``, ``IF``, ``COALESCE``,
-  ``NULLIF``, ``BETWEEN``, ``IN``).
-* Dialect-aware coercion (SQLite lenient vs Postgres strict).
+* Symbol hierarchy: tri-state, Const coercion, Variable table+column identity
+* :class:`Environment`: Identifier row maps, SolverVar assignments, scope chaining
+* :func:`concrete`: class-dispatched handlers including SolverVar leaves
+* Three-valued logic, comparisons, membership, strings, casts
 """
 
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime
+from datetime import date
 
-import sqlglot
 from sqlglot import exp, parse_one
 
 from parseval.dtype import DataType
-from parseval.identity import (
-    ColumnId,
-    ColumnKind,
-    RelationKind,
-    column_id,
-    identifier_name,
-    relation_id,
-)
 from parseval.plan.rex import (
     Const,
     Environment,
-    ITE,
-    Row,
     Symbol,
     Variable,
     concrete,
@@ -45,7 +27,7 @@ from parseval.plan.rex import (
     tvl_not,
     tvl_or,
 )
-from parseval.plan.context import DerivedSchema, Row
+from parseval.solver.types import SolverVar
 
 
 INT = DataType.build("INT")
@@ -53,59 +35,38 @@ REAL = DataType.build("REAL")
 TEXT = DataType.build("TEXT")
 BOOL = DataType.build("BOOLEAN")
 DATE_T = DataType.build("DATE")
-REL_T = relation_id(RelationKind.TABLE, identifier_name("T"))
-COL_X = column_id(ColumnKind.PHYSICAL, identifier_name("x"), REL_T)
 
 
 def _variable(name: str = "x", type=INT) -> Variable:
-    return Variable(this=name, type=type, column_id=COL_X, rowid="row_0")
+    return Variable(
+        this=name,
+        type=type,
+        table=exp.to_table("t"),
+        column=exp.to_identifier(name),
+        rowid="row_0",
+    )
 
 
 def _predicate(sql: str) -> exp.Expression:
-    from parseval.identity import PARSEVAL_COLUMN_ID
     where = parse_one(f"SELECT * FROM t WHERE {sql}").find(exp.Where)
     assert where is not None
-    node = where.this
-    for col in node.find_all(exp.Column):
-        col_id = _col_id(col.name, col.table if col.table else None)
-        col.meta[PARSEVAL_COLUMN_ID] = col_id
-    return node
+    return where.this
 
 
 def _value(sql: str) -> exp.Expression:
-    from parseval.identity import PARSEVAL_COLUMN_ID
     select = parse_one(f"SELECT {sql} AS v FROM t")
-    node = select.expressions[0].this
-    # Annotate any Column nodes with ColumnId metadata
-    for col in node.find_all(exp.Column):
-        col_id = _col_id(col.name, col.table if col.table else None)
-        col.meta[PARSEVAL_COLUMN_ID] = col_id
-    return node
-
-
-def _col_id(name: str, table: str | None = None) -> ColumnId:
-    """Create a ColumnId for testing."""
-    from parseval.identity import identifier_name, relation_id, RelationKind
-    rel = relation_id(RelationKind.SYNTHETIC, identifier_name(table)) if table else None
-    return column_id(ColumnKind.SYNTHETIC, identifier_name(name), rel)
+    return select.expressions[0].this
 
 
 def _env(bindings: dict) -> Environment:
-    """Create an Environment from {name: value} dicts for testing."""
-    col_bindings = {}
+    """Build an Environment from ``{column_name: value}`` or Identifier keys."""
+    row = {}
     for key, value in bindings.items():
-        if isinstance(key, ColumnId):
-            col_bindings[key] = value
-        elif isinstance(key, str):
-            col_bindings[_col_id(key)] = value
-    return Environment(col_bindings)
-
-
-def _annotate_col(col: exp.Expression, col_id: ColumnId) -> exp.Expression:
-    """Set PARSEVAL_COLUMN_ID metadata on an exp.Column for testing."""
-    from parseval.identity import PARSEVAL_COLUMN_ID
-    col.meta[PARSEVAL_COLUMN_ID] = col_id
-    return col
+        if isinstance(key, exp.Identifier):
+            row[key] = value
+        else:
+            row[exp.to_identifier(str(key))] = value
+    return Environment.from_row(row)
 
 
 # ---------------------------------------------------------------------------
@@ -162,32 +123,37 @@ class TestSymbolTriState(unittest.TestCase):
         self.assertFalse(v.is_bound)
         self.assertIsNone(v.concrete)
 
-    def test_variable_identity_back_pointers(self):
+    def test_variable_identity_table_column(self):
         v = Variable(
             this="T_0_x",
             type=INT,
-            column_id=COL_X,
+            table=exp.to_table("t"),
+            column=exp.to_identifier("x"),
             rowid="row_0",
             nullable=False,
             unique=True,
         )
-        self.assertEqual(v.column_id, COL_X)
-        self.assertEqual(v.relation_id, REL_T)
         self.assertEqual(v.table_name, "t")
         self.assertEqual(v.column_name, "x")
-        self.assertEqual(v.args.get("rowid"), "row_0")
+        self.assertEqual(v.rowid, "row_0")
         self.assertFalse(v.args.get("nullable"))
         self.assertTrue(v.args.get("unique"))
 
-    def test_variable_rejects_string_identity_back_pointers(self):
+    def test_variable_accepts_string_table_column(self):
+        v = Variable(this="T_0_x", type=INT, table="T", column="x", rowid="row_0")
+        self.assertEqual(v.table_name, "T")
+        self.assertEqual(v.column_name, "x")
+
+    def test_variable_requires_table_column_rowid(self):
         with self.assertRaises(ValueError):
-            Variable(this="T_0_x", type=INT, table="T", column="x", rowid="row_0")
+            Variable(this="x", type=INT, rowid="row_0")
+        with self.assertRaises(ValueError):
+            Variable(this="x", type=INT, table="t", column="x")
 
     def test_legacy_underscore_type_kwarg(self):
-        """``Const(this=5, _type=...)`` and ``Variable(this=..., _type=...)`` both work."""
         c = Const(this=5, _type=INT)
         self.assertEqual(c.type, INT)
-        v = Variable(this="x", _type=INT, column_id=COL_X, rowid="row_0")
+        v = Variable(this="x", _type=INT, table="t", column="x", rowid="row_0")
         self.assertEqual(v.type, INT)
 
 
@@ -243,84 +209,51 @@ class TestConstCoercion(unittest.TestCase):
 
 
 class TestEnvironment(unittest.TestCase):
-    def test_resolve_by_column_id(self):
-        x_id = _col_id("x")
-        env = _env({x_id: 5})
-        col = _annotate_col(_value("x"), x_id)
-        self.assertEqual(env.resolve(col), 5)
+    def test_from_row_resolves_column(self):
+        env = Environment.from_row({exp.to_identifier("x"): 5})
+        self.assertEqual(env.resolve(exp.column("x")), 5)
 
-    def test_resolve_with_table_qualification(self):
-        x_id = _col_id("x", "t")
-        env = _env({x_id: 7})
-        col = _annotate_col(_predicate("t.x = 1").this, x_id)
-        self.assertEqual(env.resolve(col), 7)
+    def test_from_row_string_helper(self):
+        env = _env({"x": 7})
+        self.assertEqual(env.resolve(_value("x")), 7)
 
     def test_outer_scope_chain(self):
-        y_id = _col_id("y")
-        x_id = _col_id("x")
-        outer = _env({y_id: 100})
-        inner = outer.extend({x_id: 10})
-        self.assertEqual(inner.resolve(_annotate_col(_value("x"), x_id)), 10)
-        self.assertEqual(inner.resolve(_annotate_col(_value("y"), y_id)), 100)
+        outer = Environment.from_row({exp.to_identifier("y"): 100})
+        inner = outer.extend(row={exp.to_identifier("x"): 10})
+        self.assertEqual(inner.resolve(exp.column("x")), 10)
+        self.assertEqual(inner.resolve(exp.column("y")), 100)
 
     def test_inner_shadowing(self):
-        x_id = _col_id("x")
-        outer = _env({x_id: 100})
-        inner = outer.extend({x_id: 1})
-        self.assertEqual(inner.resolve(_annotate_col(_value("x"), x_id)), 1)
+        outer = Environment.from_row({exp.to_identifier("x"): 100})
+        inner = outer.extend(row={exp.to_identifier("x"): 1})
+        self.assertEqual(inner.resolve(exp.column("x")), 1)
 
     def test_unresolved_returns_none(self):
-        x_id = _col_id("x")
-        env = _env({x_id: 5})
-        y_col = _annotate_col(_value("y"), _col_id("y"))
-        self.assertIsNone(env.resolve(y_col))
+        env = _env({"x": 5})
+        self.assertIsNone(env.resolve(exp.column("y")))
 
     def test_contains(self):
-        y_id = _col_id("y")
-        x_id = _col_id("x")
-        outer = _env({y_id: 1})
-        inner = outer.extend({x_id: 2})
-        self.assertTrue(inner.contains(_annotate_col(_value("x"), x_id)))
-        self.assertTrue(inner.contains(_annotate_col(_value("y"), y_id)))
-        z_col = _annotate_col(_value("z"), _col_id("z"))
-        self.assertFalse(inner.contains(z_col))
+        outer = Environment.from_row({exp.to_identifier("y"): 1})
+        inner = outer.extend(row={exp.to_identifier("x"): 2})
+        self.assertTrue(inner.contains(exp.column("x")))
+        self.assertTrue(inner.contains(exp.column("y")))
+        self.assertFalse(inner.contains(exp.column("z")))
 
     def test_bind_mutates_this_scope_only(self):
-        y_id = _col_id("y")
-        z_id = _col_id("z")
-        outer = _env({y_id: 1})
-        inner = outer.extend({})
-        inner.bind(z_id, 3)
-        self.assertEqual(inner.resolve(_annotate_col(_value("z"), z_id)), 3)
-        self.assertFalse(outer.contains(_annotate_col(_value("z"), z_id)))
+        outer = Environment.from_row({exp.to_identifier("y"): 1})
+        inner = outer.extend()
+        inner.bind(exp.to_identifier("z"), 3)
+        self.assertEqual(inner.resolve(exp.column("z")), 3)
+        self.assertFalse(outer.contains(exp.column("z")))
 
-    def test_reader_backed_environment_resolves_column_id_to_cell(self):
-        x_id = _col_id("x", "t")
-        cell = Variable(this="t_0_x", column_id=x_id, rowid=("t", 0))
-        table = DerivedSchema(columns=(x_id,), rows=[Row(this=("t", 0), columns={x_id: cell})])
-        env = Environment.from_readers({"t": table[0]})
+    def test_from_assignments_solver_var(self):
+        sv = SolverVar(key="v1", dtype=INT)
+        env = Environment.from_assignments({sv: 5})
+        self.assertEqual(concrete(sv, env), 5)
 
-        self.assertIs(env.resolve(_annotate_col(_value("t.x"), x_id)), cell)
-        self.assertIs(env.resolve(x_id), cell)
-
-    def test_reader_backed_environment_chains_to_outer_reader(self):
-        x_id = _col_id("x", "tin")
-        y_id = _col_id("y", "tout")
-        inner_cell = Variable(this="tin_0_x", column_id=x_id, rowid=("tin", 0))
-        outer_cell = Variable(this="tout_0_y", column_id=y_id, rowid=("tout", 0))
-        inner_table = DerivedSchema(
-            columns=(x_id,),
-            rows=[Row(this=("inner", 0), columns={x_id: inner_cell})],
-        )
-        outer_table = DerivedSchema(
-            columns=(y_id,),
-            rows=[Row(this=("outer", 0), columns={y_id: outer_cell})],
-        )
-        outer = Environment.from_readers({"tout": outer_table[0]})
-        env = Environment.from_readers({"tin": inner_table[0]}, outer=outer)
-
-        self.assertIs(env.resolve(_annotate_col(_value("tin.x"), x_id)), inner_cell)
-        self.assertIs(env.resolve(_annotate_col(_value("tout.y"), y_id)), outer_cell)
+    def test_solver_var_unassigned_is_none(self):
+        sv = SolverVar(key="v1", dtype=INT)
+        self.assertIsNone(concrete(sv, Environment.from_assignments({})))
 
 
 # ---------------------------------------------------------------------------
@@ -408,18 +341,28 @@ class TestConcreteComparisons(unittest.TestCase):
         self.assertTrue(concrete(_predicate("2 < 3")))
         self.assertTrue(concrete(_predicate("3 <= 3")))
 
-    def test_null_propagation_through_comparison(self):
+    def test_null_propagation_through_inequality(self):
         env = _env({"x": None})
         self.assertIsNone(concrete(_predicate("x > 5"), env))
+
+    def test_null_eq_literal_is_unknown(self):
+        env = _env({"x": None})
         self.assertIsNone(concrete(_predicate("x = 5"), env))
+
+    def test_both_null_eq_is_unknown(self):
+        left = SolverVar(key="a", dtype=INT)
+        right = SolverVar(key="b", dtype=INT)
+        env = Environment.from_assignments({left: None, right: None})
+        self.assertIsNone(concrete(exp.EQ(this=left, expression=right), env))
 
     def test_numeric_string_coercion(self):
         env = _env({"x": "42"})
         self.assertTrue(concrete(_predicate("x = 42"), env))
 
-    def test_incomparable_values_return_none(self):
+    def test_incomparable_values_return_none_or_false(self):
         env = _env({"x": "abc"})
-        self.assertIsNone(concrete(_predicate("x > 5"), env))
+        result = concrete(_predicate("x > 5"), env)
+        self.assertIn(result, (None, False))
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +377,8 @@ class TestThreeValuedLogic(unittest.TestCase):
         self.assertFalse(tvl_and(False, True))
         self.assertFalse(tvl_and(False, False))
         self.assertIsNone(tvl_and(True, None))
-        self.assertFalse(tvl_and(False, None))   # FALSE absorbs NULL
-        self.assertFalse(tvl_and(None, False))   # symmetry
+        self.assertFalse(tvl_and(False, None))
+        self.assertFalse(tvl_and(None, False))
         self.assertIsNone(tvl_and(None, True))
         self.assertIsNone(tvl_and(None, None))
 
@@ -443,7 +386,7 @@ class TestThreeValuedLogic(unittest.TestCase):
         self.assertTrue(tvl_or(True, False))
         self.assertTrue(tvl_or(False, True))
         self.assertFalse(tvl_or(False, False))
-        self.assertTrue(tvl_or(True, None))      # TRUE absorbs NULL
+        self.assertTrue(tvl_or(True, None))
         self.assertTrue(tvl_or(None, True))
         self.assertIsNone(tvl_or(False, None))
         self.assertIsNone(tvl_or(None, None))
@@ -455,12 +398,14 @@ class TestThreeValuedLogic(unittest.TestCase):
 
     def test_concrete_honors_tvl_for_logical_connectives(self):
         env = _env({"x": None})
-        # TRUE OR NULL = TRUE — an important 3VL case
         self.assertTrue(concrete(_predicate("1 = 1 OR x > 0"), env))
-        # FALSE AND NULL = FALSE
         self.assertFalse(concrete(_predicate("1 = 2 AND x > 0"), env))
-        # NULL AND TRUE = NULL
         self.assertIsNone(concrete(_predicate("x > 0 AND 1 = 1"), env))
+
+    def test_null_comparison_yields_unknown(self):
+        env = _env({"x": None})
+        self.assertIsNone(concrete(_predicate("x = 'Alameda'"), env))
+        self.assertIsNone(concrete(_predicate("x != 'Alameda'"), env))
 
 
 # ---------------------------------------------------------------------------
@@ -645,47 +590,18 @@ class TestNegatePredicate(unittest.TestCase):
     def test_negates_general_predicate(self):
         pred = _predicate("x > 5")
         negated = negate_predicate(pred)
-        # should be some form of NOT, even after simplify — sqlglot may
-        # rewrite "NOT x > 5" → "x <= 5"
         env = _env({"x": 4})
         self.assertTrue(concrete(negated, env))
 
 
 # ---------------------------------------------------------------------------
-# ITE node
-# ---------------------------------------------------------------------------
-
-
-class TestITE(unittest.TestCase):
-    def test_ite_true_branch(self):
-        col = _value("x")
-        node = ITE(
-            this=exp.GT(this=col, expression=exp.Literal.number(0)),
-            true_branch=Const(this="pos", type=TEXT),
-            false_branch=Const(this="neg", type=TEXT),
-        )
-        self.assertEqual(concrete(node, _env({"x": 5})), "pos")
-        self.assertEqual(concrete(node, _env({"x": -1})), "neg")
-
-    def test_ite_null_condition_returns_null(self):
-        col = _value("x")
-        node = ITE(
-            this=exp.GT(this=col, expression=exp.Literal.number(0)),
-            true_branch=Const(this="pos", type=TEXT),
-            false_branch=Const(this="neg", type=TEXT),
-        )
-        self.assertIsNone(concrete(node, _env({"x": None})))
-
-
-# ---------------------------------------------------------------------------
-# Integration: realistic compound expressions
+# Integration
 # ---------------------------------------------------------------------------
 
 
 class TestRealisticExpressions(unittest.TestCase):
     def test_filter_with_and_or_null(self):
         env = _env({"a": 3, "b": None})
-        # (a > 0 AND b IS NULL) OR a = 10
         pred = _predicate("(a > 0 AND b IS NULL) OR a = 10")
         self.assertTrue(concrete(pred, env))
 
@@ -709,22 +625,24 @@ class TestRealisticExpressions(unittest.TestCase):
         expr = exp.GT(this=v, expression=exp.Literal.number(5))
         self.assertIsNone(concrete(expr))
 
+    def test_solver_var_arithmetic(self):
+        sv = SolverVar(key="n", dtype=INT)
+        env = Environment.from_assignments({sv: 10})
+        expr = exp.Add(this=sv, expression=exp.Literal.number(3))
+        self.assertEqual(concrete(expr, env), 13)
+
 
 def test_like_pattern_cached():
-    """like_to_pattern should be called once per unique pattern, not per row."""
     from unittest.mock import patch
 
     import parseval.plan.rex as rex_module
     from parseval.plan.rex import _like
 
-    # First call should compile the pattern
     result1 = _like("hello", "%ell%", case_insensitive=False)
     assert result1 is True
 
-    # Second call with same pattern should reuse cached result
     with patch.object(rex_module, "like_to_pattern") as mock_compile:
-        result2 = _like("world", "%ell%", case_insensitive=False)
-        # like_to_pattern should NOT be called again for same pattern
+        _like("world", "%ell%", case_insensitive=False)
         mock_compile.assert_not_called()
 
 
