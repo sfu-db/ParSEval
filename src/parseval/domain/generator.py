@@ -92,7 +92,7 @@ class DomainGenerator:
         )
         if not column_schema.nullable:
             space.not_null = True
-        value = space.pick(hint=col.name)
+        value = space.pick(hint=col.name, rng=self.rng)
         if value is None and not column_schema.nullable:
             raise ConstraintConflict(
                 f"empty_value_space:{table_schema.name}.{col.name}"
@@ -226,7 +226,7 @@ class DomainGenerator:
             )
             if not column.nullable:
                 space.not_null = True
-            value = space.pick(hint=col_ident.name)
+            value = space.pick(hint=col_ident.name, rng=self.rng)
             if value is None and not column.nullable:
                 raise ConstraintConflict(
                     f"empty_value_space:{table_schema.name}.{col_ident.name}"

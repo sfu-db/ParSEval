@@ -137,6 +137,7 @@ class DerivedSchema:
         status: str = "sat",
         reason: str = "",
         coverage_ratio: float = 0.0,
+        coverage_tree: Optional[Any] = None,
     ):
         self.columns = tuple(columns)
         self.column_range = column_range
@@ -160,6 +161,7 @@ class DerivedSchema:
         self.status = status
         self.reason = reason
         self.coverage_ratio = coverage_ratio
+        self.coverage_tree = coverage_tree
 
         if rows:
             assert len(rows[0]) == len(
@@ -223,6 +225,7 @@ class DerivedSchema:
             status=self.status,
             reason=self.reason,
             coverage_ratio=self.coverage_ratio,
+            coverage_tree=self.coverage_tree,
         )
 
     @property

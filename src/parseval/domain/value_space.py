@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 import hashlib
+import random as _random
 import re
+import string as _string
 from typing import Any, Dict, Optional, Set
 
 from parseval.dtype import TypeFamily, parse_date, parse_datetime, parse_time
@@ -59,7 +61,7 @@ class ValueSpace:
             return True
         return False
 
-    def pick(self, hint: Any = None) -> Any:
+    def pick(self, hint: Any = None, rng: _random.Random | None = None) -> Any:
         if self.must_null:
             return None
         if self.equals is not None:
@@ -67,11 +69,11 @@ class ValueSpace:
         if self.allowed is not None:
             return self._first_valid(sorted(self.allowed, key=repr))
         if self.family in (TypeFamily.INTEGER, TypeFamily.DECIMAL):
-            return self._pick_numeric()
+            return self._pick_numeric(rng=rng)
         if self.family == TypeFamily.TEXT:
-            return self._pick_text(hint=hint)
+            return self._pick_text(hint=hint, rng=rng)
         if self.family in (TypeFamily.DATE, TypeFamily.DATETIME, TypeFamily.TIME):
-            return self._pick_temporal()
+            return self._pick_temporal(rng=rng)
         if self.family == TypeFamily.BOOLEAN:
             candidates = {True, False}
             if self.allowed is not None:
@@ -165,7 +167,7 @@ class ValueSpace:
                 return candidate
         return None
 
-    def _pick_numeric(self) -> Any:
+    def _pick_numeric(self, rng: _random.Random | None = None) -> Any:
         lo = self.min_val if self.min_val is not None else min(self.max_val - 100, 1) if self.max_val is not None else 1
         hi = self.max_val if self.max_val is not None else max(self.min_val + 100, lo + 100) if self.min_val is not None else lo + 100
         if lo > hi:
@@ -177,6 +179,14 @@ class ValueSpace:
                 lo += 1
             if self.max_val is not None and not self.max_inclusive:
                 hi -= 1
+            if rng is not None:
+                if lo > hi:
+                    return None
+                for _ in range(50):
+                    candidate = rng.randint(lo, hi)
+                    if self._candidate_valid(candidate):
+                        return candidate
+                return None
             candidates = []
             if self.min_val is not None:
                 candidates.append(lo)
@@ -193,6 +203,16 @@ class ValueSpace:
                     if lo <= try_val <= hi and self._candidate_valid(try_val):
                         return try_val
         else:
+            if rng is not None:
+                lo_f = float(lo)
+                hi_f = float(hi)
+                if lo_f > hi_f:
+                    return None
+                for _ in range(50):
+                    candidate = rng.uniform(lo_f, hi_f)
+                    if self._candidate_valid(candidate):
+                        return candidate
+                return None
             candidates = []
             if self.min_val is not None:
                 candidates.append(self.min_val)
@@ -213,13 +233,19 @@ class ValueSpace:
                         return try_val
         return None
 
-    def _pick_text(self, hint: Any = None) -> Optional[str]:
+    def _pick_text(self, hint: Any = None, rng: _random.Random | None = None) -> Optional[str]:
         length = min(self.max_length or 10, 10)
         has_numeric_min = self.min_val is not None and isinstance(self.min_val, (int, float))
         has_numeric_max = self.max_val is not None and isinstance(self.max_val, (int, float))
         if has_numeric_min or has_numeric_max:
             lo = int(self.min_val) if has_numeric_min else int(self.max_val) - 100
             hi = int(self.max_val) if has_numeric_max else int(self.min_val) + 1000
+            if rng is not None:
+                for _ in range(50):
+                    text = str(rng.randint(lo, hi))
+                    if self._candidate_valid(text):
+                        return text
+                return None
             mid = (lo + hi) // 2
             candidates = []
             for offset in range(hi - lo + 1):
@@ -247,6 +273,19 @@ class ValueSpace:
         base = base[:length]
         if not base:
             base = "v"
+        if rng is not None:
+            for _ in range(50):
+                budget = rng.randint(1, length)
+                prefix = base[:budget]
+                remaining = length - len(prefix)
+                if remaining > 0:
+                    suffix = "".join(rng.choices(_string.ascii_lowercase, k=remaining))
+                    candidate = prefix + suffix
+                else:
+                    candidate = prefix
+                if candidate not in self.not_equals and self._candidate_valid(candidate):
+                    return candidate
+            return None
         i = 1
         while base in self.not_equals:
             base = f"val_{i}"[:length]
@@ -255,7 +294,7 @@ class ValueSpace:
             i += 1
         return base if self._candidate_valid(base) else None
 
-    def _pick_temporal(self) -> Any:
+    def _pick_temporal(self, rng: _random.Random | None = None) -> Any:
         if self.like_pattern:
             prefix = self.like_pattern.replace("%", "").replace("_", "")
             if len(prefix) >= 4:
@@ -277,6 +316,15 @@ class ValueSpace:
                 if self.max_val is not None and isinstance(self.max_val, (int, float))
                 else lo + 365
             )
+            if rng is not None:
+                for _ in range(50):
+                    try:
+                        val = date(1970, 1, 1) + timedelta(days=rng.randint(lo, hi))
+                        if self._candidate_valid(val):
+                            return val
+                    except (ValueError, OverflowError):
+                        continue
+                return None
             candidates = [lo]
             if hi != lo:
                 candidates.append(hi)
@@ -328,6 +376,17 @@ class ValueSpace:
                         return val
                 except (ValueError, IndexError):
                     pass
+        if rng is not None:
+            for _ in range(50):
+                offset = rng.randint(0, 1825)
+                sign = -1 if rng.choice([True, False]) else 1
+                try:
+                    val = date(2024, 6, 15) + timedelta(days=sign * offset)
+                    if self._candidate_valid(val):
+                        return val
+                except (ValueError, OverflowError):
+                    continue
+            return None
         base = date(2024, 6, 15)
         for offset in range(0, 366):
             for candidate in (base + timedelta(days=offset), base - timedelta(days=offset)):
