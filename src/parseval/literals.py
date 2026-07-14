@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 from sqlglot import exp
 
+from parseval.dtype import TypeFamily, type_family
+
 
 def unit_name(node: Any) -> Optional[str]:
     if node is None:
@@ -30,10 +32,24 @@ def integer_literal(value: Any) -> Optional[int]:
 def literal_value(node: exp.Expression) -> Any:
     """Extract a Python value from a literal-ish AST leaf (no Environment)."""
     if isinstance(node, exp.Literal):
+        dtype = getattr(node, "type", None)
+        if dtype is not None and type_family(dtype) in {
+            TypeFamily.TEXT,
+            TypeFamily.DATE,
+            TypeFamily.DATETIME,
+            TypeFamily.TIME,
+        }:
+            return str(node.this)
         if node.is_int:
-            return int(node.this)
+            try:
+                return int(node.this)
+            except (TypeError, ValueError):
+                return str(node.this)
         if node.is_number:
-            return float(node.this)
+            try:
+                return float(node.this)
+            except (TypeError, ValueError):
+                return str(node.this)
         return str(node.this)
     if isinstance(node, exp.Boolean):
         return bool(node.this)

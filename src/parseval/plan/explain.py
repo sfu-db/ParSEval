@@ -225,6 +225,10 @@ def _annotate_type(
 ) -> exp.Expression:
     """Attach DF-provided type (and optional nullability) onto ``expr``."""
     expr.type = _sqlglot_type(df_type)
+    if isinstance(expr, exp.Cast) and isinstance(expr.this, exp.Literal):
+        to_type = expr.args.get("to")
+        if isinstance(to_type, exp.DataType):
+            expr.this.type = to_type
     if nullable is not None:
         expr.meta["nullable"] = nullable
     return expr
