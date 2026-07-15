@@ -1,10 +1,3 @@
-"""MySQL disprove experiment — load leetcode dataset, parallel run, summarize.
-
-Usage::
-
-    python scripts/exp_mysql_disprover.py --workers 16
-    python scripts/exp_mysql_disprover.py --limit 100 --workers 8
-"""
 
 import argparse
 import datetime
@@ -12,20 +5,32 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import TimeoutError, as_completed
 from urllib.parse import urlparse, urlunparse
 
 import sqlglot
 from sqlglot import exp
 
+# Import pebble for robust process management
+from pebble import ProcessPool, ProcessExpired
+
 try:
     from tqdm import tqdm
+    HAS_TQDM = True
 except Exception:
+    HAS_TQDM = False
     def tqdm(x, **kwargs):
         return x
 
 
 DEFAULT_MYSQL_CONNECTION = "mysql+pymysql://root:rootpass@localhost:3306/mydb"
+
+
+def _progress_enabled() -> bool:
+    # Allow forcing progress bars in non-interactive environments.
+    if os.environ.get("PARSEVAL_FORCE_TQDM") == "1":
+        return True
+    return sys.stdout.isatty() or sys.stderr.isatty()
 
 
 def load_jsonlines(fp: str) -> list[dict]:
@@ -424,10 +429,29 @@ def run_disprove_experiment(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    if not HAS_TQDM:
+        print(
+            "tqdm is not installed; progress bars are disabled. "
+            "Install with: pip install tqdm",
+            flush=True,
+        )
+
+    progress_enabled = _progress_enabled()
+    print(
+        f"Preparing tasks from {len(selected)} entries (start={start}, limit={limit})",
+        flush=True,
+    )
+
     tasks = []
     skipped = 0
 
-    for offset, entry in enumerate(selected):
+    for offset, entry in enumerate(
+        tqdm(
+            selected,
+            desc="Preparing MySQL tasks",
+            disable=not progress_enabled,
+        )
+    ):
         index = start + offset
         sql1, sql2 = (
             _prepare_mysql_query(sql, entry["schema"])
@@ -461,24 +485,61 @@ def run_disprove_experiment(
                 for task in tqdm(
                     tasks,
                     desc="Disproving LeetCode pairs",
-                    disable=not sys.stdout.isatty(),
+                    disable=not progress_enabled,
                 )
             ]
         else:
             records_by_index = {}
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(_process_disprove_task, task)
+            with ProcessPool(max_workers=workers) as pool:
+                # Map futures to tasks so we can recover the payload if a worker crashes
+                future_to_task = {
+                    pool.schedule(_process_disprove_task, args=(task,), timeout=timeout): task
                     for task in tasks
-                ]
+                }
+
                 for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
+                    as_completed(future_to_task),
+                    total=len(future_to_task),
                     desc="Disproving LeetCode pairs",
-                    disable=not sys.stdout.isatty(),
+                    disable=not progress_enabled,
                 ):
-                    record = future.result()
-                    records_by_index[record["index"]] = record
+                    task = future_to_task[future]
+                    index = task[0]
+                    sql1 = task[1]
+                    sql2 = task[2]
+
+                    try:
+                        record = future.result()
+                        records_by_index[record["index"]] = record
+                    except TimeoutError:
+                        records_by_index[index] = {
+                            "index": index,
+                            "sql1": sql1,
+                            "sql2": sql2,
+                            "verdict": "timeout",
+                            "error_msg": f"Task exceeded {timeout} seconds",
+                            "elapsed_time": timeout,
+                        }
+                    except ProcessExpired as e:
+                        # This catches the Rust panic without killing the manager process!
+                        records_by_index[index] = {
+                            "index": index,
+                            "sql1": sql1,
+                            "sql2": sql2,
+                            "verdict": "execution_error",
+                            "error_msg": f"Worker process crashed (Rust panic): {e}",
+                            "elapsed_time": 0.0,
+                        }
+                    except Exception as e:
+                        records_by_index[index] = {
+                            "index": index,
+                            "sql1": sql1,
+                            "sql2": sql2,
+                            "verdict": "execution_error",
+                            "error_msg": f"Python Exception: {str(e)[:500]}",
+                            "elapsed_time": 0.0,
+                        }
+
             records = [records_by_index[index] for index, *_rest in tasks]
     finally:
         _cleanup_databases(connection_string, tasks)

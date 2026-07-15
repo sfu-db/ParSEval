@@ -980,11 +980,35 @@ class CspBackend:
         env = Environment.from_assignments(assignments)
         for expr in exprs:
             value = concrete(expr, env)
+            if value is None:
+                value = self._csp_truth(expr, assignments)
             if value is False:
                 return False
             if value is not True:
                 return None
         return True
+
+    def _csp_truth(
+        self,
+        expr: exp.Expression,
+        assignments: Dict[SolverVar, Any],
+    ) -> Optional[bool]:
+        if not isinstance(expr, (exp.EQ, exp.NEQ)):
+            return None
+        left, right = expr.this, expr.expression
+        if isinstance(left, SolverVar):
+            assigned = assignments.get(left)
+            literal = literal_value(right)
+        elif isinstance(right, SolverVar):
+            assigned = assignments.get(right)
+            literal = literal_value(left)
+        else:
+            return None
+        if assigned is None and literal is None:
+            return isinstance(expr, exp.EQ)
+        if assigned is None or literal is None:
+            return isinstance(expr, exp.NEQ)
+        return None
 
 
 __all__ = ["CspBackend"]
