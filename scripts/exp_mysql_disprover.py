@@ -15,6 +15,9 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from urllib.parse import urlparse, urlunparse
 
+import sqlglot
+from sqlglot import exp
+
 try:
     from tqdm import tqdm
 except Exception:
@@ -49,7 +52,11 @@ def _make_task_connection_string(base_connection_string: str, index: int) -> str
 
 def _parse_ref(column_ref: str) -> tuple[str, str]:
     table, col = column_ref.split("__", 1)
-    return table, col
+    return _canonical_identifier(table), _canonical_identifier(col)
+
+
+def _canonical_identifier(identifier: str) -> str:
+    return identifier.lower()
 
 
 def _constraint_refs(node) -> set[tuple[str, str]]:
@@ -170,7 +177,22 @@ def _normalize_dtype(dtype: str) -> str:
 def _prepare_mysql_query(sql: str, schema: dict) -> str:
     sql = _quote_mysql_enum_literals(sql, schema)
     sql = _quote_mysql_reserved_rank_alias(sql)
+    sql = _canonicalize_unquoted_identifiers(sql)
     return sql
+
+
+def _canonicalize_unquoted_identifiers(sql: str) -> str:
+    try:
+        tree = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    def lower_identifier(node):
+        if isinstance(node, exp.Identifier) and not node.args.get("quoted"):
+            node.set("this", _canonical_identifier(node.name))
+        return node
+
+    return tree.transform(lower_identifier).sql(dialect="mysql")
 
 
 def _quote_mysql_enum_literals(sql: str, schema: dict) -> str:
@@ -243,6 +265,13 @@ def _topological_sort(deps: dict[str, set[str]]) -> list[str]:
 
 
 def build_ddl(schema: dict, constraints: list[dict] | None) -> str:
+    schema = {
+        _canonical_identifier(table): {
+            _canonical_identifier(column): dtype
+            for column, dtype in columns.items()
+        }
+        for table, columns in schema.items()
+    }
     primary_keys = {}
     fks = []
     checks_by_table = {}

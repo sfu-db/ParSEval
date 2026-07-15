@@ -183,3 +183,14 @@ tmp/
 results/
 
 docs/superpowers
+
+# AI Assistant / Editor Configs
+.claude/
+.codegraph/
+.cursor/
+.kiro/
+.mcp.json
+.opencode/
+opencode.jsonc
+
+CLAUDE.md
