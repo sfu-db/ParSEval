@@ -113,26 +113,6 @@ def table_for_column(
     return matches[0] if len(matches) == 1 else None
 
 
-def order_keys_supported(
-    instance: Instance,
-    table: exp.Table,
-    keys: Sequence[exp.Expression],
-) -> bool:
-    for ordered in keys:
-        expr = ordered.this if isinstance(ordered, exp.Ordered) else ordered
-        if expr.find(exp.AggFunc) or expr.find(exp.Window) or expr.find(exp.Subquery):
-            return False
-        columns = tuple(expr.find_all(exp.Column))
-        if not columns:
-            return False
-        for column in columns:
-            try:
-                instance.resolve_column(table, column.name)
-            except KeyError:
-                return False
-    return True
-
-
 def resolved_order_expressions(
     instance: Instance,
     table: exp.Table,
@@ -196,21 +176,6 @@ def join_order_keys_supported(
             except KeyError:
                 return False
     return True
-
-
-def order_expression_table(
-    instance: Instance,
-    alias_tables: Mapping[exp.Identifier, exp.Table],
-    expression: exp.Expression,
-) -> exp.Table | None:
-    tables = {
-        table
-        for column in expression.find_all(exp.Column)
-        for table in (table_for_column(instance, alias_tables, column),)
-        if table is not None
-    }
-    return next(iter(tables)) if len(tables) == 1 else None
-
 
 def order_expression_value(
     instance: Instance,

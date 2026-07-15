@@ -15,6 +15,7 @@ dependencies = [
     "z3-solver>=4.16.0.0",
     "pandas>=2.3.3",
     "pymysql>=1.2.0",
+    "datafusion>=50.1.0",
 ]
 
 [project.optional-dependencies]

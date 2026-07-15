@@ -8,30 +8,22 @@ import sqlglot
 from sqlglot import exp
 
 from parseval.generator.bounds import BmcBounds
-from parseval.generator.order import sql_order_key
 from parseval.generator.coverage import (
     CoverageTreeNode,
     CoverageObligation,
     SemanticCoverageRecorder,
     _coverage_ratio,
 )
-from parseval.generator.symbolic_resolution import (
-    join_alias_tables,
-    join_order_keys_supported,
-    leaf_table_scans,
-    order_expression_table,
-    resolved_order_expressions,
-    same_identifier,
-    single_dependency_join,
-    single_leaf_scan,
-    storage_table_for_join_column,
+from parseval.generator.helper import (
+    leaf_table_scans,    
+    same_identifier,    
 )
-from parseval.domain.exceptions import ConstraintViolationError, UniqueConflictError
 from parseval.instance import Instance
 from parseval.plan.context import DerivedSchema
 from parseval.plan.explain import (
     Aggregate,
     Filter,
+    explain,
     Join,
     Limit,
     Plan,
@@ -51,6 +43,7 @@ from .operator import (
     _database_constraints_for_solver,
     pipeline_ordered_steps,
 )
+from parseval.generator.speculate import speculate
 
 
 @dataclass(frozen=True)
@@ -69,24 +62,42 @@ class GenerationState:
     coverage_ratio: float = 0.0
 
 
-def _materialize_row(row) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
-    for col_ident, val in row.column_values.items():
-        if isinstance(val, SolverVar):
-            continue
-        name = col_ident.name if hasattr(col_ident, "name") else str(col_ident)
-        if isinstance(val, Variable):
-            result[name] = val.concrete
-        else:
-            result[name] = val
-    return result
-
 def generate(
+    ddls: str,
+    query: str,
+    dialect: str = "sqlite",
+    *,
+    bounds: BmcBounds | None = None,
+    generate_negatives: bool = True,
+) -> Instance:
+    """Generate witness rows for *query* under *ddls*.
+
+    Speculative seeding supplies the initial rows. When the query can be
+    planned, EncodePipeline appends additional coverage-driven rows to the same
+    instance. If planning fails, the speculative instance is returned.
+    """
+    instance = speculate(
+        ddls,
+        query,
+        dialect=dialect,
+        bounds=bounds,
+        generate_negatives=generate_negatives,
+    )
+
+    try:
+        plan = explain(ddls, query, dialect=dialect)
+    except Exception:
+        return instance
+
+    return _generate_from_plan(plan, instance, bounds=bounds, before_counts={})
+
+
+def _generate_from_plan(
     plan: Plan,
     instance: Instance,
     *,
-    query: str | None = None,
     bounds: BmcBounds | None = None,
+    before_counts: Mapping[str, int] | None = None,
 ) -> Instance:
     """Generate semantic witnesses for *plan* through EncodePipeline.
 
@@ -94,17 +105,8 @@ def generate(
     ``instance`` and the same object is returned.
     """
     current_bounds = _bounds_for_plan(plan, bounds or BmcBounds())
-    sql = query or plan.sql
-    if not sql:
-        schema = _unknown_result(plan, current_bounds, "missing_query_sql")
-        _attach_generation_state(
-            instance,
-            schema=schema,
-            obligations=tuple(schema.obligations),
-        )
-        return instance
-
-    before_counts = _row_counts(instance)
+    if before_counts is None:
+        before_counts = _row_counts(instance)
     schema = EncodePipeline(plan, instance, bounds=current_bounds).forward()
     tree = schema.coverage_tree
     if tree is None:
@@ -845,23 +847,6 @@ def _attach_generation_state(
     )
 
 
-def _unknown_result(
-    plan: Plan,
-    bounds: BmcBounds,
-    reason: str,
-) -> DerivedSchema:
-    obligations = _obligations_for_status(plan, None, "unsupported")
-    return DerivedSchema(
-        columns=(),
-        rows=[],
-        status="unknown",
-        obligations=obligations,
-        coverage_ratio=_coverage_ratio(obligations),
-        reason=reason,
-        bounds=bounds,
-    )
-
-
 def _obligations_for_status(
     plan: Plan,
     instance: Instance | None,
@@ -885,14 +870,3 @@ def _evidence_for_obligations(
         for obligation in obligations
         if obligation.status == "covered" and rowids
     }
-
-
-def materialize(instance: Instance) -> List[Dict[str, Any]]:
-    """Return all rows from *instance* as flat dicts."""
-    rows: List[Dict[str, Any]] = []
-    for table in instance.schema.fk_safe_table_order():
-        for row in instance.get_rows(table):
-            materialized = _materialize_row(row)
-            if materialized:
-                rows.append(materialized)
-    return rows
