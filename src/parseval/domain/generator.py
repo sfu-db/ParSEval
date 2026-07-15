@@ -153,6 +153,15 @@ class DomainGenerator:
                     )
                 continue
 
+            if any(
+                col in row
+                and row[col] is None
+                and table_schema.columns[col].nullable
+                for col in sources
+            ):
+                locked.update(col for col in sources if col in row)
+                continue
+
             if not parents:
                 raise ForeignKeyResolutionError(
                     f"missing_parent_rows:{table_schema.name}->{table_key(target)}"

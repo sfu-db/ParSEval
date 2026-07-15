@@ -612,13 +612,14 @@ wheels = [
 
 [[package]]
 name = "parseval"
-version = "0.0.3"
+version = "0.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "datafusion", version = "50.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "datafusion", version = "54.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pebble" },
     { name = "pymysql" },
     { name = "sqlalchemy" },
     { name = "sqlglot" },
@@ -648,6 +649,7 @@ requires-dist = [
     { name = "func-timeout", marker = "extra == 'dev'", specifier = "==4.3.5" },
     { name = "ordered-set", marker = "extra == 'dev'", specifier = ">=4.1.0,<5.0.0" },
     { name = "pandas", specifier = ">=2.3.3" },
+    { name = "pebble", specifier = ">=5.2.0" },
     { name = "py4j", marker = "extra == 'dev'", specifier = ">=0.10.9.9,<0.11.0.0" },
     { name = "pydot", marker = "extra == 'dev'", specifier = ">=4.0.1,<5.0.0" },
     { name = "pymysql", specifier = ">=1.2.0" },
@@ -663,6 +665,15 @@ provides-extras = ["dev"]
 dev = [
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "tqdm", specifier = ">=4.67.3" },
+]
+
+[[package]]
+name = "pebble"
+version = "5.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/3b/7debef984e227a70798963cf2e5ea90882f62bca659b33cbd421a453abd1/pebble-5.2.0.tar.gz", hash = "sha256:8e0a5f6a1cfdd0ac1bfc4a789e20d2b4b895de976e547d23b7de23b71ef39b34", size = 39811, upload-time = "2026-01-25T12:05:11.422Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b5/de/1cce5274efcb921484998864820f2ba41679ea472daef748a7bc03fc0bb7/pebble-5.2.0-py3-none-any.whl", hash = "sha256:6237a792a78524648857ec6d2dae069c91a45bdef18daf957078a56e2dd8e0a8", size = 34881, upload-time = "2026-01-25T12:05:09.714Z" },
 ]
 
 [[package]]
