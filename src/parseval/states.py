@@ -156,9 +156,7 @@ def compare_results(
 ) -> Verdict:
     """Compare two execution results and return a verdict."""
     if r1.is_error or r2.is_error:
-        if r1.is_syntax_error or r2.is_syntax_error:
-            return Verdict.SYNTAX_ERROR
-        return Verdict.RUNTIME_ERROR
+        return Verdict.SYNTAX_ERROR
 
     rows1 = [normalize_row(row) for row in r1.rows]
     rows2 = [normalize_row(row) for row in r2.rows]
@@ -254,4 +252,3 @@ def non_fatal(
         return wrapper
 
     return decorator
-

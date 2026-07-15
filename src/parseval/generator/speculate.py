@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 from sqlglot import exp, parse_one
 
@@ -151,6 +151,9 @@ def speculate(
     elif offset_val is not None:
         min_rows = max(3, min(offset_val + 1, MIN_ROWS_CAP))
 
+    group_column_keys = _extract_group_column_keys(tree, alias_map, instance)
+    agg_input_column_keys = _extract_aggregate_input_column_keys(tree, alias_map, instance)
+
     not_exists_not_in_items: list[dict[str, Any]] = []
     for drop_optional in (False, True):
         predicates, equalities, not_exists_not_in_items = _extract_predicates(
@@ -184,6 +187,8 @@ def speculate(
                 group_count=group_count,
                 min_rows=min_rows,
                 dialect=dialect,
+                group_key_column_keys=group_column_keys,
+                aggregate_input_column_keys=agg_input_column_keys,
             )
             # Two-phase seeding for NOT EXISTS / NOT IN
             if not_exists_not_in_items:
@@ -351,6 +356,41 @@ def _collect_column_vars(
         table_vars.setdefault(table_node, []).append(var)
 
     return col_var_map, table_vars
+
+
+def _extract_group_column_keys(
+    tree: exp.Select,
+    alias_map: dict[exp.Identifier, exp.Table],
+    instance: Instance,
+) -> list[tuple[str, str | None, str]]:
+    """Extract column keys for GROUP BY columns that are simple column references."""
+    group = tree.args.get("group")
+    if not group or not group.expressions:
+        return []
+    keys: list[tuple[str, str | None, str]] = []
+    for expr in group.expressions:
+        if isinstance(expr, exp.Column):
+            key = _column_key(expr, alias_map, instance)
+            if key is not None:
+                keys.append(key)
+    return keys
+
+
+def _extract_aggregate_input_column_keys(
+    tree: exp.Select,
+    alias_map: dict[exp.Identifier, exp.Table],
+    instance: Instance,
+) -> list[tuple[str, str | None, str]]:
+    """Extract column keys for columns referenced inside aggregate functions."""
+    seen: set[tuple[str, str | None, str]] = set()
+    keys: list[tuple[str, str | None, str]] = []
+    for agg_func in tree.find_all(exp.AggFunc):
+        for col in agg_func.find_all(exp.Column):
+            key = _column_key(col, alias_map, instance)
+            if key is not None and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -994,8 +1034,16 @@ def _seed_from_assignments(
     group_count: int = 1,
     min_rows: int = 1,
     dialect: str = "sqlite",
+    group_key_column_keys: Sequence[tuple[str, str | None, str]] = (),
+    aggregate_input_column_keys: Sequence[tuple[str, str | None, str]] = (),
 ) -> None:
-    """Seed the instance with solver assignments, re-solving for extra rows."""
+    """Seed the instance with solver assignments, re-solving for extra rows.
+
+    When *group_key_column_keys* is provided, a portion of extra rows are
+    generated with duplicate group-key values (multiple rows per group).
+    When *aggregate_input_column_keys* is provided, a portion of extra rows
+    set nullable aggregate-input columns to NULL.
+    """
     total_rows = max(1, group_count, min_rows)
     def _build_rows_by_table(assignments: dict[SolverVar, Any]) -> dict[exp.Table, list[dict]]:
         return {
@@ -1009,8 +1057,39 @@ def _seed_from_assignments(
 
     instance.create_rows(_build_rows_by_table(first_assignments))
 
+    # Read first-row group-key values from the instance (the instance fills
+    # in random values even when solver assignments are empty).
+    first_row_group_values: dict[tuple[str, str | None, str], Any] = {}
+    if group_key_column_keys:
+        for gkey in group_key_column_keys:
+            tk, alias, cn = gkey
+            for tn, vs in table_vars.items():
+                if table_key(tn) == tk:
+                    existing = instance.get_rows(tn)
+                    if existing:
+                        col_ident = instance.resolve_column(tn, cn)
+                        val = existing[0].column_values.get(col_ident)
+                        if val is not None and hasattr(val, 'concrete'):
+                            val = val.concrete
+                        first_row_group_values[gkey] = val
+                    break
+    can_duplicate = bool(group_key_column_keys) and len(first_row_group_values) == len(group_key_column_keys)
+
+    # Pre-compute nullable aggregate-input column keys for the NULL strategy
+    nullable_agg_keys: list[tuple[str, str | None, str]] = []
+    if aggregate_input_column_keys:
+        for akey in aggregate_input_column_keys:
+            var = col_var_map.get(akey)
+            if var is not None and var.dtype.args.get("nullable") is not False:
+                nullable_agg_keys.append(akey)
+    can_null = bool(nullable_agg_keys)
+
     extra_idx = 0
     while extra_idx < total_rows - 1:
+        strategy = extra_idx % 3
+        if (strategy == 1 and not can_duplicate) or (strategy == 2 and not can_null):
+            strategy = 0
+
         suffix = f"_e{extra_idx}"
         new_col_var_map: dict[tuple[str, str | None, str], SolverVar] = {}
         for key, var in col_var_map.items():
@@ -1036,6 +1115,21 @@ def _seed_from_assignments(
             if new_a is not None and new_b is not None:
                 new_equalities.append((new_a, new_b))
 
+        if strategy == 1:
+            for gkey, value in first_row_group_values.items():
+                new_var = new_col_var_map.get(gkey)
+                if new_var is not None:
+                    new_constraints.append(
+                        exp.EQ(this=new_var, expression=_literal_for_value(value))
+                    )
+        elif strategy == 2:
+            for akey in nullable_agg_keys:
+                new_var = new_col_var_map.get(akey)
+                if new_var is not None:
+                    new_constraints.append(
+                        exp.Is(this=new_var, expression=exp.Null())
+                    )
+
         _add_database_constraints(new_constraints, instance, new_col_var_map, table_vars)
 
         problem = Problem(
@@ -1047,6 +1141,9 @@ def _seed_from_assignments(
         result = solver.solve(problem)
 
         if not result.sat:
+            if strategy != 0:
+                extra_idx += 1
+                continue
             break
 
         extra_rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}

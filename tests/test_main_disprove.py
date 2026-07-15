@@ -39,6 +39,38 @@ class TestMainDisprove(unittest.TestCase):
         )
         generate_mock.assert_not_called()
 
+    def test_disprove_returns_syntax_error_for_execution_error_after_generation(self):
+        sql1 = "SELECT id FROM users"
+        sql2 = "SELECT id FROM users JOIN orders ON users.id = orders.user_id"
+        schema = "CREATE TABLE users (id INT PRIMARY KEY);"
+        connection_string = "sqlite:///tmp/test-main-disprove.sqlite"
+        instance = SimpleNamespace(
+            generation=SimpleNamespace(
+                status="sat",
+                create_rows={"users": [{"id": 1}]},
+                coverage_ratio=1.0,
+            ),
+            tables={"users": object()},
+            get_rows=lambda table: [{"id": 1}],
+        )
+
+        def execute(query, *_args):
+            if execute_mock.call_count <= 2:
+                return ExecutionResult(query=query)
+            if query == sql2:
+                return ExecutionResult(query=query, error_msg="ambiguous column name: id")
+            return ExecutionResult(query=query, rows=[(1,)])
+
+        with (
+            patch("parseval.main.generate", return_value=instance),
+            patch("parseval.main.to_db"),
+            patch("parseval.main.execute_query", side_effect=execute) as execute_mock,
+        ):
+            result = disprove(sql1, sql2, schema, connection_string, "sqlite")
+
+        self.assertEqual(Verdict.SYNTAX_ERROR, result.verdict)
+        self.assertEqual("ambiguous column name: id", result.error_msg)
+
     def test_disprove_returns_neq_before_generation_for_different_projection_counts(self):
         sql1 = "SELECT id FROM users"
         sql2 = "SELECT id, age FROM users"

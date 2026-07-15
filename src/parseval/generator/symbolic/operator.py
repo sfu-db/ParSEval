@@ -1083,15 +1083,21 @@ class AggregateEncodeStep(EncodeStep):
 
         out_cols: List[Any] = []
         out_cols.extend(group_exprs)
-        out_cols.extend(_aggregate_key(aggregate, self.dialect) for aggregate in aggregations)
+        aggregate_keys = _aggregate_output_keys(aggregations, self.dialect)
+        duplicate_keys = _duplicate_aggregate_key_names(aggregate_keys)
+        if duplicate_keys:
+            raise ValueError(
+                "Duplicate aggregate output key(s): " + ", ".join(duplicate_keys)
+            )
+        out_cols.extend(aggregate_keys)
         out_rows: List[Row] = []
 
         for group_index, (group_key, rows) in enumerate(grouped.items()):
             values: Dict[Any, Any] = {}
             for expr, value in zip(group_exprs, group_key):
                 values[expr] = value
-            for aggregate in aggregations:
-                values[_aggregate_key(aggregate, self.dialect)] = _aggregate_value(aggregate, rows)
+            for aggregate, key in zip(aggregations, aggregate_keys):
+                values[key] = _aggregate_value(aggregate, rows)
             rowids = tuple(row.rowid for row in rows)
             out_rows.append(
                 Row(
@@ -1532,7 +1538,38 @@ def _aggregate_key(
     )
 
 
-def _aggregate_name(
+def _aggregate_output_keys(
+    aggregations: Sequence[exp.Expression],
+    dialect: str | None,
+) -> Tuple[exp.Column, ...]:
+    compatible_keys = tuple(
+        _aggregate_output_key(aggregate, dialect) for aggregate in aggregations
+    )
+    counts: Dict[str, int] = {}
+    for key in compatible_keys:
+        name = key.name.casefold()
+        counts[name] = counts.get(name, 0) + 1
+    return tuple(
+        _aggregate_key(aggregate, dialect)
+        if counts[compatible_key.name.casefold()] > 1
+        else compatible_key
+        for aggregate, compatible_key in zip(aggregations, compatible_keys)
+    )
+
+
+def _aggregate_output_key(
+    aggregate: exp.Expression,
+    dialect: str | None,
+) -> exp.Column:
+    return exp.Column(
+        this=exp.Identifier(
+            this=_aggregate_output_name(aggregate, dialect),
+            quoted=True,
+        )
+    )
+
+
+def _aggregate_output_name(
     aggregate: exp.Expression,
     dialect: str | None,
 ) -> str:
@@ -1550,7 +1587,28 @@ def _aggregate_name(
         return f"min({_aggregate_arg_name(expression.this, dialect)})"
     if isinstance(expression, exp.Max):
         return f"max({_aggregate_arg_name(expression.this, dialect)})"
-    return expression.alias_or_name or expression.sql(dialect=dialect)
+    return expression.sql(dialect=dialect)
+
+
+def _aggregate_name(
+    aggregate: exp.Expression,
+    dialect: str | None,
+) -> str:
+    expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
+    if isinstance(expression, (exp.Count, exp.Avg, exp.Sum, exp.Min, exp.Max)):
+        source = expression.this
+        function_name = expression.key.lower()
+        if source is None or isinstance(source, exp.Star):
+            return f"{function_name}(*)"
+        if isinstance(source, exp.Distinct):
+            source_sql = ", ".join(
+                item.sql(dialect=dialect) for item in source.expressions
+            )
+            return f"{function_name}(DISTINCT {source_sql})"
+        if expression.args.get("distinct"):
+            return f"{function_name}(DISTINCT {source.sql(dialect=dialect)})"
+        return f"{function_name}({source.sql(dialect=dialect)})"
+    return expression.sql(dialect=dialect)
 
 
 def _aggregate_arg_name(
@@ -1566,6 +1624,17 @@ def _aggregate_arg_name(
     return expr.sql(dialect=dialect)
 
 
+def _duplicate_aggregate_key_names(keys: Sequence[exp.Column]) -> Tuple[str, ...]:
+    seen: Set[str] = set()
+    duplicates: List[str] = []
+    for key in keys:
+        name = key.name.casefold()
+        if name in seen and key.name not in duplicates:
+            duplicates.append(key.name)
+        seen.add(name)
+    return tuple(duplicates)
+
+
 def _aggregate_value(aggregate: exp.Expression, rows: List[Row]) -> Any:
     expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
     if isinstance(expression, exp.Count):
@@ -1573,7 +1642,7 @@ def _aggregate_value(aggregate: exp.Expression, rows: List[Row]) -> Any:
         if source is None or isinstance(source, exp.Star):
             return len(rows)
         values = _aggregate_inputs(source, rows)
-        if isinstance(source, exp.Distinct):
+        if isinstance(source, exp.Distinct) or expression.args.get("distinct"):
             return len({value for value in values if value is not None})
         return sum(1 for value in values if value is not None)
     if isinstance(expression, exp.Avg):
@@ -1606,11 +1675,14 @@ def _aggregate_expression_map(
     dialect: str | None = None,
 ) -> Dict[str, exp.Expression]:
     mapping: Dict[str, exp.Expression] = {}
-    for expression in aggregate.aggregations or ():
+    output_keys = _aggregate_output_keys(tuple(aggregate.aggregations or ()), dialect)
+    for expression, key in zip(aggregate.aggregations or (), output_keys):
         unaliased = expression.this if isinstance(expression, exp.Alias) else expression
-        key = _aggregate_key(expression, dialect)
         mapping[key.name.casefold()] = unaliased
         mapping[_expression_key(key, dialect)] = unaliased
+        canonical_key = _aggregate_key(expression, dialect)
+        mapping[canonical_key.name.casefold()] = unaliased
+        mapping[_expression_key(canonical_key, dialect)] = unaliased
         mapping[_expression_key(unaliased, dialect)] = unaliased
         if expression.alias_or_name:
             mapping[str(expression.alias_or_name).casefold()] = unaliased
