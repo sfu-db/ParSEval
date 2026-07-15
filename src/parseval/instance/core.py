@@ -360,18 +360,29 @@ class Instance:
                     continue
                 synthetic = {}
                 for local_col, target_col in zip(sources, targets):
+                    if (
+                        local_col in concretes
+                        and concretes[local_col] is None
+                        and table_schema.columns[local_col].nullable
+                    ):
+                        presets[local_col] = None
+                        locked.add(local_col)
+                        continue
                     preferred = (
                         concretes[local_col]
                         if local_col in concretes and concretes[local_col] is not None
                         else _BOOTSTRAP_MISSING
                     )
-                    value = self._ensure_bootstrap_value(
-                        target, target_col, preferred=preferred
-                    )
-                    presets[local_col] = value
-                    locked.add(local_col)
+                    if preferred is not _BOOTSTRAP_MISSING:
+                        value = preferred
+                    else:
+                        value = self._ensure_bootstrap_value(
+                            target, target_col, preferred=preferred
+                        )
+                        presets[local_col] = value
+                        locked.add(local_col)
                     synthetic[target_col] = value
-                    if target == table:
+                    if target == table and target_col not in presets:
                         presets[target_col] = value
                         locked.add(target_col)
                 # Domain fail-closed on dangling FKs; cycle partners are not
