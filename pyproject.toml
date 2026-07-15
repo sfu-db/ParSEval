@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=2.3.3",
     "pymysql>=1.2.0",
     "datafusion>=50.1.0",
+    "pebble>=5.2.0",
 ]
 
 [project.optional-dependencies]

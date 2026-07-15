@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from parseval.generator.speculate import speculate
+from parseval.instance import Instance
 
 
 class TestSpeculateSelfJoin(unittest.TestCase):
@@ -154,6 +156,113 @@ CREATE TABLE c (id INT, b_id INT);"""
         self.assertIsNotNone(inst)
         total = sum(len(inst.get_rows(t)) for t in inst.schema.fk_safe_table_order())
         self.assertGreater(total, 0)
+
+
+class TestSpeculateRelationScope(unittest.TestCase):
+    def test_cte_alias_is_not_resolved_as_physical_table(self):
+        ddls = """
+CREATE TABLE activity (
+    player_id INT,
+    event_date TEXT
+);
+"""
+        query = """
+WITH first_login AS (
+    SELECT player_id, MIN(event_date) AS first_date
+    FROM activity
+    GROUP BY player_id
+)
+SELECT a.player_id
+FROM first_login AS a
+LEFT JOIN activity AS b
+    ON a.player_id = b.player_id
+"""
+        calls: list[str] = []
+        original = Instance.resolve_table
+
+        def recording_resolve_table(self, table):
+            name = table.name if hasattr(table, "name") else str(table)
+            calls.append(name)
+            return original(self, table)
+
+        with patch.object(Instance, "resolve_table", recording_resolve_table):
+            inst = speculate(ddls, query, "sqlite")
+
+        self.assertIsNotNone(inst)
+        self.assertNotIn("first_login", calls)
+        self.assertGreater(len(inst.get_rows("activity")), 0)
+
+
+class TestSpeculateConstraintCompletion(unittest.TestCase):
+    def test_check_constraint_with_non_query_column_is_satisfied(self):
+        ddls = """
+CREATE TABLE customer (
+    id INT,
+    referee_id INT,
+    CHECK (referee_id <> id)
+);
+"""
+        inst = speculate(
+            ddls,
+            "SELECT referee_id FROM customer WHERE referee_id = 1",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        id_col = inst.resolve_column("customer", "id")
+        referee_col = inst.resolve_column("customer", "referee_id")
+        for row in inst.get_rows("customer"):
+            values = Instance._row_value_dict(row)
+            self.assertNotEqual(values[referee_col], values[id_col])
+
+    def test_self_fk_check_constraint_can_seed_customer_filter(self):
+        ddls = """
+CREATE TABLE customer (
+    id INT PRIMARY KEY,
+    name VARCHAR(255),
+    referee_id INT,
+    FOREIGN KEY (referee_id) REFERENCES customer(id),
+    CHECK (referee_id <> id)
+);
+"""
+        inst = speculate(
+            ddls,
+            "SELECT name FROM customer "
+            "WHERE referee_id <> 2 OR referee_id IS NULL",
+            "mysql",
+            generate_negatives=False,
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("customer")), 0)
+        id_col = inst.resolve_column("customer", "id")
+        referee_col = inst.resolve_column("customer", "referee_id")
+        ids = {
+            Instance._row_value_dict(row)[id_col]
+            for row in inst.get_rows("customer")
+        }
+        for row in inst.get_rows("customer"):
+            values = Instance._row_value_dict(row)
+            self.assertNotEqual(values[referee_col], values[id_col])
+            if values[referee_col] is not None:
+                self.assertIn(values[referee_col], ids)
+
+    def test_unique_values_are_reserved_across_speculative_batch(self):
+        ddls = "CREATE TABLE insurance (pid INT PRIMARY KEY);"
+        inst = speculate(
+            ddls,
+            "SELECT pid FROM insurance WHERE pid > 0",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        pid_col = inst.resolve_column("insurance", "pid")
+        pids = [
+            Instance._row_value_dict(row)[pid_col]
+            for row in inst.get_rows("insurance")
+        ]
+        self.assertEqual(len(pids), len(set(pids)))
+        self.assertGreaterEqual(len(pids), 3)
 
 
 if __name__ == "__main__":

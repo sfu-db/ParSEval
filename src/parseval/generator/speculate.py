@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from typing import Any, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence, Tuple
 
 from sqlglot import exp, parse_one
+from sqlglot.optimizer.scope import build_scope, traverse_scope
 
+from parseval.domain.exceptions import DomainError
 from parseval.instance import Instance
 from parseval.instance.schema import table_key, normalize_identifier
 from parseval.solver import Problem, SolverVar
@@ -24,6 +27,12 @@ from parseval.plan.rex import negate_predicate
 logger = logging.getLogger(__name__)
 
 MIN_ROWS_CAP = 1000
+
+
+@dataclass
+class RelationScopeInfo:
+    alias_maps: dict[int, dict[exp.Identifier, exp.Table]] = field(default_factory=dict)
+    physical_tables: set[exp.Table] = field(default_factory=set)
 
 
 def _is_outer_join(join: exp.Join) -> bool:
@@ -83,45 +92,26 @@ def speculate(
         _seed_base_rows(instance)
         return instance
 
-    cte_names: set[exp.Identifier] = set()
     if isinstance(tree, exp.With):
         tree = tree.this
-    with_node = tree.args.get("with") if isinstance(tree, exp.Select) else None
-    if with_node is not None:
-        for cte in (with_node.args.get("expressions") or []):
-            alias = cte.args.get("alias")
-            if alias and alias.this:
-                cte_names.add(normalize_identifier(alias.this, dialect))
     if not isinstance(tree, exp.Select):
         logger.warning("Only SELECT queries are supported, got %s", type(tree).__name__)
         _seed_base_rows(instance)
         return instance
 
-    alias_map = _build_alias_map(tree, instance, cte_names=cte_names)
-    query_tables: set[exp.Table] = set(alias_map.values())
+    relation_info = _collect_relation_scope_info(tree, instance)
+    alias_map = _build_alias_map(tree, instance, relation_info=relation_info)
+    query_tables: set[exp.Table] = set(relation_info.physical_tables)
     if not alias_map:
-        if cte_names:
-            for table_node in tree.find_all(exp.Table):
-                try:
-                    query_tables.add(instance.resolve_table(table_node))
-                except KeyError:
-                    continue
-            if query_tables:
-                _seed_base_rows(instance, tables=query_tables)
-            else:
-                _seed_base_rows(instance)
+        if query_tables:
+            _seed_base_rows(instance, tables=query_tables)
             return instance
         logger.debug("No tables found in query")
         _seed_base_rows(instance)
         return instance
 
-    for table_node in tree.find_all(exp.Table):
-        try:
-            query_tables.add(instance.resolve_table(table_node))
-        except KeyError:
-            continue
-
     col_var_map, table_vars = _collect_column_vars(tree, instance, alias_map)
+    _ensure_check_constraint_vars(instance, col_var_map, table_vars)
 
     if not col_var_map:
         _seed_base_rows(instance, tables=query_tables)
@@ -158,6 +148,7 @@ def speculate(
     for drop_optional in (False, True):
         predicates, equalities, not_exists_not_in_items = _extract_predicates(
             tree, instance, alias_map, col_var_map, table_vars,
+            relation_info=relation_info,
             drop_optional=drop_optional,
         )
 
@@ -222,37 +213,39 @@ def _build_alias_map(
     tree: exp.Select,
     instance: Instance,
     *,
-    cte_names: set[exp.Identifier] | None = None,
+    relation_info: RelationScopeInfo | None = None,
 ) -> dict[exp.Identifier, exp.Table]:
-    """Build ``{normalized_alias: resolved_Table}`` from FROM/JOIN clauses."""
-    cte_names = cte_names or set()
-    alias_map: dict[exp.Identifier, exp.Table] = {}
-    from_node = tree.args.get("from")
-    if from_node is None:
-        return alias_map
-
-    main = from_node.this
-    if isinstance(main, exp.Table):
-        key = _alias_key(main, instance.dialect)
-        if key not in cte_names:
-            resolved = instance.resolve_table(main)
-            alias_map[key] = resolved
-
-    for join in (tree.args.get("joins") or []):
-        join_table = join.this
-        if isinstance(join_table, exp.Table):
-            key = _alias_key(join_table, instance.dialect)
-            if key not in cte_names:
-                resolved = instance.resolve_table(join_table)
-                alias_map[key] = resolved
-
-    return alias_map
+    """Build ``{normalized_alias: resolved_Table}`` for physical sources only."""
+    info = relation_info or _collect_relation_scope_info(tree, instance)
+    return dict(info.alias_maps.get(id(tree), {}))
 
 
-def _alias_key(table: exp.Table, dialect: str) -> exp.Identifier:
-    raw = table.alias or table.name
-    ident = exp.Identifier(this=raw, quoted=False)
-    return normalize_identifier(ident, dialect)
+def _collect_relation_scope_info(tree: exp.Select, instance: Instance) -> RelationScopeInfo:
+    """Classify scope sources, excluding CTE and derived-table aliases."""
+    info = RelationScopeInfo()
+    try:
+        build_scope(tree)
+        scopes = list(traverse_scope(tree))
+    except Exception:
+        logger.debug("Failed to build sqlglot scope", exc_info=True)
+        scopes = []
+
+    for scope in scopes:
+        alias_map: dict[exp.Identifier, exp.Table] = {}
+        for source_name, (_node, source) in scope.selected_sources.items():
+            if not isinstance(source, exp.Table):
+                continue
+            try:
+                resolved = instance.resolve_table(source)
+            except KeyError:
+                logger.debug("Skipping unresolved physical source %s", source.sql())
+                continue
+            alias = normalize_identifier(source_name, instance.dialect)
+            alias_map[alias] = resolved
+            info.physical_tables.add(resolved)
+        info.alias_maps[id(scope.expression)] = alias_map
+
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +398,7 @@ def _extract_predicates(
     col_var_map: dict[tuple[str, str | None, str], SolverVar],
     table_vars: dict[exp.Table, list[SolverVar]],
     *,
+    relation_info: RelationScopeInfo | None = None,
     drop_optional: bool = False,
 ) -> tuple[list[exp.Expression], list[tuple[SolverVar, SolverVar]], list[dict[str, Any]]]:
     """Extract predicates and equalities from the query AST.
@@ -432,6 +426,7 @@ def _extract_predicates(
                         sp, se = _process_exists_in_subquery(
                             inner_select, kind, outer_expr,
                             instance, alias_map, col_var_map, table_vars, dialect,
+                            relation_info=relation_info,
                         )
                         predicates.extend(sp)
                         equalities.extend(se)
@@ -439,6 +434,7 @@ def _extract_predicates(
                         items = _collect_not_exists_not_in_items(
                             inner_select, kind, outer_expr,
                             instance, alias_map, col_var_map, table_vars,
+                            relation_info=relation_info,
                         )
                         not_exists_not_in_items.extend(items)
             else:
@@ -645,13 +641,17 @@ def _process_exists_in_subquery(
     col_var_map: dict[tuple[str, str | None, str], SolverVar],
     table_vars: dict[exp.Table, list[SolverVar]],
     dialect: str,
+    *,
+    relation_info: RelationScopeInfo | None = None,
 ) -> tuple[list[exp.Expression], list[tuple[SolverVar, SolverVar]]]:
     """Process EXISTS / IN (subquery).
 
     Returns ``(predicates, equalities)`` the solver must satisfy for the
     EXISTS/IN condition to produce at least one matching row.
     """
-    inner_alias_map = _build_alias_map(inner_select, instance)
+    inner_alias_map = _build_alias_map(
+        inner_select, instance, relation_info=relation_info,
+    )
     if not inner_alias_map:
         return [], []
 
@@ -723,6 +723,8 @@ def _collect_not_exists_not_in_items(
     outer_alias_map: dict[exp.Identifier, exp.Table],
     col_var_map: dict[tuple[str, str | None, str], SolverVar],
     table_vars: dict[exp.Table, list[SolverVar]],
+    *,
+    relation_info: RelationScopeInfo | None = None,
 ) -> list[dict[str, Any]]:
     """Collect NOT EXISTS / NOT IN info for two-phase seeding.
 
@@ -735,7 +737,9 @@ def _collect_not_exists_not_in_items(
     - ``"inner_on_exprs"``: inner side of correlation (column refs)
     - ``"outer_in_expr"``: for NOT IN, the outer expression
     """
-    inner_alias_map = _build_alias_map(inner_select, instance)
+    inner_alias_map = _build_alias_map(
+        inner_select, instance, relation_info=relation_info,
+    )
     if not inner_alias_map:
         return []
 
@@ -899,7 +903,11 @@ def _seed_not_exists_not_in(
                         except KeyError:
                             continue
                 if row_data:
-                    instance.create_rows({table_node: [row_data]})
+                    _try_create_rows(
+                        instance,
+                        {table_node: [row_data]},
+                        reason="not_exists_not_in_solver",
+                    )
             else:
                 # Fallback heuristic: use non-matching values
                 fallback_row: dict[exp.Identifier, Any] = {}
@@ -917,7 +925,11 @@ def _seed_not_exists_not_in(
                     except KeyError:
                         continue
                 if fallback_row:
-                    instance.create_rows({table_node: [fallback_row]})
+                    _try_create_rows(
+                        instance,
+                        {table_node: [fallback_row]},
+                        reason="not_exists_not_in_fallback",
+                    )
 
 
 def _extract_equality_pair(
@@ -976,6 +988,35 @@ def _add_not_null_for_column(
         predicates.append(exp.Not(this=exp.Is(this=var, expression=exp.Null())))
 
 
+def _ensure_check_constraint_vars(
+    instance: Instance,
+    col_var_map: dict[tuple[str, str | None, str], SolverVar],
+    table_vars: dict[exp.Table, list[SolverVar]],
+) -> None:
+    """Add internal solver vars for supported CHECK columns missing from the query."""
+    for table_node in list(table_vars):
+        tkey = table_key(table_node)
+        table_schema = instance.database_constraints(table_node)
+        for check in table_schema.checks:
+            if not check.supported:
+                continue
+            for col_ident in check.referenced_columns:
+                if any(tk == tkey and cn == col_ident.name for tk, _alias, cn in col_var_map):
+                    continue
+                dtype = instance.get_column_type(table_node, col_ident)
+                if not instance.nullable(table_node, col_ident):
+                    dtype = dtype.copy()
+                    dtype.args["nullable"] = False
+                key = (tkey, None, col_ident.name)
+                var = SolverVar(
+                    key=f"{tkey}._check.{col_ident.name}",
+                    dtype=dtype,
+                    meta={"internal": "check"},
+                )
+                col_var_map[key] = var
+                table_vars.setdefault(table_node, []).append(var)
+
+
 # ---------------------------------------------------------------------------
 # Column to SolverVar replacement
 # ---------------------------------------------------------------------------
@@ -1023,6 +1064,110 @@ def _row_from_assignments(
     return row
 
 
+def _row_value_maps(instance: Instance, table_node: exp.Table) -> list[dict[exp.Identifier, Any]]:
+    return [
+        Instance._row_value_dict(row)
+        for row in instance.get_rows(table_node)
+    ]
+
+
+def _normalize_pending_row(
+    instance: Instance,
+    table_node: exp.Table,
+    row: Mapping[exp.Identifier | str, Any],
+) -> dict[exp.Identifier, Any]:
+    return {
+        instance.resolve_column(table_node, column): value
+        for column, value in row.items()
+    }
+
+
+def _reserve_unique_values(
+    instance: Instance,
+    rows_by_table: Mapping[exp.Table, Sequence[Mapping[exp.Identifier | str, Any]]],
+) -> dict[exp.Table, list[dict[exp.Identifier, Any]]]:
+    reserved: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
+    for table_node, rows in rows_by_table.items():
+        table_node = instance.resolve_table(table_node)
+        table_schema = instance.database_constraints(table_node)
+        seen = _row_value_maps(instance, table_node)
+        table_rows: list[dict[exp.Identifier, Any]] = []
+        for raw_row in rows:
+            row = _normalize_pending_row(instance, table_node, raw_row)
+            for group in table_schema.uniqueness_groups():
+                if any(col not in row or row[col] is None for col in group):
+                    continue
+                target = tuple(row[col] for col in group)
+                if not any(tuple(existing.get(col) for col in group) == target for existing in seen):
+                    continue
+                adjust_col = group[-1]
+                avoid = [
+                    existing.get(adjust_col)
+                    for existing in seen
+                    if all(
+                        col == adjust_col or existing.get(col) == row.get(col)
+                        for col in group
+                    )
+                ]
+                try:
+                    row[adjust_col] = instance._domain.next_value(
+                        table_node,
+                        adjust_col,
+                        existing_rows=seen,
+                        avoid=avoid,
+                    )
+                except DomainError:
+                    logger.info(
+                        "speculate_generation_skipped:unique_reservation_failed:%s:%s",
+                        table_key(table_node),
+                        tuple(col.name for col in group),
+                    )
+            table_rows.append(row)
+            seen.append(dict(row))
+            for fk in table_schema.foreign_keys:
+                if len(fk.source_columns) != 1 or len(fk.target_columns) != 1:
+                    continue
+                if instance.resolve_table(fk.target_table) != table_node:
+                    continue
+                source_col = fk.source_columns[0]
+                target_col = fk.target_columns[0]
+                if source_col == target_col:
+                    continue
+                source_value = row.get(source_col)
+                target_value = row.get(target_col)
+                if source_value is None or target_value is None:
+                    continue
+                if instance.nullable(table_node, source_col):
+                    row[source_col] = None
+                    continue
+                if any(existing.get(target_col) == source_value for existing in seen):
+                    continue
+                companion = {
+                    target_col: source_value,
+                    source_col: target_value,
+                }
+                table_rows.append(companion)
+                seen.append(dict(companion))
+        reserved[table_node] = table_rows
+    return reserved
+
+
+def _try_create_rows(
+    instance: Instance,
+    rows_by_table: Mapping[exp.Table, Sequence[Mapping[exp.Identifier | str, Any]]],
+    *,
+    reason: str,
+) -> bool:
+    token = instance.checkpoint()
+    try:
+        instance.create_rows(_reserve_unique_values(instance, rows_by_table))
+        return True
+    except (DomainError, KeyError) as exc:
+        instance.rollback(token)
+        logger.info("speculate_generation_skipped:%s:%s", reason, exc)
+        return False
+
+
 def _seed_from_assignments(
     instance: Instance,
     first_assignments: dict[SolverVar, Any],
@@ -1052,10 +1197,19 @@ def _seed_from_assignments(
         }
 
     if total_rows <= 1:
-        instance.create_rows(_build_rows_by_table(first_assignments))
+        _try_create_rows(
+            instance,
+            _build_rows_by_table(first_assignments),
+            reason="solver_assignment",
+        )
         return
 
-    instance.create_rows(_build_rows_by_table(first_assignments))
+    if not _try_create_rows(
+        instance,
+        _build_rows_by_table(first_assignments),
+        reason="solver_assignment",
+    ):
+        return
 
     # Read first-row group-key values from the instance (the instance fills
     # in random values even when solver assignments are empty).
@@ -1161,7 +1315,13 @@ def _seed_from_assignments(
                     continue
                 row[col_ident] = result.assignments[new_var]
             extra_rows_by_table[table_node] = [row]
-        instance.create_rows(extra_rows_by_table)
+        if _try_create_rows(
+            instance,
+            extra_rows_by_table,
+            reason="extra_solver_assignment",
+        ):
+            extra_idx += 1
+            continue
         extra_idx += 1
 
 
@@ -1311,7 +1471,7 @@ def _seed_base_rows(
         if tables is not None and table_node not in tables:
             continue
         rows_by_table[table_node] = [{} for _ in range(row_count)]
-    instance.create_rows(rows_by_table)
+    _try_create_rows(instance, rows_by_table, reason="base_rows")
 
 
 # ---------------------------------------------------------------------------
@@ -1353,4 +1513,4 @@ def _seed_negative_rows(
                 t: [_row_from_assignments(instance, result.assignments, vs, t)]
                 for t, vs in table_vars.items()
             }
-            instance.create_rows(rows_by_table)
+            _try_create_rows(instance, rows_by_table, reason="negative_rows")
