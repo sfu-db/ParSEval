@@ -7,19 +7,23 @@ from unittest.mock import patch
 
 from sqlglot import exp
 
+from parseval.dtype import DataType
 from parseval.generator import BmcBounds, generate_query_database
 from parseval.generator.symbolic import operator as symbolic_operator
 from parseval.generator.symbolic.generate import generate
 from parseval.generator.symbolic.operator import (
+    AggregateEncodeStep,
     EncodePipeline,
     _database_constraints_for_solver,
+    _aggregate_expression_map,
+    _aggregate_key,
     _schema_constraints_for_solver_rows,
     _solve_table_rows,
 )
 from parseval.instance import Instance
 from parseval.instance.exporter import InstanceValueSerializer
-from parseval.plan.explain import explain
-from parseval.plan.context import DerivedSchema
+from parseval.plan.explain import Aggregate, explain
+from parseval.plan.context import DerivedSchema, Row
 from parseval.solver.types import SolverVar
 
 symbolic_generate_module = importlib.import_module("parseval.generator.symbolic.generate")
@@ -380,6 +384,86 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         )
 
         self.assertEqual(1, len(result.generation.root_schema.rows))
+
+    def test_aggregate_keys_distinguish_distinct_and_cast_inputs(self):
+        plain = exp.Count(this=exp.column("x"))
+        distinct = exp.Count(this=exp.Distinct(expressions=[exp.column("x")]))
+        casted = exp.Count(
+            this=exp.Cast(this=exp.column("x"), to=DataType.build("REAL"))
+        )
+
+        plain_key = _aggregate_key(plain, "sqlite")
+        distinct_key = _aggregate_key(distinct, "sqlite")
+        casted_key = _aggregate_key(casted, "sqlite")
+
+        self.assertNotEqual(plain_key.name, distinct_key.name)
+        self.assertNotEqual(plain_key.name, casted_key.name)
+
+    def test_aggregate_expression_map_resolves_distinct_and_alias_independently(self):
+        aggregate = Aggregate()
+        plain = exp.Count(this=exp.column("x"))
+        distinct = exp.Alias(
+            this=exp.Count(this=exp.Distinct(expressions=[exp.column("x")])),
+            alias=exp.to_identifier("distinct_x"),
+        )
+        aggregate.aggregations = [plain, distinct]
+
+        mapping = _aggregate_expression_map(aggregate, "sqlite")
+
+        self.assertIs(mapping[_aggregate_key(plain, "sqlite").name.casefold()], plain)
+        self.assertIs(
+            mapping[_aggregate_key(distinct, "sqlite").name.casefold()],
+            distinct.this,
+        )
+        self.assertIs(mapping["distinct_x"], distinct.this)
+
+    def test_symbolic_generation_keeps_cast_count_and_distinct_count_columns(self):
+        ddl = """
+        CREATE TABLE event (event_id TEXT PRIMARY KEY);
+        CREATE TABLE attendance (
+            link_to_event TEXT,
+            link_to_member TEXT,
+            FOREIGN KEY(link_to_event) REFERENCES event(event_id)
+        );
+        """
+        query = """
+        SELECT CAST(COUNT(T2.link_to_event) AS REAL) / COUNT(DISTINCT T2.link_to_event)
+        FROM attendance AS T2
+        """
+
+        result = generate(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=2, rows_per_group=2, max_iterations=0),
+        )
+
+        self.assertTrue(result.generation.root_schema.rows)
+        self.assertTrue(
+            all(
+                len(row.column_values) == len(result.generation.root_schema.columns)
+                for row in result.generation.root_schema.rows
+            )
+        )
+
+        source = exp.column("link_to_event", table="t2")
+        plain = exp.Count(this=source.copy())
+        distinct = exp.Count(this=source.copy(), distinct=True)
+        aggregate = Aggregate()
+        aggregate.aggregations = [plain, distinct]
+        child = DerivedSchema(
+            columns=(source,),
+            rows=[
+                Row(this=("r1",), columns={source: "e1"}),
+                Row(this=("r2",), columns={source: "e1"}),
+                Row(this=("r3",), columns={source: "e2"}),
+            ],
+        )
+
+        aggregate_schema = AggregateEncodeStep(aggregate).forward(child)
+
+        self.assertEqual(2, len(aggregate_schema.columns))
+        self.assertEqual(2, len(aggregate_schema.rows[0].column_values))
 
     def test_symbolic_generation_passes_referenced_check_constraints_to_problem(self):
         ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT CHECK (age > 0));"

@@ -332,6 +332,29 @@ class TestSmtBackendProblemApi(unittest.TestCase):
         if result.status == "unknown":
             self.assertEqual("unsupported_smt_expression", result.reason)
 
+    def test_strftime_year_subtraction_returns_unknown_without_type_error(self):
+        started = var("events.started_at", "DATE")
+        ended = var("events.ended_at", "DATE")
+        year_diff = exp.Sub(
+            this=exp.TimeToStr(
+                this=exp.Cast(this=started, to=DataType.build("TEXT")),
+                format=text("%Y"),
+            ),
+            expression=exp.TimeToStr(
+                this=exp.Cast(this=ended, to=DataType.build("TEXT")),
+                format=text("%Y"),
+            ),
+        )
+        predicate = exp.GT(this=year_diff, expression=number(2))
+
+        result = SmtBackend().solve(
+            Problem(constraints=[predicate], variables={started, ended})
+        )
+
+        self.assertEqual("unknown", result.status)
+        self.assertEqual("unsupported_smt_expression", result.reason)
+        self.assertEqual({}, result.assignments)
+
 
 if __name__ == "__main__":
     unittest.main()

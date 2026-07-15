@@ -426,8 +426,14 @@ class Z3SmtSession:
         null_expr = z3.Not(z3.And(left_some, right_some))
         if null_condition is not None:
             null_expr = z3.Or(null_expr, null_condition(raw_left, raw_right))
+        try:
+            payload = op(raw_left, raw_right)
+        except TypeError as exc:
+            raise UnsupportedSMTError(
+                "unsupported_smt_arithmetic"
+            ) from exc
         return SMTValue(
-            z3.If(null_expr, option_sort.NULL, option_sort.Some(op(raw_left, raw_right))),
+            z3.If(null_expr, option_sort.NULL, option_sort.Some(payload)),
             result_type,
         )
 

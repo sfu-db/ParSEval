@@ -1,4 +1,4 @@
-name: Run MySQL Experiment
+name: Execute MySQL Script
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   mysql-experiment:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     services:
       mysql:
@@ -60,18 +60,21 @@ jobs:
           uv sync
           uv pip install -e .
 
-      - name: Run MySQL experiment
+      - name: Execute script
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
           MYSQL_CONNECTION_STRING: mysql+pymysql://root:rootpass@127.0.0.1:3306/mydb
         run: |
           source .venv/bin/activate
-          python -u tests/experiment/test_mysql.py \
+          
+          # Updated to target your script folder. 
+          # Change "your_script_name.py" to your actual file name.
+          python -u script/scripts/exp_mysql_disprover.py  \
             --data_fp data/mysql/leetcode.jsonlines \
             --connection_string "$MYSQL_CONNECTION_STRING" \
             --output_dir results \
-            --workers 32
+            --workers 8
 
       - name: Upload results as artifact
         uses: actions/upload-artifact@v4
