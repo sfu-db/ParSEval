@@ -41,9 +41,7 @@ from parseval.generator.coverage import (
     _step_semantic_targets,
     sql_order_key
 )
-from parseval.generator.symbolic_resolution import same_identifier
-
-from . import values as v
+from parseval.generator.helper import same_identifier
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
@@ -129,6 +127,16 @@ class RowAllocator:
         self.next_index_by_table[key] = index + 1
         return index
 
+def _row_value_dict(row) -> Dict[exp.Identifier, Any]:
+    """Extract concrete {col_ident: value} from a Row/Variable row."""
+    d: Dict[exp.Identifier, Any] = {}
+    for col_ident, val in row.column_values.items():
+        if isinstance(val, Variable):
+            d[col_ident] = val.concrete
+        else:
+            d[col_ident] = val
+    return d
+
 
 def _step_name(step: Step) -> str:
     return step.name.name if step.name else type(step).__name__
@@ -168,7 +176,7 @@ def _database_constraints_for_solver(
         if not set(names) <= available:
             continue
         for row in instance.get_rows(table_schema.table):
-            values = v._row_value_dict(row)
+            values = _row_value_dict(row)
             existing = [values.get(column) for column in group]
             if any(value is None for value in existing):
                 continue
@@ -185,7 +193,7 @@ def _database_constraints_for_solver(
         target_values = []
         target_column = fk.target_columns[0]
         for parent_row in instance.get_rows(fk.target_table):
-            value = v._row_value_dict(parent_row).get(target_column)
+            value = _row_value_dict(parent_row).get(target_column)
             if value is not None:
                 target_values.append(value)
         if target_values:
@@ -916,10 +924,10 @@ class JoinEncodeStep(EncodeStep):
         if jt in ("SEMI", "ANTI"):
             output_rows: List[Row] = []
             for lrow in left_ds.rows:
-                ldict = v._row_value_dict(lrow) if hasattr(lrow, 'column_values') else {}
+                ldict = _row_value_dict(lrow) if hasattr(lrow, 'column_values') else {}
                 has_match = False
                 for rrow in right_ds.rows:
-                    rdict = v._row_value_dict(rrow) if hasattr(rrow, 'column_values') else {}
+                    rdict = _row_value_dict(rrow) if hasattr(rrow, 'column_values') else {}
                     merged = {**ldict, **rdict}
                     env = Environment(row=merged)
                     ok = True
@@ -957,9 +965,9 @@ class JoinEncodeStep(EncodeStep):
         output_rows = []
 
         for lrow in left_ds.rows:
-            ldict = v._row_value_dict(lrow) if hasattr(lrow, 'column_values') else {}
+            ldict = _row_value_dict(lrow) if hasattr(lrow, 'column_values') else {}
             for rrow in right_ds.rows:
-                rdict = v._row_value_dict(rrow) if hasattr(rrow, 'column_values') else {}
+                rdict = _row_value_dict(rrow) if hasattr(rrow, 'column_values') else {}
                 merged = {**ldict, **rdict}
                 env = Environment(row=merged)
                 ok = True
@@ -2080,6 +2088,27 @@ def _aggregate_group_demands(
         )
         for index in range(max(group_count, 1))
     )
+
+
+def _schema_satisfies_group_demands(
+    schema: DerivedSchema,
+    demand: SchemaDemand,
+) -> bool:
+    group_sizes = sorted(max(len(row.rowid) - 2, 0) for row in schema.rows)
+    used: set[int] = set()
+    for required in sorted(group.row_count for group in demand.group_demands):
+        match = next(
+            (
+                index
+                for index, size in enumerate(group_sizes)
+                if index not in used and size >= required
+            ),
+            None,
+        )
+        if match is None:
+            return False
+        used.add(match)
+    return True
 
 
 def _root_result_count(root: Step, bounds: object) -> int:
@@ -3418,7 +3447,7 @@ def _solve_distinct_column_values(
         for index in range(count)
     )
     existing_values = {
-        v._row_value_dict(row).get(column_ident)
+        _row_value_dict(row).get(column_ident)
         for row in instance.get_rows(table)
     }
     constraints: List[exp.Expression] = []
@@ -3720,7 +3749,10 @@ class EncodePipeline:
 
             before = self._row_counts()
             root_demand = self._root_demand(self.plan.root)
-            if len(schema.rows) < root_demand.count:
+            if (
+                len(schema.rows) < root_demand.count
+                or not _schema_satisfies_group_demands(schema, root_demand)
+            ):
                 self._lower_demand(
                     self.plan.root,
                     root_demand,

@@ -5,9 +5,10 @@ from itertools import product
 from typing import Any, Mapping, Optional, Sequence
 
 from sqlglot import exp
-
+from decimal import Decimal
 from parseval.instance import Instance
 from parseval.plan.rex import Environment, concrete
+from datetime import datetime, date, time
 from parseval.plan.explain import (
     Aggregate,
     Distinct,
@@ -15,16 +16,16 @@ from parseval.plan.explain import (
     Join,
     Limit,
     Plan,
-    PlanError,
     Projection,
     Sort,
     Step,
     TableScan,
     explain,
 )
-from parseval.generator.symbolic_resolution import (
+from parseval.generator.helper import (
     join_alias_tables,
     join_order_keys_supported,
+    leaf_table_scans,
     order_expression_value,
     resolved_order_expressions,
     single_dependency_join,
@@ -111,29 +112,18 @@ def generate_query_database(
     if isinstance(ddl, Instance):
         instance = ddl
         plan = explain(instance.ddls, query, instance.dialect)
-        from parseval.generator.symbolic.generate import generate as symbolic_generate
+        from parseval.generator.symbolic.generate import _generate_from_plan
 
-        symbolic_generate(
+        _generate_from_plan(
             plan,
             instance,
-            query=query,
             bounds=bounds,
         )
         return instance.generation
 
-    instance = Instance(ddl, name="generation", dialect=dialect)
-    try:
-        plan = explain(instance.ddls, query, dialect)
-    except ValueError as e:
-        raise PlanError(f"Failed to generate plan for query: {query}") from e
     from parseval.generator.symbolic.generate import generate as symbolic_generate
 
-    return symbolic_generate(
-        plan,
-        instance,
-        query=query,
-        bounds=bounds,
-    )
+    return symbolic_generate(ddl, query, dialect=dialect, bounds=bounds)
 
 def _ordered_steps(root: Step) -> tuple[Step, ...]:
     ordered: list[Step] = []
@@ -453,17 +443,6 @@ def _case_expressions(
     return tuple(cases)
 
 
-def _leaf_table_scans(step: Step | None) -> tuple[TableScan, ...]:
-    if step is None:
-        return ()
-    if isinstance(step, TableScan):
-        return (step,)
-    scans: list[TableScan] = []
-    for dependency in step.dependencies:
-        scans.extend(_leaf_table_scans(dependency))
-    return tuple(scans)
-
-
 class SemanticCoverageRecorder:
     def __init__(self, plan: Plan, instance: Instance) -> None:
         self._plan = plan
@@ -685,7 +664,7 @@ def _existing_step_rows(
     instance: Instance,
     step: Step | None,
 ) -> tuple[Mapping[exp.Identifier, Any], ...]:
-    scans = tuple(_leaf_table_scans(step)) if step is not None else ()
+    scans = tuple(leaf_table_scans(step)) if step is not None else ()
     if not scans:
         return ()
     row_groups: list[list[Mapping[exp.Identifier, Any]]] = []
@@ -740,7 +719,7 @@ def _coverage_ratio(obligations: Sequence[CoverageObligation]) -> float:
 
 
 def _condition_has_nullable_input(instance: Instance, step: Filter) -> bool:
-    scans = _leaf_table_scans(step)
+    scans = leaf_table_scans(step)
     for column in step.condition.find_all(exp.Column) if step.condition is not None else ():
         for scan in scans:
             try:

@@ -13,6 +13,7 @@ from parseval.plan.explain import (
     Limit,
     PlanError,
     Projection,
+    ScalarSubqueryRef,
     Sort,
     Step,
     SubqueryAlias,
@@ -24,6 +25,7 @@ from parseval.plan.explain import (
     explain,
     repr_expr,
     repr_step,
+    _annotate_type,
     _from_logical,
 )
 
@@ -60,12 +62,44 @@ def _types(plan) -> set[str]:
     return {type(step).__name__ for step in plan.dag}
 
 
+def _step_expressions(step: Step) -> list[exp.Expression]:
+    exprs: list[exp.Expression] = []
+    if isinstance(step, Filter) and step.condition is not None:
+        exprs.append(step.condition)
+    if isinstance(step, Projection):
+        exprs.extend(step.projections)
+    if isinstance(step, Aggregate):
+        exprs.extend(step.group)
+        exprs.extend(step.aggregations)
+    if isinstance(step, Join):
+        if step.condition is not None:
+            exprs.append(step.condition)
+        for left, right in step.on_keys:
+            exprs.extend((left, right))
+    if isinstance(step, Sort):
+        exprs.extend(step.key)
+    if isinstance(step, Window):
+        exprs.extend(step.window_exprs)
+    return exprs
+
+
 def test_sqlglot_identifier_helpers() -> None:
     """Call sites use sqlglot's builders, not local wrappers."""
     assert isinstance(exp.to_identifier("foo"), exp.Identifier)
     assert isinstance(exp.column("a", table="t"), exp.Column)
     assert isinstance(exp.table_("t"), exp.Table)
     assert exp.to_identifier(exp.column("a").this).name == "a"
+
+
+def test_scalar_subquery_ref_renders_inside_supported_dialects() -> None:
+    expression = exp.Cast(
+        this=ScalarSubqueryRef(this=exp.to_identifier("sq0")),
+        to=exp.DataType.build("FLOAT"),
+    )
+
+    assert expression.sql(dialect="sqlite") == "CAST(sq0 AS REAL)"
+    assert expression.sql(dialect="mysql") == "CAST(sq0 AS FLOAT)"
+    assert expression.sql(dialect="postgres") == "CAST(sq0 AS REAL)"
 
 
 def test_strftime_kept_as_sqlite_builtin_stub() -> None:
@@ -125,6 +159,26 @@ def test_rewrite_sum_boolean_predicate() -> None:
     assert "IIF(" not in upper
 
 
+def test_rewrite_sqlite_literal_truthiness_in_boolean_context() -> None:
+    false_zero = _prepare("SELECT a FROM t WHERE a = 1 OR '0'", "sqlite").upper()
+    false_text = _prepare("SELECT a FROM t WHERE a = 1 OR '+-'", "sqlite").upper()
+    true_one = _prepare("SELECT a FROM t WHERE a = 1 OR '1'", "sqlite").upper()
+
+    assert " OR FALSE" in false_zero
+    assert " OR FALSE" in false_text
+    assert " OR TRUE" in true_one
+
+
+def test_rewrite_sqlite_boolean_arithmetic_to_numeric_case() -> None:
+    sql = _prepare("SELECT a * (b = 1) FROM t", "sqlite")
+    upper = sql.upper()
+
+    assert "CASE" in upper
+    assert "THEN 1" in upper
+    assert "ELSE 0" in upper
+    assert "* (B = 1)" not in upper
+
+
 def test_explain_like_utf8view_lowers() -> None:
     """CAST/LIKE plans may use Arrow Utf8View; lowerer must not raise."""
     plan = explain(
@@ -166,6 +220,40 @@ def test_explain_scalar_subquery_with_join_alias_filter_plans() -> None:
     )
 
     assert "Projection" in _types(plan)
+
+
+def test_explain_nested_in_with_scalar_subquery_plans() -> None:
+    plan = explain(
+        "CREATE TABLE t(a INT, b INT); CREATE TABLE u(a INT); CREATE TABLE v(x INT);",
+        "SELECT a FROM t "
+        "WHERE a IN (SELECT u.a FROM u WHERE u.a IN (SELECT MAX(x) FROM v)) "
+        "AND b = (SELECT COUNT(*) FROM v)",
+        "sqlite",
+    )
+
+    assert "Filter" in _types(plan)
+    assert plan.scalar_subqueries
+
+
+def test_explain_sqlite_boolean_arithmetic_plans() -> None:
+    plan = explain(
+        "CREATE TABLE t(a INT, b INT)",
+        "SELECT a * (b = 1) FROM t",
+        "sqlite",
+    )
+
+    assert "Projection" in _types(plan)
+
+
+def test_explain_sqlite_string_literal_boolean_context_plans() -> None:
+    for literal in ("'0'", "'+-'", "'1'"):
+        plan = explain(
+            "CREATE TABLE t(a INT)",
+            f"SELECT a FROM t WHERE a = 1 OR {literal}",
+            "sqlite",
+        )
+
+        assert "TableScan" in _types(plan)
 
 
 def test_explain_julianday_subtraction_plans() -> None:
@@ -452,6 +540,16 @@ def test_date32_literal() -> None:
     assert lit.type == exp.DataType.build("DATE")
 
 
+def test_cast_literal_annotation_propagates_to_inner_literal() -> None:
+    literal = exp.Literal.string("2000-01-01")
+    cast = exp.Cast(this=literal, to=exp.DataType.build("DATE"))
+
+    _annotate_type(cast, "Date32")
+
+    assert cast.type == exp.DataType.build("DATE")
+    assert literal.type == exp.DataType.build("DATE")
+
+
 def test_utf8view_null_literal_in_case() -> None:
     """DF encodes ELSE NULL on a string CASE as Utf8View(NULL)."""
     plan = explain(
@@ -487,10 +585,10 @@ def test_scalar_subquery_in_filter() -> None:
     )
     filt = next(s for s in plan.dag if isinstance(s, Filter))
     assert isinstance(filt.condition, exp.EQ)
-    subq = filt.condition.expression
-    assert isinstance(subq, exp.Subquery)
-    assert isinstance(subq.this, Step)
-    assert isinstance(subq.this, Aggregate)
+    ref = filt.condition.expression
+    assert isinstance(ref, ScalarSubqueryRef)
+    assert ref.subquery_id == "sq0"
+    assert isinstance(plan.scalar_subqueries[ref.subquery_id], Aggregate)
     assert_no_bare_string_identifiers(plan)
 
 
@@ -501,7 +599,8 @@ def test_scalar_subquery_in_projection() -> None:
         "sqlite",
     )
     proj = next(s for s in plan.dag if isinstance(s, Projection))
-    assert any(isinstance(e, exp.Subquery) for e in proj.projections)
+    assert any(e.find(ScalarSubqueryRef) for e in proj.projections)
+    assert "sq0" in plan.scalar_subqueries
     assert_no_bare_string_identifiers(plan)
 
 
@@ -512,9 +611,9 @@ def test_two_scalar_subqueries() -> None:
         "sqlite",
     )
     proj = next(s for s in plan.dag if isinstance(s, Projection))
-    subqs = [n for e in proj.projections for n in e.find_all(exp.Subquery)]
-    assert len(subqs) == 2
-    assert all(isinstance(s.this, Step) for s in subqs)
+    refs = [n for e in proj.projections for n in e.find_all(ScalarSubqueryRef)]
+    assert [ref.subquery_id for ref in refs] == ["sq0", "sq1"]
+    assert set(plan.scalar_subqueries) == {"sq0", "sq1"}
     assert_no_bare_string_identifiers(plan)
 
 
@@ -529,9 +628,13 @@ def test_scalar_subquery_in_projection_and_filter() -> None:
         "sqlite",
     )
     filt = next(s for s in plan.dag if isinstance(s, Filter))
-    assert filt.condition.find(exp.Subquery) is not None
+    assert filt.condition.find(ScalarSubqueryRef) is not None
     proj = next(s for s in plan.dag if isinstance(s, Projection))
-    assert any(e.find(exp.Subquery) for e in proj.projections)
+    assert any(e.find(ScalarSubqueryRef) for e in proj.projections)
+    refs = [ref.subquery_id for e in proj.projections for ref in e.find_all(ScalarSubqueryRef)]
+    refs.extend(ref.subquery_id for ref in filt.condition.find_all(ScalarSubqueryRef))
+    assert set(refs) <= set(plan.scalar_subqueries)
+    assert len(refs) == 2
     assert_no_bare_string_identifiers(plan)
 
 
@@ -544,8 +647,32 @@ def test_scalar_subquery_in_complex_predicate() -> None:
         "sqlite",
     )
     filt = next(s for s in plan.dag if isinstance(s, Filter))
-    assert filt.condition.find(exp.Subquery) is not None
+    assert filt.condition.find(ScalarSubqueryRef) is not None
     assert_no_bare_string_identifiers(plan)
+
+
+def test_scalar_subquery_refs_are_valid_sqlglot_leaves() -> None:
+    plan = explain(
+        "CREATE TABLE t(a INT); CREATE TABLE u(b INT);",
+        "SELECT a FROM t WHERE a = (SELECT MAX(b) FROM u)",
+        "sqlite",
+    )
+    filt = next(s for s in plan.dag if isinstance(s, Filter))
+    assert filt.condition is not None
+
+    assert filt.condition.sql()
+    copied = filt.condition.copy()
+    assert copied.find(ScalarSubqueryRef) is not None
+    transformed = filt.condition.transform(lambda node: node)
+    assert transformed.find(ScalarSubqueryRef) is not None
+    assert list(filt.condition.find_all(ScalarSubqueryRef))
+    assert not list(filt.condition.find_all(exp.Subquery))
+    assert all(
+        not isinstance(subquery.this, (Step, str))
+        for step in plan.dag
+        for expr in _step_expressions(step)
+        for subquery in expr.find_all(exp.Subquery)
+    )
 
 
 def test_timestamp_schema_field_params() -> None:
@@ -679,18 +806,16 @@ def test_repr_step_and_expr() -> None:
     assert "Filter(" in plan_repr
     assert "TableScan(" in plan_repr
 
-    subq = filt.condition.expression
-    assert isinstance(subq, exp.Subquery)
-    subq_repr = repr_expr(subq)
-    assert subq_repr.startswith("Subquery(")
-    assert "Aggregate(" in subq_repr
-    assert "Min(" in subq_repr
+    ref = filt.condition.expression
+    assert isinstance(ref, ScalarSubqueryRef)
+    subq_repr = repr_expr(ref)
+    assert subq_repr.startswith("ScalarSubqueryRef(")
 
-    inner_repr = repr_step(subq.this)
+    inner_repr = repr_step(plan.scalar_subqueries[ref.subquery_id])
     assert inner_repr.startswith("Aggregate(")
     assert "TableScan(" in inner_repr
 
-    subq_proj = next(e for e in proj.projections if isinstance(e, exp.Subquery))
+    subq_proj = next(e.find(ScalarSubqueryRef) for e in proj.projections if e.find(ScalarSubqueryRef))
     subq_proj_repr = repr_expr(subq_proj)
-    assert "Subquery(" in subq_proj_repr
-    assert "Max(" in subq_proj_repr
+    assert subq_proj_repr.startswith("ScalarSubqueryRef(")
+    assert "Max(" in repr_step(plan.scalar_subqueries[subq_proj.subquery_id])

@@ -84,9 +84,11 @@ class ExecutionResult:
         }
 
 @dataclass
-class GenerationResult:
-    """Result of test database generation."""
+class RunResult:
+    """Metadata for a generator/disprover run."""
+
     success: bool
+    status: str = ""
     rows_generated: int = 0
     coverage: float = 0.0
     error_msg: str = ""
@@ -95,11 +97,11 @@ class GenerationResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
+            "status": self.status,
             "rows_generated": self.rows_generated,
             "coverage": self.coverage,
             "error_msg": self.error_msg,
             "elapsed_time": self.elapsed_time,
-            "generation_coverage": self.coverage,
         }
 
 
@@ -110,7 +112,7 @@ class DisproveResult:
     semantics: str
     q1_result: ExecutionResult
     q2_result: ExecutionResult
-    generation: GenerationResult
+    generation: RunResult
     connection_string: str = ""
     error_msg: str = ""
 
@@ -134,7 +136,7 @@ class DisproveResult:
 class InstantiateResult:
     """Result of database instantiation."""
     success: bool
-    generation: GenerationResult
+    generation: RunResult
     q_result: Optional[ExecutionResult] = None
     connection_string: str = ""
     error_msg: str = ""
@@ -253,20 +255,3 @@ def non_fatal(
 
     return decorator
 
-
-# Legacy compat
-@dataclass
-class RunResult:
-    q1: str
-    q2: str
-    host_or_path: str
-    db_id: str
-    q1_result: ExecutionResult
-    q2_result: ExecutionResult
-    state: str
-    set_semantic: bool
-    error_msg: str = ""
-    reuse_hit: bool = False
-    database_source: str = "none"
-    database_name: str | None = None
-    elapsed_time: float = 0.0

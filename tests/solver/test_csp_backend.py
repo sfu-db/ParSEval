@@ -78,6 +78,17 @@ class CspBackendTests(unittest.TestCase):
         self.assertGreater(value, datetime.fromisoformat(lower))
         self.assertLess(value, datetime.fromisoformat(upper))
 
+    def test_date_literal_flagged_numeric_does_not_crash_support_check(self):
+        observed = var("t.observed", "DATE")
+        constraint = exp.LT(
+            this=observed,
+            expression=exp.Literal.number("2019-12-27"),
+        )
+
+        result = CspBackend().solve(Problem(constraints=[constraint]))
+
+        self.assertIn(result.status, {"sat", "unknown"})
+
     def test_datetime_equality_preserves_slash_separated_fractional_literal_for_storage(self):
         created = var("t.CreationDate", "DATETIME")
         constraint = exp.EQ(
@@ -414,6 +425,48 @@ class CspBackendTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "unknown")
+
+    def test_composite_solver_var_disequality_or_is_unknown_for_smt_fallback(self):
+        left_id = var("left.id", "INT")
+        right_id = var("right.id", "INT")
+        left_date = var("left.date", "DATE")
+        right_date = var("right.date", "DATE")
+        constraint = exp.Or(
+            this=exp.NEQ(this=left_id, expression=right_id),
+            expression=exp.NEQ(this=left_date, expression=right_date),
+        )
+
+        result = CspBackend().solve(Problem(constraints=[constraint]))
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.reason, "complex_disjunction")
+
+    def test_small_simple_or_still_branches_in_csp(self):
+        amount = var("orders.amount", "INT")
+        constraint = exp.Or(
+            this=exp.EQ(this=amount, expression=number(7)),
+            expression=exp.EQ(this=amount, expression=number(9)),
+        )
+
+        result = CspBackend().solve(Problem(constraints=[constraint]))
+
+        self.assertEqual(result.status, "sat")
+        self.assertIn(result.assignments[amount], {7, 9})
+
+    def test_large_or_branch_budget_returns_unknown(self):
+        amount = var("orders.amount", "INT")
+        constraints = [
+            exp.Or(
+                this=exp.EQ(this=amount, expression=number(index * 2)),
+                expression=exp.EQ(this=amount, expression=number(index * 2 + 1)),
+            )
+            for index in range(5)
+        ]
+
+        result = CspBackend().solve(Problem(constraints=constraints))
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.reason, "complex_disjunction")
 
     def test_text_var_equals_numeric_literal_assigns_text_form(self):
         nces = var("schools.ncesdist", "TEXT")

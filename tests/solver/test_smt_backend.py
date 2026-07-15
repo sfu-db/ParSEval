@@ -250,6 +250,38 @@ class TestSmtBackendProblemApi(unittest.TestCase):
         self.assertEqual("unsupported_smt_expression", result.reason)
         self.assertEqual({}, result.assignments)
 
+    def test_solver_falls_back_to_smt_for_composite_uniqueness_disjunctions(self):
+        ids = [var(f"lab.{index}.id", "INT") for index in range(3)]
+        dates = [var(f"lab.{index}.date", "DATE") for index in range(3)]
+        constraints = [
+            exp.EQ(this=id_var, expression=number(1))
+            for id_var in ids
+        ]
+        for left_index in range(len(ids)):
+            for right_index in range(left_index + 1, len(ids)):
+                constraints.append(
+                    exp.Or(
+                        this=exp.NEQ(
+                            this=ids[left_index],
+                            expression=ids[right_index],
+                        ),
+                        expression=exp.NEQ(
+                            this=dates[left_index],
+                            expression=dates[right_index],
+                        ),
+                    )
+                )
+
+        result = Solver().solve(Problem(constraints=constraints, variables=set(ids + dates)))
+
+        self.assertEqual("sat", result.status, result.reason)
+        tuples = [
+            (result.assignments[id_var], result.assignments[date_var])
+            for id_var, date_var in zip(ids, dates)
+        ]
+        self.assertEqual(3, len(set(tuples)))
+        self.assertTrue(all(date_value is not None for _id, date_value in tuples))
+
     def test_solver_rejects_non_problem_input(self):
         with self.assertRaises(TypeError):
             Solver().solve(object())  # type: ignore[arg-type]

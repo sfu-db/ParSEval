@@ -6,10 +6,12 @@ from .coverage import (
     CoverageObligation,
     generate_query_database,
 )
+from .symbolic.generate import generate
 
 __all__ = [
     "BmcBounds",
     "CoverageTreeNode",
     "CoverageObligation",
+    "generate",
     "generate_query_database",
 ]

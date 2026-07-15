@@ -19,6 +19,7 @@ from parseval.solver import Problem, SolverVar
 from parseval.solver.api import Solver
 from parseval.solver.partition import flatten_conjuncts
 from parseval.generator.bounds import BmcBounds
+from parseval.plan.rex import negate_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,13 @@ def speculate(
     dialect: str = "sqlite",
     *,
     bounds: BmcBounds | None = None,
+    generate_negatives: bool = True,
 ) -> Instance | None:
     """Seed data for *query* so it returns at least one row.
+
+    When *generate_negatives* is True (default), also seed additional
+    rows that violate individual WHERE atoms, providing both matching
+    and non-matching data.
 
     Returns an ``Instance`` with seeded rows, or a base-row-only
     ``Instance`` if the query is unsatisfiable within the solver's
@@ -105,7 +111,7 @@ def speculate(
             else:
                 _seed_base_rows(instance)
             return instance
-        logger.warning("No tables found in query")
+        logger.debug("No tables found in query")
         _seed_base_rows(instance)
         return instance
 
@@ -120,6 +126,15 @@ def speculate(
     if not col_var_map:
         _seed_base_rows(instance, tables=query_tables)
         return instance
+
+    # Extract WHERE atoms for negative-data generation
+    where_atoms: list[exp.Expression] = []
+    where_node = tree.args.get("where")
+    if where_node is not None:
+        for conj in flatten_conjuncts(where_node.this):
+            if not _find_subquery_predicates(conj):
+                replaced = _replace_columns_with_vars(conj, col_var_map, alias_map, instance)
+                where_atoms.append(replaced)
 
     limit_val, offset_val = _extract_limit_offset(tree)
     min_rows = 3
@@ -176,6 +191,14 @@ def speculate(
                     instance, not_exists_not_in_items, result.assignments,
                     col_var_map, table_vars, dialect,
                 )
+
+            # Negative data: seed rows that violate individual WHERE atoms
+            if generate_negatives and where_atoms:
+                _seed_negative_rows(
+                    instance, where_atoms, col_var_map, table_vars,
+                    list(equalities), dialect,
+                )
+
             return instance
 
         if not_exists_not_in_items and not result.sat:
@@ -252,13 +275,6 @@ def _resolve_column_table(
             candidates.append(table)
         except KeyError:
             continue
-
-    if len(candidates) > 1:
-        logger.warning(
-            "Ambiguous column %s --- found in %d tables, picking first",
-            col.name,
-            len(candidates),
-        )
     return candidates[0] if candidates else None
 
 
@@ -1199,3 +1215,45 @@ def _seed_base_rows(
             continue
         rows_by_table[table_node] = [{} for _ in range(row_count)]
     instance.create_rows(rows_by_table)
+
+
+# ---------------------------------------------------------------------------
+# Negative data seeding
+# ---------------------------------------------------------------------------
+
+
+def _seed_negative_rows(
+    instance: Instance,
+    where_atoms: list[exp.Expression],
+    col_var_map: dict[tuple[str, str | None, str], SolverVar],
+    table_vars: dict[exp.Table, list[SolverVar]],
+    equalities: list[tuple[SolverVar, SolverVar]],
+    dialect: str,
+) -> None:
+    """For each WHERE atom, seed a row that violates just that atom.
+
+    For ``A AND B AND C``, this generates rows for ``NOT A AND B AND C``,
+    ``A AND NOT B AND C``, and ``A AND B AND NOT C`` (where possible).
+    """
+    for i, atom in enumerate(where_atoms):
+        negated = negate_predicate(atom)
+        constraints: list[exp.Expression] = [negated]
+        constraints.extend(
+            a for j, a in enumerate(where_atoms) if j != i
+        )
+        _add_database_constraints(constraints, instance, col_var_map, table_vars)
+
+        problem = Problem(
+            constraints=constraints,
+            equalities=list(equalities),
+            variables=set(col_var_map.values()),
+        )
+        solver = Solver(dialect=dialect)
+        result = solver.solve(problem)
+
+        if result.sat:
+            rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {
+                t: [_row_from_assignments(instance, result.assignments, vs, t)]
+                for t, vs in table_vars.items()
+            }
+            instance.create_rows(rows_by_table)
