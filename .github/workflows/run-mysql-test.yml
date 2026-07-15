@@ -73,7 +73,7 @@ jobs:
             --data_fp data/mysql/leetcode.jsonlines \
             --connection_string "$MYSQL_CONNECTION_STRING" \
             --output_dir results \
-            --workers 8
+            --workers 1
 
       - name: Upload results as artifact
         uses: actions/upload-artifact@v4
