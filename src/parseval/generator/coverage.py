@@ -6,7 +6,6 @@ from typing import Any, Mapping, Optional, Sequence
 
 from sqlglot import exp
 
-from parseval.generator.order import sql_order_key
 from parseval.instance import Instance
 from parseval.plan.rex import Environment, concrete
 from parseval.plan.explain import (
@@ -208,6 +207,7 @@ def _step_semantic_targets(
                 )
             )
     if isinstance(step, Join):
+        jt = step.join_type.upper()
         targets.append(
             SemanticTarget(
                 id=f"{prefix}.match",
@@ -226,7 +226,7 @@ def _step_semantic_targets(
                 target="no_match",
             )
         )
-        if step.join_type.upper() in {"LEFT", "RIGHT", "FULL"}:
+        if jt in {"LEFT", "RIGHT", "FULL"}:
             targets.append(
                 SemanticTarget(
                     id=f"{prefix}.preserved_unmatched",
@@ -234,6 +234,26 @@ def _step_semantic_targets(
                     step_type=step_type,
                     kind="join",
                     target="preserved_unmatched",
+                )
+            )
+        if jt == "SEMI":
+            targets.append(
+                SemanticTarget(
+                    id=f"{prefix}.semi_match",
+                    step=step,
+                    step_type=step_type,
+                    kind="semi_join",
+                    target="semi_match",
+                )
+            )
+        if jt == "ANTI":
+            targets.append(
+                SemanticTarget(
+                    id=f"{prefix}.anti_no_match",
+                    step=step,
+                    step_type=step_type,
+                    kind="anti_join",
+                    target="anti_no_match",
                 )
             )
     if isinstance(step, Aggregate):
@@ -738,3 +758,20 @@ def _is_not_null_filter(expression: exp.Expression) -> bool:
         and isinstance(expression.this, exp.Is)
         and isinstance(expression.this.expression, exp.Null)
     )
+    
+    
+def sql_order_key(value: Any) -> tuple[int, int, Any]:
+    """Return a deterministic SQL-like key for generated ORDER BY values."""
+    if value is None:
+        return (0, 0, None)
+    if isinstance(value, bool):
+        return (1, 1, int(value))
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        return (1, 1, float(value))
+    if isinstance(value, (datetime, date, time)):
+        return (1, 2, value.isoformat())
+    if isinstance(value, bytes):
+        return (1, 4, value)
+    if isinstance(value, str):
+        return (1, 3, value)
+    return (1, 5, str(value))
