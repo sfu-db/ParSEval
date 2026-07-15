@@ -40,6 +40,7 @@ _CMP = {
 }
 _NEGATED = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
 _MAX_SEARCH_DEPTH = 32
+_MAX_OR_BRANCH_COMBINATIONS = 16
 _FINITE_INT_SPAN = 64
 _STRFTIME_COMPONENTS = {
     "%Y": "year",
@@ -282,12 +283,18 @@ class CspBackend:
         flat: List[exp.Expression] = []
         for expr in exprs:
             flat.extend(self._flatten_and(expr))
+        for index, expr in enumerate(flat):
+            while isinstance(expr, exp.Paren):
+                expr = expr.this
+            flat[index] = expr
+
+        if self._contains_smt_preferred_disjunction(flat):
+            return Result(status="unknown", reason="complex_disjunction")
+        if self._or_branch_cost(flat) > _MAX_OR_BRANCH_COMBINATIONS:
+            return Result(status="unknown", reason="complex_disjunction")
 
         # Handle OR by branching; everything else is forced.
         for index, expr in enumerate(flat):
-            if isinstance(expr, exp.Paren):
-                flat[index] = expr.this
-                expr = flat[index]
             if isinstance(expr, exp.Or):
                 for branch in (expr.this, expr.expression):
                     branched = flat[:index] + [branch] + flat[index + 1 :]
@@ -339,6 +346,44 @@ class CspBackend:
         if isinstance(expr, exp.And):
             return self._flatten_and(expr.this) + self._flatten_and(expr.expression)
         return [expr]
+
+    def _or_branch_cost(self, exprs: List[exp.Expression]) -> int:
+        cost = 1
+        for expr in exprs:
+            cost *= self._disjunction_leaf_count(expr)
+            if cost > _MAX_OR_BRANCH_COMBINATIONS:
+                return cost
+        return cost
+
+    def _disjunction_leaf_count(self, expr: exp.Expression) -> int:
+        while isinstance(expr, exp.Paren):
+            expr = expr.this
+        if isinstance(expr, exp.Or):
+            return self._disjunction_leaf_count(expr.this) + self._disjunction_leaf_count(
+                expr.expression
+            )
+        return 1
+
+    def _is_solver_var_disequality_or(self, expr: exp.Expression) -> bool:
+        while isinstance(expr, exp.Paren):
+            expr = expr.this
+        if isinstance(expr, exp.Or):
+            return self._is_solver_var_disequality_or(
+                expr.this
+            ) and self._is_solver_var_disequality_or(expr.expression)
+        return (
+            isinstance(expr, exp.NEQ)
+            and isinstance(expr.this, SolverVar)
+            and isinstance(expr.expression, SolverVar)
+        )
+
+    def _contains_smt_preferred_disjunction(self, exprs: List[exp.Expression]) -> bool:
+        for expr in exprs:
+            while isinstance(expr, exp.Paren):
+                expr = expr.this
+            if isinstance(expr, exp.Or) and self._is_solver_var_disequality_or(expr):
+                return True
+        return False
 
     def _search(
         self,

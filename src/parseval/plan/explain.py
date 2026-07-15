@@ -27,6 +27,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -36,6 +37,10 @@ from typing import (
 from datafusion import SessionContext
 from datafusion.unparser import Dialect as UnparserDialect
 from datafusion.unparser import Unparser
+from sqlglot.dialects.mysql import MySQL
+from sqlglot.dialects.postgres import Postgres
+from sqlglot.dialects.sqlite import SQLite
+from sqlglot.generator import Generator
 from sqlglot import exp
 import sqlglot
 
@@ -85,9 +90,9 @@ _IDENT_ATTRS = frozenset(
 # - ``Cast`` target type comes from ``RawExpr.types().friendly_arrow_type_name()``.
 # - Logical ``Limit`` has no skip/fetch accessors → parse ``display``.
 # - ``DFSchema`` only exposes ``field_names()`` → parse ``display_indent_schema``.
-# - ``ScalarSubquery``: inner DF ``LogicalPlan`` → ``_from_logical`` Step tree stored
-#   in ``exp.Subquery(this=<Step>)``. Recovering inner plan when ``Subquery.input()``
-#   is empty still uses unparse + replan (binding gap only).
+# - ``ScalarSubquery``: inner DF ``LogicalPlan`` → plan-level scalar registry plus
+#   a ``ScalarSubqueryRef`` placeholder in the outer sqlglot expression. Recovering
+#   the inner plan when ``Subquery.input()`` is empty still uses unparse + replan.
 
 _BINARY_OPS: Dict[str, type[exp.Expression]] = {
     "=": exp.EQ,
@@ -532,12 +537,7 @@ def _lower_from_variant(
             raise PlanError(
                 f"unsupported DataFusion expr variant {kind!r}: {raw.canonical_name()}"
             )
-        sq = variant.subquery()
-        inner_lp = _scalar_inner_logical(sq, state)
-        inner_root = _from_logical(inner_lp, ctx=state.ctx, dialect=state.dialect)
-        node = exp.Subquery()
-        node.set("this", inner_root)
-        return node
+        return state.register_scalar_subquery(variant.subquery())
 
     raise PlanError(
         f"unsupported DataFusion expr variant {kind!r}: {raw.canonical_name()}"
@@ -641,46 +641,28 @@ def to_expression(
     return _lower_from_variant(variant, df_expr, state=state)
 
 
-def _scalar_inner_logical(sq: Any, state: "_NodeLowerState") -> Any:
+def _scalar_inner_logical(sq: Any, state: "_NodeLowerState", plan: Any) -> Any:
     """Inner logical plan for a scalar subquery (bindings or unparse fallback)."""
     inputs = sq.input()
     if inputs:
         return inputs[0]
-    fragment = state.pop_scalar_sql()
+    fragment = state.pop_scalar_sql(plan)
     return state.ctx.sql(fragment).optimized_logical_plan()
 
 
-def _is_subquery_step(node: Any) -> bool:
-    return isinstance(node, exp.Subquery) and isinstance(node.this, Step)
-
-
-def _contains_subquery_step(node: exp.Expression) -> bool:
-    if _is_subquery_step(node):
-        return True
-    return any(
-        _contains_subquery_step(child)
-        for child in node.iter_expressions()
-        if isinstance(child, exp.Expression)
-    )
-
 def repr_expr(node: Any, *, indent: int = 0) -> str:
-    """Detailed tree representation of a sqlglot expression (or nested Step)."""
+    """Detailed tree representation of a sqlglot expression."""
     pad = "  " * indent
     inner = "  " * (indent + 1)    
-    if _is_subquery_step(node):
-        body = repr_step(node.this, indent=indent + 1)
-        return f"Subquery(\n{body}\n{pad})"
     if isinstance(node, Step):
         return repr_step(node, indent=indent)
 
     if not isinstance(node, exp.Expression):
         return repr(node)
 
-    # 2. Fast Path: Collapse simple subquery-free expressions into one line
-    if not _contains_subquery_step(node):
+    if not list(node.iter_expressions()):
         return f"{type(node).__name__}({node.sql()!r})"
 
-    # 3. Generic AST Unpacking (Handles ALL sqlglot expression types dynamically)
     cls = type(node).__name__
     parts = []
 
@@ -708,47 +690,6 @@ def repr_expr(node: Any, *, indent: int = 0) -> str:
     return f"{cls}(\n" + "\n".join(parts) + f"\n{pad})"
 
 def _all_reachable_steps(root: Step) -> List[Step]:
-    def inner_steps_from_expr(expr: Optional[exp.Expression]) -> List[Step]:
-        if expr is None:
-            return []
-        found: List[Step] = []
-
-        def walk(node: exp.Expression) -> None:
-            if _is_subquery_step(node):
-                found.append(node.this)
-                walk_step_exprs(node.this)
-                return
-            for child in node.iter_expressions():
-                walk(child)
-
-        def walk_step_exprs(s: Step) -> None:
-            if isinstance(s, Filter) and s.condition is not None:
-                walk(s.condition)
-            if isinstance(s, Projection):
-                for projection in s.projections:
-                    walk(projection)
-            if isinstance(s, Aggregate):
-                for aggregation in s.aggregations:
-                    walk(aggregation)
-                for group_expr in s.group:
-                    walk(group_expr)
-            if isinstance(s, Join):
-                if s.condition is not None:
-                    walk(s.condition)
-                for left_key, right_key in s.on_keys:
-                    walk(left_key)
-                    walk(right_key)
-            if isinstance(s, Window):
-                for window_expr in s.window_exprs:
-                    walk(window_expr)
-
-        walk(expr)
-        return found
-
-    def push_expr_inners(stack: List[Step], expr: Optional[exp.Expression]) -> None:
-        for inner in inner_steps_from_expr(expr):
-            stack.append(inner)
-
     seen: Set[int] = set()
     out: List[Step] = []
     stack: List[Step] = [root]
@@ -760,71 +701,7 @@ def _all_reachable_steps(root: Step) -> List[Step]:
         seen.add(sid)
         out.append(step)
         stack.extend(step.dependencies)
-        if isinstance(step, Filter):
-            push_expr_inners(stack, step.condition)
-        elif isinstance(step, Projection):
-            for projection in step.projections:
-                push_expr_inners(stack, projection)
-        elif isinstance(step, Aggregate):
-            for aggregation in step.aggregations:
-                push_expr_inners(stack, aggregation)
-            for group_expr in step.group:
-                push_expr_inners(stack, group_expr)
-        elif isinstance(step, Join):
-            push_expr_inners(stack, step.condition)
-            for left_key, right_key in step.on_keys:
-                push_expr_inners(stack, left_key)
-                push_expr_inners(stack, right_key)
-        elif isinstance(step, Window):
-            for window_expr in step.window_exprs:
-                push_expr_inners(stack, window_expr)
     return out
-
-
-def _walk_df_expr(df_expr: Any, visit: Callable[[], None]) -> None:
-    """DFS over DF expr variants and rex Calls; ``visit`` on each ``ScalarSubquery``."""
-    try:
-        variant = df_expr.to_variant()
-    except ValueError:
-        rex_type = df_expr.rex_type()
-        if str(rex_type).endswith("Call") or getattr(rex_type, "name", "") == "Call":
-            for operand in df_expr.rex_call_operands() or []:
-                _walk_df_expr(operand, visit)
-        return
-    kind = type(variant).__name__
-    if kind == "ScalarSubquery":
-        visit()
-        return
-    if kind == "BinaryExpr":
-        _walk_df_expr(variant.left(), visit)
-        _walk_df_expr(variant.right(), visit)
-        return
-    if kind in {"Not", "Negative", "IsNull", "IsNotNull", "Cast"}:
-        _walk_df_expr(variant.expr(), visit)
-        return
-    if kind in {"Like", "ILike"}:
-        _walk_df_expr(variant.expr(), visit)
-        _walk_df_expr(variant.pattern(), visit)
-        return
-    if kind == "Alias":
-        _walk_df_expr(variant.expr(), visit)
-        return
-    if kind == "Case":
-        for when, then in variant.when_then_expr() or []:
-            _walk_df_expr(when, visit)
-            _walk_df_expr(then, visit)
-        else_expr = variant.else_expr()
-        if else_expr is not None:
-            _walk_df_expr(else_expr, visit)
-        return
-    if kind == "AggregateFunction":
-        for arg in variant.args() or []:
-            _walk_df_expr(arg, visit)
-        return
-    if kind == "InList":
-        _walk_df_expr(variant.expr(), visit)
-        for item in variant.list() or []:
-            _walk_df_expr(item, visit)
 
 
 
@@ -919,32 +796,68 @@ def _extract_scalar_subquery_sql(
     return fragments
 
 
+def _plannable_sql_fragments(ctx: SessionContext, fragments: Iterable[str]) -> List[str]:
+    candidates = list(fragments)
+    for fragment in candidates:
+        try:
+            ctx.sql(fragment).optimized_logical_plan()
+        except Exception:
+            return []
+    return candidates
+
+
 @dataclass
 class _NodeLowerState:
-    """Per logical-plan-node state for lazy scalar-subquery SQL fragments."""
+    """Shared root-plan lowering state for scalar-subquery dependencies."""
 
     ctx: SessionContext
     dialect: str
     plan: Any
     sql: str = ""
-    _scalar_sql: Optional[Deque[str]] = field(default=None, repr=False)
+    scalar_subqueries: Dict[str, "Step"] = field(default_factory=dict)
+    _scalar_counter: int = 0
+    _scalar_sql: Dict[int, Deque[str]] = field(default_factory=dict, repr=False)
 
-    def pop_scalar_sql(self) -> str:
-        if self._scalar_sql is None:
-            source_sql = self.sql
-            if not source_sql:
+    def register_scalar_subquery(self, sq: Any) -> "ScalarSubqueryRef":
+        subquery_id = f"sq{self._scalar_counter}"
+        self._scalar_counter += 1
+        inner_lp = _scalar_inner_logical(sq, self, self.plan)
+        self.scalar_subqueries[subquery_id] = _from_logical(
+            inner_lp,
+            ctx=self.ctx,
+            dialect=self.dialect,
+            sql=self.sql,
+            state=self,
+        )
+        return ScalarSubqueryRef(this=exp.to_identifier(subquery_id))
+
+    def pop_scalar_sql(self, plan: Any) -> str:
+        key = id(plan)
+        if key not in self._scalar_sql:
+            fragments: List[str] = []
+            try:
                 source_sql = Unparser(UNPARSER_DIALECTS[self.dialect]).plan_to_sql(
-                    self.plan
+                    plan
                 )
-            fragments = _extract_scalar_subquery_sql(
-                source_sql,
-                self.dialect,
-                self.plan,
-            )
-            self._scalar_sql = deque(fragments)
-        if not self._scalar_sql:
+                fragments = _extract_scalar_subquery_sql(
+                    source_sql,
+                    self.dialect,
+                    plan,
+                )
+                fragments = _plannable_sql_fragments(self.ctx, fragments)
+            except Exception:
+                fragments = []
+            if not fragments and self.sql:
+                fragments = _extract_scalar_subquery_sql(
+                    self.sql,
+                    self.dialect,
+                    plan,
+                )
+            self._scalar_sql[key] = deque(fragments)
+        queue = self._scalar_sql[key]
+        if not queue:
             raise PlanError("ScalarSubquery SQL fragment queue is empty")
-        return self._scalar_sql.popleft()
+        return queue.popleft()
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +884,34 @@ class Step:
     @property
     def type_name(self) -> str:
         return self.__class__.__name__
+
+
+class ScalarSubqueryRef(exp.Expression):
+    """SQLGlot leaf that points to a plan-level scalar-subquery dependency."""
+
+    arg_types = {"this": True}
+
+    @property
+    def subquery_id(self) -> str:
+        value = self.this
+        if isinstance(value, exp.Identifier):
+            return value.name
+        return str(value)
+
+    def sql(self, *args: Any, **kwargs: Any) -> str:
+        return self.subquery_id
+
+
+def _generate_scalar_subquery_ref(
+    generator: Generator,
+    expression: ScalarSubqueryRef,
+) -> str:
+    del generator
+    return expression.subquery_id
+
+
+for _generator_class in (Generator, SQLite.Generator, MySQL.Generator, Postgres.Generator):
+    _generator_class.TRANSFORMS[ScalarSubqueryRef] = _generate_scalar_subquery_ref
 
 
 class TableScan(Step):
@@ -1652,14 +1593,16 @@ def _from_logical(
     ctx: SessionContext,
     dialect: str,
     sql: str = "",
+    state: Optional[_NodeLowerState] = None,
 ) -> Step:
-    state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=plan, sql=sql)
+    if state is None:
+        state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=plan, sql=sql)
     variant = plan.to_variant()
     op = type(variant).__name__
     display = plan.display()
     fields = _parse_plan_schema(plan)
     children = [
-        _from_logical(child, ctx=ctx, dialect=dialect, sql=sql)
+        _from_logical(child, ctx=ctx, dialect=dialect, sql=sql, state=state)
         for child in (plan.inputs() or [])
     ]
     builder = _VARIANT_BUILDERS.get(op)
@@ -1667,7 +1610,12 @@ def _from_logical(
         raise PlanError(
             f"unsupported DataFusion logical plan variant {op!r}: {display}"
         )
-    return builder(variant, children, display, fields, state)
+    previous_plan = state.plan
+    state.plan = plan
+    try:
+        return builder(variant, children, display, fields, state)
+    finally:
+        state.plan = previous_plan
 
 
 # ---------------------------------------------------------------------------
@@ -1685,11 +1633,13 @@ class Plan:
         sql: str,
         dialect: str,
         logical_display: str = "",
+        scalar_subqueries: Optional[Mapping[str, Step]] = None,
     ) -> None:
         self.root = root
         self.sql = sql
         self.dialect = dialect
         self.logical_display = logical_display
+        self.scalar_subqueries: Dict[str, Step] = dict(scalar_subqueries or {})
         self._dag: Dict[Step, Set[Step]] = {}
 
     @property
@@ -1734,17 +1684,29 @@ def explain(
     ctx = session.context
     df = ctx.sql(df_sql)
     logical = df.optimized_logical_plan()
+    state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=logical, sql=df_sql)
+    root = _from_logical(logical, ctx=ctx, dialect=dialect, sql=df_sql, state=state)
     return Plan(
-        _from_logical(logical, ctx=ctx, dialect=dialect, sql=df_sql),
+        root,
         sql=df_sql,
         dialect=dialect,
         logical_display=str(logical),
+        scalar_subqueries=state.scalar_subqueries,
     )
 
 
 def assert_no_bare_string_identifiers(plan: Plan) -> None:
     """Raise ``AssertionError`` if semantic Step fields hold bare ``str`` ids."""
-    for step in _all_reachable_steps(plan.root):
+    roots = [plan.root, *plan.scalar_subqueries.values()]
+    seen: Set[int] = set()
+    steps: List[Step] = []
+    for root in roots:
+        for step in _all_reachable_steps(root):
+            if id(step) in seen:
+                continue
+            seen.add(id(step))
+            steps.append(step)
+    for step in steps:
         for attr in _IDENT_ATTRS:
             if not hasattr(step, attr):
                 continue

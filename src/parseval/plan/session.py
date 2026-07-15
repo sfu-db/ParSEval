@@ -88,7 +88,59 @@ def _truthy_column(node: exp.Expression) -> exp.Expression:
     return exp.NEQ(this=node.copy(), expression=exp.Literal.number(0))
 
 
+def _sqlite_numeric_value(value: str) -> float:
+    match = re.match(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", value)
+    if match is None:
+        return 0.0
+    return float(match.group(1))
+
+
+def _sqlite_literal_truthiness(node: exp.Expression) -> Optional[bool]:
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if not isinstance(node, exp.Literal):
+        return None
+    if node.is_string:
+        return _sqlite_numeric_value(str(node.this)) != 0
+    return _sqlite_numeric_value(str(node.this)) != 0
+
+
+def _literal_bool(node: exp.Expression) -> Optional[exp.Expression]:
+    truthy = _sqlite_literal_truthiness(node)
+    if truthy is None:
+        return None
+    return exp.Boolean(this=truthy)
+
+
+def _numeric_case(node: exp.Expression) -> exp.Expression:
+    return exp.Case(
+        ifs=[exp.If(this=node.copy(), true=exp.Literal.number(1))],
+        default=exp.Literal.number(0),
+    )
+
+
+def _maybe_numeric_bool_operand(
+    child: Optional[exp.Expression],
+) -> Optional[exp.Expression]:
+    if isinstance(child, exp.Paren) and isinstance(
+        child.this, (exp.Predicate, exp.Connector, exp.Not, exp.Boolean)
+    ):
+        return exp.Paren(this=_numeric_case(child.this))
+    if isinstance(child, (exp.Predicate, exp.Connector, exp.Not, exp.Boolean)):
+        return _numeric_case(child)
+    return child
+
+
 def _maybe_truthy_bool_child(child: Optional[exp.Expression]) -> Optional[exp.Expression]:
+    if child is None:
+        return child
+    literal = _literal_bool(child)
+    if literal is not None:
+        return literal
+    if isinstance(child, exp.Paren):
+        literal = _literal_bool(child.this)
+        if literal is not None:
+            return exp.Paren(this=literal)
     if isinstance(child, exp.Column):
         return _truthy_column(child)
     if isinstance(child, exp.Paren) and isinstance(child.this, exp.Column):
@@ -270,6 +322,22 @@ def _rewrite_strftime_arithmetic(node: exp.Expression) -> exp.Expression:
     return new
 
 
+def _rewrite_boolean_arithmetic(node: exp.Expression) -> exp.Expression:
+    """SQLite allows predicate values as 0/1 arithmetic operands."""
+    if not isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+        return node
+    left = _maybe_numeric_bool_operand(node.this)
+    right = _maybe_numeric_bool_operand(node.args.get("expression"))
+    if left is node.this and right is node.args.get("expression"):
+        return node
+    new = node.copy()
+    if left is not None:
+        new.set("this", left)
+    if right is not None:
+        new.set("expression", right)
+    return new
+
+
 def _rewrite_tuple_in(node: exp.Expression) -> exp.Expression:
     """``(a, b) IN (SELECT …)`` → correlated ``EXISTS`` (DF rejects multi-column IN)."""
     if not isinstance(node, exp.In):
@@ -326,6 +394,7 @@ _REWRITE_PASSES = (
     _rewrite_agg_boolean,
     _rewrite_if_to_case,
     _rewrite_strftime_arithmetic,
+    _rewrite_boolean_arithmetic,
     _rewrite_tuple_in,
     _rewrite_bare_predicate_columns,
     _rewrite_group_by_select_list,

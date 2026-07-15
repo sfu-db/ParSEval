@@ -8,8 +8,9 @@ from typing import ClassVar, Tuple
 class BmcBounds:
     table_rows: int = 1
     join_width: int = 1
-    groups: int = 1
-    rows_per_group: int = 1
+    result_rows: int = 3
+    groups: int = 3
+    rows_per_group: int = 3
     subquery_rows: int = 1
     order_competitors: int = 0
     max_iterations: int = 4
@@ -18,6 +19,7 @@ class BmcBounds:
 
     EXPANSION_ORDER: ClassVar[Tuple[str, ...]] = (
         "subquery_rows",
+        "result_rows",
         "table_rows",
         "join_width",
         "rows_per_group",
