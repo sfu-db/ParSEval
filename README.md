@@ -40,33 +40,35 @@ result = disprove(
 print(result.verdict)  # Verdict.EQ or Verdict.NEQ
 ```
 
-### Coverage Thresholds
+### Generation Bounds
 
-Control how many rows are generated per branch type. Set a threshold to `0` to skip that branch type entirely. Higher values generate more rows but improve coverage.
+Control row counts with `BmcBounds` parameters. Higher values generate more rows but improve coverage.
 
 ```python
 result = instantiate_db(
-    sql="SELECT name FROM users WHERE age > 25",
-    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    sql="SELECT department, COUNT(*) FROM employees GROUP BY department",
+    schema="CREATE TABLE employees (id INT, department TEXT, salary INT)",
     connection_string="sqlite:////tmp/test.db",
     dialect="sqlite",
-    atom_null=2,           # Generate 2 rows where WHERE evaluates to NULL
-    atom_false=1,          # Generate 1 row where WHERE is FALSE
-    project_null=1,        # Generate 1 row where SELECT output is NULL
-    distinct_duplicate=1,  # Generate 1 duplicate row for DISTINCT elimination
-    distinct_unique=1,     # Generate 1 unique row for DISTINCT
+    groups=6,            # Number of distinct groups to generate
+    rows_per_group=3,    # Rows within each group (for aggregates)
+    result_rows=3,       # Target row count at the root projection
+    table_rows=1,        # Initial row target per table scan    
+    subquery_rows=1,     # Rows per scalar subquery    
+    max_iterations=4,    # Max bounded expansion iterations
 )
 ```
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `atom_null` | Rows where a WHERE/ON predicate evaluates to NULL | 1 |
-| `atom_false` | Rows where a WHERE/ON predicate is FALSE | 1 |
-| `atom_dup` | Rows that trigger duplicate detection | 1 |
-| `project_null` | Rows where a projected column is NULL | 1 |
-| `distinct_duplicate` | Duplicate rows eliminated by DISTINCT | 1 |
-| `distinct_unique` | Unique rows retained by DISTINCT | 1 |
-| `max_iterations` | Max iterations for the symbolic engine | 10 |
+| `table_rows` | Initial row target per table scan | 1 |
+| `result_rows` | Target row count at the root projection | 3 |
+| `groups` | Number of aggregate groups | 3 |
+| `rows_per_group` | Rows per aggregate group | 3 |
+| `subquery_rows` | Rows per scalar subquery | 1 |
+| `max_iterations` | Max iterations for the symbolic expansion loop | 4 |
+| `max_table_rows` | Safety cap for rows per table | 512 |
+| `generate_negatives` | Include rows that violate individual WHERE atoms | True |
 
 ### Connection Strings
 
@@ -81,24 +83,35 @@ connection_string="mysql+pymysql://user:password@localhost:3306/mydb"
 connection_string="postgresql://user:password@localhost:5432/mydb"
 ```
 
+## Solver Backend
+
+To speed up the constraint solving, the solver (`solver/`) follows a cascade strategy: partition the constraint problem by variable independence, then try the CSP backend first, falling back to the SMT (Z3) backend for each component. Supports type constraints (INT, TEXT, DATE, TIME, TIMESTAMP, BOOLEAN), NULL semantics, string domains, and temporal bounds.
+
 ## File Structure
 
 ```
 src/parseval/
 ├── main.py              # Public API: instantiate_db, disprove
-├── disprover.py         # Query equivalence disproval
 ├── states.py            # Result types (Verdict, DisproveResult, etc.)
-├── symbolic/            # Coverage-driven data generation engine
-├── solver/              # Constraint satisfaction (CSP + SMT/Z3)
-├── plan/                # Query plan analysis
-├── instance/            # In-memory row management and persistence
-└── domain/              # Type-aware value generation
+│
+├── generator/           # Plan-aware data generation│
+├── solver/              # Solver orchestration (CSP → SMT cascade)
+│
+├── plan/
+│   ├── explain.py       # DataFusion-based query plan extraction
+│   ├── context.py       # DerivedSchema, Row — intermediate representations
+│   ├── rex.py           # Symbol, Variable, Environment — row expression eval
+│   ├── session.py       # Session-level plan analysis
+│   └── helper.py        # Plan AST helpers
+│
+├── instance/            # Schema parsing and management
+└── domain/              # Type-aware value spaces and domain constraints
 ```
 
 ## Running Experiments
 
 ```bash
-python tests/experiment/test_sqlite.py \
+python scripts/exp_sqlite_disprover.py \
     --schema_fp data/sqlite/schema.json \
     --gold_fp data/sqlite/dev.json \
     --preds_fp data/sqlite/dail.txt \
@@ -106,10 +119,10 @@ python tests/experiment/test_sqlite.py \
 ```
 
 ## Updates
-
+- Update the query parser to Datafusion. 
 - See the `dev` branch for the latest features and ongoing development.
 - See the `webui` branch for the frontend web interface of ParSEval.
 
 ## Experimental Results
 
-Experiment outputs are available from GitHub Actions. Open the repository’s **Actions** tab, choose the corresponding workflow, such as **Run SQLite Experiment** or **Run MySQL Experiment**, and select the latest successful run. The generated result and metric files can be downloaded from the run’s **Artifacts** section.
+Experiment outputs are available on GitHub Actions. Open the repository's **Actions** tab, choose the relevant workflow (for example, **Run SQLite Experiment** or **Run MySQL Experiment**), and select the latest successful run. You can download the generated result and metric files from the run's **Artifacts** section. Current false positives in the experimental results are caused by the aggregation `DISTINCT` pattern and will be fixed soon.
