@@ -20,12 +20,21 @@ from sqlglot import exp
 
 try:
     from tqdm import tqdm
+    HAS_TQDM = True
 except Exception:
+    HAS_TQDM = False
     def tqdm(x, **kwargs):
         return x
 
 
 DEFAULT_MYSQL_CONNECTION = "mysql+pymysql://root:rootpass@localhost:3306/mydb"
+
+
+def _progress_enabled() -> bool:
+    # Allow forcing progress bars in non-interactive environments.
+    if os.environ.get("PARSEVAL_FORCE_TQDM") == "1":
+        return True
+    return sys.stdout.isatty() or sys.stderr.isatty()
 
 
 def load_jsonlines(fp: str) -> list[dict]:
@@ -424,10 +433,29 @@ def run_disprove_experiment(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    if not HAS_TQDM:
+        print(
+            "tqdm is not installed; progress bars are disabled. "
+            "Install with: pip install tqdm",
+            flush=True,
+        )
+
+    progress_enabled = _progress_enabled()
+    print(
+        f"Preparing tasks from {len(selected)} entries (start={start}, limit={limit})",
+        flush=True,
+    )
+
     tasks = []
     skipped = 0
 
-    for offset, entry in enumerate(selected):
+    for offset, entry in enumerate(
+        tqdm(
+            selected,
+            desc="Preparing MySQL tasks",
+            disable=not progress_enabled,
+        )
+    ):
         index = start + offset
         sql1, sql2 = (
             _prepare_mysql_query(sql, entry["schema"])
@@ -461,7 +489,7 @@ def run_disprove_experiment(
                 for task in tqdm(
                     tasks,
                     desc="Disproving LeetCode pairs",
-                    disable=not sys.stdout.isatty(),
+                    disable=not progress_enabled,
                 )
             ]
         else:
@@ -475,7 +503,7 @@ def run_disprove_experiment(
                     as_completed(futures),
                     total=len(futures),
                     desc="Disproving LeetCode pairs",
-                    disable=not sys.stdout.isatty(),
+                    disable=not progress_enabled,
                 ):
                     record = future.result()
                     records_by_index[record["index"]] = record
