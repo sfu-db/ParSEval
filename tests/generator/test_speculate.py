@@ -209,11 +209,13 @@ CREATE TABLE customer (
         )
 
         self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("customer")), 0)
         id_col = inst.resolve_column("customer", "id")
         referee_col = inst.resolve_column("customer", "referee_id")
         for row in inst.get_rows("customer"):
             values = Instance._row_value_dict(row)
             self.assertNotEqual(values[referee_col], values[id_col])
+            self.assertIn(id_col, values)
 
     def test_self_fk_check_constraint_can_seed_customer_filter(self):
         ddls = """
@@ -263,6 +265,32 @@ CREATE TABLE customer (
         ]
         self.assertEqual(len(pids), len(set(pids)))
         self.assertGreaterEqual(len(pids), 3)
+
+
+class TestSpeculateEnum(unittest.TestCase):
+    def test_mysql_enum_filter_generates_declared_values_only(self):
+        ddls = """
+CREATE TABLE employee (
+    employee_id INT,
+    primary_flag ENUM('Y', 'N') NOT NULL
+);
+"""
+        inst = speculate(
+            ddls,
+            "SELECT employee_id FROM employee WHERE primary_flag = 'Y'",
+            "mysql",
+            generate_negatives=False,
+        )
+
+        self.assertIsNotNone(inst)
+        flag_col = inst.resolve_column("employee", "primary_flag")
+        values = [
+            Instance._row_value_dict(row)[flag_col]
+            for row in inst.get_rows("employee")
+        ]
+        self.assertGreater(len(values), 0)
+        self.assertIn("Y", values)
+        self.assertTrue(all(value in {"Y", "N"} for value in values))
 
 
 if __name__ == "__main__":
