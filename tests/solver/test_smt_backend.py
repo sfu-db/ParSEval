@@ -11,7 +11,7 @@ from parseval.dtype import DataType
 from parseval.solver import Solver
 from parseval.solver.smt import SmtBackend
 from parseval.solver.smt_solver import Z3SmtSession
-from parseval.solver.smt_types import UnsupportedSMTError
+from parseval.solver.smt_types import UnsupportedSMTError, normalize_dtype
 from parseval.solver.types import Problem, SolverVar
 
 import z3
@@ -173,6 +173,13 @@ class TestSmtBackendProblemApi(unittest.TestCase):
 
         with self.assertRaises(UnsupportedSMTError):
             solver.translate(unsupported)
+
+    def test_enum_dtype_normalizes_as_text_for_smt(self):
+        typeinfo = normalize_dtype(DataType.build("ENUM('open', 'closed')"))
+
+        self.assertEqual(typeinfo.logical_name, "TEXT")
+        self.assertEqual(typeinfo.family, "text")
+        self.assertEqual(typeinfo.payload_sort, z3.StringSort())
 
     def test_strftime_cast_as_text_translates_after_peel(self):
         opened = var("schools.opendate", "DATE")

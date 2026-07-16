@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from sqlglot import exp
-
-from parseval.dtype import DataType, TypeFamily
+from parseval.dtype import DataType, TypeFamily, enum_values
 
 from .generic import GenericTypeAdapter
 
@@ -18,8 +16,9 @@ class MySQLTypeAdapter(GenericTypeAdapter):
     def profile(self, datatype: DataType, dialect: Optional[str]):
         profile = super().profile(datatype, dialect)
         metadata = dict(profile.metadata)
-        if datatype.is_type(DataType.Type.ENUM):
-            metadata["allowed_values"] = _enum_allowed_values(datatype)
+        allowed_values = enum_values(datatype)
+        if allowed_values is not None:
+            metadata["allowed_values"] = allowed_values
             profile = type(profile)(
                 datatype=profile.datatype,
                 dialect=profile.dialect,
@@ -63,17 +62,6 @@ class MySQLTypeAdapter(GenericTypeAdapter):
         if profile.family == TypeFamily.TEXT and not _is_binary_text(profile):
             return str(coerced).casefold()
         return coerced
-
-
-def _enum_allowed_values(datatype: DataType) -> tuple[Any, ...]:
-    values = []
-    for expression in datatype.args.get("expressions") or ():
-        value = expression.this if isinstance(expression, exp.Literal) else expression
-        literal = getattr(value, "this", value)
-        if literal not in values:
-            values.append(literal)
-    return tuple(values)
-
 
 def _is_binary_text(profile) -> bool:
     exact_type = (profile.exact_type or "").upper()

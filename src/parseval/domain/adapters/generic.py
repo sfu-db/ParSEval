@@ -5,7 +5,13 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 import uuid
 
-from parseval.dtype import DataType, TypeFamily, TypeProfile, StorageLiteral
+from parseval.dtype import (
+    DataType,
+    TypeFamily,
+    TypeProfile,
+    StorageLiteral,
+    is_enum_type,
+)
 
 from .base import TypeAdapter
 
@@ -130,6 +136,8 @@ class GenericTypeAdapter(TypeAdapter):
         return super().coerce_out(value, profile)
 
     def _family_for(self, datatype: DataType) -> TypeFamily:
+        if is_enum_type(datatype):
+            return TypeFamily.TEXT
         if datatype.is_type(DataType.Type.UUID):
             return TypeFamily.UUID
         if datatype.is_type(DataType.Type.BOOLEAN):

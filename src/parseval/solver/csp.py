@@ -10,6 +10,7 @@ from sqlglot import exp
 
 from parseval.dtype import (
     TypeFamily,
+    enum_values,
     parse_date,
     parse_datetime,
     type_family,
@@ -262,6 +263,9 @@ class CspBackend:
     def _space_for_var(self, var: SolverVar) -> ValueSpace:
         dtype = var.dtype
         space = ValueSpace(family=type_family(dtype))
+        allowed_values = enum_values(dtype)
+        if allowed_values is not None:
+            space.allowed = set(allowed_values)
         length = getattr(dtype, "length", None)
         if isinstance(length, int):
             space.max_length = length
