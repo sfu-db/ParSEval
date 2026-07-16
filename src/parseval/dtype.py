@@ -131,11 +131,42 @@ class TypeService:
 class StorageLiteral(str):
     """String value that should be stored without type coercion."""
 
+def _enum_type_members() -> tuple[Any, ...]:
+    members = [DataType.Type.ENUM]
+    for name in ("ENUM8", "ENUM16"):
+        member = getattr(DataType.Type, name, None)
+        if member is not None:
+            members.append(member)
+    return tuple(members)
+
+
+def is_enum_type(dtype: DataType) -> bool:
+    """Return True when *dtype* is a SQL ENUM-like type."""
+    dtype = DataType.build(dtype)
+    return dtype.is_type(*_enum_type_members())
+
+
+def enum_values(dtype: DataType) -> Optional[tuple[Any, ...]]:
+    """Return declared ENUM values in order, or None for non-enum types."""
+    dtype = DataType.build(dtype)
+    if not is_enum_type(dtype):
+        return None
+    values: list[Any] = []
+    for node in dtype.args.get("expressions") or ():
+        value = getattr(node, "this", node)
+        value = getattr(value, "this", value)
+        if value not in values:
+            values.append(value)
+    return tuple(values) if values else None
+
+
 def type_family(dtype: DataType) -> TypeFamily:
     """Map a SQL DataType to a neutral ParSEval type family."""
     dtype = DataType.build(dtype)
     if dtype.is_type(DataType.Type.UUID):
         return TypeFamily.UUID
+    if is_enum_type(dtype):
+        return TypeFamily.TEXT
     if dtype.is_type(DataType.Type.JSON):
         return TypeFamily.JSON
     if dtype.is_type(DataType.Type.BINARY, DataType.Type.VARBINARY):

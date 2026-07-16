@@ -185,7 +185,6 @@ def _speculate_select(
         return True
 
     col_var_map, table_vars = _collect_column_vars(tree, instance, alias_map)
-    _ensure_check_constraint_vars(instance, col_var_map, table_vars)
 
     if not col_var_map:
         _seed_base_rows(instance, tables=query_tables)
@@ -224,6 +223,7 @@ def _speculate_select(
             relation_info=relation_info,
             drop_optional=drop_optional,
         )
+        _ensure_check_constraint_vars(instance, col_var_map, table_vars)
 
         constraints: list[exp.Expression] = []
         for pred in predicates:
@@ -942,65 +942,38 @@ def _seed_not_exists_not_in(
 
         # Use solver to find a non-matching row for each inner table
         for table_node in inner_alias_map.values():
-            inner_cols = instance.column_names(table_node)
-            solver_vars_map: dict[str, SolverVar] = {}
             solver_constraints: list[exp.Expression] = []
 
-            for col_name in inner_cols:
-                alias = exp.to_identifier(list(inner_alias_map.keys())[0].name) if inner_alias_map else None
-                col_ident = instance.resolve_column(table_node, col_name)
-                alias_normalized = normalize_identifier(alias, dialect) if alias else None
-                key = (table_key(table_node), alias_normalized, col_ident.name)
-                sv = col_var_map.get(key)
-                if sv is not None:
-                    solver_vars_map[col_name] = sv
-
             solver_constraints.extend(non_matching_constraints)
+            table_subset = {table_node: table_vars.get(table_node, [])}
+            _ensure_check_constraint_vars(instance, col_var_map, table_subset)
+            _add_database_constraints(
+                solver_constraints,
+                instance,
+                col_var_map,
+                table_subset,
+            )
 
             problem = Problem(
                 constraints=solver_constraints,
                 equalities=[],
-                variables=set(solver_vars_map.values()),
+                variables={var for vars in table_subset.values() for var in vars},
             )
             solver = Solver(dialect=dialect)
             result = solver.solve(problem)
 
             if result.sat:
-                row_data: dict[exp.Identifier, Any] = {}
-                for col_name, sv in solver_vars_map.items():
-                    if sv in result.assignments:
-                        try:
-                            col_ident = instance.resolve_column(table_node, col_name)
-                            row_data[col_ident] = result.assignments[sv]
-                        except KeyError:
-                            continue
+                row_data = _row_from_assignments(
+                    instance,
+                    result.assignments,
+                    table_subset[table_node],
+                    table_node,
+                )
                 if row_data:
                     _try_create_rows(
                         instance,
                         {table_node: [row_data]},
                         reason="not_exists_not_in_solver",
-                    )
-            else:
-                # Fallback heuristic: use non-matching values
-                fallback_row: dict[exp.Identifier, Any] = {}
-                for col_name, sv in solver_vars_map.items():
-                    try:
-                        col_ident = instance.resolve_column(table_node, col_name)
-                        if outer_values:
-                            ov = outer_values[0]
-                            if isinstance(ov, (int, float)):
-                                fallback_row[col_ident] = ov + 1
-                            else:
-                                fallback_row[col_ident] = f"no_match_{ov}"
-                        else:
-                            fallback_row[col_ident] = 1
-                    except KeyError:
-                        continue
-                if fallback_row:
-                    _try_create_rows(
-                        instance,
-                        {table_node: [fallback_row]},
-                        reason="not_exists_not_in_fallback",
                     )
 
 
@@ -1071,9 +1044,20 @@ def _ensure_check_constraint_vars(
         table_schema = instance.database_constraints(table_node)
         for check in table_schema.checks:
             if not check.supported:
-                continue
+                raise ValueError(
+                    f"unsupported_check_constraint:{tkey}:{check.reason or 'unknown'}"
+                )
             for col_ident in check.referenced_columns:
-                if any(tk == tkey and cn == col_ident.name for tk, _alias, cn in col_var_map):
+                existing = next(
+                    (
+                        var for (tk, _alias, cn), var in col_var_map.items()
+                        if tk == tkey and cn == col_ident.name
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing not in table_vars.setdefault(table_node, []):
+                        table_vars[table_node].append(existing)
                     continue
                 dtype = instance.get_column_type(table_node, col_ident)
                 if not instance.nullable(table_node, col_ident):
@@ -1083,10 +1067,15 @@ def _ensure_check_constraint_vars(
                 var = SolverVar(
                     key=f"{tkey}._check.{col_ident.name}",
                     dtype=dtype,
-                    meta={"internal": "check"},
+                    meta={
+                        "internal": "check",
+                        "table": tkey,
+                        "column": col_ident.name,
+                    },
                 )
                 col_var_map[key] = var
-                table_vars.setdefault(table_node, []).append(var)
+                if var not in table_vars.setdefault(table_node, []):
+                    table_vars[table_node].append(var)
 
 
 # ---------------------------------------------------------------------------
@@ -1127,10 +1116,12 @@ def _row_from_assignments(
     for var in vars:
         if var not in assignments:
             continue
-        col_name = var.var_key.split(".")[-1]
+        col_name = str(var.meta.get("column") or var.var_key.split(".")[-1])
         try:
             col_ident = instance.resolve_column(table_node, col_name)
         except KeyError:
+            continue
+        if var.meta.get("internal") == "check" and col_ident in row:
             continue
         row[col_ident] = assignments[var]
     return row
@@ -1319,7 +1310,11 @@ def _seed_from_assignments(
         suffix = f"_e{extra_idx}"
         new_col_var_map: dict[tuple[str, str | None, str], SolverVar] = {}
         for key, var in col_var_map.items():
-            new_var = SolverVar(key=f"{var.var_key}{suffix}", dtype=var.dtype)
+            new_var = SolverVar(
+                key=f"{var.var_key}{suffix}",
+                dtype=var.dtype,
+                meta=var.meta,
+            )
             new_col_var_map[key] = new_var
 
         var_key_map = {var.var_key: new_var for key, var in col_var_map.items() for new_key, new_var in new_col_var_map.items() if key == new_key}
@@ -1374,18 +1369,14 @@ def _seed_from_assignments(
 
         extra_rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
         for table_node, vs in table_vars.items():
-            row: dict[exp.Identifier, Any] = {}
+            suffixed_assignments: dict[SolverVar, Any] = {}
             for var in vs:
                 new_var_key = f"{var.var_key}{suffix}"
                 new_var = next((v for v in result.assignments if v.var_key == new_var_key), None)
                 if new_var is None or new_var not in result.assignments:
                     continue
-                col_name = var.var_key.split(".")[-1]
-                try:
-                    col_ident = instance.resolve_column(table_node, col_name)
-                except KeyError:
-                    continue
-                row[col_ident] = result.assignments[new_var]
+                suffixed_assignments[var] = result.assignments[new_var]
+            row = _row_from_assignments(instance, suffixed_assignments, vs, table_node)
             extra_rows_by_table[table_node] = [row]
         if _try_create_rows(
             instance,
@@ -1511,7 +1502,9 @@ def _add_database_constraints(
         # -- CHECK constraints --
         for check in table_schema.checks:
             if not check.supported:
-                continue
+                raise ValueError(
+                    f"unsupported_check_constraint:{tkey}:{check.reason or 'unknown'}"
+                )
             ref_names = {c.name for c in check.referenced_columns}
             if not ref_names:
                 continue
@@ -1522,13 +1515,20 @@ def _add_database_constraints(
                         col_to_sv[col_name] = var
                         break
                 if col_name not in col_to_sv:
-                    break
-            else:
-                rewritten = deepcopy(check.expression)
-                for col_node in list(rewritten.find_all(exp.Column)):
-                    if isinstance(col_node.this, exp.Identifier) and col_node.this.name in col_to_sv:
-                        col_node.replace(col_to_sv[col_node.this.name])
-                constraints.append(rewritten)
+                    raise ValueError(f"unlowerable_check_constraint:{tkey}:{col_name}")
+
+            rewritten = deepcopy(check.expression)
+            for col_node in list(rewritten.find_all(exp.Column)):
+                if isinstance(col_node.this, exp.Identifier):
+                    col_name = col_node.this.name
+                    if col_name in col_to_sv:
+                        col_node.replace(col_to_sv[col_name].copy())
+
+            for col_node in rewritten.find_all(exp.Column):
+                col_name = col_node.name or col_node.sql(dialect=instance.dialect)
+                raise ValueError(f"unlowered_check_column:{tkey}:{col_name}")
+
+            constraints.append(rewritten)
 
 
 def _seed_base_rows(
@@ -1570,6 +1570,7 @@ def _seed_negative_rows(
         constraints.extend(
             a for j, a in enumerate(where_atoms) if j != i
         )
+        _ensure_check_constraint_vars(instance, col_var_map, table_vars)
         _add_database_constraints(constraints, instance, col_var_map, table_vars)
 
         problem = Problem(

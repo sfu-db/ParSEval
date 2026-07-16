@@ -7,7 +7,7 @@ from typing import Any, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.dtype import DataType, TypeService, type_family
+from parseval.dtype import DataType, TypeService, enum_values, type_family
 from parseval.instance.schema import ColumnSchema, TableSchema, table_key
 
 from .value_space import ValueSpace
@@ -90,17 +90,6 @@ def _extract_length(datatype: DataType) -> Optional[int]:
     return None
 
 
-def _enum_values(datatype: DataType) -> Optional[Tuple[Any, ...]]:
-    if not datatype.is_type(DataType.Type.ENUM):
-        return None
-    values: list[Any] = []
-    for node in datatype.args.get("expressions") or ():
-        val = node.this if isinstance(node, exp.Literal) else str(node)
-        if val not in values:
-            values.append(val)
-    return tuple(values) if values else None
-
-
 def compile_column(
     column: ColumnSchema,
     *,
@@ -114,7 +103,7 @@ def compile_column(
     if allowed is not None:
         allowed_values: Optional[Tuple[Any, ...]] = tuple(allowed)
     else:
-        allowed_values = _enum_values(datatype)
+        allowed_values = enum_values(datatype)
 
     return ColumnDomainPlan(
         datatype=datatype,

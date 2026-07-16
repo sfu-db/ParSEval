@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from parseval.generator.symbolic.generate import generate
+from parseval.instance import Instance
 
 
 def generated_rows(instance):
@@ -85,6 +86,29 @@ class TestSymbolicPipeline(unittest.TestCase):
                 for row in rows
             )
         )
+
+    def test_mysql_enum_filter_generates_declared_values_only(self):
+        ddl = """
+CREATE TABLE employee (
+    employee_id INT,
+    primary_flag ENUM('Y', 'N') NOT NULL
+);
+"""
+        result = generate(
+            ddl,
+            "SELECT employee_id FROM employee WHERE primary_flag = 'Y'",
+            dialect="mysql",
+            generate_negatives=False,
+        )
+
+        flag_col = result.resolve_column("employee", "primary_flag")
+        values = [
+            Instance._row_value_dict(row)[flag_col]
+            for row in result.get_rows("employee")
+        ]
+        self.assertGreater(len(values), 0)
+        self.assertIn("Y", values)
+        self.assertTrue(all(value in {"Y", "N"} for value in values))
 
 
 if __name__ == "__main__":
