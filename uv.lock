@@ -612,7 +612,7 @@ wheels = [
 
 [[package]]
 name = "parseval"
-version = "0.0.4"
+version = "0.0.4b0"
 source = { editable = "." }
 dependencies = [
     { name = "datafusion", version = "50.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Dict, Mapping, Sequence
 
-import sqlglot
 from sqlglot import exp
 
 from parseval.generator.bounds import BmcBounds
@@ -15,8 +13,9 @@ from parseval.generator.coverage import (
     _coverage_ratio,
 )
 from parseval.generator.helper import (
-    leaf_table_scans,    
-    same_identifier,    
+    leaf_table_scans,
+    resolve_column_reference,
+    same_identifier,
 )
 from parseval.instance import Instance
 from parseval.plan.context import DerivedSchema
@@ -24,16 +23,11 @@ from parseval.plan.explain import (
     Aggregate,
     Filter,
     explain,
-    Join,
     Limit,
     Plan,
     Sort,
-    Step,
-    TableScan,
-    Projection,
 )
-from parseval.plan.rex import Environment, Variable, concrete
-from parseval.solver.api import Solver
+from parseval.plan.rex import Environment, concrete
 from parseval.solver.types import Problem, SolverVar
 
 from .operator import (
@@ -41,6 +35,8 @@ from .operator import (
     EncodePipeline,
     ScanEncodeStep,
     _database_constraints_for_solver,
+    _root_aggregate,
+    _root_fetch,
     pipeline_ordered_steps,
 )
 from parseval.generator.speculate import speculate
@@ -142,24 +138,6 @@ def _generate_from_plan(
     return instance
 
 
-# def _ensure_base_rows(
-#     plan: Plan,
-#     instance: Instance,
-#     *,
-#     bounds: BmcBounds,
-#     skip_tables: set[str] | None = None,
-# ) -> None:
-#     skip_tables = skip_tables or set()
-#     for step in pipeline_ordered_steps(plan):
-#         if not isinstance(step, TableScan):
-#             continue
-#         if step.table.name in skip_tables:
-#             continue
-#         missing = max(bounds.table_rows - len(instance.get_rows(step.table)), 0)
-#         if missing:
-#             instance.create_rows({step.table: [{} for _ in range(missing)]})
-
-
 def _bounds_for_plan(plan: Plan, bounds: BmcBounds) -> BmcBounds:
     required_rows = bounds.table_rows
     for step in pipeline_ordered_steps(plan):
@@ -175,292 +153,6 @@ def _bounds_for_plan(plan: Plan, bounds: BmcBounds) -> BmcBounds:
             required_rows = max(required_rows, bounds.result_rows)
     adjusted, _ = bounds.raise_table_rows(required_rows)
     return adjusted
-
-
-def _root_fetch(root: Step) -> int | None:
-    node = root
-    while True:
-        if isinstance(node, (Limit, Sort)) and node.fetch is not None:
-            return node.fetch
-        if not isinstance(node, Projection) or len(node.dependencies) != 1:
-            return None
-        node = next(iter(node.dependencies))
-
-
-def _root_aggregate(root: Step) -> Aggregate | None:
-    node = root
-    while True:
-        if isinstance(node, Aggregate):
-            return node
-        if isinstance(node, (Limit, Sort)):
-            return None
-        if not isinstance(node, Projection) or len(node.dependencies) != 1:
-            return None
-        node = next(iter(node.dependencies))
-
-def _solve_column_value(
-    instance: Instance,
-    table: exp.Table,
-    column: exp.Column,
-    *,
-    avoid_values: Sequence[object] = (),
-    nonce: int = 0,
-) -> object | None:
-    var = SolverVar(
-        key=f"generated.{table.sql(dialect=instance.dialect)}.{column.name}.{nonce}",
-        dtype=instance.get_column_type(table, column.name),
-        meta={"table": table.name, "column": column.name},
-    )
-    constraints = [
-        exp.NEQ(this=var, expression=_literal_for_value(value))
-        for value in avoid_values
-        if value is not None
-    ]
-    result = Solver(dialect=instance.dialect, timeout_ms=2000).solve(
-        Problem(constraints=constraints, variables={var})
-    )
-    if not result.sat:
-        return None
-    return result.assignments.get(var)
-
-
-def _literal_for_value(value: object) -> exp.Expression:
-    if value is None:
-        return exp.Null()
-    if isinstance(value, bool):
-        return exp.Boolean(this=value)
-    if isinstance(value, (int, float)):
-        return exp.Literal.number(value)
-    return exp.Literal.string(str(value))
-
-
-# def _ensure_aggregate_input_rows(
-#     plan: Plan,
-#     instance: Instance,
-#     *,
-#     bounds: BmcBounds,
-#     cardinality_only: bool = False,
-# ) -> None:
-#     having_aggregates = {
-#         aggregate_step for _filter_step, aggregate_step in _having_filters(plan)
-#     }
-#     for aggregate_step in (
-#         step for step in pipeline_ordered_steps(plan) if isinstance(step, Aggregate)
-#     ):
-#         if aggregate_step in having_aggregates and aggregate_step.group:
-#             continue
-#         if cardinality_only and not _is_simple_count_cardinality_aggregate(aggregate_step):
-#             continue
-#         table = _single_input_table(aggregate_step)
-#         if table is None:
-#             continue
-#         material_count = _aggregate_material_input_count(aggregate_step, table, instance)
-#         required_count = max(1, bounds.rows_per_group)
-#         if material_count >= required_count:
-#             continue
-#         for _ in range(required_count - material_count):
-#             row = _aggregate_input_row(aggregate_step, table, instance)
-#             try:
-#                 instance.create_rows({table: [row]})
-#             except (ConstraintViolationError, UniqueConflictError):
-#                 break
-
-
-def _aggregate_material_input_count(
-    aggregate_step: Aggregate,
-    table: exp.Table,
-    instance: Instance,
-) -> int:
-    required = _aggregate_input_column_names(aggregate_step)
-    if not required:
-        return len(instance.get_rows(table))
-    count = 0
-    for row in instance.get_rows(table):
-        values = Instance._row_value_dict(row)
-        if all(values.get(exp.to_identifier(column)) is not None for column in required):
-            count += 1
-    return count
-
-
-def _is_simple_count_cardinality_aggregate(aggregate_step: Aggregate) -> bool:
-    if aggregate_step.group:
-        return False
-    return any(
-        isinstance(
-            aggregate.this if isinstance(aggregate, exp.Alias) else aggregate,
-            exp.Count,
-        )
-        for aggregate in aggregate_step.aggregations
-    )
-
-
-def _aggregate_input_row(
-    aggregate_step: Aggregate,
-    table: exp.Table,
-    instance: Instance,
-) -> dict[str, object]:
-    row: dict[str, object] = {}
-    _assign_identity_values(instance, table, row, len(instance.get_rows(table)))
-    row.update(_base_group_row(aggregate_step, instance, table, prefix="__scalar_group"))
-    for aggregate in aggregate_step.aggregations:
-        expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
-        if isinstance(expression, exp.Count):
-            continue
-        if isinstance(expression, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
-            _assign_input_columns(expression.this, [row], 10)
-    return row
-
-
-def _aggregate_input_column_names(aggregate_step: Aggregate) -> set[str]:
-    columns: set[str] = set()
-    for aggregate in aggregate_step.aggregations:
-        expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
-        if isinstance(expression, exp.Count):
-            continue
-        if isinstance(expression, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
-            for column in expression.find_all(exp.Column):
-                columns.add(column.name)
-    return columns
-
-
-# def _ensure_join_match_rows(plan: Plan, instance: Instance) -> None:
-#     for step in pipeline_ordered_steps(plan):
-#         if not isinstance(step, Join) or not step.on_keys:
-#             continue
-#         left_col, right_col = step.on_keys[0]
-#         if not isinstance(left_col, exp.Column) or not isinstance(right_col, exp.Column):
-#             continue
-#         if not left_col.table or not right_col.table:
-#             continue
-#         left_table = storage_table_for_join_column(step, left_col, instance)
-#         right_table = storage_table_for_join_column(step, right_col, instance)
-#         if left_table is None or right_table is None:
-#             continue
-#         if not _has_join_match(instance, left_table, right_table, left_col, right_col):
-#             left_rows = instance.get_rows(left_table)
-#             right_rows = instance.get_rows(right_table)
-#             if left_rows:
-#                 value = Instance._row_value_dict(left_rows[0]).get(
-#                     instance.resolve_column(left_table, left_col.name)
-#                 )
-#                 if value is not None:
-#                     instance.create_rows({right_table: [{right_col.name: value}]})
-#             elif right_rows:
-#                 value = Instance._row_value_dict(right_rows[0]).get(
-#                     instance.resolve_column(right_table, right_col.name)
-#                 )
-#                 if value is not None:
-#                     instance.create_rows({left_table: [{left_col.name: value}]})
-#             else:
-#                 instance.create_rows({left_table: [{}]})
-#                 left_rows = instance.get_rows(left_table)
-#                 if left_rows:
-#                     value = Instance._row_value_dict(left_rows[-1]).get(
-#                         instance.resolve_column(left_table, left_col.name)
-#                     )
-#                     if value is not None:
-#                         instance.create_rows({right_table: [{right_col.name: value}]})
-#         if step.join_type.upper() == "RIGHT":
-#             _ensure_join_no_match_row(
-#                 instance,
-#                 source_table=right_table,
-#                 source_col=right_col,
-#                 other_table=left_table,
-#                 other_col=left_col,
-#             )
-#         else:
-#             _ensure_join_no_match_row(
-#                 instance,
-#                 source_table=left_table,
-#                 source_col=left_col,
-#                 other_table=right_table,
-#                 other_col=right_col,
-#             )
-
-
-# def _ensure_join_no_match_row(
-#     instance: Instance,
-#     *,
-#     source_table: exp.Table,
-#     source_col: exp.Column,
-#     other_table: exp.Table,
-#     other_col: exp.Column,
-# ) -> None:
-#     source_ident = instance.resolve_column(source_table, source_col.name)
-#     other_ident = instance.resolve_column(other_table, other_col.name)
-#     source_values = {
-#         Instance._row_value_dict(row).get(source_ident)
-#         for row in instance.get_rows(source_table)
-#     }
-#     other_values = {
-#         Instance._row_value_dict(row).get(other_ident)
-#         for row in instance.get_rows(other_table)
-#     }
-#     if any(value is not None and value not in other_values for value in source_values):
-#         return
-#     value = _solve_column_value(
-#         instance,
-#         source_table,
-#         source_col,
-#         avoid_values=tuple(other_values),
-#         nonce=len(source_values) + len(other_values) + 1,
-#     )
-#     if value is None or value in other_values:
-#         return
-#     row: dict[str, object] = {source_ident.name: value}
-#     _assign_identity_values(
-#         instance,
-#         source_table,
-#         row,
-#         len(source_values) + len(other_values) + 1,
-#     )
-#     try:
-#         instance.create_rows({source_table: [row]})
-#     except (ConstraintViolationError, UniqueConflictError):
-#         return
-
-
-# def _has_join_match(
-#     instance: Instance,
-#     left_table: exp.Table,
-#     right_table: exp.Table,
-#     left_col: exp.Column,
-#     right_col: exp.Column,
-# ) -> bool:
-#     left_ident = instance.resolve_column(left_table, left_col.name)
-#     right_ident = instance.resolve_column(right_table, right_col.name)
-#     right_values = {
-#         Instance._row_value_dict(row).get(right_ident)
-#         for row in instance.get_rows(right_table)
-#     }
-#     return any(
-#         Instance._row_value_dict(row).get(left_ident) in right_values
-#         for row in instance.get_rows(left_table)
-#     )
-
-
-# def _ensure_having_branch_groups(
-#     plan: Plan,
-#     instance: Instance,
-# ) -> Mapping[exp.Table, Sequence[Mapping[str, object]]]:
-#     create_rows: dict[exp.Table, list[Mapping[str, object]]] = {}
-#     for filter_step, aggregate_step in _having_filters(plan):
-#         table = _single_input_table(aggregate_step)
-#         if table is None:
-#             continue
-#         if not _aggregate_filter_has_outcome(filter_step, aggregate_step, instance, True):
-#             rows = _passing_having_group_rows(filter_step, aggregate_step, instance)
-#             if rows:
-#                 instance.create_rows({table: rows})
-#                 create_rows.setdefault(table, []).extend(rows)
-#         if _aggregate_filter_has_outcome(filter_step, aggregate_step, instance, False):
-#             continue
-#         rows = _failing_having_group_rows(filter_step, aggregate_step, instance)
-#         if not rows:
-#             continue
-#         instance.create_rows({table: rows})
-#         create_rows.setdefault(table, []).extend(rows)
-#     return create_rows
 
 
 def _having_filter_statuses(
@@ -480,16 +172,6 @@ def _having_filter_statuses(
         if _aggregate_filter_has_outcome(step, aggregate_step, instance, False):
             statuses[f"{prefix}.false"] = "covered"
     return statuses
-
-
-def _having_filters(plan: Plan) -> tuple[tuple[Filter, Aggregate], ...]:
-    filters: list[tuple[Filter, Aggregate]] = []
-    for step in pipeline_ordered_steps(plan):
-        if isinstance(step, Filter) and step.condition is not None:
-            aggregate_step = _single_aggregate_dependency(step)
-            if aggregate_step is not None:
-                filters.append((step, aggregate_step))
-    return tuple(filters)
 
 
 def _single_aggregate_dependency(step: Filter) -> Aggregate | None:
@@ -523,169 +205,10 @@ def _aggregate_child_schema(
     aggregate_step: Aggregate,
     instance: Instance,
 ) -> DerivedSchema:
-    scans = _leaf_table_scans(aggregate_step)
+    scans = leaf_table_scans(aggregate_step)
     if len(scans) != 1:
         return DerivedSchema(columns=(), rows=[])
     return ScanEncodeStep(scans[0], instance=instance).forward()
-
-
-# def _failing_having_group_rows(
-#     filter_step: Filter,
-#     aggregate_step: Aggregate,
-#     instance: Instance,
-# ) -> list[Mapping[str, object]]:
-#     table = _single_input_table(aggregate_step)
-#     if table is None:
-#         return []
-#     row_count = 2 if _has_avg_aggregate(aggregate_step) else 1
-#     base = _base_group_row(aggregate_step, instance, table)
-#     if not base:
-#         return []
-#     rows = [dict(base) for _ in range(row_count)]
-#     for aggregate in aggregate_step.aggregations:
-#         expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
-#         _apply_failing_aggregate_inputs(expression, rows)
-#     return rows
-
-
-# def _passing_having_group_rows(
-#     filter_step: Filter,
-#     aggregate_step: Aggregate,
-#     instance: Instance,
-# ) -> list[Mapping[str, object]]:
-#     table = _single_input_table(aggregate_step)
-#     if table is None:
-#         return []
-#     row_count = 2 if _has_avg_aggregate(aggregate_step) else 1
-#     base = _base_group_row(aggregate_step, instance, table, prefix="__having_true")
-#     if not base:
-#         return []
-#     rows = [dict(base) for _ in range(row_count)]
-#     for aggregate in aggregate_step.aggregations:
-#         expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
-#         _apply_passing_aggregate_inputs(expression, rows)
-#     return rows
-
-
-def _base_group_row(
-    aggregate_step: Aggregate,
-    instance: Instance,
-    table: exp.Table,
-    *,
-    prefix: str = "__having_false",
-) -> dict[str, object]:
-    row: dict[str, object] = {}
-    for index, group_expr in enumerate(aggregate_step.group):
-        if isinstance(group_expr, exp.Column):
-            row[group_expr.name] = _fresh_group_value(
-                instance,
-                table,
-                group_expr,
-                index,
-                prefix=prefix,
-            )
-    return row
-
-
-def _fresh_group_value(
-    instance: Instance,
-    table: exp.Table,
-    column: exp.Column,
-    index: int,
-    *,
-    prefix: str,
-) -> object:
-    existing = {
-        values.get(column.this)
-        for values in (Instance._row_value_dict(row) for row in instance.get_rows(table))
-    }
-    candidate = f"{prefix}_{index}"
-    suffix = 0
-    while candidate in existing:
-        suffix += 1
-        candidate = f"{prefix}_{index}_{suffix}"
-    return candidate
-
-
-def _apply_passing_aggregate_inputs(
-    aggregate: exp.Expression,
-    rows: list[dict[str, object]],
-) -> None:
-    if isinstance(aggregate, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
-        _assign_input_columns(aggregate.this, rows, 20)
-
-
-def _apply_failing_aggregate_inputs(
-    aggregate: exp.Expression,
-    rows: list[dict[str, object]],
-) -> None:
-    if isinstance(aggregate, exp.Sum):
-        _assign_input_columns(aggregate.this, rows, 0)
-    elif isinstance(aggregate, exp.Avg):
-        _assign_input_columns(aggregate.this, rows, 0)
-    elif isinstance(aggregate, (exp.Min, exp.Max)):
-        _assign_input_columns(aggregate.this, rows, 0)
-
-
-def _assign_input_columns(
-    expression: exp.Expression | None,
-    rows: list[dict[str, object]],
-    value: object,
-) -> None:
-    if expression is None:
-        return
-    for column in expression.find_all(exp.Column):
-        for row in rows:
-            row.setdefault(column.name, value)
-
-
-def _has_avg_aggregate(aggregate_step: Aggregate) -> bool:
-    for aggregate in aggregate_step.aggregations:
-        expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
-        if isinstance(expression, exp.Avg):
-            return True
-    return False
-
-
-def _single_input_table(aggregate_step: Aggregate) -> exp.Table | None:
-    scans = _leaf_table_scans(aggregate_step)
-    return scans[0].table if len(scans) == 1 else None
-
-
-def _having_source_tables(plan: Plan) -> set[str]:
-    tables: set[str] = set()
-    for _, aggregate_step in _having_filters(plan):
-        table = _single_input_table(aggregate_step)
-        if table is not None:
-            tables.add(table.name)
-    return tables
-
-
-def _join_source_tables(plan: Plan) -> set[str]:
-    tables: set[str] = set()
-    for step in pipeline_ordered_steps(plan):
-        if isinstance(step, Join):
-            for left, right in step.on_keys:
-                for expression in (left, right):
-                    if isinstance(expression, exp.Column) and expression.table:
-                        tables.add(expression.table)
-    return tables
-
-
-def _leaf_table_scans(step: Step) -> tuple[TableScan, ...]:
-    return leaf_table_scans(step)
-
-
-# def _merge_create_rows(
-#     left: Mapping[exp.Table, Sequence[Mapping[exp.Identifier, object]]],
-#     right: Mapping[exp.Table, Sequence[Mapping[str, object]]],
-# ) -> Mapping[exp.Table, Sequence[Mapping[object, object]]]:
-#     merged: dict[exp.Table, list[Mapping[object, object]]] = {
-#         table: list(rows) for table, rows in left.items()
-#     }
-#     for table, rows in right.items():
-#         merged.setdefault(table, []).extend(rows)
-#     return merged
 
 
 def _row_counts(instance: Instance) -> dict[str, int]:
@@ -776,9 +299,8 @@ def _constraint_columns_by_table(
                     instance.dialect,
                 ):
                     continue
-                try:
-                    resolved = instance.resolve_column(table, column)
-                except KeyError:
+                resolved = resolve_column_reference(instance, table, column)
+                if resolved is None:
                     continue
                 referenced[table.name].add(resolved.name)
                 break
