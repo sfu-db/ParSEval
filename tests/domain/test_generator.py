@@ -11,19 +11,16 @@ from parseval.instance.schema import InstanceSchema
 class TestCompileColumn(unittest.TestCase):
     def test_enum_allowed_values(self):
         schema = InstanceSchema.from_ddl(
-            "CREATE TABLE t (status VARCHAR(10));",
-            dialect="sqlite",
+            "CREATE TABLE t (status ENUM('open', 'closed') NOT NULL);",
+            dialect="mysql",
         )
-        # SQLite has no native ENUM; use mysql-style via datatype expressions if present.
-        schema = InstanceSchema.from_ddl(
-            "CREATE TABLE t (id INT PRIMARY KEY, kind TEXT);",
-            dialect="sqlite",
-        )
-        col = schema.get_table("t").columns[schema.resolve_column("t", "id")]
-        plan = compile_column(col, dialect="sqlite", unique=True)
+        col = schema.get_table("t").columns[schema.resolve_column("t", "status")]
+        plan = compile_column(col, dialect="mysql")
         space = plan.to_value_space()
+
+        self.assertEqual(plan.allowed_values, ("open", "closed"))
         self.assertTrue(space.not_null)
-        self.assertIsNotNone(space.pick())
+        self.assertIn(space.pick(), {"open", "closed"})
 
 
 class TestDomainGenerator(unittest.TestCase):

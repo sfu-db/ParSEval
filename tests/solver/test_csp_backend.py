@@ -134,6 +134,23 @@ class CspBackendTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unsat")
 
+    def test_enum_var_rejects_value_outside_declared_domain(self):
+        status = var("t.status", "ENUM('open', 'closed')")
+        constraint = exp.EQ(this=status, expression=text("archived"))
+
+        result = CspBackend().solve(Problem(constraints=[constraint], variables={status}))
+
+        self.assertEqual(result.status, "unsat")
+
+    def test_enum_var_picks_declared_value_after_narrowing(self):
+        status = var("t.status", "ENUM('open', 'closed')")
+        constraint = exp.NEQ(this=status, expression=text("open"))
+
+        result = CspBackend().solve(Problem(constraints=[constraint], variables={status}))
+
+        self.assertEqual(result.status, "sat")
+        self.assertEqual(result.assignments[status], "closed")
+
     def test_year_function_predicate_generates_matching_datetime(self):
         created = var("t.created", "DATETIME")
         constraint = exp.GT(

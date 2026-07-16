@@ -8,9 +8,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import z3
 from sqlglot import exp
-from sqlglot.expressions import DataType
 
 from parseval.dtype import (
+    DataType,
+    is_enum_type,
     parse_date,
     parse_time,
     parse_datetime,
@@ -201,6 +202,9 @@ def normalize_dtype(
     elif dtype.is_type(DataType.Type.BOOLEAN):
         logical_name, family = "BOOLEAN", "bool"
         payload_sort = z3.BoolSort(z3ctx)
+    elif is_enum_type(dtype):
+        logical_name, family = "TEXT", "text"
+        payload_sort = z3.StringSort(z3ctx)
     elif dtype.is_type(*DataType.TEXT_TYPES):
         logical_name, family = "TEXT", "text"
         payload_sort = z3.StringSort(z3ctx)
