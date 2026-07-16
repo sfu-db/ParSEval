@@ -53,6 +53,7 @@ class GroupDemand:
     row_count: int
     group_key_values: Tuple[Tuple[exp.Expression, object], ...] = ()
     row_predicates: Tuple[exp.Expression, ...] = ()
+    row_predicates_by_index: Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -326,9 +327,10 @@ def _expression_demand_batch_constraints(
     del dialect
     constraints: List[exp.Expression] = []
     distinct_by_origin: Dict[str, Dict[int, exp.Expression]] = {}
+    equal_by_origin: Dict[Tuple[str, object | None], Dict[int, exp.Expression]] = {}
     order_by_origin: Dict[str, Dict[int, Tuple[exp.Expression, object | None]]] = {}
     for demand in expression_demands:
-        if demand.kind not in {"distinct", "order"} or demand.rank is None:
+        if demand.kind not in {"distinct", "order", "equal"} or demand.rank is None:
             continue
         if demand.rank < 0 or demand.rank >= len(sv_rows):
             continue
@@ -343,6 +345,8 @@ def _expression_demand_batch_constraints(
         origin = demand.origin or _normalize_expression_key(demand.expression.sql())
         if demand.kind == "distinct":
             distinct_by_origin.setdefault(origin, {})[demand.rank] = expression
+        elif demand.kind == "equal":
+            equal_by_origin.setdefault((origin, demand.value), {})[demand.rank] = expression
         else:
             order_by_origin.setdefault(origin, {})[demand.rank] = (
                 expression,
@@ -353,6 +357,11 @@ def _expression_demand_batch_constraints(
         for left_index, (left_rank, left_expression) in enumerate(ranked):
             for _right_rank, right_expression in ranked[left_index + 1 :]:
                 constraints.append(exp.NEQ(this=left_expression, expression=right_expression))
+    for rank_to_expression in equal_by_origin.values():
+        ranked = sorted(rank_to_expression.items())
+        for left_index, (_left_rank, left_expression) in enumerate(ranked):
+            for _right_rank, right_expression in ranked[left_index + 1 :]:
+                constraints.append(exp.EQ(this=left_expression, expression=right_expression))
     for rank_to_expression in order_by_origin.values():
         ranked = sorted(rank_to_expression.items())
         for left_index, (_left_rank, (left_expression, left_value)) in enumerate(ranked):
@@ -1153,17 +1162,30 @@ class AggregateEncodeStep(EncodeStep):
                 dialect=context.dialect,
             )
         if node.group and group_demands:
+            group_demands = _ensure_aggregate_group_key_values(
+                node,
+                group_demands,
+                context.dialect,
+            )
             expression_demands = expression_demands + _aggregate_group_key_expression_demands(
                 node,
                 group_demands,
                 context.dialect,
             )
-        child_group_demands = group_demands if node.group else ()
-        child_predicates = demand.predicates + tuple(
-            predicate
-            for group in group_demands
-            for predicate in group.row_predicates
-        ) if not node.group else demand.predicates
+        rows_per_group = max(
+            int(getattr(context.bounds, "rows_per_group", 1) or 1),
+            1,
+        )
+        group_demands, stress_expression_demands = _aggregate_argument_stress_demands(
+            node,
+            child_schema,
+            group_demands,
+            rows_per_group=rows_per_group,
+            dialect=context.dialect,
+        )
+        expression_demands = expression_demands + stress_expression_demands
+        child_group_demands = group_demands
+        child_predicates = demand.predicates
         child_order_keys = tuple(node.group or ()) + tuple(
             key
             for key in demand.order_keys
@@ -1748,6 +1770,8 @@ def _group_key_values(
 
 
 def _group_key_value_for_index(expression: exp.Expression, index: int) -> object:
+    if isinstance(expression, exp.Alias):
+        expression = expression.this
     if isinstance(expression, exp.Case):
         values = _distinct_target_values(expression, index + 1)
         if values:
@@ -1825,6 +1849,301 @@ def _aggregate_arg_expression(expression: exp.Expression) -> exp.Expression | No
     if isinstance(arg, exp.Star):
         return None
     return arg
+
+
+def _aggregate_argument_columns(
+    aggregate: Aggregate,
+    child_schema: DerivedSchema,
+    dialect: str | None = None,
+) -> Tuple[Tuple[exp.Expression, exp.Column], ...]:
+    columns: List[Tuple[exp.Expression, exp.Column]] = []
+    seen: Set[str] = set()
+    for item in aggregate.aggregations or ():
+        expression = item.this if isinstance(item, exp.Alias) else item
+        if not isinstance(expression, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+            continue
+        arg = _aggregate_arg_expression(expression)
+        while isinstance(arg, exp.Cast):
+            arg = arg.this
+        if not isinstance(arg, exp.Column):
+            continue
+        visible = _visible_schema_column(child_schema, arg, dialect)
+        if visible is None:
+            continue
+        key = _expression_key(visible, dialect)
+        if key in seen:
+            continue
+        seen.add(key)
+        columns.append((expression, visible))
+    if not aggregate.aggregations:
+        for expression in aggregate.group or ():
+            arg = expression.this if isinstance(expression, exp.Alias) else expression
+            while isinstance(arg, exp.Cast):
+                arg = arg.this
+            if not isinstance(arg, exp.Column):
+                continue
+            visible = _visible_schema_column(child_schema, arg, dialect)
+            if visible is None:
+                continue
+            key = _expression_key(visible, dialect)
+            if key in seen:
+                continue
+            seen.add(key)
+            columns.append((expression, visible))
+    return tuple(columns)
+
+
+def _aggregate_argument_stress_demands(
+    aggregate: Aggregate,
+    child_schema: DerivedSchema,
+    group_demands: Sequence[GroupDemand],
+    *,
+    rows_per_group: int,
+    dialect: str | None = None,
+) -> Tuple[Tuple[GroupDemand, ...], Tuple[ExpressionDemand, ...]]:
+    arguments = _aggregate_argument_columns(aggregate, child_schema, dialect)
+    if not arguments:
+        return tuple(group_demands), ()
+    demands = list(group_demands) or (
+        [
+            GroupDemand(
+                group_index=0,
+                row_count=max(rows_per_group, 1),
+                group_key_values=_group_key_values(aggregate, 0, dialect),
+            )
+        ]
+    )
+    expression_demands: List[ExpressionDemand] = []
+    stressed: List[GroupDemand] = []
+    base_rank = 0
+    for group in demands:
+        row_predicates_by_index = {
+            index: tuple(predicates)
+            for index, predicates in group.row_predicates_by_index
+        }
+        row_count = group.row_count
+        for aggregate_expression, argument in arguments:
+            nullable = child_schema.nullable(argument)
+            unique = child_schema.is_unique(argument)
+            mandatory = group.row_predicates
+            is_group_key_argument = any(
+                _expression_key(key, dialect) == _expression_key(argument, dialect)
+                or any(
+                    _expression_key(column, dialect) == _expression_key(argument, dialect)
+                    for column in _columns_including_self(key)
+                )
+                for key, _value in group.group_key_values
+            )
+            allow_null = (
+                nullable
+                and not is_group_key_argument
+                and not _predicate_contradicts_null_stress(
+                    mandatory,
+                    argument,
+                    dialect,
+                )
+            )
+            allow_duplicate = (
+                not unique
+                and _aggregate_allows_duplicate_stress(
+                    aggregate_expression,
+                    group,
+                )
+            )
+            if not allow_null and not allow_duplicate:
+                continue
+            required_null_rows = int(allow_null)
+            required_duplicate_rows = 2 if allow_duplicate else 0
+            required_stress_rows = required_null_rows + required_duplicate_rows
+            row_count = max(row_count, required_stress_rows)
+            null_index = None
+            if allow_null:
+                null_index = next(
+                    (
+                        index
+                        for index in range(row_count)
+                        if not _predicate_contradicts_null_stress(
+                            row_predicates_by_index.get(index, ()),
+                            argument,
+                            dialect,
+                        )
+                    ),
+                    None,
+                )
+                if null_index is not None:
+                    row_predicates_by_index[null_index] = row_predicates_by_index.get(null_index, ()) + (
+                        exp.Is(this=deepcopy(argument), expression=exp.Null()),
+                    )
+            if allow_duplicate:
+                duplicate_indexes = _duplicate_stress_indexes(
+                    row_predicates_by_index,
+                    row_count,
+                    argument,
+                    null_index,
+                    dialect,
+                )
+                if duplicate_indexes is None:
+                    continue
+                left_index, right_index = duplicate_indexes
+                row_predicates_by_index[left_index] = row_predicates_by_index.get(left_index, ()) + (
+                    _not_null_predicate(argument),
+                )
+                row_predicates_by_index[right_index] = row_predicates_by_index.get(right_index, ()) + (
+                    _not_null_predicate(argument),
+                )
+                origin = f"aggregate_argument_duplicate:{argument.sql(dialect=dialect)}:{group.group_index}"
+                for row_index in (left_index, right_index):
+                    expression_demands.append(
+                        ExpressionDemand(
+                            expression=deepcopy(argument),
+                            kind="equal",
+                            value=origin,
+                            rank=base_rank + row_index,
+                            origin=origin,
+                        )
+                    )
+        stressed.append(
+            GroupDemand(
+                group_index=group.group_index,
+                row_count=row_count,
+                group_key_values=group.group_key_values,
+                row_predicates=group.row_predicates,
+                row_predicates_by_index=tuple(
+                    sorted(row_predicates_by_index.items(), key=lambda item: item[0])
+                ),
+            )
+        )
+        base_rank += row_count
+    return tuple(stressed), tuple(expression_demands)
+
+
+def _aggregate_allows_duplicate_stress(
+    aggregate_expression: exp.Expression,
+    group: GroupDemand,
+) -> bool:
+    if isinstance(aggregate_expression, (exp.Min, exp.Max)):
+        return True
+    if isinstance(aggregate_expression, exp.Count):
+        if isinstance(aggregate_expression.this, exp.Distinct) or aggregate_expression.args.get("distinct"):
+            return True
+        return not group.row_predicates
+    if isinstance(aggregate_expression, (exp.Sum, exp.Avg)):
+        return not group.row_predicates
+    return True
+
+
+def _predicate_contradicts_null_stress(
+    predicates: Sequence[exp.Expression],
+    argument: exp.Expression,
+    dialect: str | None = None,
+) -> bool:
+    argument_key = _expression_key(argument, dialect)
+    for predicate in predicates:
+        for atom in _conjuncts(predicate):
+            if _is_not_null_atom_for_argument(atom, argument_key, dialect):
+                return True
+            if isinstance(atom, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                if _expression_key(atom.this, dialect) == argument_key and isinstance(atom.expression, exp.Literal):
+                    return True
+                if _expression_key(atom.expression, dialect) == argument_key and isinstance(atom.this, exp.Literal):
+                    return True
+    return False
+
+
+def _is_not_null_atom_for_argument(
+    atom: exp.Expression,
+    argument_key: str,
+    dialect: str | None = None,
+) -> bool:
+    if _is_not_null_filter(atom):
+        target = atom.this
+        if isinstance(atom, exp.Not) and isinstance(atom.this, exp.Is):
+            target = atom.this.this
+        return _expression_key(target, dialect) == argument_key
+    if (
+        isinstance(atom, exp.Not)
+        and isinstance(atom.this, exp.Is)
+        and isinstance(atom.this.expression, exp.Null)
+    ):
+        return _expression_key(atom.this.this, dialect) == argument_key
+    return False
+
+
+def _duplicate_stress_indexes(
+    row_predicates_by_index: Mapping[int, Tuple[exp.Expression, ...]],
+    row_count: int,
+    argument: exp.Expression,
+    null_index: int | None,
+    dialect: str | None = None,
+) -> Tuple[int, int] | None:
+    unconstrained: List[int] = []
+    forced_by_value: Dict[object, List[int]] = {}
+    for index in range(row_count):
+        if index == null_index:
+            continue
+        predicates = row_predicates_by_index.get(index, ())
+        forces_null, forced_value = _predicate_argument_row_state(
+            predicates,
+            argument,
+            dialect,
+        )
+        if forces_null:
+            continue
+        if forced_value is _MISSING:
+            unconstrained.append(index)
+        else:
+            forced_by_value.setdefault(forced_value, []).append(index)
+    if len(unconstrained) >= 2:
+        return unconstrained[0], unconstrained[1]
+    if unconstrained:
+        for indexes in forced_by_value.values():
+            if indexes:
+                return unconstrained[0], indexes[0]
+    for indexes in forced_by_value.values():
+        if len(indexes) >= 2:
+            return indexes[0], indexes[1]
+    return None
+
+
+def _predicate_argument_row_state(
+    predicates: Sequence[exp.Expression],
+    argument: exp.Expression,
+    dialect: str | None = None,
+) -> Tuple[bool, object]:
+    argument_key = _expression_key(argument, dialect)
+    forced_value: object = _MISSING
+    for predicate in predicates:
+        for atom in _conjuncts(predicate):
+            if (
+                isinstance(atom, exp.Is)
+                and _expression_key(atom.this, dialect) == argument_key
+                and isinstance(atom.expression, exp.Null)
+            ):
+                return True, forced_value
+            if not isinstance(atom, exp.EQ):
+                continue
+            if (
+                _expression_key(atom.this, dialect) == argument_key
+                and isinstance(atom.expression, exp.Literal)
+            ):
+                forced_value = _literal_value(atom.expression)
+            if (
+                _expression_key(atom.expression, dialect) == argument_key
+                and isinstance(atom.this, exp.Literal)
+            ):
+                forced_value = _literal_value(atom.this)
+    return False, forced_value
+
+
+def _row_predicates_for_group_row(
+    group: GroupDemand,
+    row_index: int,
+) -> Tuple[exp.Expression, ...]:
+    predicates = list(group.row_predicates)
+    for local_index, local_predicates in group.row_predicates_by_index:
+        if local_index == row_index:
+            predicates.extend(local_predicates)
+    return tuple(predicates)
 
 
 def _not_null_predicate(expression: exp.Expression) -> exp.Expression:
@@ -1924,6 +2243,12 @@ def _group_demand_for_having(
                 if demand is not None
                 for predicate in demand.row_predicates
             ),
+            row_predicates_by_index=tuple(
+                item
+                for demand in demands
+                if demand is not None
+                for item in demand.row_predicates_by_index
+            ),
         )
     target = _comparison_target(condition)
     if target is None:
@@ -1935,6 +2260,7 @@ def _group_demand_for_having(
 
     aggregates = _aggregate_expression_map(aggregate, dialect)
     row_predicates: List[exp.Expression] = []
+    row_predicates_by_index: List[Tuple[int, Tuple[exp.Expression, ...]]] = []
     row_count = max(default_row_count, 1)
 
     if isinstance(expression, exp.Div):
@@ -1953,12 +2279,21 @@ def _group_demand_for_having(
             else exp.LTE(this=deepcopy(numerator_arg), expression=_literal_for_value(value))
         )
         if denominator_arg is not None:
-            row_predicates.append(_not_null_predicate(denominator_arg))
+            row_predicates_by_index.extend(
+                _required_not_null_row_predicates(
+                    denominator_arg,
+                    required_count=1,
+                    row_count=row_count,
+                    existing=row_predicates_by_index,
+                    dialect=dialect,
+                )
+            )
         return GroupDemand(
             group_index=group_index,
             row_count=row_count,
             group_key_values=_group_key_values(aggregate, group_index, dialect),
             row_predicates=tuple(row_predicates),
+            row_predicates_by_index=tuple(row_predicates_by_index),
         )
 
     aggregate_expression = _resolve_aggregate_expression(expression, aggregates, dialect)
@@ -1974,7 +2309,21 @@ def _group_demand_for_having(
         )
         arg = _aggregate_arg_expression(aggregate_expression)
         if arg is not None:
-            row_predicates.append(_not_null_predicate(arg))
+            required_non_null = _non_null_count_for_count(
+                threshold,
+                operator,
+                row_count,
+                pass_group=pass_group,
+            )
+            row_predicates_by_index.extend(
+                _required_not_null_row_predicates(
+                    arg,
+                    required_count=required_non_null,
+                    row_count=row_count,
+                    existing=row_predicates_by_index,
+                    dialect=dialect,
+                )
+            )
     elif isinstance(aggregate_expression, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
         arg = _aggregate_arg_expression(aggregate_expression)
         if arg is None:
@@ -1998,7 +2347,62 @@ def _group_demand_for_having(
         row_count=row_count,
         group_key_values=_group_key_values(aggregate, group_index, dialect),
         row_predicates=tuple(row_predicates),
+        row_predicates_by_index=tuple(row_predicates_by_index),
     )
+
+
+def _required_not_null_row_predicates(
+    argument: exp.Expression,
+    *,
+    required_count: int,
+    row_count: int,
+    existing: Sequence[Tuple[int, Tuple[exp.Expression, ...]]],
+    dialect: str | None = None,
+) -> Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...]:
+    if required_count <= 0:
+        return ()
+    existing_by_index: Dict[int, Tuple[exp.Expression, ...]] = {
+        index: predicates for index, predicates in existing
+    }
+    selected: List[Tuple[int, Tuple[exp.Expression, ...]]] = []
+    for index in range(row_count):
+        predicates = existing_by_index.get(index, ())
+        forces_null, _forced_value = _predicate_argument_row_state(
+            predicates,
+            argument,
+            dialect,
+        )
+        if forces_null:
+            continue
+        selected.append((index, (_not_null_predicate(argument),)))
+        if len(selected) == required_count:
+            return tuple(selected)
+    return tuple(selected)
+
+
+def _non_null_count_for_count(
+    threshold: float,
+    operator: str,
+    row_count: int,
+    *,
+    pass_group: bool,
+) -> int:
+    if pass_group:
+        if operator == "gt":
+            return min(max(int(threshold) + 1, 0), row_count)
+        if operator == "gte":
+            return min(max(int(threshold), 0), row_count)
+        if operator == "eq":
+            return min(max(int(threshold), 0), row_count)
+        if operator == "lt":
+            return min(max(int(threshold) - 1, 0), row_count)
+        if operator == "lte":
+            return min(max(int(threshold), 0), row_count)
+    if operator in {"gt", "gte"}:
+        return 0
+    if operator in {"lt", "lte", "eq"}:
+        return min(row_count, max(int(threshold) + 1, 1))
+    return 0
 
 
 def _aggregate_expression_group_demands(
@@ -2048,6 +2452,33 @@ def _aggregate_group_key_expression_demands(
                 )
             )
     return tuple(demands)
+
+
+def _ensure_aggregate_group_key_values(
+    aggregate: Aggregate,
+    group_demands: Sequence[GroupDemand],
+    dialect: str | None = None,
+) -> Tuple[GroupDemand, ...]:
+    normalized: List[GroupDemand] = []
+    for group in group_demands:
+        existing = list(group.group_key_values)
+        for key, value in _group_key_values(aggregate, group.group_index, dialect):
+            if any(
+                _expression_key(existing_key, dialect) == _expression_key(key, dialect)
+                for existing_key, _existing_value in existing
+            ):
+                continue
+            existing.append((key, value))
+        normalized.append(
+            GroupDemand(
+                group_index=group.group_index,
+                row_count=group.row_count,
+                group_key_values=tuple(existing),
+                row_predicates=group.row_predicates,
+                row_predicates_by_index=group.row_predicates_by_index,
+            )
+        )
+    return tuple(normalized)
 
 
 def _expression_contains_aggregate(expression: exp.Expression) -> bool:
@@ -2181,6 +2612,62 @@ def _schema_satisfies_group_demands(
             return False
         used.add(match)
     return True
+
+
+def _schema_satisfies_aggregate_argument_stress(
+    root: Step,
+    cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    dialect: str | None = None,
+) -> bool:
+    aggregates = [
+        step
+        for step in _reachable_steps(root)
+        if isinstance(step, Aggregate) and step in cache and step.dependencies
+    ]
+    for aggregate in aggregates:
+        child = next(iter(aggregate.dependencies))
+        if child not in cache:
+            continue
+        child_schema = _schema_for(cache, child)
+        arguments = _aggregate_argument_columns(aggregate, child_schema, dialect)
+        if not arguments:
+            continue
+        groups = _rows_by_group(aggregate, child_schema)
+        for _aggregate_expression, argument in arguments:
+            if child_schema.nullable(argument) and not any(
+                any(_expr_value(argument, row) is None for row in rows)
+                for rows in groups.values()
+            ):
+                return False
+            if not child_schema.is_unique(argument) and not any(
+                _has_duplicate_non_null_argument(argument, rows)
+                for rows in groups.values()
+            ):
+                return False
+    return True
+
+
+def _rows_by_group(
+    aggregate: Aggregate,
+    child_schema: DerivedSchema,
+) -> Dict[Tuple[Any, ...], List[Row]]:
+    group_exprs = tuple(aggregate.group or ())
+    grouped: Dict[Tuple[Any, ...], List[Row]] = {}
+    for row in child_schema.rows:
+        key = tuple(_expr_value(expr, row) for expr in group_exprs)
+        grouped.setdefault(key, []).append(row)
+    if not grouped and not group_exprs:
+        grouped[()] = []
+    return grouped
+
+
+def _has_duplicate_non_null_argument(
+    argument: exp.Expression,
+    rows: Sequence[Row],
+) -> bool:
+    values = [_expr_value(argument, row) for row in rows]
+    non_null_values = [value for value in values if value is not None]
+    return len(set(non_null_values)) < len(non_null_values)
 
 
 def _root_result_count(root: Step, bounds: object) -> int:
@@ -2424,6 +2911,16 @@ def _rewrite_demand_alias(
                     _rewrite_columns_through_schema(predicate, alias, column_map, dialect)
                     for predicate in group.row_predicates
                 ),
+                row_predicates_by_index=tuple(
+                    (
+                        index,
+                        tuple(
+                            _rewrite_columns_through_schema(predicate, alias, column_map, dialect)
+                            for predicate in predicates
+                        ),
+                    )
+                    for index, predicates in group.row_predicates_by_index
+                ),
             )
             for group in demand.group_demands
         ),
@@ -2537,6 +3034,16 @@ def _rewrite_projection_demand(
                 row_predicates=tuple(
                     _rewrite_projection_expression(predicate, expression_by_output, dialect)
                     for predicate in group.row_predicates
+                ),
+                row_predicates_by_index=tuple(
+                    (
+                        index,
+                        tuple(
+                            _rewrite_projection_expression(predicate, expression_by_output, dialect)
+                            for predicate in predicates
+                        ),
+                    )
+                    for index, predicates in group.row_predicates_by_index
                 ),
             )
             for group in demand.group_demands
@@ -2714,6 +3221,8 @@ def _expression_demand_predicates(
 ) -> Tuple[exp.Expression, ...]:
     expression = demand.expression
     value = demand.value
+    if demand.kind == "equal":
+        return ()
     if demand.kind == "predicate_expression":
         return (deepcopy(expression),)
     if isinstance(expression, exp.Alias):
@@ -2928,6 +3437,36 @@ def _split_predicate_by_schema(
         elif all(_schema_has_column(right_schema, column, dialect) for column in columns):
             right.append(_expression_in_schema_scope(atom, right_schema, dialect))
     return tuple(left), tuple(right)
+
+
+def _split_group_row_predicates_by_schema(
+    group: GroupDemand,
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    dialect: str | None = None,
+) -> Tuple[
+    Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...],
+    Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...],
+]:
+    left_rows: List[Tuple[int, Tuple[exp.Expression, ...]]] = []
+    right_rows: List[Tuple[int, Tuple[exp.Expression, ...]]] = []
+    for row_index, predicates in group.row_predicates_by_index:
+        left_predicates: List[exp.Expression] = []
+        right_predicates: List[exp.Expression] = []
+        for predicate in predicates:
+            left_part, right_part = _split_predicate_by_schema(
+                predicate,
+                left_schema,
+                right_schema,
+                dialect,
+            )
+            left_predicates.extend(left_part)
+            right_predicates.extend(right_part)
+        if left_predicates:
+            left_rows.append((row_index, tuple(left_predicates)))
+        if right_predicates:
+            right_rows.append((row_index, tuple(right_predicates)))
+    return tuple(left_rows), tuple(right_rows)
 
 
 def _aggregate_case_predicates(step: Aggregate) -> Tuple[exp.Expression, ...]:
@@ -3824,6 +4363,14 @@ class EncodePipeline:
             if (
                 len(schema.rows) < root_demand.count
                 or not _schema_satisfies_group_demands(schema, root_demand)
+                or (
+                    self.bounds is not None
+                    and not _schema_satisfies_aggregate_argument_stress(
+                        self.plan.root,
+                        cache,
+                        self.dialect,
+                    )
+                )
             ):
                 self._lower_demand(
                     self.plan.root,
@@ -3853,13 +4400,22 @@ class EncodePipeline:
         count = _root_result_count(root, self.bounds)
         aggregate = _root_aggregate(root)
         group_demands: Tuple[GroupDemand, ...] = ()
-        if aggregate is not None and aggregate.group:
-            group_demands = _aggregate_group_demands(
-                aggregate,
-                group_count=max(int(getattr(self.bounds, "groups", 1) or 1), count),
-                rows_per_group=max(int(getattr(self.bounds, "rows_per_group", 1) or 1), 1),
-                dialect=self.dialect,
-            )
+        if aggregate is not None:
+            rows_per_group = max(int(getattr(self.bounds, "rows_per_group", 1) or 1), 1)
+            if aggregate.group:
+                group_demands = _aggregate_group_demands(
+                    aggregate,
+                    group_count=max(int(getattr(self.bounds, "groups", 1) or 1), count),
+                    rows_per_group=rows_per_group,
+                    dialect=self.dialect,
+                )
+            else:
+                group_demands = (
+                    GroupDemand(
+                        group_index=0,
+                        row_count=rows_per_group,
+                    ),
+                )
         return SchemaDemand(count=count, group_demands=group_demands)
 
     def _next_seed(self) -> int:
@@ -4147,6 +4703,14 @@ class EncodePipeline:
             right_predicates.extend(
                 self._filter_conditions_for_step(right_dep, right_schema, cache)
             )
+            left_row_predicates_by_index, right_row_predicates_by_index = (
+                _split_group_row_predicates_by_schema(
+                    group,
+                    left_schema,
+                    right_schema,
+                    self.dialect,
+                )
+            )
 
             left_group_keys: List[Tuple[exp.Expression, object]] = []
             right_group_keys: List[Tuple[exp.Expression, object]] = []
@@ -4278,6 +4842,7 @@ class EncodePipeline:
                                 row_count=max(left_count, 1),
                                 group_key_values=tuple(left_group_keys),
                                 row_predicates=(),
+                                row_predicates_by_index=left_row_predicates_by_index,
                             ),
                         ),
                     ),
@@ -4296,6 +4861,7 @@ class EncodePipeline:
                                 row_count=max(right_count, 1),
                                 group_key_values=tuple(right_group_keys),
                                 row_predicates=(),
+                                row_predicates_by_index=right_row_predicates_by_index,
                             ),
                         ),
                     ),
@@ -4319,7 +4885,7 @@ class EncodePipeline:
         aliases = {alias: table}
         if demand.group_demands:
             for group in demand.group_demands:
-                for _ in range(max(group.row_count, 1)):
+                for row_index in range(max(group.row_count, 1)):
                     alias_rows = {alias: {}}
                     row_seed = self._seed_alias_rows(alias_rows, aliases)
                     group_key_predicates = _group_key_predicates_for_table(
@@ -4329,7 +4895,7 @@ class EncodePipeline:
                     )
                     predicates = (
                         demand.predicates
-                        + group.row_predicates
+                        + _row_predicates_for_group_row(group, row_index)
                         + group_key_predicates
                         + _rank_expression_predicates(
                             demand.expression_demands,

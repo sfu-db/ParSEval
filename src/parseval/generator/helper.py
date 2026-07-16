@@ -72,21 +72,50 @@ def join_alias_tables(join: Join) -> tuple[tuple[exp.Identifier, exp.Table], ...
     return tuple(pairs)
 
 
+def resolve_table_reference(
+    instance: Instance,
+    alias_tables: Mapping[exp.Identifier, exp.Table],
+    qualifier: exp.Identifier | None,
+) -> exp.Table | None:
+    if qualifier is None:
+        return None
+    for alias, table in alias_tables.items():
+        if same_identifier(alias, qualifier, instance.dialect):
+            return table
+    return _resolve_table_or_none(instance, exp.Table(this=qualifier.copy()))
+
+
+def resolve_column_reference(
+    instance: Instance,
+    table: exp.Table,
+    column: exp.Column | exp.Identifier | str,
+) -> exp.Identifier | None:
+    try:
+        return instance.resolve_column(table, column)
+    except KeyError:
+        return None
+
+
+def _resolve_table_or_none(
+    instance: Instance,
+    table: exp.Table,
+) -> exp.Table | None:
+    try:
+        return instance.resolve_table(table)
+    except KeyError:
+        return None
+
+
 def storage_table_for_join_column(
     join: Join,
     column: exp.Column,
     instance: Instance,
 ) -> exp.Table | None:
-    qualifier = column.args.get("table")
-    if qualifier is None:
-        return None
-    for alias, table in join_alias_tables(join):
-        if same_identifier(alias, qualifier, instance.dialect):
-            return table
-    try:
-        return instance.resolve_table(exp.Table(this=qualifier.copy()))
-    except KeyError:
-        return None
+    return resolve_table_reference(
+        instance,
+        dict(join_alias_tables(join)),
+        column.args.get("table"),
+    )
 
 
 def table_for_column(
@@ -96,20 +125,11 @@ def table_for_column(
 ) -> exp.Table | None:
     qualifier = column.args.get("table")
     if qualifier is not None:
-        for alias, table in alias_tables.items():
-            if same_identifier(alias, qualifier, instance.dialect):
-                return table
-        try:
-            return instance.resolve_table(exp.Table(this=qualifier.copy()))
-        except KeyError:
-            return None
+        return resolve_table_reference(instance, alias_tables, qualifier)
     matches = []
     for table in alias_tables.values():
-        try:
-            instance.resolve_column(table, column.name)
-        except KeyError:
-            continue
-        matches.append(table)
+        if resolve_column_reference(instance, table, column.name) is not None:
+            matches.append(table)
     return matches[0] if len(matches) == 1 else None
 
 
@@ -148,9 +168,7 @@ def _physical_expression_supported(
     if not columns:
         return False
     for column in columns:
-        try:
-            instance.resolve_column(table, column.name)
-        except KeyError:
+        if resolve_column_reference(instance, table, column.name) is None:
             return False
     return True
 
@@ -171,9 +189,7 @@ def join_order_keys_supported(
             table = table_for_column(instance, alias_tables, column)
             if table is None:
                 return False
-            try:
-                instance.resolve_column(table, column.name)
-            except KeyError:
+            if resolve_column_reference(instance, table, column.name) is None:
                 return False
     return True
 
@@ -187,14 +203,12 @@ def order_expression_value(
         table = table_for_column(instance, alias_tables, expression)
         if table is None:
             return None
-        return row.get(instance.resolve_column(table, expression.name))
+        column = resolve_column_reference(instance, table, expression.name)
+        return None if column is None else row.get(column)
     if isinstance(expression, exp.Div):
         left = order_expression_value(instance, alias_tables, row, expression.this)
         right = order_expression_value(instance, alias_tables, row, expression.expression)
         if left is None or right in {None, 0}:
             return None
         return left / right
-    try:
-        return concrete(expression, Environment.from_row(row))
-    except Exception:
-        return None
+    return concrete(expression, Environment.from_row(row))
