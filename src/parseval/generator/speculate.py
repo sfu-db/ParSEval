@@ -64,6 +64,20 @@ def _extract_limit_offset(tree: exp.Select) -> tuple[int | None, int | None]:
     return limit_val, offset_val
 
 
+def _collect_operation_leaves(tree: exp.Union) -> list[exp.Select]:
+    """Flatten a set-operation tree into a left-to-right list of leaf SELECTs."""
+    leaves: list[exp.Select] = []
+    stack: list[exp.Union | exp.Select] = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Select):
+            leaves.append(node)
+        else:
+            stack.append(node.right)
+            stack.append(node.left)
+    return leaves
+
+
 def speculate(
     ddls: str,
     query: str,
@@ -94,30 +108,89 @@ def speculate(
 
     if isinstance(tree, exp.With):
         tree = tree.this
+
+    if isinstance(tree, exp.Union):
+        _speculate_set_operation(instance, tree, bounds, generate_negatives, dialect)
+        return instance
+
     if not isinstance(tree, exp.Select):
         logger.warning("Only SELECT queries are supported, got %s", type(tree).__name__)
         _seed_base_rows(instance)
         return instance
 
+    if not _speculate_select(instance, tree, bounds, generate_negatives, dialect):
+        relation_info = _collect_relation_scope_info(tree, instance)
+        query_tables: set[exp.Table] = set(relation_info.physical_tables)
+        if query_tables:
+            _seed_base_rows(instance, tables=query_tables)
+        else:
+            logger.debug("No tables found in query")
+            _seed_base_rows(instance)
+    return instance
+
+
+def _speculate_set_operation(
+    instance: Instance,
+    tree: exp.Union,
+    bounds: BmcBounds,
+    generate_negatives: bool,
+    dialect: str,
+) -> None:
+    """Seed data for a UNION/INTERSECT/EXCEPT set operation.
+
+    Processes each leaf SELECT independently, accumulating rows in
+    *instance*.  Falls back to base rows only if all branches fail.
+    """
+    leaves = _collect_operation_leaves(tree)
+    any_solved = False
+    for leaf in leaves:
+        if _speculate_select(instance, leaf, bounds, generate_negatives, dialect):
+            any_solved = True
+
+    if not any_solved:
+        all_tables: set[exp.Table] = set()
+        for leaf in leaves:
+            try:
+                info = _collect_relation_scope_info(leaf, instance)
+                all_tables.update(info.physical_tables)
+            except Exception:
+                continue
+        if all_tables:
+            _seed_base_rows(instance, tables=all_tables)
+        else:
+            _seed_base_rows(instance)
+
+
+def _speculate_select(
+    instance: Instance,
+    tree: exp.Select,
+    bounds: BmcBounds,
+    generate_negatives: bool,
+    dialect: str,
+) -> bool:
+    """Seed data for a single SELECT.
+
+    Returns True if a solver solution was found, False if UNSAT (caller
+    should seed base rows as fallback).
+    """
     relation_info = _collect_relation_scope_info(tree, instance)
     alias_map = _build_alias_map(tree, instance, relation_info=relation_info)
     query_tables: set[exp.Table] = set(relation_info.physical_tables)
     if not alias_map:
         if query_tables:
             _seed_base_rows(instance, tables=query_tables)
-            return instance
-        logger.debug("No tables found in query")
-        _seed_base_rows(instance)
-        return instance
+        else:
+            logger.debug("No tables found in query")
+            _seed_base_rows(instance)
+        return True
 
     col_var_map, table_vars = _collect_column_vars(tree, instance, alias_map)
     _ensure_check_constraint_vars(instance, col_var_map, table_vars)
 
     if not col_var_map:
         _seed_base_rows(instance, tables=query_tables)
-        return instance
+        return True
 
-    # Extract WHERE atoms for negative-data generation
     where_atoms: list[exp.Expression] = []
     where_node = tree.args.get("where")
     if where_node is not None:
@@ -157,8 +230,12 @@ def speculate(
             constraints.extend(flatten_conjuncts(pred))
 
         if not constraints and not equalities and not not_exists_not_in_items:
-            _seed_base_rows(instance, row_count=max(1, group_count, min_rows), tables=query_tables)
-            return instance
+            _seed_base_rows(
+                instance,
+                row_count=max(1, group_count, min_rows),
+                tables=query_tables,
+            )
+            return True
 
         _add_database_constraints(constraints, instance, col_var_map, table_vars)
 
@@ -181,27 +258,22 @@ def speculate(
                 group_key_column_keys=group_column_keys,
                 aggregate_input_column_keys=agg_input_column_keys,
             )
-            # Two-phase seeding for NOT EXISTS / NOT IN
             if not_exists_not_in_items:
                 _seed_not_exists_not_in(
                     instance, not_exists_not_in_items, result.assignments,
                     col_var_map, table_vars, dialect,
                 )
-
-            # Negative data: seed rows that violate individual WHERE atoms
             if generate_negatives and where_atoms:
                 _seed_negative_rows(
                     instance, where_atoms, col_var_map, table_vars,
                     list(equalities), dialect,
                 )
-
-            return instance
+            return True
 
         if not_exists_not_in_items and not result.sat:
             break
 
-    _seed_base_rows(instance, tables=query_tables)
-    return instance
+    return False
 
 
 # ---------------------------------------------------------------------------

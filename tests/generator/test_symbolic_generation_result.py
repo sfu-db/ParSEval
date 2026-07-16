@@ -316,7 +316,9 @@ class TestSymbolicGenerationResult(unittest.TestCase):
 
         self.assertEqual("sat", result.generation.status, result.generation.reason)
         rows = snapshot_rows(result)["t"]
-        self.assertGreater(sum(row["a"] for row in rows) / len(rows), sum(row["b"] for row in rows) / len(rows))
+        a_values = [row["a"] for row in rows if row["a"] is not None]
+        b_values = [row["b"] for row in rows if row["b"] is not None]
+        self.assertGreater(sum(a_values) / len(a_values), sum(b_values) / len(b_values))
         self.assertEqual([("a",)], sqlite_rows(ddl, result.generation.create_rows, query))
 
     def test_symbolic_generation_grouped_aggregate_case_generates_group_branch(self):
@@ -384,6 +386,115 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         )
 
         self.assertEqual(1, len(result.generation.root_schema.rows))
+
+    def test_symbolic_generation_count_column_witnesses_null_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+
+        result = generate_query_database(
+            ddl,
+            "SELECT COUNT(a), COUNT(*) FROM t",
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        rows = snapshot_rows(result)["t"]
+        self.assertTrue(any(row["a"] is None for row in rows))
+        self.assertNotEqual(
+            sqlite_rows(ddl, result.generation.create_rows, "SELECT COUNT(a) FROM t"),
+            sqlite_rows(ddl, result.generation.create_rows, "SELECT COUNT(*) FROM t"),
+        )
+
+    def test_symbolic_generation_count_distinct_witnesses_duplicate_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+
+        result = generate_query_database(
+            ddl,
+            "SELECT COUNT(DISTINCT a), COUNT(a) FROM t",
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        values = [row["a"] for row in snapshot_rows(result)["t"] if row["a"] is not None]
+        self.assertLess(len(set(values)), len(values))
+        self.assertNotEqual(
+            sqlite_rows(ddl, result.generation.create_rows, "SELECT COUNT(DISTINCT a) FROM t"),
+            sqlite_rows(ddl, result.generation.create_rows, "SELECT COUNT(a) FROM t"),
+        )
+
+    def test_symbolic_generation_sum_witnesses_nullable_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+
+        result = generate_query_database(
+            ddl,
+            "SELECT SUM(a) FROM t",
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        values = [row["a"] for row in snapshot_rows(result)["t"]]
+        self.assertIn(None, values)
+        self.assertTrue(any(value is not None for value in values))
+
+    def test_symbolic_generation_having_count_preserves_row_with_null_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+        query = "SELECT COUNT(a) FROM t HAVING COUNT(a) > 0"
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+        self.assertTrue(any(row["a"] is None for row in snapshot_rows(result)["t"]))
+
+    def test_symbolic_generation_having_count_distinct_preserves_duplicate_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT);"
+        query = "SELECT COUNT(DISTINCT a) FROM t HAVING COUNT(DISTINCT a) > 0"
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+        values = [row["a"] for row in snapshot_rows(result)["t"] if row["a"] is not None]
+        self.assertLess(len(set(values)), len(values))
+
+    def test_symbolic_generation_skips_null_stress_for_non_nullable_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL);"
+
+        result = generate_query_database(
+            ddl,
+            "SELECT SUM(a) FROM t",
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(all(row["a"] is not None for row in snapshot_rows(result)["t"]))
+
+    def test_symbolic_generation_skips_duplicate_stress_for_unique_argument(self):
+        ddl = "CREATE TABLE t (id INT PRIMARY KEY, a INT UNIQUE);"
+
+        result = generate_query_database(
+            ddl,
+            "SELECT COUNT(DISTINCT a), COUNT(a) FROM t",
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, rows_per_group=1, max_iterations=0),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        values = [row["a"] for row in snapshot_rows(result)["t"] if row["a"] is not None]
+        self.assertEqual(len(values), len(set(values)))
 
     def test_aggregate_keys_distinguish_distinct_and_cast_inputs(self):
         plain = exp.Count(this=exp.column("x"))
