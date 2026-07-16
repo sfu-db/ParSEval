@@ -14,29 +14,13 @@ jobs:
       matrix:
         start:
           - 0
-          - 1000
-          - 2000
           - 3000
-          - 4000
-          - 5000
           - 6000
-          - 7000
-          - 8000
           - 9000
-          - 10000
-          - 11000
           - 12000
-          - 13000
-          - 14000
           - 15000
-          - 16000
-          - 17000
           - 18000
-          - 19000
-          - 20000
           - 21000
-          - 22000
-          - 23000
 
     services:
       mysql:
@@ -101,7 +85,7 @@ jobs:
             --connection_string "$MYSQL_CONNECTION_STRING" \
             --output_dir results \
             --start "${{ matrix.start }}" \
-            --limit 1000 \
+            --limit 3000 \
             --workers 8 \
             --timeout 30
 
