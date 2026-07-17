@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, call, patch
 
-from parseval.main import _final_projection_count, disprove
+from parseval.main import _final_projection_count, _normalize_sql, disprove
 from parseval.states import ExecutionResult, Verdict
 
 
@@ -150,6 +150,44 @@ class TestMainDisprove(unittest.TestCase):
         self.assertEqual(Verdict.EQ, result.verdict)
         generate_mock.assert_not_called()
         self.assertTrue(result.generation.success)
+
+    def test_normalize_sql_normalizes_identifier_case_but_preserves_string_literals(self):
+        self.assertEqual(
+            _normalize_sql(
+                "SELECT ID FROM USERS WHERE NAME = 'Legal'",
+                "sqlite",
+            ),
+            _normalize_sql(
+                "select id from users where name = 'Legal'",
+                "sqlite",
+            ),
+        )
+        self.assertNotEqual(
+            _normalize_sql(
+                "SELECT id FROM users WHERE name = 'Legal'",
+                "sqlite",
+            ),
+            _normalize_sql(
+                "SELECT id FROM users WHERE name = 'legal'",
+                "sqlite",
+            ),
+        )
+
+    def test_disprove_does_not_treat_literal_case_change_as_textual_identity(self):
+        sql1 = "SELECT id FROM users WHERE name = 'Legal'"
+        sql2 = "select id from users where name = 'legal'"
+
+        with patch("parseval.main.generate", side_effect=RuntimeError("generated")):
+            result = disprove(
+                sql1,
+                sql2,
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
+                "sqlite:///tmp/test-main-disprove.sqlite",
+                "sqlite",
+            )
+
+        self.assertEqual(Verdict.UNKNOWN, result.verdict)
+        self.assertEqual("generated", result.error_msg)
 
     def test_disprove_strips_matching_order_by_and_limit_before_generation(self):
         sql1 = "SELECT id FROM users WHERE age > 21 ORDER BY id LIMIT 1"

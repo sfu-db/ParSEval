@@ -111,6 +111,13 @@ class ValueSpaceTests(unittest.TestCase):
 
         self.assertEqual(space.pick(), "A")
 
+    def test_sqlite_like_accepts_ascii_case_variant(self):
+        space = ValueSpace(family=TypeFamily.TEXT)
+        space.like_pattern = "Legal%"
+        space.like_case_insensitive = True
+
+        self.assertTrue(space._candidate_valid("legal_case"))
+
     def test_like_text_pick_varies_underscore_candidate(self):
         space = ValueSpace(family=TypeFamily.TEXT, like_pattern="A_")
         space.narrow_neq("Aa")

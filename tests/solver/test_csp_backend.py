@@ -377,6 +377,15 @@ class CspBackendTests(unittest.TestCase):
         self.assertLessEqual(len(result.assignments[name]), 3)
         self.assertTrue(result.assignments[name].startswith("ABC"))
 
+    def test_sqlite_like_assignment_allows_ascii_case_variant(self):
+        name = var("t.name", "TEXT")
+        constraint = exp.Like(this=name, expression=text("Legal%"))
+
+        result = CspBackend(dialect="sqlite").solve(Problem(constraints=[constraint]))
+
+        self.assertEqual(result.status, "sat")
+        self.assertTrue(result.assignments[name].lower().startswith("legal"))
+
     def test_variable_inequality_uses_finite_search_when_domains_are_bounded(self):
         left = var("t.left", "INT")
         right = var("t.right", "INT")

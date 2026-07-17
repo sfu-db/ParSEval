@@ -11,7 +11,6 @@ Usage::
 from __future__ import annotations
 
 import time
-import re
 
 from sqlglot import exp, parse_one
 
@@ -187,17 +186,6 @@ def disprove(
         DisproveResult with verdict.
     """
     t0 = time.time()
-    if _normalize_sql(sql1) == _normalize_sql(sql2):
-        _log.info("disprove: textual identity -> EQ, %.3fs", time.time() - t0)
-        return DisproveResult(
-            verdict=Verdict.EQ,
-            semantics=semantics,
-            q1_result=ExecutionResult(query=sql1),
-            q2_result=ExecutionResult(query=sql2),
-            generation=RunResult(success=True, elapsed_time=time.time() - t0),
-            connection_string=connection_string,
-        )
-
     syntax_error = _execution_syntax_error_for_pair(
         schema,
         sql1,
@@ -214,6 +202,17 @@ def disprove(
             connection_string,
             syntax_error.error_msg,
             t0,
+        )
+
+    if _normalize_sql(sql1, dialect) == _normalize_sql(sql2, dialect):
+        _log.info("disprove: textual identity -> EQ, %.3fs", time.time() - t0)
+        return DisproveResult(
+            verdict=Verdict.EQ,
+            semantics=semantics,
+            q1_result=ExecutionResult(query=sql1),
+            q2_result=ExecutionResult(query=sql2),
+            generation=RunResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string,
         )
 
     projection_counts = (_final_projection_count(sql1, dialect), _final_projection_count(sql2, dialect))
@@ -399,10 +398,17 @@ def _final_projection_count(sql: str, dialect: str) -> int | None:
     return len(expressions)
 
 
-def _normalize_sql(sql: str) -> str:
+def _normalize_sql(sql: str, dialect: str = "sqlite") -> str:
     normalized = sql.strip().rstrip(";").strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized.lower()
+    expression = parse_one(normalized, dialect=dialect)
+    expression = expression.copy().transform(_normalize_identifier)
+    return expression.sql(dialect=dialect, normalize=True)
+
+
+def _normalize_identifier(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Identifier):
+        node.set("this", str(node.this).casefold())
+    return node
 
 
 def _preprocess_sql_pair(sql1: str, sql2: str, dialect: str = "sqlite") -> tuple[str, str]:

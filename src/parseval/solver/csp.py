@@ -77,6 +77,9 @@ def _unwrap_temporal_arg(node: exp.Expression) -> exp.Expression:
 class CspBackend:
     """CSP solver: propagate + search over sqlglot constraint expressions."""
 
+    def __init__(self, *, dialect: str = "sqlite") -> None:
+        self.dialect = dialect
+
     def solve(self, problem: Problem) -> Result:
         if not problem.constraints and not problem.equalities:
             return Result(status="sat", assignments={})
@@ -263,6 +266,7 @@ class CspBackend:
     def _space_for_var(self, var: SolverVar) -> ValueSpace:
         dtype = var.dtype
         space = ValueSpace(family=type_family(dtype))
+        space.like_case_insensitive = self.dialect == "sqlite"
         allowed_values = enum_values(dtype)
         if allowed_values is not None:
             space.allowed = set(allowed_values)
@@ -710,6 +714,7 @@ class CspBackend:
                 return False, "unknown"
             variable = atom.this
             spaces[variable].like_pattern = str(atom.expression.this)
+            spaces[variable].like_case_insensitive = self.dialect == "sqlite"
             return (False, "contradictory_bounds") if spaces[variable].is_empty() else (True, "")
 
         if isinstance(atom, exp.In):

@@ -3272,13 +3272,10 @@ def _rewrite_projection_expression(
 
 
 def _expression_key(expression: exp.Expression, dialect: str | None = None) -> str:
-    text = _safe_expression_sql(expression, dialect) if isinstance(expression, exp.Expression) else str(expression)
-    return (
-        text.casefold()
-        .replace('"', "")
-        .replace("`", "")
-        .replace(" ", "")
-    )
+    if isinstance(expression, exp.Expression):
+        canonical = deepcopy(expression).transform(_normalize_identifier)
+        return canonical.sql(dialect=dialect, normalize=True)
+    return str(expression)
 
 
 def _expression_key_without_casts(
@@ -3288,18 +3285,24 @@ def _expression_key_without_casts(
     rewritten = deepcopy(expression).transform(
         lambda node: node.this.copy() if isinstance(node, exp.Cast) else node
     )
-    return _normalize_expression_key(_safe_expression_sql(rewritten, dialect))
+    return _expression_key(rewritten, dialect)
 
 
 def _physical_expression_key(
     expression: exp.Expression,
     dialect: str | None = None,
 ) -> str:
-    return _strip_generated_casts(_safe_expression_sql(expression, dialect))
+    return _expression_key_without_casts(expression, dialect)
 
 
 def _safe_expression_sql(expression: exp.Expression, dialect: str | None = None) -> str:
     return expression.sql(dialect=dialect)
+
+
+def _normalize_identifier(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Identifier):
+        node.set("this", str(node.this).casefold())
+    return node
 
 
 def _normalize_expression_key(text: str) -> str:
