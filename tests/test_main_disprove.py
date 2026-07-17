@@ -4,11 +4,29 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, call, patch
 
-from parseval.main import disprove
+from parseval.main import _final_projection_count, disprove
 from parseval.states import ExecutionResult, Verdict
 
 
 class TestMainDisprove(unittest.TestCase):
+    def test_final_projection_count_only_counts_selects_without_star_projection(self):
+        self.assertEqual(
+            2,
+            _final_projection_count("SELECT id, age FROM users", "sqlite"),
+        )
+        self.assertIsNone(
+            _final_projection_count("SELECT * FROM users", "sqlite"),
+        )
+        self.assertIsNone(
+            _final_projection_count("SELECT users.* FROM users", "sqlite"),
+        )
+        self.assertIsNone(
+            _final_projection_count(
+                "SELECT id FROM users UNION SELECT id FROM admins",
+                "sqlite",
+            ),
+        )
+
     def test_disprove_returns_syntax_error_before_generation_for_invalid_query(self):
         sql1 = "SELECT FROM users"
         sql2 = "SELECT id FROM users"
@@ -87,6 +105,34 @@ class TestMainDisprove(unittest.TestCase):
         self.assertEqual(Verdict.NEQ, result.verdict)
         self.assertTrue(result.generation.success)
         generate_mock.assert_not_called()
+
+    def test_disprove_does_not_return_neq_before_generation_for_star_projection_count(self):
+        sql1 = "SELECT * FROM users"
+        sql2 = "SELECT id, age FROM users"
+        schema = "CREATE TABLE users (id INT PRIMARY KEY, age INT);"
+        connection_string = "sqlite:///tmp/test-main-disprove.sqlite"
+        instance = SimpleNamespace(
+            generation=SimpleNamespace(
+                status="sat",
+                create_rows={"users": [{"id": 1, "age": 21}]},
+                coverage_ratio=1.0,
+            ),
+            tables={"users": object()},
+            get_rows=lambda table: [{"id": 1, "age": 21}],
+        )
+
+        def execute(query, *_args):
+            return ExecutionResult(query=query, rows=[(1, 21)])
+
+        with (
+            patch("parseval.main.generate", return_value=instance) as generate_mock,
+            patch("parseval.main.to_db"),
+            patch("parseval.main.execute_query", side_effect=execute),
+        ):
+            result = disprove(sql1, sql2, schema, connection_string, "sqlite")
+
+        self.assertNotEqual(Verdict.NEQ, result.verdict)
+        generate_mock.assert_called()
 
     def test_disprove_returns_eq_for_normalized_textual_identity_without_generation(self):
         sql1 = " SELECT id FROM users ; "

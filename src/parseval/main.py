@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 import re
 
-from sqlglot import parse_one
+from sqlglot import exp, parse_one
 
 from parseval.db_manager import execute_query
 from parseval.generator import BmcBounds, generate
@@ -387,8 +387,14 @@ def _final_projection_count(sql: str, dialect: str) -> int | None:
         expression = parse_one(sql, dialect=dialect)
     except Exception:
         return None
-    expressions = getattr(expression, "expressions", None)
-    if expressions is None:
+    if not isinstance(expression, exp.Select):
+        return None
+    expressions = expression.expressions
+    if any(
+        isinstance(projection, exp.Star)
+        or isinstance(getattr(projection, "this", None), exp.Star)
+        for projection in expressions
+    ):
         return None
     return len(expressions)
 
