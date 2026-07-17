@@ -26,6 +26,7 @@ class ValueSpace:
     must_null: bool = False
     not_null: bool = False
     like_pattern: Optional[str] = None
+    like_case_insensitive: bool = False
     max_length: Optional[int] = None
     temporal_components: Dict[str, "ValueSpace"] = field(default_factory=dict)
 
@@ -115,7 +116,11 @@ class ValueSpace:
         if self.max_length is not None and isinstance(value, str):
             if len(value) > self.max_length:
                 return False
-        if self.like_pattern is not None and not _matches_like(str(value), self.like_pattern):
+        if self.like_pattern is not None and not _matches_like(
+            str(value),
+            self.like_pattern,
+            case_insensitive=self.like_case_insensitive,
+        ):
             return False
         if not self._temporal_components_valid(value):
             return False
@@ -454,9 +459,10 @@ class ValueSpace:
 __all__ = ["ValueSpace"]
 
 
-def _matches_like(value: str, pattern: str) -> bool:
+def _matches_like(value: str, pattern: str, *, case_insensitive: bool = False) -> bool:
     regex = "^" + re.escape(pattern).replace("%", ".*").replace("_", ".") + "$"
-    return re.match(regex, value) is not None
+    flags = re.IGNORECASE if case_insensitive else 0
+    return re.match(regex, value, flags) is not None
 
 
 def _numeric_like(value: Any) -> bool:
