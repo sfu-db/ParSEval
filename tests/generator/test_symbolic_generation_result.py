@@ -21,6 +21,7 @@ from parseval.generator.symbolic.operator import (
     _solve_table_rows,
 )
 from parseval.instance import Instance
+from parseval.domain.exceptions import DomainError
 from parseval.instance.exporter import InstanceValueSerializer
 from parseval.plan.explain import Aggregate, explain
 from parseval.plan.context import DerivedSchema, Row
@@ -73,6 +74,12 @@ def sqlite_rows(ddl: str, rows: dict[str, list[dict[str, object]]], query: str):
         return conn.execute(query).fetchall()
     finally:
         conn.close()
+
+
+def replay_generation_rows(ddl: str, result: Instance, dialect: str = "sqlite") -> Instance:
+    replay = Instance(ddl, name="replay", dialect=dialect)
+    replay.create_rows(result.generation.create_rows)
+    return replay
 
 
 class TestSymbolicGenerationResult(unittest.TestCase):
@@ -602,6 +609,109 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         rows = snapshot_rows(result).get("users", [])
         self.assertTrue(all(row["age"] >= 0 for row in rows))
 
+    def test_symbolic_generation_satisfies_self_fk_check_for_not_in_case(self):
+        ddl = """
+        CREATE TABLE customer (
+            id INT PRIMARY KEY,
+            name VARCHAR(255),
+            referee_id INT,
+            FOREIGN KEY (referee_id) REFERENCES customer(id),
+            CHECK (referee_id <> id)
+        );
+        """
+        query = """
+        SELECT name
+        FROM customer
+        WHERE NOT CASE WHEN referee_id IS NULL THEN 0 ELSE referee_id END IN (
+            SELECT referee_id FROM customer WHERE referee_id = 2
+        )
+        """
+
+        result = generate(ddl, query, dialect="mysql", bounds=BmcBounds(max_iterations=0))
+
+        rows = snapshot_rows(result).get("customer", [])
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertTrue(row["referee_id"] is None or row["referee_id"] != row["id"])
+        replay_generation_rows(ddl, result, dialect="mysql")
+
+    def test_symbolic_generation_satisfies_common_supported_checks(self):
+        cases = [
+            (
+                "prices",
+                "CREATE TABLE prices (product_id INT PRIMARY KEY, price INT, CHECK (price > 0));",
+                "SELECT product_id FROM prices WHERE price > 10",
+                lambda row: row["price"] > 0,
+            ),
+            (
+                "playback",
+                "CREATE TABLE playback (session_id INT PRIMARY KEY, start_time INT, end_time INT, CHECK (end_time >= start_time));",
+                "SELECT session_id FROM playback WHERE end_time > start_time",
+                lambda row: row["end_time"] >= row["start_time"],
+            ),
+            (
+                "loginfo",
+                "CREATE TABLE loginfo (account_id INT PRIMARY KEY, login INT, logout INT, CHECK (logout >= login));",
+                "SELECT account_id FROM loginfo WHERE logout > login",
+                lambda row: row["logout"] >= row["login"],
+            ),
+            (
+                "delivery",
+                "CREATE TABLE delivery (delivery_id INT PRIMARY KEY, order_date INT, customer_pref_delivery_date INT, CHECK (customer_pref_delivery_date >= order_date));",
+                "SELECT delivery_id FROM delivery WHERE customer_pref_delivery_date > order_date",
+                lambda row: row["customer_pref_delivery_date"] >= row["order_date"],
+            ),
+            (
+                "queries",
+                "CREATE TABLE queries (query_name TEXT PRIMARY KEY, rating INT, CHECK (rating >= 1));",
+                "SELECT query_name FROM queries WHERE rating > 2",
+                lambda row: row["rating"] >= 1,
+            ),
+            (
+                "products",
+                "CREATE TABLE products (product_id INT PRIMARY KEY, low_fats TEXT, recyclable TEXT, CHECK (low_fats <> recyclable));",
+                "SELECT product_id FROM products WHERE low_fats = 'Y'",
+                lambda row: row["low_fats"] != row["recyclable"],
+            ),
+        ]
+
+        for table, ddl, query, check in cases:
+            with self.subTest(table=table):
+                result = generate(
+                    ddl,
+                    query,
+                    dialect="sqlite",
+                    bounds=BmcBounds(max_iterations=0),
+                )
+                rows = snapshot_rows(result).get(table, [])
+                self.assertTrue(rows)
+                self.assertTrue(all(check(row) for row in rows))
+                replay_generation_rows(ddl, result, dialect="sqlite")
+
+    def test_symbolic_generation_reports_unsupported_check_constraint(self):
+        ddl = """
+        CREATE TABLE other (id INT);
+        CREATE TABLE customer (
+            id INT,
+            CHECK (id > (SELECT MAX(id) FROM other))
+        );
+        """
+
+        result = generate(
+            ddl,
+            "SELECT id FROM customer WHERE id > 1",
+            dialect="sqlite",
+            bounds=BmcBounds(max_iterations=0),
+            generate_negatives=False,
+        )
+
+        self.assertEqual("unknown", result.generation.status)
+        self.assertEqual(
+            "unsupported_check_constraint:customer:subquery",
+            result.generation.reason,
+        )
+        self.assertEqual([], result.get_rows("customer"))
+
     def test_symbolic_generation_passes_referenced_unique_constraints_to_problem(self):
         ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT UNIQUE);"
         query = "SELECT id FROM users WHERE age > 30"
@@ -770,6 +880,29 @@ class TestSymbolicGenerationResult(unittest.TestCase):
                 for constraint in result.generation.problem.constraints
             )
         )
+
+    def test_try_create_rows_rolls_back_invalid_materialization(self):
+        ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT CHECK (age >= 0));"
+        instance = Instance(ddl, name="rollback_invalid", dialect="sqlite")
+        plan = explain(ddl, "SELECT id FROM users", "sqlite")
+        pipeline = EncodePipeline(plan, instance)
+        table = instance.resolve_table("users")
+
+        ok = pipeline._try_create_rows(
+            {table: [{"id": 1, "age": -1}]},
+            reason="schema_constraint_materialization_failed:users",
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual([], instance.get_rows(table))
+        self.assertEqual(
+            "schema_constraint_materialization_failed:users",
+            pipeline.schema_failure_reason,
+        )
+        with self.assertRaises(DomainError):
+            Instance(ddl, name="direct_invalid", dialect="sqlite").create_rows(
+                {"users": [{"id": 1, "age": -1}]}
+            )
 
     def test_coverage_generator_uses_symbolic_pipeline_result(self):
         ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT);"

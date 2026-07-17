@@ -117,6 +117,32 @@ CREATE TABLE u (id INT, t_id INT);"""
         total = sum(len(inst.get_rows(t)) for t in inst.schema.fk_safe_table_order())
         self.assertGreater(total, 0)
 
+    def test_not_in_aliased_projection(self):
+        ddls = """CREATE TABLE orders (id INT);
+CREATE TABLE customers (id INT);"""
+        inst = speculate(
+            ddls,
+            "SELECT id FROM orders WHERE id NOT IN "
+            "(SELECT c.id AS customers FROM customers AS c)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("orders")), 0)
+
+    def test_not_in_parenthesized_distinct_projection(self):
+        ddls = """CREATE TABLE orders (id INT);
+CREATE TABLE customers (id INT);"""
+        inst = speculate(
+            ddls,
+            "SELECT id FROM orders WHERE id NOT IN "
+            "(SELECT DISTINCT (customers.id) FROM customers)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("orders")), 0)
+
 
 class TestSpeculateEdgeCases(unittest.TestCase):
     """Edge cases around subqueries."""
@@ -191,6 +217,78 @@ LEFT JOIN activity AS b
         self.assertIsNotNone(inst)
         self.assertNotIn("first_login", calls)
         self.assertGreater(len(inst.get_rows("activity")), 0)
+
+    def test_computed_cte_output_does_not_resolve_as_base_column(self):
+        ddls = """
+CREATE TABLE contacts (
+    first_name TEXT,
+    last_name TEXT
+);
+"""
+        inst = speculate(
+            ddls,
+            "WITH locations AS ("
+            "SELECT CONCAT(first_name, last_name) AS city FROM contacts"
+            ") SELECT city FROM locations WHERE city = 'Boston'",
+            "mysql",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("contacts")), 0)
+
+    def test_star_cte_output_resolves_unambiguous_base_column(self):
+        ddls = """
+CREATE TABLE a (id INT, name TEXT);
+CREATE TABLE b (id INT, name TEXT);
+"""
+        inst = speculate(
+            ddls,
+            "WITH expanded AS ("
+            "SELECT a.*, b.name FROM a JOIN b ON a.id = b.id"
+            ") SELECT id FROM expanded WHERE id > 0",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("a")), 0)
+
+    def test_cte_aggregate_keeps_simple_group_output_lineage(self):
+        ddls = "CREATE TABLE contacts (user_id INT, email TEXT);"
+        inst = speculate(
+            ddls,
+            "WITH allcontacts AS ("
+            "SELECT user_id, COUNT(*) AS cnt FROM contacts GROUP BY user_id"
+            ") SELECT allcontacts.user_id FROM allcontacts "
+            "WHERE allcontacts.user_id > 0",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("contacts")), 0)
+
+    def test_two_derived_aliases_of_same_table_keep_occurrences_separate(self):
+        ddls = "CREATE TABLE t (id INT);"
+        inst = speculate(
+            ddls,
+            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM t) "
+            "SELECT a.id FROM a JOIN b ON a.id <> b.id",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreaterEqual(len(inst.get_rows("t")), 2)
+
+    def test_parenthesized_union_branch_is_seeded(self):
+        ddls = "CREATE TABLE t (id INT);"
+        inst = speculate(
+            ddls,
+            "SELECT id FROM t WHERE id > 0 UNION "
+            "(SELECT id FROM t WHERE id < 0)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("t")), 0)
 
 
 class TestSpeculateConstraintCompletion(unittest.TestCase):

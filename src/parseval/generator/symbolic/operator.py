@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as dt_time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
 from sqlglot import exp
 
 from parseval.coercion import CoercionError, coerce_literal_value
+from parseval.domain.exceptions import DomainError
+from parseval.generator.schema_constraints import (
+    SchemaConstraintLoweringError,
+    batch_unique_constraints_for_solver_rows,
+    literal_for_value as _literal_for_value,
+    schema_constraints_for_solver_row,
+)
 from parseval.plan.context import DerivedSchema, Row
 from parseval.plan.rex import Symbol
 from parseval.solver.types import SolverVar, Problem
@@ -45,6 +52,9 @@ from parseval.generator.helper import same_identifier
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -151,68 +161,13 @@ def _database_constraints_for_solver(
     *,
     constrain_exact_fks: bool = True,
 ) -> List[exp.Expression]:
-    table_schema = instance.database_constraints(table)
-    constraints: List[exp.Expression] = []
-    available = set(sv_map)
-    required_non_null: Set[str] = set(exact_columns)
-    if not exact_columns:
-        required_non_null.clear()
-    for check in table_schema.checks:
-        if not check.supported:
-            continue
-        referenced = {column.name for column in check.referenced_columns}
-        if not referenced or not referenced <= available:
-            continue
-        if exact_columns and not referenced.intersection(exact_columns):
-            continue
-        if not exact_columns:
-            continue
-        rewritten = deepcopy(check.expression)
-        for col in list(rewritten.find_all(exp.Column)):
-            if isinstance(col.this, exp.Identifier) and col.this.name in sv_map:
-                col.replace(sv_map[col.this.name])
-        constraints.append(rewritten)
-    for group in table_schema.uniqueness_groups():
-        names = tuple(column.name for column in group)
-        if not set(names) <= available:
-            continue
-        for row in instance.get_rows(table_schema.table):
-            values = _row_value_dict(row)
-            existing = [values.get(column) for column in group]
-            if any(value is None for value in existing):
-                continue
-            constraints.append(_unique_non_collision_constraint(sv_map, names, existing))
-            required_non_null.update(names)
-    for fk in table_schema.foreign_keys:
-        names = tuple(column.name for column in fk.source_columns)
-        if len(names) != 1 or not set(names) <= available:
-            continue
-        if exact_columns and not set(names).intersection(exact_columns):
-            continue
-        if not constrain_exact_fks and set(names).intersection(exact_columns):
-            continue
-        target_values = []
-        target_column = fk.target_columns[0]
-        for parent_row in instance.get_rows(fk.target_table):
-            value = _row_value_dict(parent_row).get(target_column)
-            if value is not None:
-                target_values.append(value)
-        if target_values:
-            constraints.append(
-                exp.In(
-                    this=sv_map[names[0]],
-                    expressions=[
-                        _literal_for_value(value)
-                        for value in dict.fromkeys(target_values)
-                    ],
-                )
-            )
-            required_non_null.update(names)
-    return _not_null_constraints_for_columns(
-        table_schema,
+    return schema_constraints_for_solver_row(
+        instance,
+        table,
         sv_map,
-        required_non_null,
-    ) + constraints
+        exact_columns=exact_columns,
+        constrain_exact_fks=constrain_exact_fks,
+    )
 
 
 def _not_null_constraints_for_columns(
@@ -284,11 +239,11 @@ def _schema_constraints_for_solver_rows(
     required_non_null_by_row: List[Set[str]] = [set() for _ in sv_rows]
     for sv_map, exact_columns in zip(sv_rows, exact_columns_by_row):
         constraints.extend(
-            _database_constraints_for_solver(
+            schema_constraints_for_solver_row(
                 instance,
                 table,
                 sv_map,
-                exact_columns,
+                exact_columns=exact_columns,
             )
         )
 
@@ -296,18 +251,11 @@ def _schema_constraints_for_solver_rows(
         names = tuple(column.name for column in group)
         if any(not set(names) <= set(sv_map) for sv_map in sv_rows):
             continue
-        for left_index, left in enumerate(sv_rows):
-            for right_index, right in enumerate(sv_rows[left_index + 1 :], start=left_index + 1):
-                atoms = [
-                    exp.NEQ(this=left[name], expression=right[name])
-                    for name in names
-                ]
-                expr = atoms[0]
-                for atom in atoms[1:]:
-                    expr = exp.Or(this=expr, expression=atom)
-                constraints.append(expr)
+        for left_index, _left in enumerate(sv_rows):
+            for right_index, _right in enumerate(sv_rows[left_index + 1 :], start=left_index + 1):
                 required_non_null_by_row[left_index].update(names)
                 required_non_null_by_row[right_index].update(names)
+    constraints.extend(batch_unique_constraints_for_solver_rows(instance, table, sv_rows))
     for sv_map, column_names in zip(sv_rows, required_non_null_by_row):
         constraints.extend(
             _not_null_constraints_for_columns(
@@ -396,6 +344,7 @@ def _solve_table_rows(
     expression_demands: Sequence[ExpressionDemand] = (),
     timeout_ms: int = 2000,
 ) -> Optional[List[Dict[str, object]]]:
+    _solve_table_rows.schema_failure_reason = ""
     table_node = instance.resolve_table(table)
     table_schema = instance.database_constraints(table_node)
     sv_rows: List[Dict[str, SolverVar]] = []
@@ -438,14 +387,18 @@ def _solve_table_rows(
             constraints.append(_rewrite_columns_to_solver_vars(predicate, sv_map))
         exact_columns_by_row.append(exact_columns)
 
-    constraints.extend(
-        _schema_constraints_for_solver_rows(
-            instance,
-            table_node,
-            sv_rows,
-            exact_columns_by_row,
+    try:
+        constraints.extend(
+            _schema_constraints_for_solver_rows(
+                instance,
+                table_node,
+                sv_rows,
+                exact_columns_by_row,
+            )
         )
-    )
+    except SchemaConstraintLoweringError as exc:
+        _solve_table_rows.schema_failure_reason = exc.reason
+        return None
     constraints.extend(
         _expression_demand_batch_constraints(
             expression_demands,
@@ -512,34 +465,6 @@ def _rows_with_required_fk_parents(
     for target_table, target_rows in planned.items():
         rows_by_table.setdefault(target_table, []).extend(target_rows)
     return rows_by_table
-
-
-def _unique_non_collision_constraint(
-    sv_map: Mapping[str, SolverVar],
-    names: Tuple[str, ...],
-    existing: List[Any],
-) -> exp.Expression:
-    atoms = [
-        exp.NEQ(this=sv_map[name], expression=_literal_for_value(value))
-        for name, value in zip(names, existing)
-    ]
-    if len(atoms) == 1:
-        return atoms[0]
-    expr = atoms[0]
-    for atom in atoms[1:]:
-        expr = exp.Or(this=expr, expression=atom)
-    return expr
-
-
-def _literal_for_value(value: Any) -> exp.Expression:
-    if value is None:
-        return exp.Null()
-    if isinstance(value, bool):
-        return exp.Boolean(this=value)
-    return exp.Literal(
-        this=str(value),
-        is_string=isinstance(value, (str, date, datetime, dt_time)),
-    )
 
 
 # ------------------------------------------------------------------
@@ -4169,6 +4094,7 @@ class EncodePipeline:
         self.dialect = plan.dialect
         self._allocator = RowAllocator(instance) if instance is not None else None
         self._operator_registry: Dict[type, type] = dict(self._DEFAULT_REGISTRY)
+        self.schema_failure_reason = ""
 
     def register_operator(self, step_type: type, operator_class: type) -> None:
         self._operator_registry[step_type] = operator_class
@@ -4441,6 +4367,24 @@ class EncodePipeline:
             child_schemas,
             DemandContext(self, cache),
         )
+
+    def _try_create_rows(
+        self,
+        rows_by_table: Mapping[exp.Table, Sequence[Mapping[str, object]]],
+        *,
+        reason: str,
+    ) -> bool:
+        if self.instance is None:
+            return False
+        token = self.instance.checkpoint()
+        try:
+            self.instance.create_rows(rows_by_table)
+            return True
+        except (DomainError, KeyError) as exc:
+            self.instance.rollback(token)
+            self.schema_failure_reason = reason
+            logger.info("%s:%s", reason, exc)
+            return False
 
     def _materialize_having_demand(
         self,
@@ -4931,9 +4875,13 @@ class EncodePipeline:
                     expression_demands=demand.expression_demands,
                 )
                 if solved_rows:
-                    self.instance.create_rows(
-                        _rows_with_required_fk_parents(self.instance, table, solved_rows)
+                    table_name = self.instance.resolve_table(table).name
+                    self._try_create_rows(
+                        _rows_with_required_fk_parents(self.instance, table, solved_rows),
+                        reason=f"schema_constraint_materialization_failed:{table_name}",
                     )
+                elif getattr(_solve_table_rows, "schema_failure_reason", ""):
+                    self.schema_failure_reason = _solve_table_rows.schema_failure_reason
             return
         distinct_column: str | None = None
         distinct_values: Tuple[object, ...] = ()
@@ -4990,9 +4938,13 @@ class EncodePipeline:
                 expression_demands=demand.expression_demands,
             )
             if solved_rows:
-                self.instance.create_rows(
-                    _rows_with_required_fk_parents(self.instance, table, solved_rows)
+                table_name = self.instance.resolve_table(table).name
+                self._try_create_rows(
+                    _rows_with_required_fk_parents(self.instance, table, solved_rows),
+                    reason=f"schema_constraint_materialization_failed:{table_name}",
                 )
+            elif getattr(_solve_table_rows, "schema_failure_reason", ""):
+                self.schema_failure_reason = _solve_table_rows.schema_failure_reason
 
     def _materialize_coverage_demands(
         self,

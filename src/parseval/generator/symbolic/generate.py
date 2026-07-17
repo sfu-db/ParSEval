@@ -103,11 +103,14 @@ def _generate_from_plan(
     current_bounds = _bounds_for_plan(plan, bounds or BmcBounds())
     if before_counts is None:
         before_counts = _row_counts(instance)
-    schema = EncodePipeline(plan, instance, bounds=current_bounds).forward()
+    pipeline = EncodePipeline(plan, instance, bounds=current_bounds)
+    schema = pipeline.forward()
     tree = schema.coverage_tree
     if tree is None:
-        schema = EncodePipeline(plan, instance, bounds=current_bounds).forward()
+        pipeline = EncodePipeline(plan, instance, bounds=current_bounds)
+        schema = pipeline.forward()
         tree = schema.coverage_tree
+    schema_failure_reason = getattr(pipeline, "schema_failure_reason", "")
     evaluated_tree = (
         SemanticCoverageRecorder(plan, instance).evaluate_tree(
             tree,
@@ -121,8 +124,8 @@ def _generate_from_plan(
     evidence = _evidence_for_obligations(obligations, schema)
     schema.obligations.extend(obligations)
     schema.evidence.update(evidence)
-    schema.status = "sat"
-    schema.reason = ""
+    schema.status = "unknown" if schema_failure_reason else "sat"
+    schema.reason = schema_failure_reason
     schema.create_rows = _created_rows_since(instance, before_counts)
     schema.assignments = _assignments_for_created_rows(instance, schema.create_rows)
     schema.problem = _problem_for_schema(
