@@ -41,7 +41,6 @@ class SpecRecord:
     # Speculative seeder outcome
     seed_status: str          # "sat" | "unsat" | "error" | "timeout"
     seed_reason: str
-    relaxation_needed: int
     elapsed_seconds: float
     sql: str
     instance_row_total: int = field(default=0)
@@ -173,24 +172,17 @@ def run_speculative(
     db_path = database_path_for_query(out_dir, db_id=db_id, question_id=question_id)
     connection_string = f"sqlite:///{db_path}"
 
-    started = time.perf_counter()
-    relaxation_used = -1
+    started = time.perf_counter()    
     nrows = 0
     inst: Instance | None = None
 
-    for attempt in range(4):
-        inst = speculate(ddl, sql, dialect=dialect, bounds=bounds)
-        if inst is None:
-            relaxation_used = attempt
-            break
-        nrows = sum(
-            len(inst.get_rows(table_node))
-            for table_node in inst.schema.fk_safe_table_order()
-        )
-        relaxation_used = attempt
-        if nrows > 0:
-            break
-
+    
+    inst = speculate(ddl, sql, dialect=dialect, bounds=bounds)    
+    nrows = sum(
+        len(inst.get_rows(table_node))
+        for table_node in inst.schema.fk_safe_table_order()
+    )
+    
     elapsed = time.perf_counter() - started
 
     if inst is None:
@@ -198,7 +190,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="error", seed_reason="returned_none",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+            elapsed_seconds=elapsed,
             sql=sql, instance_row_total=0, shape_tags=tags, db_path=str(db_path),
         )
 
@@ -207,7 +199,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="unsat", seed_reason="all_relaxations_exhausted",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=0, shape_tags=tags, db_path=str(db_path),
         )
 
@@ -221,7 +213,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="sat", seed_reason="",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=nrows,
             validation_rows=0, column_count=0,
             db_path=str(db_path), shape_tags=tags,
@@ -244,7 +236,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="sat", seed_reason=f"validation_error:{e}",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=nrows,
             validation_rows=0, column_count=0,
             db_path=str(db_path), shape_tags=tags,
@@ -257,7 +249,7 @@ def run_speculative(
         dataset_index=dataset_index, question_id=question_id,
         db_id=db_id, difficulty=str(query.get("difficulty", "?")),
         seed_status=seed_status, seed_reason=seed_reason,
-        relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+         elapsed_seconds=elapsed,
         sql=sql, instance_row_total=nrows,
         validation_rows=validation_rows,
         column_count=column_count,
@@ -314,8 +306,7 @@ def print_spec_record(record: SpecRecord) -> None:
         f"elapsed={record.elapsed_seconds:.3f}s "
         f"seed_rows={record.instance_row_total} "
         f"db_rows={record.validation_rows} "
-        f"cols={record.column_count} "
-        f"relax={record.relaxation_needed} "
+        f"cols={record.column_count} "        
         f"reason={record.seed_reason}",
         file=sys.stderr,
         flush=True,
@@ -334,8 +325,7 @@ def _timeout_record(task: SpecTask, elapsed: float, task_timeout: float) -> Spec
         db_id=db_id,
         difficulty=str(query.get("difficulty", "?")),
         seed_status="timeout",
-        seed_reason=f"exceeded_task_timeout_{task_timeout:.1f}s",
-        relaxation_needed=-1,
+        seed_reason=f"exceeded_task_timeout_{task_timeout:.1f}s",        
         elapsed_seconds=elapsed,
         sql=sql,
         instance_row_total=0,
@@ -357,8 +347,7 @@ def _worker_error_record(task: SpecTask, elapsed: float, exc: BaseException | st
         db_id=db_id,
         difficulty=str(query.get("difficulty", "?")),
         seed_status="error",
-        seed_reason=reason,
-        relaxation_needed=-1,
+        seed_reason=reason,        
         elapsed_seconds=elapsed,
         sql=sql,
         instance_row_total=0,
@@ -390,14 +379,12 @@ def summarize(records: Sequence[SpecRecord]) -> dict[str, Any]:
     from collections import Counter
 
     seed_status_counts: Counter[str] = Counter()
-    tag_counts: Counter[str] = Counter()
-    relaxation_counts: Counter[int] = Counter()
+    tag_counts: Counter[str] = Counter()    
 
     for record in records:
         seed_status_counts[record.seed_status] += 1
         for tag in record.shape_tags:
-            tag_counts[tag] += 1
-        relaxation_counts[record.relaxation_needed] += 1
+            tag_counts[tag] += 1        
 
     sat_records = [r for r in records if r.seed_status == "sat"]
     return {
@@ -413,9 +400,6 @@ def summarize(records: Sequence[SpecRecord]) -> dict[str, Any]:
         "instance_rows_avg": sum(r.instance_row_total for r in sat_records) / len(sat_records) if sat_records else 0.0,
         "validation_rows_avg": sum(r.validation_rows for r in sat_records) / len(sat_records) if sat_records else 0.0,
         "column_count_avg": sum(r.column_count for r in sat_records) / len(sat_records) if sat_records else 0.0,
-        "relaxation_distribution": {
-            str(k): v for k, v in sorted(relaxation_counts.items())
-        },
         "shape_tag_counts": dict(tag_counts.most_common()),
         "records": [asdict(record) for record in records],
     }

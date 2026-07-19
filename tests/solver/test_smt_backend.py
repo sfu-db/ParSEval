@@ -289,6 +289,29 @@ class TestSmtBackendProblemApi(unittest.TestCase):
         self.assertEqual(3, len(set(tuples)))
         self.assertTrue(all(date_value is not None for _id, date_value in tuples))
 
+    def test_solver_preserves_variable_candidates_in_mixed_in_constraints(self):
+        child = var("satscores.cds", "TEXT")
+        parent = var("schools.CDSCode", "TEXT")
+        existing = text("sat_60f9cd")
+        predicate = exp.And(
+            this=exp.NEQ(this=child, expression=existing.copy()),
+            expression=exp.And(
+                this=exp.NEQ(this=parent, expression=existing.copy()),
+                expression=exp.In(
+                    this=child,
+                    expressions=[existing.copy(), parent],
+                ),
+            ),
+        )
+
+        result = Solver().solve(
+            Problem(constraints=[predicate], variables={child, parent})
+        )
+
+        self.assertEqual("sat", result.status, result.reason)
+        self.assertEqual(result.assignments[parent], result.assignments[child])
+        self.assertNotEqual("sat_60f9cd", result.assignments[child])
+
     def test_solver_rejects_non_problem_input(self):
         with self.assertRaises(TypeError):
             Solver().solve(object())  # type: ignore[arg-type]

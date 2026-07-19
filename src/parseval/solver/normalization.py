@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import calendar
 from datetime import date as _date, datetime as _datetime, timedelta
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from sqlglot import exp
 
@@ -42,10 +42,11 @@ def normalize_problem(problem: Problem) -> Problem:
 def normalize_expression(expression: exp.Expression) -> exp.Expression:
     """Normalize one predicate expression."""
     expression = unwrap_transparent_aliases(expression)
+    expression = lower_mixed_in_variable_candidates(expression)
     witness = lower_expression_witness(expression)
     if witness is not None:
         return witness
-    return lower_temporal_projection_bounds(expression)
+    return lower_mixed_in_variable_candidates(lower_temporal_projection_bounds(expression))
 
 
 def unwrap_transparent_aliases(expression: exp.Expression) -> exp.Expression:
@@ -73,6 +74,74 @@ def lower_temporal_projection_bounds(expression: exp.Expression) -> exp.Expressi
     if lowered is not None:
         return lowered
     return expression
+
+
+def lower_mixed_in_variable_candidates(expression: exp.Expression) -> exp.Expression:
+    """Rewrite ``x IN (..., y)`` so CSP preserves variable candidates.
+
+    CSP narrows ``IN`` from literal values only.  Variable-bearing candidates
+    therefore need explicit equality branches; SMT already treats ``IN`` as an
+    equality disjunction, and this normalization gives CSP the same semantics.
+    """
+    if isinstance(expression, exp.And):
+        return exp.And(
+            this=lower_mixed_in_variable_candidates(expression.this),
+            expression=lower_mixed_in_variable_candidates(expression.expression),
+        )
+    if isinstance(expression, exp.Or):
+        return exp.Or(
+            this=lower_mixed_in_variable_candidates(expression.this),
+            expression=lower_mixed_in_variable_candidates(expression.expression),
+        )
+    if isinstance(expression, exp.Not):
+        return exp.Not(this=lower_mixed_in_variable_candidates(expression.this))
+    if isinstance(expression, exp.Paren):
+        return exp.Paren(this=lower_mixed_in_variable_candidates(expression.this))
+    if not isinstance(expression, exp.In):
+        return expression.copy()
+
+    expressions = list(expression.expressions)
+    if not expressions:
+        return expression.copy()
+
+    needle = expression.this
+    literal_candidates: list[exp.Expression] = []
+    variable_candidates: list[exp.Expression] = []
+    for candidate in expressions:
+        lowered = lower_mixed_in_variable_candidates(candidate)
+        if any(True for _ in lowered.find_all(SolverVar)):
+            variable_candidates.append(lowered)
+        else:
+            literal_candidates.append(lowered)
+
+    if not variable_candidates:
+        return exp.In(
+            this=needle.copy(),
+            expressions=[candidate.copy() for candidate in literal_candidates],
+        )
+
+    branches: list[exp.Expression] = []
+    if literal_candidates:
+        branches.append(
+            exp.In(
+                this=needle.copy(),
+                expressions=[candidate.copy() for candidate in literal_candidates],
+            )
+        )
+    branches.extend(
+        exp.EQ(this=needle.copy(), expression=candidate.copy())
+        for candidate in variable_candidates
+    )
+    return _or_expressions(branches)
+
+
+def _or_expressions(expressions: Sequence[exp.Expression]) -> exp.Expression:
+    if not expressions:
+        return exp.false()
+    current = expressions[0]
+    for expression in expressions[1:]:
+        current = exp.Or(this=current, expression=expression)
+    return current
 
 
 def lower_expression_witness(expression: exp.Expression) -> Optional[exp.Expression]:
