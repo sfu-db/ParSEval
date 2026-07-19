@@ -56,6 +56,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_GENERATOR_SOLVER_TIMEOUT_MS = 2000
+
 
 @dataclass(frozen=True)
 class GroupDemand:
@@ -3482,6 +3484,8 @@ def _sort_required_child_count(
     demand: SchemaDemand,
     child_schema: DerivedSchema,
     competitor_count: int,
+    *,
+    require_rank_tie_coverage: bool,
 ) -> int:
     fetch = sort.fetch or demand.count
     required_window = max(demand.count, fetch)
@@ -3495,9 +3499,9 @@ def _sort_required_child_count(
     has_tie = _sort_has_rank_tie(sort, rows, selected)
 
     missing = max(required_window - selected_count, 0)
-    if competitor_count and not has_competitor:
+    if require_rank_tie_coverage and competitor_count and not has_competitor:
         missing += competitor_count
-    if not has_tie:
+    if require_rank_tie_coverage and not has_tie:
         missing = max(missing, 2)
     return missing
 
@@ -3739,7 +3743,10 @@ def _solve_join_key_value(
             dialect,
         )
     )
-    result = Solver(dialect=dialect or "sqlite", timeout_ms=2000).solve(
+    result = Solver(
+        dialect=dialect or "sqlite",
+        timeout_ms=_GENERATOR_SOLVER_TIMEOUT_MS,
+    ).solve(
         Problem(constraints=constraints)
     )
     if not result.sat:
@@ -3892,6 +3899,106 @@ def _schema_key_tuples(
     return tuple(dict.fromkeys(values))
 
 
+def _predicate_signature(
+    predicates: Sequence[exp.Expression],
+    dialect: str | None,
+) -> tuple[str, ...]:
+    return tuple(sorted(predicate.sql(dialect=dialect) for predicate in predicates))
+
+
+def _group_demand_signature(
+    group: GroupDemand,
+    dialect: str | None,
+) -> tuple[object, ...]:
+    return (
+        group.group_index,
+        group.row_count,
+        tuple(
+            (key.sql(dialect=dialect), repr(value))
+            for key, value in group.group_key_values
+        ),
+        _predicate_signature(group.row_predicates, dialect),
+        tuple(
+            (index, _predicate_signature(predicates, dialect))
+            for index, predicates in group.row_predicates_by_index
+        ),
+    )
+
+
+def _join_key_value_satisfies_predicates(
+    schema: DerivedSchema,
+    column: exp.Column,
+    predicates: Sequence[exp.Expression],
+    value: object,
+    dialect: str | None,
+) -> bool:
+    dtype = _schema_column_dtype(schema, column, dialect)
+    var = SolverVar(
+        key=f"join.existing.{column.sql(dialect=dialect)}",
+        dtype=dtype,
+        meta={"column": column.name},
+    )
+    constraints: List[exp.Expression] = [
+        exp.EQ(this=var, expression=_literal_for_value(value)),
+    ]
+    constraints.extend(
+        _rewrite_join_key_predicates(
+            predicates,
+            schema,
+            column,
+            var,
+            dialect,
+        )
+    )
+    return Solver(
+        dialect=dialect or "sqlite",
+        timeout_ms=_GENERATOR_SOLVER_TIMEOUT_MS,
+    ).solve(
+        Problem(constraints=constraints)
+    ).sat
+
+
+def _existing_join_key_value(
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    left: exp.Column,
+    right: exp.Column,
+    left_predicates: Sequence[exp.Expression],
+    right_predicates: Sequence[exp.Expression],
+    dialect: str | None,
+) -> object | None:
+    left_values = [
+        value
+        for value in _schema_column_values(left_schema, left, dialect)
+        if value is not None
+    ]
+    right_values = {
+        value
+        for value in _schema_column_values(right_schema, right, dialect)
+        if value is not None
+    }
+    for value in left_values:
+        if value not in right_values:
+            continue
+        if not _join_key_value_satisfies_predicates(
+            left_schema,
+            left,
+            left_predicates,
+            value,
+            dialect,
+        ):
+            continue
+        if _join_key_value_satisfies_predicates(
+            right_schema,
+            right,
+            right_predicates,
+            value,
+            dialect,
+        ):
+            return value
+    return None
+
+
 def _join_key_pairs_for_schemas(
     join: Join,
     left_schema: DerivedSchema,
@@ -4025,7 +4132,10 @@ def _solve_schema_column_value(
             dialect,
         )
     )
-    result = Solver(dialect=dialect or "sqlite", timeout_ms=2000).solve(
+    result = Solver(
+        dialect=dialect or "sqlite",
+        timeout_ms=_GENERATOR_SOLVER_TIMEOUT_MS,
+    ).solve(
         Problem(constraints=constraints, variables={var})
     )
     if not result.sat:
@@ -4207,7 +4317,10 @@ def _solve_predicate_join_value(
         ),
         meta={"column": right.name},
     )
-    result = Solver(dialect=instance.dialect, timeout_ms=2000).solve(
+    result = Solver(
+        dialect=instance.dialect,
+        timeout_ms=_GENERATOR_SOLVER_TIMEOUT_MS,
+    ).solve(
         Problem(
             constraints=[exp.EQ(this=left_var, expression=right_var)],
             variables={left_var, right_var},
@@ -4250,7 +4363,10 @@ def _solve_distinct_column_values(
         )
         for other in variables[:index]:
             constraints.append(exp.NEQ(this=var, expression=other))
-    result = Solver(dialect=instance.dialect, timeout_ms=2000).solve(
+    result = Solver(
+        dialect=instance.dialect,
+        timeout_ms=_GENERATOR_SOLVER_TIMEOUT_MS,
+    ).solve(
         Problem(constraints=constraints, variables=set(variables))
     )
     if not result.sat:
@@ -4354,6 +4470,7 @@ class EncodePipeline:
         self.schema_failure_reason = ""
         self.demand_failure_reasons: List[str] = []
         self._correlated_bindings: Dict[JoinKeyRef, object] = {}
+        self._materialized_join_group_demands: set[tuple[object, ...]] = set()
 
     def register_operator(self, step_type: type, operator_class: type) -> None:
         self._operator_registry[step_type] = operator_class
@@ -4756,22 +4873,30 @@ class EncodePipeline:
         if identity in materialized_having:
             return False
         aggregate_schema = _schema_for(cache, aggregate)
-        outcomes = _filter_outcomes(aggregate_schema, step.condition)
+        passing_count = 0
+        failing_count = 0
+        for row in aggregate_schema.rows:
+            outcome = concrete(step.condition, Environment.from_row(row))
+            if outcome is True:
+                passing_count += 1
+            elif outcome is False:
+                failing_count += 1
         group_count = max(int(getattr(self.bounds, "groups", 1) or 1), demand.count, 1)
         default_row_count = max(int(getattr(self.bounds, "rows_per_group", 1) or 1), 1)
         group_demands: List[GroupDemand] = list(demand.group_demands)
-        if True not in outcomes:
+        if passing_count < group_count:
             group_demands.extend(
                 _having_group_demands(
                     step.condition,
                     aggregate,
-                    group_count=group_count,
+                    group_count=group_count - passing_count,
                     default_row_count=default_row_count,
                     pass_group=True,
+                    start_index=passing_count,
                     dialect=self.dialect,
                 )
             )
-        if False not in outcomes:
+        if failing_count < 1:
             group_demands.extend(
                 _having_group_demands(
                     step.condition,
@@ -5131,6 +5256,22 @@ class EncodePipeline:
                     )
             left_count = 1 if left_group_keys and not right_group_keys else group.row_count
             right_count = 1 if right_group_keys and not left_group_keys else group.row_count
+            demand_key = (
+                id(join),
+                _group_demand_signature(group, self.dialect),
+                tuple(
+                    (
+                        key_left.sql(dialect=self.dialect),
+                        key_right.sql(dialect=self.dialect),
+                    )
+                    for key_left, key_right in join.on_keys
+                ),
+                _predicate_signature(left_predicates, self.dialect),
+                _predicate_signature(right_predicates, self.dialect),
+            )
+            if demand_key in self._materialized_join_group_demands:
+                continue
+            self._materialized_join_group_demands.add(demand_key)
             for left, right in join.on_keys:
                 if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
                     continue
@@ -5148,6 +5289,19 @@ class EncodePipeline:
                 )
                 left_side_schema = left_schema if left_target == "left" else right_schema
                 right_side_schema = left_schema if right_target == "left" else right_schema
+                left_side_table = getattr(left_side_schema, "_table", None)
+                right_side_table = getattr(right_side_schema, "_table", None)
+                left_side_predicates = (
+                    left_predicates if left_target == "left" else right_predicates
+                )
+                right_side_predicates = (
+                    left_predicates if right_target == "left" else right_predicates
+                )
+                same_physical_table = (
+                    left_side_table is not None
+                    and right_side_table is not None
+                    and left_side_table.sql() == right_side_table.sql()
+                )
                 if (
                     left_group_keys
                     and not right_group_keys
@@ -5176,21 +5330,47 @@ class EncodePipeline:
                 )
                 join_value_count = group.row_count if left_count > 1 and right_count > 1 else 1
                 for row_index in range(join_value_count):
-                    avoid_values = tuple(
-                        list(used_join_values.get(join_key, ()))
-                        + list(_schema_column_values(left_side_schema, left, self.dialect))
-                        + list(_schema_column_values(right_side_schema, right, self.dialect))
-                    )
-                    value = _solve_join_key_value(
-                        left_side_schema,
-                        right_side_schema,
-                        left,
-                        right,
-                        left_predicates if left_target == "left" else right_predicates,
-                        left_predicates if right_target == "left" else right_predicates,
-                        avoid_values,
-                        self.dialect,
-                    )
+                    value = None
+                    if same_physical_table:
+                        value = _existing_join_key_value(
+                            left_side_schema,
+                            right_side_schema,
+                            left,
+                            right,
+                            left_side_predicates,
+                            right_side_predicates,
+                            self.dialect,
+                        )
+                    if value is None:
+                        avoid_values = tuple(used_join_values.get(join_key, ()))
+                        if not same_physical_table:
+                            avoid_values = tuple(
+                                list(avoid_values)
+                                + list(
+                                    _schema_column_values(
+                                        left_side_schema,
+                                        left,
+                                        self.dialect,
+                                    )
+                                )
+                                + list(
+                                    _schema_column_values(
+                                        right_side_schema,
+                                        right,
+                                        self.dialect,
+                                    )
+                                )
+                            )
+                        value = _solve_join_key_value(
+                            left_side_schema,
+                            right_side_schema,
+                            left,
+                            right,
+                            left_side_predicates,
+                            right_side_predicates,
+                            avoid_values,
+                            self.dialect,
+                        )
                     if value is None:
                         continue
                     used_join_values.setdefault(join_key, []).append(value)
@@ -5444,11 +5624,16 @@ class EncodePipeline:
         child_schema: DerivedSchema,
         cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
     ) -> bool:
+        competitor_count = int(getattr(self.bounds, "order_competitors", 0) or 0)
+        is_root_unbounded_sort = step is self.plan.root and step.fetch is None
+        require_rank_tie_coverage = not is_root_unbounded_sort
+
         required_count = _sort_required_child_count(
             step,
             demand,
             child_schema,
-            int(getattr(self.bounds, "order_competitors", 0) or 0),
+            competitor_count,
+            require_rank_tie_coverage=require_rank_tie_coverage,
         )
         if required_count <= 0:
             return False
@@ -5584,6 +5769,21 @@ class EncodePipeline:
     ) -> bool:
         child = _single_dependency(step)
         child_schema = _schema_for(cache, child)
+        aggregate_schema = _schema_for(cache, step)
+        if (
+            step.group
+            and not step.aggregations
+            and not any(max(len(row.rowid) - 2, 0) > 1 for row in aggregate_schema.rows)
+        ):
+            self._lower_demand(
+                step,
+                SchemaDemand(
+                    count=max(len(aggregate_schema.rows), 1),
+                    group_demands=(GroupDemand(group_index=0, row_count=2),),
+                ),
+                cache,
+            )
+            return True
         if (
             not step.group
             and not child_schema.rows

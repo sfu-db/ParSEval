@@ -23,6 +23,7 @@ from parseval.generator.symbolic.operator import (
 )
 from parseval.instance import Instance
 from parseval.domain.exceptions import DomainError
+from parseval.generator.schema_constraints import SchemaConstraintLoweringError
 from parseval.instance.exporter import InstanceValueSerializer
 from parseval.plan.explain import Aggregate, explain
 from parseval.plan.context import DerivedSchema, Row
@@ -687,7 +688,7 @@ class TestSymbolicGenerationResult(unittest.TestCase):
                 self.assertTrue(all(check(row) for row in rows))
                 replay_generation_rows(ddl, result, dialect="sqlite")
 
-    def test_symbolic_generation_reports_unsupported_check_constraint(self):
+    def test_symbolic_generation_raises_unsupported_check_constraint(self):
         ddl = """
         CREATE TABLE other (id INT);
         CREATE TABLE customer (
@@ -696,20 +697,17 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         );
         """
 
-        result = generate(
-            ddl,
-            "SELECT id FROM customer WHERE id > 1",
-            dialect="sqlite",
-            bounds=BmcBounds(max_iterations=0),
-            generate_negatives=False,
-        )
-
-        self.assertEqual("unknown", result.generation.status)
-        self.assertEqual(
+        with self.assertRaisesRegex(
+            SchemaConstraintLoweringError,
             "unsupported_check_constraint:customer:subquery",
-            result.generation.reason,
-        )
-        self.assertEqual([], result.get_rows("customer"))
+        ):
+            generate(
+                ddl,
+                "SELECT id FROM customer WHERE id > 1",
+                dialect="sqlite",
+                bounds=BmcBounds(max_iterations=0),
+                generate_negatives=False,
+            )
 
     def test_symbolic_generation_passes_referenced_unique_constraints_to_problem(self):
         ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT UNIQUE);"
@@ -925,6 +923,37 @@ class TestSymbolicGenerationResult(unittest.TestCase):
                 for obligation in result.generation.obligations
             )
         )
+
+    def test_mysql_self_join_correlated_aggregate_generation_is_bounded(self):
+        ddl = "CREATE TABLE person (id INT PRIMARY KEY, email VARCHAR(255))"
+        query = """
+        SELECT p.email
+        FROM person AS p
+        WHERE p.id IN (
+            SELECT p1.id
+            FROM person AS p1
+            WHERE 1 < (
+                SELECT COUNT(*)
+                FROM person AS p2
+                WHERE p1.email = p2.email
+            )
+        )
+        GROUP BY p.email
+        """
+
+        instance = generate(
+            ddl,
+            query,
+            dialect="mysql",
+            bounds=BmcBounds(max_iterations=25),
+        )
+
+        rows = instance.get_rows("person")
+        self.assertLessEqual(len(rows), 60)
+        self.assertTrue(hasattr(instance, "generation"))
+        self.assertEqual("sat", instance.generation.status)
+        self.assertIsNotNone(instance.generation.root_schema)
+        self.assertGreater(len(instance.generation.root_schema.rows), 0)
 
     def test_subquery_alias_handles_string_table_qualifiers(self):
         ddl = "CREATE TABLE schools (id INT PRIMARY KEY, score INT);"
@@ -1388,25 +1417,107 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         }
         self.assertEqual("covered", obligations[("ordering", "rank_tie")])
 
-    def test_unbounded_sort_coverage_adds_only_missing_tie_rows(self):
-        ddl = "CREATE TABLE scores (id INT PRIMARY KEY, points INT);"
-        query = "SELECT id FROM scores ORDER BY points DESC"
+    def test_root_order_by_without_limit_does_not_force_rank_ties(self):
+        ddl = "CREATE TABLE scores (id INT PRIMARY KEY, birthday DATE)"
+        query = "SELECT id, birthday FROM scores ORDER BY birthday ASC"
 
-        result = generate_query_database(
+        instance = generate(
             ddl,
             query,
             dialect="sqlite",
-            bounds=BmcBounds(table_rows=1, order_competitors=0, max_iterations=15),
+            bounds=BmcBounds(max_iterations=15),
         )
 
-        self.assertEqual("sat", result.generation.status, result.generation.reason)
-        rows = snapshot_rows(result)["scores"]
-        self.assertLessEqual(len(rows), 5)
-        top_points = max(row["points"] for row in rows)
-        self.assertGreaterEqual(
-            sum(1 for row in rows if row["points"] == top_points),
-            2,
+        rows = instance.get_rows("scores")
+        self.assertLessEqual(len(rows), 4)
+        self.assertTrue(hasattr(instance, "generation"))
+        self.assertIn(instance.generation.status, {"sat", "unknown"})
+        self.assertIsNotNone(instance.generation.root_schema)
+        self.assertGreater(len(instance.generation.root_schema.rows), 0)
+
+    def test_sqlite_bird_1234_root_sort_aggregate_join_generation_is_bounded(self):
+        ddl = """
+        CREATE TABLE Patient (
+            ID INT PRIMARY KEY,
+            SEX TEXT,
+            Birthday TEXT
+        );
+        CREATE TABLE Laboratory (
+            ID INT,
+            Date TEXT,
+            WBC REAL,
+            PRIMARY KEY (ID, Date),
+            FOREIGN KEY (ID) REFERENCES Patient(ID)
         )
+        """
+        query = """
+        SELECT DISTINCT T1.ID, T1.SEX, T1.Birthday
+        FROM Patient AS T1
+        INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID
+        WHERE T2.WBC <= 3.5 OR T2.WBC >= 9.0
+        GROUP BY T1.SEX, T1.ID
+        ORDER BY T1.Birthday ASC
+        """
+
+        instance = generate(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(max_iterations=15),
+        )
+
+        patient_rows = instance.get_rows("Patient")
+        laboratory_rows = instance.get_rows("Laboratory")
+        self.assertLessEqual(len(patient_rows), 40)
+        self.assertLessEqual(len(laboratory_rows), 60)
+        self.assertTrue(hasattr(instance, "generation"))
+        self.assertIn(instance.generation.status, {"sat", "unknown"})
+        self.assertIsNotNone(instance.generation.root_schema)
+        self.assertGreater(len(instance.generation.root_schema.rows), 0)
+
+    def test_distinct_projection_generation_creates_duplicate_projected_rows(self):
+        ddl = """
+        CREATE TABLE atom (
+            atom_id INT PRIMARY KEY,
+            element TEXT
+        );
+        CREATE TABLE bond (
+            bond_id INT PRIMARY KEY,
+            bond_type TEXT
+        );
+        CREATE TABLE connected (
+            atom_id INT,
+            bond_id INT
+        );
+        """
+        distinct_query = """
+        SELECT DISTINCT T3.element
+        FROM bond AS T1
+        INNER JOIN connected AS T2 ON T1.bond_id = T2.bond_id
+        INNER JOIN atom AS T3 ON T2.atom_id = T3.atom_id
+        WHERE T1.bond_type = '#'
+        """
+        bag_query = """
+        SELECT T3.element
+        FROM bond AS T1
+        INNER JOIN connected AS T2 ON T1.bond_id = T2.bond_id
+        INNER JOIN atom AS T3 ON T2.atom_id = T3.atom_id
+        WHERE T1.bond_type = '#'
+        """
+
+        instance = generate(
+            ddl,
+            distinct_query,
+            dialect="sqlite",
+            bounds=BmcBounds(max_iterations=15),
+        )
+
+        rows = snapshot_rows(instance)
+        distinct_rows = sqlite_rows(ddl, rows, distinct_query)
+        bag_rows = sqlite_rows(ddl, rows, bag_query)
+        self.assertGreater(len(distinct_rows), 0)
+        self.assertGreater(len(bag_rows), len(distinct_rows))
+        self.assertLess(len(set(bag_rows)), len(bag_rows))
 
     def test_symbolic_generation_ranks_derived_physical_expression(self):
         ddl = "CREATE TABLE scores (id INT PRIMARY KEY, points INT, total INT);"
