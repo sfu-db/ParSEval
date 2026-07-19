@@ -246,7 +246,7 @@ if __name__ == "__main__":
     parser.add_argument("--preds_fp", default="data/sqlite/dail.txt")
     parser.add_argument("--output_dir", default="results")
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--timeout", type=int, default=60, help="Query execution timeout per task in seconds")
+    parser.add_argument("--timeout", type=int, default=360, help="Query execution timeout per task in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
     args = parser.parse_args()
