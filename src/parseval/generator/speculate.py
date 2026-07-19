@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from itertools import islice, product
 from typing import Any, Mapping, Sequence
 
 from sqlglot import exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.scope import build_scope, traverse_scope
 
+from parseval.coercion import CoercionError, coerce_literal_value
 from parseval.domain.exceptions import DomainError
 from parseval.generator.schema_constraints import (
     SchemaConstraintLoweringError,
@@ -23,6 +25,7 @@ from parseval.generator.schema_constraints import (
 from parseval.generator.helper import same_identifier
 from parseval.instance import Instance
 from parseval.instance.schema import table_key, normalize_identifier
+from parseval.literals import literal_value
 from parseval.solver import Problem, SolverVar
 from parseval.solver.api import Solver
 from parseval.solver.partition import flatten_conjuncts
@@ -211,8 +214,6 @@ def _speculate_select(
     group = tree.args.get("group")
     has_group_by = group is not None and group.expressions
     group_count = max(int(getattr(bounds, "groups", 1) or 1), 1)
-    if has_group_by and group_count < 6:
-        group_count = max(6, len(group.expressions) * 4)
     if limit_val is not None and offset_val is not None:
         min_rows = max(3, min(offset_val + limit_val, MIN_ROWS_CAP))
     elif limit_val is not None:
@@ -222,6 +223,8 @@ def _speculate_select(
 
     group_column_keys = _extract_group_column_keys(tree, relation_info, instance)
     agg_input_column_keys = _extract_aggregate_input_column_keys(tree, relation_info, instance)
+    for key in (*group_column_keys, *agg_input_column_keys):
+        _ensure_solver_var(key, instance, col_var_map, table_vars, occurrence_tables)
 
     not_exists_not_in_items: list[dict[str, Any]] = []
     for drop_optional in (False, True):
@@ -234,16 +237,32 @@ def _speculate_select(
         for pred in predicates:
             constraints.extend(flatten_conjuncts(pred))
 
+        if has_group_by:
+            if not _prepare_database_constraints(
+                instance, constraints, col_var_map, table_vars, occurrence_tables,
+            ):
+                return True
+            seeded = _seed_group_rows(
+                instance, tree, col_var_map, table_vars, occurrence_tables,
+                constraints, list(equalities),
+                relation_info=relation_info,
+                group_column_keys=group_column_keys,
+                group_count=group_count,
+                dialect=dialect,
+            )
+            if not seeded:
+                logger.info("speculate_generation_skipped:group_batch_solver_assignment")
+            return True
+
         if not constraints and not equalities and not not_exists_not_in_items:
             _seed_base_rows(
                 instance,
                 row_count=max(1, group_count, min_rows),
                 tables=query_tables,
             )
-            try:
-                _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
-                _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
-            except SchemaConstraintLoweringError:
+            if not _prepare_database_constraints(
+                instance, constraints, col_var_map, table_vars, occurrence_tables,
+            ):
                 return True
             _seed_case_arm_rows(
                 instance, tree, col_var_map, table_vars, occurrence_tables,
@@ -253,10 +272,9 @@ def _speculate_select(
             )
             return True
 
-        try:
-            _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
-            _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
-        except SchemaConstraintLoweringError:
+        if not _prepare_database_constraints(
+            instance, constraints, col_var_map, table_vars, occurrence_tables,
+        ):
             continue
 
         variables = set(col_var_map.values())
@@ -736,7 +754,9 @@ def _extract_predicates(
 
     # -- HAVING (skippable) --
     having = tree.args.get("having")
-    if having is not None and not drop_optional:
+    group = tree.args.get("group")
+    has_group_by = group is not None and bool(group.expressions)
+    if having is not None and not drop_optional and not has_group_by:
         _add_predicate(predicates, having.this, tree, relation_info, col_var_map, instance)
 
     return predicates, equalities, not_exists_not_in_items
@@ -1510,6 +1530,18 @@ def _rows_by_physical_table(
     return rows_by_table
 
 
+def _rows_by_table_from_assignments(
+    assignments: dict[SolverVar, Any],
+    table_vars: Mapping[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: Mapping[OccurrenceKey, exp.Table],
+) -> dict[exp.Table, list[dict[exp.Identifier, Any]]]:
+    occurrence_rows = {
+        occurrence: _row_from_assignments(assignments, vs)
+        for occurrence, vs in table_vars.items()
+    }
+    return _rows_by_physical_table(occurrence_rows, occurrence_tables)
+
+
 def _row_value_maps(instance: Instance, table_node: exp.Table) -> list[dict[exp.Identifier, Any]]:
     return [
         Instance._row_value_dict(row)
@@ -1614,6 +1646,25 @@ def _try_create_rows(
         return False
 
 
+def _prepare_database_constraints(
+    instance: Instance,
+    constraints: list[exp.Expression],
+    col_var_map: dict[ColumnKey, SolverVar],
+    table_vars: dict[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: dict[OccurrenceKey, exp.Table],
+) -> bool:
+    try:
+        _ensure_check_constraint_vars(
+            instance, col_var_map, table_vars, occurrence_tables,
+        )
+        _add_database_constraints(
+            constraints, instance, col_var_map, table_vars, occurrence_tables,
+        )
+    except SchemaConstraintLoweringError:
+        return False
+    return True
+
+
 def _seed_case_arm_rows(
     instance: Instance,
     tree: exp.Select,
@@ -1656,18 +1707,526 @@ def _seed_case_arm_rows(
             if not result.sat:
                 continue
 
-            occurrence_rows = {
-                occurrence: _row_from_assignments(result.assignments, vs)
-                for occurrence, vs in table_vars.items()
-            }
-            rows_by_table = _rows_by_physical_table(
-                occurrence_rows, occurrence_tables,
-            )
             _try_create_rows(
                 instance,
-                rows_by_table,
+                _rows_by_table_from_assignments(
+                    result.assignments, table_vars, occurrence_tables,
+                ),
                 reason="case_arm_solver_assignment",
             )
+
+
+def _coerced_group_value(
+    value: Any,
+    var: SolverVar,
+    instance: Instance,
+) -> Any | None:
+    try:
+        return coerce_literal_value(
+            value,
+            var.dtype,
+            instance.dialect,
+            for_equality=True,
+        )
+    except CoercionError:
+        return None
+
+
+def _group_var_for_column(
+    column: exp.Expression,
+    tree: exp.Select,
+    group_key_set: set[ColumnKey],
+    col_var_map: Mapping[ColumnKey, SolverVar],
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+) -> tuple[ColumnKey, SolverVar] | None:
+    if not isinstance(column, exp.Column):
+        return None
+    key = _resolve_column_key(column, tree, relation_info, instance)
+    if key not in group_key_set:
+        return None
+    var = col_var_map.get(key)
+    if var is None:
+        return None
+    return key, var
+
+
+def _group_candidate_values(
+    tree: exp.Select,
+    group_column_keys: Sequence[ColumnKey],
+    col_var_map: Mapping[ColumnKey, SolverVar],
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+) -> dict[ColumnKey, list[Any]]:
+    candidates: dict[ColumnKey, list[Any]] = {}
+    where = tree.args.get("where")
+    if where is None:
+        return candidates
+
+    group_key_set = set(group_column_keys)
+    for conjunct in flatten_conjuncts(where.this):
+        if isinstance(conjunct, exp.In):
+            group_var = _group_var_for_column(
+                conjunct.this,
+                tree,
+                group_key_set,
+                col_var_map,
+                relation_info,
+                instance,
+            )
+            if group_var is None:
+                continue
+            key, var = group_var
+            values: list[Any] = []
+            for expr in conjunct.expressions:
+                value = _coerced_group_value(literal_value(expr), var, instance)
+                if value is not None and value not in values:
+                    values.append(value)
+            if values:
+                candidates[key] = values
+        elif isinstance(conjunct, exp.EQ):
+            column, literal = conjunct.this, conjunct.expression
+            if not isinstance(column, exp.Column):
+                column, literal = literal, column
+            group_var = _group_var_for_column(
+                column,
+                tree,
+                group_key_set,
+                col_var_map,
+                relation_info,
+                instance,
+            )
+            if group_var is None:
+                continue
+            key, var = group_var
+            value = _coerced_group_value(literal_value(literal), var, instance)
+            if value is not None:
+                candidates[key] = [value]
+    return candidates
+
+
+def _finite_group_target_tuples(
+    tree: exp.Select,
+    group_column_keys: Sequence[ColumnKey],
+    col_var_map: Mapping[ColumnKey, SolverVar],
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+    *,
+    group_count: int,
+) -> list[tuple[Any, ...]]:
+    finite_values = _group_candidate_values(
+        tree,
+        group_column_keys,
+        col_var_map,
+        relation_info,
+        instance,
+    )
+    if finite_values and all(key in finite_values for key in group_column_keys):
+        return list(islice(
+            product(*(finite_values[key] for key in group_column_keys)),
+            group_count,
+        ))
+    return []
+
+
+def _group_values_from_assignments(
+    assignments: Mapping[SolverVar, Any],
+    group_column_keys: Sequence[ColumnKey],
+    col_var_map: Mapping[ColumnKey, SolverVar],
+) -> tuple[Any, ...] | None:
+    values: list[Any] = []
+    for key in group_column_keys:
+        var = col_var_map.get(key)
+        if var is None or var not in assignments:
+            return None
+        values.append(assignments[var])
+    return tuple(values)
+
+
+def _int_literal(expr: exp.Expression) -> int | None:
+    try:
+        value = literal_value(expr)
+    except Exception:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _count_column_key(
+    count_expr: exp.Count,
+    tree: exp.Select,
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+) -> tuple[bool, ColumnKey | None, bool]:
+    operand = count_expr.this
+    if isinstance(operand, exp.Star):
+        return True, None, False
+    is_distinct = False
+    if isinstance(operand, exp.Distinct):
+        expressions = operand.expressions
+        if len(expressions) != 1:
+            return False, None, False
+        operand = expressions[0]
+        is_distinct = True
+    if isinstance(operand, exp.Column):
+        key = _resolve_column_key(operand, tree, relation_info, instance)
+        return (True, key, is_distinct) if key is not None else (False, None, False)
+    return False, None, False
+
+
+def _count_comparison(
+    expr: exp.Expression,
+    tree: exp.Select,
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+) -> tuple[type[exp.Expression], int, ColumnKey | None, bool] | None:
+    if not isinstance(expr, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return None
+
+    left = expr.this
+    right = expr.expression
+    if isinstance(left, exp.Count):
+        literal = _int_literal(right)
+        supported, count_key, is_distinct = _count_column_key(
+            left, tree, relation_info, instance,
+        )
+        if literal is None or not supported:
+            return None
+        return type(expr), literal, count_key, is_distinct
+
+    if isinstance(right, exp.Count):
+        literal = _int_literal(left)
+        supported, count_key, is_distinct = _count_column_key(
+            right, tree, relation_info, instance,
+        )
+        if literal is None or not supported:
+            return None
+        inverse: dict[type[exp.Expression], type[exp.Expression]] = {
+            exp.EQ: exp.EQ,
+            exp.GT: exp.LT,
+            exp.GTE: exp.LTE,
+            exp.LT: exp.GT,
+            exp.LTE: exp.GTE,
+        }
+        return inverse[type(expr)], literal, count_key, is_distinct
+
+    return None
+
+
+def _apply_count_bound(
+    lower: int,
+    upper: int | None,
+    exact: int | None,
+    op: type[exp.Expression],
+    target: int,
+) -> tuple[int, int | None, int | None] | None:
+    if op is exp.EQ:
+        exact = target if exact is None else exact
+        if exact != target:
+            return None
+    if op is exp.GT:
+        lower = max(lower, target + 1)
+    if op is exp.GTE:
+        lower = max(lower, target)
+    if op is exp.LT:
+        upper = target - 1 if upper is None else min(upper, target - 1)
+    if op is exp.LTE:
+        upper = target if upper is None else min(upper, target)
+    if exact is not None and (exact < lower or (upper is not None and exact > upper)):
+        return None
+    if upper is not None and upper < lower:
+        return None
+    return lower, upper, exact
+
+
+def _count_target_sizes(
+    comparisons: Sequence[tuple[type[exp.Expression], int, ColumnKey | None, bool]],
+    *,
+    group_count: int,
+) -> tuple[int, ...]:
+    lower = 1
+    upper: int | None = None
+    exact: int | None = None
+    for op, target, _count_key, _is_distinct in comparisons:
+        bounds = _apply_count_bound(lower, upper, exact, op, target)
+        if bounds is None:
+            return ()
+        lower, upper, exact = bounds
+
+    if exact is not None:
+        return (exact,) if exact >= 1 and exact <= MIN_ROWS_CAP else ()
+    if lower > MIN_ROWS_CAP:
+        return ()
+    upper = MIN_ROWS_CAP if upper is None else min(upper, MIN_ROWS_CAP)
+    stop = min(upper, lower + group_count - 1)
+    return tuple(range(lower, stop + 1))
+
+
+def _having_count_plan(
+    tree: exp.Select,
+    relation_info: RelationScopeInfo,
+    instance: Instance,
+    *,
+    group_count: int,
+) -> tuple[tuple[int, ...], tuple[ColumnKey, ...], tuple[ColumnKey, ...]] | None:
+    having = tree.args.get("having")
+    if having is None:
+        return tuple(range(1, group_count + 1)), (), ()
+
+    comparisons: list[tuple[type[exp.Expression], int, ColumnKey | None, bool]] = []
+    non_null_keys: list[ColumnKey] = []
+    distinct_keys: list[ColumnKey] = []
+    for conjunct in flatten_conjuncts(having.this):
+        comparison = _count_comparison(conjunct, tree, relation_info, instance)
+        if comparison is None:
+            return None
+        op, target, count_key, is_distinct = comparison
+        comparisons.append((op, target, count_key, is_distinct))
+        if count_key is not None and count_key not in non_null_keys:
+            non_null_keys.append(count_key)
+        if is_distinct and count_key is not None and count_key not in distinct_keys:
+            distinct_keys.append(count_key)
+
+    sizes = _count_target_sizes(comparisons, group_count=group_count)
+    return sizes[:1], tuple(non_null_keys), tuple(distinct_keys)
+
+
+def _row_scoped_solver_context(
+    col_var_map: Mapping[ColumnKey, SolverVar],
+    table_vars: Mapping[OccurrenceKey, list[SolverVar]],
+    *,
+    suffix: str,
+) -> tuple[dict[ColumnKey, SolverVar], dict[OccurrenceKey, list[SolverVar]]]:
+    row_col_var_map: dict[ColumnKey, SolverVar] = {}
+    by_var_key: dict[str, SolverVar] = {}
+    for key, var in col_var_map.items():
+        row_var = SolverVar(
+            key=f"{var.var_key}{suffix}",
+            dtype=var.dtype,
+            meta=var.meta,
+        )
+        row_col_var_map[key] = row_var
+        by_var_key[var.var_key] = row_var
+
+    row_table_vars: dict[OccurrenceKey, list[SolverVar]] = {}
+    for occurrence, vars in table_vars.items():
+        row_table_vars[occurrence] = [
+            by_var_key[var.var_key]
+            for var in vars
+            if var.var_key in by_var_key
+        ]
+
+    return row_col_var_map, row_table_vars
+
+
+def _remap_solver_vars(
+    expr: exp.Expression,
+    var_key_map: Mapping[str, SolverVar],
+) -> exp.Expression:
+    def replacer(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, SolverVar):
+            new_var = var_key_map.get(node.var_key)
+            if new_var is not None:
+                return new_var.copy()
+        return node
+
+    return expr.copy().transform(replacer)
+
+
+def _remap_equalities(
+    equalities: Sequence[tuple[SolverVar, SolverVar]],
+    var_key_map: Mapping[str, SolverVar],
+) -> list[tuple[SolverVar, SolverVar]]:
+    remapped: list[tuple[SolverVar, SolverVar]] = []
+    for left, right in equalities:
+        new_left = var_key_map.get(left.var_key)
+        new_right = var_key_map.get(right.var_key)
+        if new_left is not None and new_right is not None:
+            remapped.append((new_left, new_right))
+    return remapped
+
+
+def _distinct_group_tuple_constraint(
+    left_vars: Sequence[SolverVar],
+    right_vars: Sequence[SolverVar],
+) -> exp.Expression | None:
+    comparisons = [
+        exp.NEQ(this=left.copy(), expression=right.copy())
+        for left, right in zip(left_vars, right_vars)
+    ]
+    if not comparisons:
+        return None
+    expr = comparisons[0]
+    for comparison in comparisons[1:]:
+        expr = exp.Or(this=expr, expression=comparison)
+    return expr
+
+
+def _seed_group_rows(
+    instance: Instance,
+    tree: exp.Select,
+    col_var_map: dict[ColumnKey, SolverVar],
+    table_vars: dict[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: dict[OccurrenceKey, exp.Table],
+    constraints: Sequence[exp.Expression],
+    equalities: Sequence[tuple[SolverVar, SolverVar]],
+    *,
+    relation_info: RelationScopeInfo,
+    group_column_keys: Sequence[ColumnKey],
+    group_count: int,
+    dialect: str = "sqlite",
+) -> bool:
+    group = tree.args.get("group")
+    if (
+        not group
+        or not group.expressions
+        or not group_column_keys
+        or len(group_column_keys) != len(group.expressions)
+    ):
+        return False
+
+    target_tuples = _finite_group_target_tuples(
+        tree,
+        group_column_keys,
+        col_var_map,
+        relation_info,
+        instance,
+        group_count=group_count,
+    )
+    if target_tuples:
+        group_count = min(group_count, len(target_tuples))
+
+    having_plan = _having_count_plan(
+        tree,
+        relation_info,
+        instance,
+        group_count=group_count,
+    )
+    if having_plan is None:
+        return False
+
+    having_sizes, having_non_null_column_keys, having_distinct_column_keys = having_plan
+    target_sizes = list(having_sizes[:group_count])
+    if not target_sizes:
+        return False
+
+    batch_constraints: list[exp.Expression] = []
+    batch_equalities: list[tuple[SolverVar, SolverVar]] = []
+    variables: set[SolverVar] = set()
+    rows: list[tuple[int, dict[ColumnKey, SolverVar], dict[OccurrenceKey, list[SolverVar]]]] = []
+
+    for group_index, group_size in enumerate(target_sizes):
+        for row_index in range(group_size):
+            suffix = f"._g{group_index}_r{row_index}"
+            row_col_var_map, row_table_vars = _row_scoped_solver_context(
+                col_var_map,
+                table_vars,
+                suffix=suffix,
+            )
+            row_var_key_map = {
+                var.var_key: row_col_var_map[key]
+                for key, var in col_var_map.items()
+                if key in row_col_var_map
+            }
+            batch_constraints.extend(
+                _remap_solver_vars(constraint, row_var_key_map)
+                for constraint in constraints
+            )
+            batch_equalities.extend(_remap_equalities(equalities, row_var_key_map))
+            try:
+                _add_database_constraints(
+                    batch_constraints,
+                    instance,
+                    row_col_var_map,
+                    row_table_vars,
+                    occurrence_tables,
+                    include_same_batch_fk_targets=True,
+                )
+            except SchemaConstraintLoweringError:
+                return False
+
+            for key in group_column_keys:
+                group_var = row_col_var_map[key]
+                batch_constraints.append(
+                    exp.Not(this=exp.Is(this=group_var, expression=exp.Null()))
+                )
+            for key in having_non_null_column_keys:
+                count_var = row_col_var_map.get(key)
+                if count_var is None:
+                    return False
+                batch_constraints.append(
+                    exp.Not(this=exp.Is(this=count_var, expression=exp.Null()))
+                )
+
+            variables.update(row_col_var_map.values())
+            rows.append((group_index, row_col_var_map, row_table_vars))
+
+    first_row_by_group: dict[int, dict[ColumnKey, SolverVar]] = {}
+    rows_by_group: dict[int, list[dict[ColumnKey, SolverVar]]] = {}
+    for group_index, row_col_var_map, _row_table_vars in rows:
+        rows_by_group.setdefault(group_index, []).append(row_col_var_map)
+        first = first_row_by_group.setdefault(group_index, row_col_var_map)
+        if first is row_col_var_map:
+            continue
+        for key in group_column_keys:
+            batch_equalities.append((row_col_var_map[key], first[key]))
+
+    for distinct_key in having_distinct_column_keys:
+        for group_rows in rows_by_group.values():
+            distinct_vars = [row_col_var_map[distinct_key] for row_col_var_map in group_rows]
+            for left_index, left_var in enumerate(distinct_vars):
+                for right_var in distinct_vars[left_index + 1:]:
+                    batch_constraints.append(
+                        exp.NEQ(this=left_var.copy(), expression=right_var.copy())
+                    )
+
+    if target_tuples:
+        for group_index, target_values in enumerate(target_tuples[:len(target_sizes)]):
+            first = first_row_by_group[group_index]
+            for key, value in zip(group_column_keys, target_values):
+                batch_constraints.append(
+                    exp.EQ(this=first[key], expression=_literal_for_value(value))
+                )
+
+    group_vars = [
+        [first_row_by_group[index][key] for key in group_column_keys]
+        for index in range(len(target_sizes))
+    ]
+    for left_index, left_vars in enumerate(group_vars):
+        for right_vars in group_vars[left_index + 1:]:
+            distinct = _distinct_group_tuple_constraint(left_vars, right_vars)
+            if distinct is not None:
+                batch_constraints.append(distinct)
+
+    solver = Solver(dialect=dialect)
+    result = solver.solve(
+        Problem(
+            constraints=batch_constraints,
+            equalities=batch_equalities,
+            variables=variables,
+        )
+    )
+    if not result.sat:
+        return False
+
+    rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
+    for _group_index, _row_col_var_map, row_table_vars in rows:
+        row_rows_by_table = _rows_by_table_from_assignments(
+            result.assignments,
+            row_table_vars,
+            occurrence_tables,
+        )
+        for table, table_rows in row_rows_by_table.items():
+            rows_by_table.setdefault(table, []).extend(table_rows)
+
+    return _try_create_rows(
+        instance,
+        rows_by_table,
+        reason="group_batch_solver_assignment",
+    )
 
 
 def _seed_from_assignments(
@@ -1693,24 +2252,22 @@ def _seed_from_assignments(
     set nullable aggregate-input columns to NULL.
     """
     total_rows = max(1, group_count, min_rows)
-    def _build_rows_by_table(assignments: dict[SolverVar, Any]) -> dict[exp.Table, list[dict]]:
-        occurrence_rows = {
-            occurrence: _row_from_assignments(assignments, vs)
-            for occurrence, vs in table_vars.items()
-        }
-        return _rows_by_physical_table(occurrence_rows, occurrence_tables)
 
     if total_rows <= 1:
         _try_create_rows(
             instance,
-            _build_rows_by_table(first_assignments),
+            _rows_by_table_from_assignments(
+                first_assignments, table_vars, occurrence_tables,
+            ),
             reason="solver_assignment",
         )
         return
 
     if not _try_create_rows(
         instance,
-        _build_rows_by_table(first_assignments),
+        _rows_by_table_from_assignments(
+            first_assignments, table_vars, occurrence_tables,
+        ),
         reason="solver_assignment",
     ):
         return
@@ -1942,6 +2499,65 @@ def _add_database_constraints(
             )
 
 
+def _check_aware_base_rows(
+    instance: Instance,
+    table_node: exp.Table,
+    *,
+    row_count: int,
+) -> list[dict[exp.Identifier, Any]] | None:
+    table_schema = instance.database_constraints(table_node)
+    check_columns = tuple(
+        dict.fromkeys(
+            column
+            for check in table_schema.checks
+            for column in check.referenced_columns
+        )
+    )
+    if not check_columns:
+        return None
+
+    sv_map = {
+        column.name: SolverVar(
+            key=f"base.{table_key(table_node)}.{column.name}",
+            dtype=table_schema.columns[column].datatype,
+            meta={"column": column},
+        )
+        for column in check_columns
+    }
+
+    constraints = schema_constraints_for_solver_row(
+        instance,
+        table_node,
+        sv_map,
+        exact_columns=set(sv_map),
+        include_checks=True,
+        include_existing_uniques=True,
+        include_existing_fks=True,
+    )
+
+    rows: list[dict[exp.Identifier, Any]] = []
+    solver = Solver(dialect=instance.dialect)
+    variables = set(sv_map.values())
+    for _ in range(row_count):
+        result = solver.solve(
+            Problem(
+                constraints=list(constraints),
+                variables=variables,
+            )
+        )
+        if not result.sat:
+            return []
+        row: dict[exp.Identifier, Any] = {}
+        for column in check_columns:
+            var = sv_map[column.name]
+            if var not in result.assignments:
+                return []
+            row[column] = result.assignments[var]
+        rows.append(row)
+
+    return rows
+
+
 def _seed_base_rows(
     instance: Instance,
     *,
@@ -1953,7 +2569,12 @@ def _seed_base_rows(
     for table_node in instance.schema.fk_safe_table_order():
         if tables is not None and table_node not in tables:
             continue
-        rows_by_table[table_node] = [{} for _ in range(row_count)]
+        check_rows = _check_aware_base_rows(
+            instance, table_node, row_count=row_count,
+        )
+        rows_by_table[table_node] = (
+            check_rows if check_rows is not None else [{} for _ in range(row_count)]
+        )
     _try_create_rows(instance, rows_by_table, reason="base_rows")
 
 
