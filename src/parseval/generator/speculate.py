@@ -670,7 +670,19 @@ def _extract_predicates(
                         )
                         not_exists_not_in_items.extend(items)
             else:
-                non_subquery_conjuncts.append(conj)
+                scalar_items = _find_scalar_subquery_items(conj)
+                if scalar_items:
+                    for kind, inner_select, outer_expr in scalar_items:
+                        sp, se = _process_scalar_subquery(
+                            inner_select, kind, outer_expr,
+                            instance, tree, col_var_map, table_vars,
+                            occurrence_tables, dialect,
+                            relation_info=relation_info,
+                        )
+                        predicates.extend(sp)
+                        equalities.extend(se)
+                else:
+                    non_subquery_conjuncts.append(conj)
 
         # Add non-subquery WHERE conjuncts
         for conj in non_subquery_conjuncts:
@@ -789,6 +801,39 @@ def _find_subquery_predicates(
             results.append(("in", sq.this, node.this))
 
     return results
+
+
+_SCALAR_CMP_KINDS: dict[type, str] = {
+    exp.EQ: "eq",
+    exp.NEQ: "neq",
+    exp.GT: "gt",
+    exp.GTE: "gte",
+    exp.LT: "lt",
+    exp.LTE: "lte",
+}
+
+
+def _find_scalar_subquery_items(
+    expr: exp.Expression,
+) -> list[tuple[str, exp.Select, exp.Expression]]:
+    """Detect scalar subqueries in comparison expressions.
+
+    For example ``col = (SELECT ...)``, ``col > (SELECT ...)``.
+
+    Returns ``[(kind, inner_select, outer_expr), ...]`` where
+    *kind* is ``"eq"``, ``"neq"``, ``"gt"``, ``"gte"``, ``"lt"``, or ``"lte"``.
+    """
+    cmp_cls = type(expr)
+    kind = _SCALAR_CMP_KINDS.get(cmp_cls)
+    if kind is None:
+        return []
+    left_sq = isinstance(expr.this, exp.Subquery) and isinstance(expr.this.this, exp.Select)
+    right_sq = isinstance(expr.expression, exp.Subquery) and isinstance(expr.expression.this, exp.Select)
+    if left_sq and not right_sq:
+        return [(kind, expr.this.this, expr.expression)]
+    if right_sq and not left_sq:
+        return [(kind, expr.expression.this, expr.this)]
+    return []
 
 
 def _collect_inner_vars(
@@ -934,6 +979,102 @@ def _process_exists_in_subquery(
                 )
 
     return inner_predicates, inner_equalities
+
+
+def _process_scalar_subquery(
+    inner_select: exp.Select,
+    kind: str,
+    outer_expr: exp.Expression,
+    instance: Instance,
+    outer_select: exp.Select,
+    col_var_map: dict[ColumnKey, SolverVar],
+    table_vars: dict[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: dict[OccurrenceKey, exp.Table],
+    dialect: str,
+    *,
+    relation_info: RelationScopeInfo,
+) -> tuple[list[exp.Expression], list[tuple[SolverVar, SolverVar]]]:
+    """Process a scalar subquery in a comparison expression.
+
+    Collects inner-SELECT solver vars and predicates, then links the
+    outer expression to the inner projected column with the appropriate
+    equality/inequality constraint.
+
+    Returns ``(predicates, equalities)``.
+    """
+    _collect_inner_vars(
+        inner_select, instance, relation_info, col_var_map, table_vars, occurrence_tables,
+    )
+
+    inner_predicates: list[exp.Expression] = []
+    inner_equalities: list[tuple[SolverVar, SolverVar]] = []
+
+    inner_where = inner_select.args.get("where")
+    if inner_where is not None:
+        correlations = _extract_correlation_equalities(
+            inner_where.this, outer_select, inner_select, relation_info, instance,
+        )
+        remaining: list[exp.Expression] = []
+        for conj in flatten_conjuncts(inner_where.this):
+            is_correlation = False
+            for outer_col, inner_col in correlations:
+                if (isinstance(conj, exp.EQ)
+                    and ((conj.this is outer_col and conj.expression is inner_col)
+                         or (conj.this is inner_col and conj.expression is outer_col))):
+                    outer_key = _resolve_column_key(outer_col, outer_select, relation_info, instance)
+                    inner_key = _resolve_column_key(inner_col, inner_select, relation_info, instance)
+                    if outer_key and inner_key:
+                        ov = col_var_map.get(outer_key)
+                        iv = col_var_map.get(inner_key)
+                        if ov is not None and iv is not None:
+                            inner_equalities.append((ov, iv))
+                    is_correlation = True
+                    break
+            if not is_correlation:
+                remaining.append(conj)
+
+        for conj in remaining:
+            _add_predicate(
+                inner_predicates, conj, inner_select, relation_info, col_var_map, instance,
+            )
+
+    inner_projections = inner_select.args.get("expressions") or []
+    if inner_projections:
+        inner_proj = _unwrap_projection_expression(inner_projections[0])
+        outer_rewritten = _replace_columns_with_vars(
+            outer_expr,
+            current_select=outer_select,
+            relation_info=relation_info,
+            col_var_map=col_var_map,
+            instance=instance,
+        )
+        inner_rewritten = _replace_columns_with_vars(
+            inner_proj,
+            current_select=inner_select,
+            relation_info=relation_info,
+            col_var_map=col_var_map,
+            instance=instance,
+        )
+        if kind == "eq":
+            if isinstance(outer_rewritten, SolverVar) and isinstance(inner_rewritten, SolverVar):
+                inner_equalities.append((outer_rewritten, inner_rewritten))
+            else:
+                inner_predicates.append(
+                    exp.EQ(this=outer_rewritten, expression=inner_rewritten),
+                )
+        else:
+            cls = _inverse_scalar_cmp(kind)
+            inner_predicates.append(cls(this=outer_rewritten, expression=inner_rewritten))
+
+    return inner_predicates, inner_equalities
+
+
+def _inverse_scalar_cmp(kind: str) -> type:
+    for cls, k in _SCALAR_CMP_KINDS.items():
+        if k == kind:
+            return cls
+    raise ValueError(f"unknown scalar comparison kind: {kind}")
+
 
 
 def _collect_not_exists_not_in_items(

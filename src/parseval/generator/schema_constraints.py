@@ -26,6 +26,7 @@ def schema_constraints_for_solver_row(
     include_existing_uniques: bool = True,
     include_existing_fks: bool = True,
     constrain_exact_fks: bool = True,
+    unconstrained_fk_columns: AbstractSet[str] = frozenset(),
 ) -> list[exp.Expression]:
     table_schema = instance.database_constraints(table)
     constraints: list[exp.Expression] = []
@@ -54,6 +55,8 @@ def schema_constraints_for_solver_row(
         for fk in table_schema.foreign_keys:
             names = tuple(column.name for column in fk.source_columns)
             if len(names) != 1 or not set(names) <= available:
+                continue
+            if set(names).intersection(unconstrained_fk_columns):
                 continue
             if exact_columns and not set(names).intersection(exact_columns):
                 continue

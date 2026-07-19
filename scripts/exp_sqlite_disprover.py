@@ -13,7 +13,8 @@ import datetime
 import shutil
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed, TimeoutError as FuturesTimeoutError
+from pebble import ProcessPool, ProcessExpired
 import sys
 try:
     from tqdm import tqdm
@@ -117,16 +118,54 @@ def run_disprove_experiment(
         ]
     else:
         records_by_index = {}
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_process_disprove_task, task) for task in tasks]
+        with ProcessPool(max_workers=workers) as pool:
+            future_to_task = {
+                pool.schedule(_process_disprove_task, args=(task,), timeout=timeout): task
+                for task in tasks
+            }
             for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
+                as_completed(future_to_task),
+                total=len(future_to_task),
                 desc="Disproving BIRD pairs",
                 disable=not sys.stdout.isatty()
             ):
-                record = future.result()
-                records_by_index[record["index"]] = record
+                task = future_to_task[future]
+                index = task[0]
+                gold_sql = task[1]
+                pred_sql = task[2]
+                try:
+                    record = future.result()
+                    records_by_index[record["index"]] = record
+                except FuturesTimeoutError:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "timeout",
+                        "error_msg": f"Task exceeded {timeout} seconds",
+                        "elapsed_time": float(timeout),
+                    }
+                except ProcessExpired as e:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "execution_error",
+                        "error_msg": f"Worker process crashed: {e}",
+                        "elapsed_time": 0.0,
+                    }
+                except Exception as e:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "execution_error",
+                        "error_msg": f"Python Exception: {str(e)[:200]}",
+                        "elapsed_time": 0.0,
+                    }
         records = [records_by_index[index] for index, *_rest in tasks]
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
