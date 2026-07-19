@@ -240,6 +240,17 @@ def _speculate_select(
                 row_count=max(1, group_count, min_rows),
                 tables=query_tables,
             )
+            try:
+                _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
+                _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
+            except SchemaConstraintLoweringError:
+                return True
+            _seed_case_arm_rows(
+                instance, tree, col_var_map, table_vars, occurrence_tables,
+                constraints, [],
+                relation_info=relation_info,
+                dialect=dialect,
+            )
             return True
 
         try:
@@ -266,6 +277,12 @@ def _speculate_select(
                 dialect=dialect,
                 group_key_column_keys=group_column_keys,
                 aggregate_input_column_keys=agg_input_column_keys,
+            )
+            _seed_case_arm_rows(
+                instance, tree, col_var_map, table_vars, occurrence_tables,
+                constraints, list(equalities),
+                relation_info=relation_info,
+                dialect=dialect,
             )
             if not_exists_not_in_items:
                 _seed_not_exists_not_in(
@@ -722,13 +739,6 @@ def _extract_predicates(
     if having is not None and not drop_optional:
         _add_predicate(predicates, having.this, tree, relation_info, col_var_map, instance)
 
-    # -- CASE WHEN (skippable) --
-    if not drop_optional:
-        for case_expr in tree.find_all(exp.Case):
-            for branch in (case_expr.args.get("ifs") or []):
-                condition = branch.this
-                _add_predicate(predicates, condition, tree, relation_info, col_var_map, instance)
-
     return predicates, equalities, not_exists_not_in_items
 
 
@@ -750,6 +760,44 @@ def _add_predicate(
     )
     if transformed is not None:
         predicates.append(transformed)
+
+
+def _case_branch_condition(case_expr: exp.Case, branch: exp.If) -> exp.Expression:
+    """Return the predicate that makes *branch* reachable."""
+    case_operand = case_expr.args.get("this")
+    condition = branch.this
+    if case_operand is None:
+        return condition.copy()
+    return exp.EQ(this=case_operand.copy(), expression=condition.copy())
+
+
+def _case_arm_predicate_sets(case_expr: exp.Case) -> list[list[exp.Expression]]:
+    """Return one predicate list for each reachable CASE arm."""
+    prior_conditions: list[exp.Expression] = []
+    predicate_sets: list[list[exp.Expression]] = []
+
+    for branch in (case_expr.args.get("ifs") or []):
+        condition = _case_branch_condition(case_expr, branch)
+        predicate_sets.append(
+            [negate_predicate(prev.copy()) for prev in prior_conditions]
+            + [condition.copy()]
+        )
+        prior_conditions.append(condition)
+
+    if case_expr.args.get("default") is not None:
+        predicate_sets.append([
+            negate_predicate(condition.copy())
+            for condition in prior_conditions
+        ])
+
+    return predicate_sets
+
+
+def _collect_case_arm_predicate_sets(tree: exp.Expression) -> list[list[exp.Expression]]:
+    predicate_sets: list[list[exp.Expression]] = []
+    for case_expr in tree.find_all(exp.Case):
+        predicate_sets.extend(_case_arm_predicate_sets(case_expr))
+    return predicate_sets
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1614,62 @@ def _try_create_rows(
         return False
 
 
+def _seed_case_arm_rows(
+    instance: Instance,
+    tree: exp.Select,
+    col_var_map: dict[ColumnKey, SolverVar],
+    table_vars: dict[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: dict[OccurrenceKey, exp.Table],
+    constraints: Sequence[exp.Expression],
+    equalities: Sequence[tuple[SolverVar, SolverVar]],
+    *,
+    relation_info: RelationScopeInfo,
+    dialect: str = "sqlite",
+) -> None:
+    arm_predicate_sets = _collect_case_arm_predicate_sets(tree)
+    if not arm_predicate_sets:
+        return
+
+    variables = set(col_var_map.values())
+    solver = Solver(dialect=dialect)
+
+    for arm_predicates in arm_predicate_sets:
+        arm_constraints: list[exp.Expression] = list(constraints)
+        for predicate in arm_predicates:
+            lowered = _solver_predicate_or_none(
+                predicate,
+                current_select=tree,
+                relation_info=relation_info,
+                col_var_map=col_var_map,
+                instance=instance,
+            )
+            if lowered is None:
+                break
+            arm_constraints.extend(flatten_conjuncts(lowered))
+        else:
+            problem = Problem(
+                constraints=arm_constraints,
+                equalities=list(equalities),
+                variables=variables,
+            )
+            result = solver.solve(problem)
+            if not result.sat:
+                continue
+
+            occurrence_rows = {
+                occurrence: _row_from_assignments(result.assignments, vs)
+                for occurrence, vs in table_vars.items()
+            }
+            rows_by_table = _rows_by_physical_table(
+                occurrence_rows, occurrence_tables,
+            )
+            _try_create_rows(
+                instance,
+                rows_by_table,
+                reason="case_arm_solver_assignment",
+            )
+
+
 def _seed_from_assignments(
     instance: Instance,
     first_assignments: dict[SolverVar, Any],
@@ -1687,16 +1791,14 @@ def _seed_from_assignments(
                         exp.Is(this=new_var, expression=exp.Null())
                     )
 
-        try:
-            _add_database_constraints(
-                new_constraints,
-                instance,
-                new_col_var_map,
-                table_vars,
-                occurrence_tables,
-            )
-        except SchemaConstraintLoweringError:
-            continue
+        _add_database_constraints(
+            new_constraints,
+            instance,
+            new_col_var_map,
+            table_vars,
+            occurrence_tables,
+            include_same_batch_fk_targets=True,
+        )
 
         problem = Problem(
             constraints=new_constraints,
@@ -1747,12 +1849,59 @@ def _literal_for_value(value: Any) -> exp.Expression:
     return exp.Literal.string(str(value))
 
 
+def _fk_candidate_expressions(
+    instance: Instance,
+    fk: Any,
+    col_var_map: Mapping[ColumnKey, SolverVar],
+) -> list[exp.Expression]:
+    if len(fk.source_columns) != 1 or len(fk.target_columns) != 1:
+        return []
+
+    target_column = fk.target_columns[0]
+    candidates: list[exp.Expression] = []
+    for parent_row in instance.get_rows(fk.target_table):
+        value = instance._row_value_dict(parent_row).get(target_column)
+        if value is not None:
+            candidates.append(_literal_for_value(value))
+
+    candidates.extend(
+        var
+        for (table, _alias, column), var in col_var_map.items()
+        if table == fk.target_table and column == target_column
+    )
+    return candidates
+
+
+def _same_batch_fk_constraints(
+    instance: Instance,
+    table_node: exp.Table,
+    sv_map: Mapping[str, SolverVar],
+    col_var_map: Mapping[ColumnKey, SolverVar],
+) -> list[exp.Expression]:
+    constraints: list[exp.Expression] = []
+    table_schema = instance.database_constraints(table_node)
+    for fk in table_schema.foreign_keys:
+        if len(fk.source_columns) != 1 or len(fk.target_columns) != 1:
+            continue
+        source_column = fk.source_columns[0]
+        source_var = sv_map.get(source_column.name)
+        if source_var is None:
+            continue
+
+        candidates = _fk_candidate_expressions(instance, fk, col_var_map)
+        if candidates:
+            constraints.append(exp.In(this=source_var, expressions=candidates))
+    return constraints
+
+
 def _add_database_constraints(
     constraints: list[exp.Expression],
     instance: Instance,
     col_var_map: dict[ColumnKey, SolverVar],
     table_vars: dict[OccurrenceKey, list[SolverVar]],
     occurrence_tables: dict[OccurrenceKey, exp.Table],
+    *,
+    include_same_batch_fk_targets: bool = False,
 ) -> None:
     """Add uniqueness, FK, and CHECK constraints for all tables in *table_vars*.
 
@@ -1779,9 +1928,18 @@ def _add_database_constraints(
                 exact_columns=set(sv_map),
                 include_checks=True,
                 include_existing_uniques=True,
-                include_existing_fks=True,
+                include_existing_fks=not include_same_batch_fk_targets,
             )
         )
+        if include_same_batch_fk_targets:
+            constraints.extend(
+                _same_batch_fk_constraints(
+                    instance,
+                    table_node,
+                    sv_map,
+                    col_var_map,
+                )
+            )
 
 
 def _seed_base_rows(

@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from unittest.mock import patch
 
 from parseval.generator.speculate import speculate
 from parseval.instance import Instance
+
+
+def _replay_sqlite_query(ddls: str, inst: Instance, query: str) -> list[tuple]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(ddls)
+        for table in inst.schema.fk_safe_table_order():
+            rows = inst.get_rows(table)
+            if not rows:
+                continue
+            columns = list(inst.schema.tables[table].columns)
+            placeholders = ", ".join("?" for _ in columns)
+            sql = (
+                f"INSERT INTO {table.name} "
+                f"({', '.join(column.name for column in columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            for row in rows:
+                values = Instance._row_value_dict(row)
+                conn.execute(sql, [values.get(column) for column in columns])
+        return list(conn.execute(query))
+    finally:
+        conn.close()
 
 
 class TestSpeculateSelfJoin(unittest.TestCase):
@@ -182,6 +206,33 @@ CREATE TABLE c (id INT, b_id INT);"""
         self.assertIsNotNone(inst)
         total = sum(len(inst.get_rows(t)) for t in inst.schema.fk_safe_table_order())
         self.assertGreater(total, 0)
+
+    def test_high_offset_fk_join_creates_same_batch_parent_child_rows(self):
+        ddls = """
+CREATE TABLE schools (
+    CDSCode TEXT PRIMARY KEY,
+    Phone TEXT,
+    Ext TEXT
+);
+CREATE TABLE satscores (
+    cds TEXT PRIMARY KEY,
+    AvgScrWrite INT,
+    FOREIGN KEY (cds) REFERENCES schools(CDSCode)
+);
+"""
+        query = """
+SELECT T1.Phone, T1.Ext
+FROM schools AS T1
+INNER JOIN satscores AS T2 ON T1.CDSCode = T2.cds
+ORDER BY T2.AvgScrWrite DESC
+LIMIT 1 OFFSET 222
+"""
+        inst = speculate(ddls, query, "sqlite")
+
+        self.assertIsNotNone(inst)
+        self.assertGreaterEqual(len(inst.get_rows("schools")), 223)
+        self.assertGreaterEqual(len(inst.get_rows("satscores")), 223)
+        self.assertEqual(len(_replay_sqlite_query(ddls, inst, query)), 1)
 
 
 class TestSpeculateRelationScope(unittest.TestCase):
