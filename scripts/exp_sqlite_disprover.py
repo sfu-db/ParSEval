@@ -4,12 +4,14 @@ Usage::
 
     python scripts/exp_sqlite_disprover.py --workers 16
     python scripts/exp_sqlite_disprover.py --limit 100 --workers 8
+    python scripts/exp_sqlite_disprover.py --workers 16 --inmemory
 """
 
 import json
 import os
 import argparse
 import datetime
+import sqlite3
 import shutil
 import tempfile
 import time
@@ -42,7 +44,7 @@ def load_preds(preds_fp: str):
     return lines
 
 
-def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout):
+def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri=None):
     t0 = time.time()
     record = {
         "index": index,
@@ -53,8 +55,14 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         "error_msg": "",
         "elapsed_time": 0.0,
     }
+    keeper_conn = None
     try:
         from parseval.main import disprove
+
+        # Keep a shared in-memory SQLite DB alive across disprove's internal
+        # connection open/close cycles (to_db -> execute_query).
+        if memory_uri:
+            keeper_conn = sqlite3.connect(memory_uri, uri=True)
 
         result = disprove(
             gold_sql, pred_sql, ddls, connection_string, "sqlite",
@@ -68,14 +76,16 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         record["verdict"] = "syntax_error"
         record["error_msg"] = str(exc)[:200]
     finally:
+        if keeper_conn is not None:
+            keeper_conn.close()
         record["elapsed_time"] = round(time.time() - t0, 4)
     return record
 
 
 def _process_disprove_task(task):
-    index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout = task
+    index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri = task
     return _process_disprove_case(
-        index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout,
+        index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri,
     )
 
 
@@ -88,6 +98,7 @@ def run_disprove_experiment(
     start: int = 0,
     workers: int = 1,
     timeout: int = 60,
+    inmemory: bool = False,
 ):
     schemas = load_schema(schema_fp)
     gold = load_gold(gold_fp)
@@ -98,7 +109,7 @@ def run_disprove_experiment(
         selected = selected[:limit]
 
     os.makedirs(output_dir, exist_ok=True)
-    tmp_dir = tempfile.mkdtemp(prefix="parseval_")
+    tmp_dir = None if inmemory else tempfile.mkdtemp(prefix="parseval_")
 
     tasks = []
     for offset, row in enumerate(selected):
@@ -107,9 +118,15 @@ def run_disprove_experiment(
         pred_sql = preds[index] if index < len(preds) else ""
         db_id = row.get("db_id")
         ddls = ";".join(schemas.get(db_id, []))
-        db_path = os.path.abspath(os.path.join(tmp_dir, f"{db_id}_{index}.db"))
-        connection_string = f"sqlite:///{db_path}"
-        tasks.append((index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout))
+        if inmemory:
+            memory_name = f"parseval_{db_id}_{index}"
+            memory_uri = f"file:{memory_name}?mode=memory&cache=shared"
+            connection_string = f"sqlite:///{memory_uri}&uri=true"
+        else:
+            db_path = os.path.abspath(os.path.join(tmp_dir, f"{db_id}_{index}.db"))
+            connection_string = f"sqlite:///{db_path}"
+            memory_uri = None
+        tasks.append((index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri))
 
     if workers <= 1:
         records = [
@@ -168,7 +185,8 @@ def run_disprove_experiment(
                     }
         records = [records_by_index[index] for index, *_rest in tasks]
 
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if tmp_dir is not None:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     metrics = compute_metrics(records)
 
@@ -249,6 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=360, help="Query execution timeout per task in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--inmemory", action="store_true", help="Use SQLite in-memory database per task")
     args = parser.parse_args()
     run_disprove_experiment(
         schema_fp=args.schema_fp,
@@ -259,4 +278,5 @@ if __name__ == "__main__":
         start=args.start,
         workers=args.workers,
         timeout=args.timeout,
+        inmemory=args.inmemory,
     )
