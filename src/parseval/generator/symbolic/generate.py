@@ -12,11 +12,6 @@ from parseval.generator.coverage import (
     SemanticCoverageRecorder,
     _coverage_ratio,
 )
-from parseval.generator.helper import (
-    leaf_table_scans,
-    resolve_column_reference,
-    same_identifier,
-)
 from parseval.instance import Instance
 from parseval.plan.context import DerivedSchema
 from parseval.plan.explain import (
@@ -26,18 +21,17 @@ from parseval.plan.explain import (
     Limit,
     Plan,
     Sort,
+    Step,
 )
 from parseval.plan.rex import Environment, concrete
 from parseval.solver.types import Problem, SolverVar
 
 from .operator import (
-    AggregateEncodeStep,
     EncodePipeline,
-    ScanEncodeStep,
-    _database_constraints_for_solver,
     _root_aggregate,
     _root_fetch,
     pipeline_ordered_steps,
+    schema_constraints_for_solver_row,
 )
 from parseval.generator.speculate import speculate
 
@@ -103,18 +97,29 @@ def _generate_from_plan(
     current_bounds = _bounds_for_plan(plan, bounds or BmcBounds())
     if before_counts is None:
         before_counts = _row_counts(instance)
-    pipeline = EncodePipeline(plan, instance, bounds=current_bounds)
+    pipeline = EncodePipeline(
+        plan,
+        instance,
+        bounds=current_bounds,
+        base_row_counts=before_counts,
+    )
     schema = pipeline.forward()
     tree = schema.coverage_tree
     if tree is None:
-        pipeline = EncodePipeline(plan, instance, bounds=current_bounds)
+        pipeline = EncodePipeline(
+            plan,
+            instance,
+            bounds=current_bounds,
+            base_row_counts=before_counts,
+        )
         schema = pipeline.forward()
         tree = schema.coverage_tree
     schema_failure_reason = getattr(pipeline, "schema_failure_reason", "")
+    demand_failures = tuple(getattr(pipeline, "demand_failure_reasons", ()))
     evaluated_tree = (
         SemanticCoverageRecorder(plan, instance).evaluate_tree(
             tree,
-            _having_filter_statuses(plan, instance),
+            _having_filter_statuses(plan, instance, tree),
         )
         if tree is not None
         else None
@@ -124,8 +129,19 @@ def _generate_from_plan(
     evidence = _evidence_for_obligations(obligations, schema)
     schema.obligations.extend(obligations)
     schema.evidence.update(evidence)
-    schema.status = "unknown" if schema_failure_reason else "sat"
-    schema.reason = schema_failure_reason
+    if schema_failure_reason:
+        failure_reasons = (schema_failure_reason,)
+    elif schema.rows:
+        failure_reasons = ()
+    else:
+        pending_reasons = _required_pending_reasons(obligations)
+        failure_reasons = tuple(
+            reason
+            for reason in (*demand_failures, *pending_reasons)
+            if reason
+        )
+    schema.status = "unknown" if failure_reasons else "sat"
+    schema.reason = ";".join(dict.fromkeys(failure_reasons))
     schema.create_rows = _created_rows_since(instance, before_counts)
     schema.assignments = _assignments_for_created_rows(instance, schema.create_rows)
     schema.problem = _problem_for_schema(
@@ -139,6 +155,21 @@ def _generate_from_plan(
     schema.bounds = current_bounds
     _attach_generation_state(instance, schema=schema, obligations=tuple(obligations))
     return instance
+
+
+def _required_pending_reasons(
+    obligations: Sequence[CoverageObligation],
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    required_kinds = {"base_row", "filter", "join", "ordering", "limit", "aggregate"}
+    for obligation in obligations:
+        if obligation.status != "pending":
+            continue
+        if obligation.kind in required_kinds:
+            reasons.append(
+                f"pending_coverage:{obligation.kind}:{obligation.target}"
+            )
+    return tuple(reasons)
 
 
 def _bounds_for_plan(plan: Plan, bounds: BmcBounds) -> BmcBounds:
@@ -161,19 +192,28 @@ def _bounds_for_plan(plan: Plan, bounds: BmcBounds) -> BmcBounds:
 def _having_filter_statuses(
     plan: Plan,
     instance: Instance,
+    tree: CoverageTreeNode,
 ) -> dict[str, str]:
     statuses: dict[str, str] = {}
-    for index, step in enumerate(pipeline_ordered_steps(plan)):
+    aggregate_filters: dict[int, tuple[Filter, Aggregate]] = {}
+    for step in pipeline_ordered_steps(plan):
         if not isinstance(step, Filter) or step.condition is None:
             continue
         aggregate_step = _single_aggregate_dependency(step)
         if aggregate_step is None:
             continue
-        prefix = f"{index}.{step.type_name}"
-        if _aggregate_filter_has_outcome(step, aggregate_step, instance, True):
-            statuses[f"{prefix}.true"] = "covered"
-        if _aggregate_filter_has_outcome(step, aggregate_step, instance, False):
-            statuses[f"{prefix}.false"] = "covered"
+        aggregate_filters[id(step)] = (step, aggregate_step)
+    for target in tree.iter_targets():
+        if target.kind != "filter":
+            continue
+        match = aggregate_filters.get(id(target.step))
+        if match is None:
+            continue
+        step, aggregate_step = match
+        if _aggregate_filter_has_outcome(plan, step, aggregate_step, instance, True):
+            statuses[f"{target.id.rsplit('.', 1)[0]}.true"] = "covered"
+        if _aggregate_filter_has_outcome(plan, step, aggregate_step, instance, False):
+            statuses[f"{target.id.rsplit('.', 1)[0]}.false"] = "covered"
     return statuses
 
 
@@ -185,33 +225,35 @@ def _single_aggregate_dependency(step: Filter) -> Aggregate | None:
 
 
 def _aggregate_filter_has_outcome(
+    plan: Plan,
     filter_step: Filter,
     aggregate_step: Aggregate,
     instance: Instance,
     outcome: bool,
 ) -> bool:
-    for row in _aggregate_rows(aggregate_step, instance):
+    for row in _existing_schema_for_step(plan, instance, aggregate_step).rows:
         if concrete(filter_step.condition, Environment.from_row(row)) is outcome:
             return True
     return False
 
 
-def _aggregate_rows(
-    aggregate_step: Aggregate,
+def _existing_schema_for_step(
+    plan: Plan,
     instance: Instance,
-) -> Sequence:
-    child = _aggregate_child_schema(aggregate_step, instance)
-    return AggregateEncodeStep(aggregate_step, instance=instance).forward(child).rows
-
-
-def _aggregate_child_schema(
-    aggregate_step: Aggregate,
-    instance: Instance,
+    root: Step,
 ) -> DerivedSchema:
-    scans = leaf_table_scans(aggregate_step)
-    if len(scans) != 1:
-        return DerivedSchema(columns=(), rows=[])
-    return ScanEncodeStep(scans[0], instance=instance).forward()
+    pipeline = EncodePipeline(plan, instance, base_row_counts=_row_counts(instance))
+    cache: dict[Step, DerivedSchema] = {}
+
+    def process(step: Step) -> DerivedSchema:
+        if step in cache:
+            return cache[step]
+        children = tuple(process(dependency) for dependency in step.dependencies)
+        schema = pipeline._build_operator(step).forward(*children)
+        cache[step] = schema
+        return schema
+
+    return process(root)
 
 
 def _row_counts(instance: Instance) -> dict[str, int]:
@@ -249,14 +291,8 @@ def _problem_for_schema(
 ) -> Problem:
     constraints = list(schema.constraints)
     variables = set(assignments)
-    constrained_columns = _constraint_columns_by_table(
-        instance,
-        create_rows,
-        constraints,
-    )
     for table, rows in create_rows.items():
         table_node = instance.resolve_table(table)
-        exact_columns = constrained_columns.get(table_node.name, set())
         for row_index, row in enumerate(rows):
             sv_map = {
                 instance.resolve_column(table_node, column).name: _created_cell_solver_var(
@@ -269,11 +305,11 @@ def _problem_for_schema(
             }
             exact_columns = set(sv_map)
             constraints.extend(
-                _database_constraints_for_solver(
+                schema_constraints_for_solver_row(
                     instance,
                     table_node,
                     sv_map,
-                    exact_columns,
+                    exact_columns=exact_columns,
                 )
             )
     return Problem(
@@ -281,33 +317,6 @@ def _problem_for_schema(
         equalities=list(schema.equalities),
         variables=variables,
     )
-
-
-def _constraint_columns_by_table(
-    instance: Instance,
-    create_rows: Mapping[exp.Table, Sequence[Mapping[object, object]]],
-    constraints: Sequence[exp.Expression],
-) -> Dict[str, set[str]]:
-    tables = tuple(instance.resolve_table(table) for table in create_rows)
-    referenced: Dict[str, set[str]] = {table.name: set() for table in tables}
-    for constraint in constraints:
-        for column in constraint.find_all(exp.Column):
-            if not isinstance(column.this, exp.Identifier):
-                continue
-            for table in tables:
-                qualifier = column.args.get("table")
-                if qualifier is not None and not same_identifier(
-                    qualifier,
-                    table.this,
-                    instance.dialect,
-                ):
-                    continue
-                resolved = resolve_column_reference(instance, table, column)
-                if resolved is None:
-                    continue
-                referenced[table.name].add(resolved.name)
-                break
-    return referenced
 
 
 def _assignments_for_created_rows(
@@ -320,7 +329,6 @@ def _assignments_for_created_rows(
         for row_index, row in enumerate(rows):
             for column, value in row.items():
                 column_node = instance.resolve_column(table_node, column)
-                dtype = instance.get_column_type(table_node, column_node)
                 var = _created_cell_solver_var(
                     instance,
                     table_node,
@@ -370,19 +378,6 @@ def _attach_generation_state(
         coverage_tree=schema.coverage_tree,
         coverage_ratio=schema.coverage_ratio,
     )
-
-
-def _obligations_for_status(
-    plan: Plan,
-    instance: Instance | None,
-    status: str,
-) -> tuple[CoverageObligation, ...]:
-    if instance is None:
-        return ()
-    tree = EncodePipeline(plan, instance).forward().coverage_tree
-    targets = tree.iter_targets() if tree is not None else ()
-    mapped = "infeasible" if status == "unsat" else status
-    return tuple(target.obligation(mapped) for target in targets)
 
 
 def _evidence_for_obligations(

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import json
 import unittest
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 from sqlglot import exp
@@ -14,11 +16,10 @@ from parseval.generator.symbolic.generate import generate
 from parseval.generator.symbolic.operator import (
     AggregateEncodeStep,
     EncodePipeline,
-    _database_constraints_for_solver,
     _aggregate_expression_map,
-    _aggregate_key,
     _schema_constraints_for_solver_rows,
     _solve_table_rows,
+    schema_constraints_for_solver_row,
 )
 from parseval.instance import Instance
 from parseval.domain.exceptions import DomainError
@@ -510,12 +511,13 @@ class TestSymbolicGenerationResult(unittest.TestCase):
             this=exp.Cast(this=exp.column("x"), to=DataType.build("REAL"))
         )
 
-        plain_key = _aggregate_key(plain, "sqlite")
-        distinct_key = _aggregate_key(distinct, "sqlite")
-        casted_key = _aggregate_key(casted, "sqlite")
+        aggregate = Aggregate()
+        aggregate.aggregations = [plain, distinct, casted]
+        mapping = _aggregate_expression_map(aggregate, "sqlite")
 
-        self.assertNotEqual(plain_key.name, distinct_key.name)
-        self.assertNotEqual(plain_key.name, casted_key.name)
+        self.assertIs(mapping["count(x)"], plain)
+        self.assertIs(mapping["count(distinct x)"], distinct)
+        self.assertIs(mapping["count(cast(x as real))"], casted)
 
     def test_aggregate_expression_map_resolves_distinct_and_alias_independently(self):
         aggregate = Aggregate()
@@ -528,11 +530,8 @@ class TestSymbolicGenerationResult(unittest.TestCase):
 
         mapping = _aggregate_expression_map(aggregate, "sqlite")
 
-        self.assertIs(mapping[_aggregate_key(plain, "sqlite").name.casefold()], plain)
-        self.assertIs(
-            mapping[_aggregate_key(distinct, "sqlite").name.casefold()],
-            distinct.this,
-        )
+        self.assertIs(mapping["count(x)"], plain)
+        self.assertIs(mapping["count(distinct x)"], distinct.this)
         self.assertIs(mapping["distinct_x"], distinct.this)
 
     def test_symbolic_generation_keeps_cast_count_and_distinct_count_columns(self):
@@ -822,11 +821,11 @@ class TestSymbolicGenerationResult(unittest.TestCase):
             "optional_score": SolverVar(key="tasks.optional_score"),
         }
 
-        constraints = _database_constraints_for_solver(
+        constraints = schema_constraints_for_solver_row(
             instance,
             table,
             sv_map,
-            set(),
+            exact_columns=set(),
         )
 
         self.assertEqual([], constraints)
@@ -842,11 +841,11 @@ class TestSymbolicGenerationResult(unittest.TestCase):
             "a13": SolverVar(key="new.a13"),
         }
 
-        constraints = _database_constraints_for_solver(
+        constraints = schema_constraints_for_solver_row(
             instance,
             table,
             sv_map,
-            {"a12", "a13"},
+            exact_columns={"a12", "a13"},
         )
 
         self.assertTrue(
@@ -1389,6 +1388,26 @@ class TestSymbolicGenerationResult(unittest.TestCase):
         }
         self.assertEqual("covered", obligations[("ordering", "rank_tie")])
 
+    def test_unbounded_sort_coverage_adds_only_missing_tie_rows(self):
+        ddl = "CREATE TABLE scores (id INT PRIMARY KEY, points INT);"
+        query = "SELECT id FROM scores ORDER BY points DESC"
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, order_competitors=0, max_iterations=15),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        rows = snapshot_rows(result)["scores"]
+        self.assertLessEqual(len(rows), 5)
+        top_points = max(row["points"] for row in rows)
+        self.assertGreaterEqual(
+            sum(1 for row in rows if row["points"] == top_points),
+            2,
+        )
+
     def test_symbolic_generation_ranks_derived_physical_expression(self):
         ddl = "CREATE TABLE scores (id INT PRIMARY KEY, points INT, total INT);"
         query = "SELECT id FROM scores ORDER BY points / total DESC LIMIT 1"
@@ -1478,6 +1497,433 @@ class TestSymbolicGenerationResult(unittest.TestCase):
             for obligation in result.generation.obligations
         }
         self.assertEqual("unsupported", obligations[("ordering", "selected")])
+
+    def test_order_tie_child_with_unique_fk_creates_enough_parent_rows(self):
+        ddl = """
+        CREATE TABLE parent (id TEXT PRIMARY KEY);
+        CREATE TABLE child (
+            id TEXT PRIMARY KEY,
+            score REAL,
+            FOREIGN KEY (id) REFERENCES parent(id)
+        );
+        """
+        query = "SELECT id FROM child ORDER BY score DESC LIMIT 1"
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, order_competitors=0, max_iterations=1),
+        )
+
+        rows = snapshot_rows(result)
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertGreaterEqual(len(rows["parent"]), 2)
+        self.assertGreaterEqual(len(rows["child"]), 2)
+        scores = [row["score"] for row in rows["child"]]
+        self.assertLess(len(set(scores)), len(scores))
+
+    def test_grouped_join_having_parallelizes_unique_join_side(self):
+        ddl = """
+        CREATE TABLE schools (CDSCode TEXT PRIMARY KEY, School TEXT, FundingType TEXT, County TEXT);
+        CREATE TABLE satscores (
+            cds TEXT PRIMARY KEY,
+            AvgScrMath INT,
+            FOREIGN KEY (cds) REFERENCES schools(CDSCode)
+        );
+        """
+        query = """
+        SELECT s.School, s.FundingType
+        FROM satscores AS sat
+        JOIN schools AS s ON sat.cds = s.CDSCode
+        WHERE s.County = 'Riverside' AND sat.AvgScrMath > 400
+        GROUP BY s.School, s.FundingType
+        HAVING AVG(sat.AvgScrMath) > 400
+        """
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, groups=1, rows_per_group=3, max_iterations=2),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        query_rows = sqlite_rows(ddl, result.generation.create_rows, query)
+        self.assertTrue(query_rows)
+
+    def test_realworld_grouped_join_having_materializes_rows(self):
+        schemas = json.loads(Path("data/sqlite/schema.json").read_text(encoding="utf-8"))
+        ddl = ";".join(schemas["california_schools"])
+        query = """
+        SELECT s.School, s.FundingType
+        FROM satscores AS sat
+        JOIN schools AS s ON sat.cds = s.CDSCode
+        WHERE s.County = 'Riverside' AND sat.AvgScrMath > 400
+        GROUP BY s.School, s.FundingType
+        HAVING AVG(sat.AvgScrMath) > 400
+        """
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(max_iterations=4),
+        )
+
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+
+    def test_scalar_order_tie_values_drive_outer_filter_materialization(self):
+        ddl = """
+        CREATE TABLE frpm (
+            CDSCode TEXT PRIMARY KEY,
+            frpm_count INT
+        );
+        CREATE TABLE satscores (
+            cds TEXT PRIMARY KEY,
+            NumTstTakr INT,
+            FOREIGN KEY (cds) REFERENCES frpm(CDSCode)
+        );
+        """
+        query = """
+        SELECT NumTstTakr
+        FROM satscores
+        WHERE cds = (
+            SELECT CDSCode FROM frpm ORDER BY frpm_count DESC LIMIT 1
+        )
+        """
+
+        instance = Instance(ddl, name="scalar_tie_values", dialect="sqlite")
+        instance.create_rows(
+            {
+                "frpm": [
+                    {"CDSCode": "A", "frpm_count": 10},
+                    {"CDSCode": "B", "frpm_count": 10},
+                ]
+            }
+        )
+
+        result = generate_query_database(
+            instance,
+            query,
+            bounds=BmcBounds(table_rows=1, order_competitors=0, max_iterations=2),
+        )
+
+        rows = snapshot_rows(instance)
+        self.assertEqual("sat", result.status, result.reason)
+        score_codes = {row["cds"] for row in rows["satscores"]}
+        self.assertTrue({"A", "B"} <= score_codes)
+
+    def test_scalar_order_limit_generates_peer_from_selected_sort_value(self):
+        ddl = """
+        CREATE TABLE frpm (
+            CDSCode TEXT PRIMARY KEY,
+            frpm_count INT
+        );
+        CREATE TABLE satscores (
+            cds TEXT PRIMARY KEY,
+            NumTstTakr INT,
+            FOREIGN KEY (cds) REFERENCES frpm(CDSCode)
+        );
+        """
+        query = """
+        SELECT NumTstTakr
+        FROM satscores
+        WHERE cds = (
+            SELECT CDSCode FROM frpm ORDER BY frpm_count DESC LIMIT 1
+        )
+        """
+
+        result = generate_query_database(
+            ddl,
+            query,
+            dialect="sqlite",
+            bounds=BmcBounds(table_rows=1, order_competitors=0, max_iterations=2),
+        )
+
+        rows = snapshot_rows(result)
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertGreaterEqual(len(rows["frpm"]), 2)
+        counts = [row["frpm_count"] for row in rows["frpm"]]
+        max_count = max(counts)
+        tied_codes = {
+            row.get("CDSCode", row.get("cdscode"))
+            for row in rows["frpm"]
+            if row["frpm_count"] == max_count
+        }
+        self.assertGreaterEqual(len(tied_codes), 2)
+        score_codes = {row["cds"] for row in rows["satscores"]}
+        self.assertTrue(tied_codes <= score_codes)
+
+    def test_unsatisfied_materializable_demand_marks_generation_unknown(self):
+        ddl = """
+        CREATE TABLE child (
+            id TEXT PRIMARY KEY,
+            score INT CHECK (score < 0)
+        );
+        """
+        instance = Instance(ddl, name="unsat_child", dialect="sqlite")
+        plan = explain(ddl, "SELECT id FROM child WHERE score > 0", "sqlite")
+
+        result = symbolic_generate_module._generate_from_plan(
+            plan, instance, bounds=BmcBounds(max_iterations=0)
+        )
+
+        self.assertEqual("unknown", result.generation.status)
+        self.assertIn("demand_unsat:child", result.generation.reason)
+
+    def test_high_offset_simple_equi_join_uses_correlated_demands(self):
+        ddl = """
+        CREATE TABLE schools (
+            CDSCode TEXT PRIMARY KEY,
+            Phone TEXT,
+            Ext TEXT
+        );
+        CREATE TABLE satscores (
+            cds TEXT PRIMARY KEY,
+            AvgScrWrite INT,
+            FOREIGN KEY (cds) REFERENCES schools(CDSCode)
+        );
+        """
+        query = """
+        SELECT T2.Phone, T2.Ext
+        FROM satscores AS T1
+        INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode
+        ORDER BY T1.AvgScrWrite DESC
+        LIMIT 122, 1
+        """
+
+        with patch.object(
+            symbolic_operator,
+            "_solve_join_key_value",
+            wraps=symbolic_operator._solve_join_key_value,
+        ) as solve_join_key:
+            result = generate_query_database(
+                ddl,
+                query,
+                dialect="sqlite",
+                bounds=BmcBounds(
+                    table_rows=1,
+                    order_competitors=0,
+                    max_iterations=0,
+                ),
+            )
+
+        rows = snapshot_rows(result)
+        self.assertGreaterEqual(len(rows["schools"]), 123)
+        self.assertGreaterEqual(len(rows["satscores"]), 123)
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+        solve_join_key.assert_not_called()
+
+    def test_integer_pk_fk_equi_join_uses_correlated_demands(self):
+        ddl = """
+        CREATE TABLE parent (
+            id INT PRIMARY KEY,
+            label TEXT
+        );
+        CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            score INT,
+            FOREIGN KEY (parent_id) REFERENCES parent(id)
+        );
+        """
+        query = """
+        SELECT parent.label
+        FROM child
+        JOIN parent ON child.parent_id = parent.id
+        ORDER BY child.score DESC
+        LIMIT 3
+        """
+
+        with patch.object(
+            symbolic_operator,
+            "_solve_join_key_value",
+            wraps=symbolic_operator._solve_join_key_value,
+        ) as solve_join_key:
+            result = generate_query_database(
+                ddl,
+                query,
+                dialect="sqlite",
+                bounds=BmcBounds(table_rows=1, max_iterations=0),
+            )
+
+        rows = snapshot_rows(result)
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(rows["parent"])
+        self.assertTrue(rows["child"])
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+        solve_join_key.assert_not_called()
+
+    def test_text_pk_fk_equi_join_uses_correlated_demands(self):
+        ddl = """
+        CREATE TABLE parent (
+            id TEXT PRIMARY KEY,
+            label TEXT
+        );
+        CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id TEXT,
+            score INT,
+            FOREIGN KEY (parent_id) REFERENCES parent(id)
+        );
+        """
+        query = """
+        SELECT parent.label
+        FROM child
+        JOIN parent ON child.parent_id = parent.id
+        ORDER BY child.score DESC
+        LIMIT 3
+        """
+
+        with patch.object(
+            symbolic_operator,
+            "_solve_join_key_value",
+            wraps=symbolic_operator._solve_join_key_value,
+        ) as solve_join_key:
+            result = generate_query_database(
+                ddl,
+                query,
+                dialect="sqlite",
+                bounds=BmcBounds(table_rows=1, max_iterations=0),
+            )
+
+        rows = snapshot_rows(result)
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertTrue(rows["parent"])
+        self.assertTrue(rows["child"])
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+        solve_join_key.assert_not_called()
+
+    def test_many_to_many_join_demands_do_not_force_distinct_keys(self):
+        ddl = """
+        CREATE TABLE left_t (
+            id INT PRIMARY KEY,
+            join_key TEXT,
+            score INT
+        );
+        CREATE TABLE right_t (
+            id INT PRIMARY KEY,
+            join_key TEXT
+        );
+        """
+        query = """
+        SELECT left_t.id
+        FROM left_t
+        JOIN right_t ON left_t.join_key = right_t.join_key
+        ORDER BY left_t.score DESC
+        LIMIT 3
+        """
+
+        join_batch_problems = []
+        original_solve = symbolic_operator.Solver.solve
+        with patch.object(symbolic_operator.Solver, "solve", autospec=True) as solve:
+            def solve_and_capture(solver, problem):
+                if any(
+                    "join.batch" in variable.var_key
+                    for variable in problem.variables
+                ):
+                    join_batch_problems.append(problem)
+                return original_solve(solver, problem)
+
+            solve.side_effect = solve_and_capture
+            result = generate_query_database(
+                ddl,
+                query,
+                dialect="sqlite",
+                bounds=BmcBounds(table_rows=1, max_iterations=0),
+            )
+
+        rows = snapshot_rows(result)
+        self.assertEqual("sat", result.generation.status, result.generation.reason)
+        self.assertGreaterEqual(len(rows["left_t"]), 3)
+        self.assertGreaterEqual(len(rows["right_t"]), 3)
+        self.assertEqual([], join_batch_problems)
+        self.assertTrue(sqlite_rows(ddl, result.generation.create_rows, query))
+
+    def test_existing_parent_row_can_satisfy_correlated_join_demand(self):
+        ddl = """
+        CREATE TABLE parent (
+            id INT PRIMARY KEY,
+            label TEXT
+        );
+        CREATE TABLE child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            score INT,
+            FOREIGN KEY (parent_id) REFERENCES parent(id)
+        );
+        """
+        query = """
+        SELECT parent.label
+        FROM child
+        JOIN parent ON child.parent_id = parent.id
+        ORDER BY child.score DESC
+        LIMIT 1
+        """
+        instance = Instance(ddl, name="existing_parent", dialect="sqlite")
+        instance.create_rows({"parent": [{"id": 10, "label": "existing"}]})
+
+        with patch.object(
+            symbolic_operator,
+            "_solve_join_key_value",
+            wraps=symbolic_operator._solve_join_key_value,
+        ) as solve_join_key:
+            result = generate_query_database(
+                instance,
+                query,
+                bounds=BmcBounds(table_rows=1, max_iterations=0),
+            )
+
+        rows = snapshot_rows(instance)
+        self.assertEqual("sat", result.status, result.reason)
+        self.assertTrue(any(parent["id"] == 10 for parent in rows["parent"]))
+        self.assertTrue(
+            any(child["parent_id"] == 10 for child in rows["child"]),
+            rows["child"],
+        )
+        self.assertTrue(sqlite_rows(ddl, rows, query))
+        solve_join_key.assert_not_called()
+
+    def test_simple_outer_equi_joins_use_correlated_demands_for_matched_rows(self):
+        ddl = """
+        CREATE TABLE left_t (
+            id TEXT PRIMARY KEY,
+            score INT
+        );
+        CREATE TABLE right_t (
+            id TEXT PRIMARY KEY,
+            label TEXT
+        );
+        """
+
+        for join_type in ("LEFT", "RIGHT"):
+            with self.subTest(join_type=join_type):
+                query = f"""
+                SELECT l.id
+                FROM left_t AS l
+                {join_type} JOIN right_t AS r ON l.id = r.id
+                ORDER BY l.score DESC
+                LIMIT 2
+                """
+                with patch.object(
+                    symbolic_operator,
+                    "_solve_join_key_value",
+                    wraps=symbolic_operator._solve_join_key_value,
+                ) as solve_join_key:
+                    result = generate_query_database(
+                        ddl,
+                        query,
+                        dialect="sqlite",
+                        bounds=BmcBounds(table_rows=1, max_iterations=0),
+                    )
+
+                self.assertEqual("sat", result.generation.status, result.generation.reason)
+                rows = snapshot_rows(result)
+                self.assertTrue(rows["left_t"])
+                self.assertTrue(rows["right_t"])
+                solve_join_key.assert_not_called()
 
 
 if __name__ == "__main__":

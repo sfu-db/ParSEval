@@ -11,6 +11,7 @@ from parseval.coercion import CoercionError, coerce_literal_value
 from parseval.domain.exceptions import DomainError
 from parseval.generator.schema_constraints import (
     SchemaConstraintLoweringError,
+    _not_null_constraints_for_columns,
     batch_unique_constraints_for_solver_rows,
     literal_for_value as _literal_for_value,
     schema_constraints_for_solver_row,
@@ -40,7 +41,6 @@ from parseval.plan.explain import (
     Window,
 )
 from parseval.plan.rex import Environment, Variable, concrete
-from parseval.solver.types import SolverVar
 from parseval.generator.coverage import (
     CoverageTreeNode,
     SemanticTarget,
@@ -48,7 +48,7 @@ from parseval.generator.coverage import (
     _step_semantic_targets,
     sql_order_key
 )
-from parseval.generator.helper import same_identifier
+from parseval.generator.helper import leaf_table_scans, same_identifier
 
 if TYPE_CHECKING:
     from parseval.instance import Instance
@@ -74,6 +74,13 @@ class ExpressionDemand:
     rank: int | None = None
     descending: bool = False
     origin: str = ""
+
+
+@dataclass(frozen=True)
+class JoinKeyRef:
+    origin: Tuple[exp.Expression, exp.Expression]
+    pair_rank: int
+    key_index: int
 
 
 @dataclass(frozen=True)
@@ -152,43 +159,6 @@ def _row_value_dict(row) -> Dict[exp.Identifier, Any]:
 def _step_name(step: Step) -> str:
     return step.name.name if step.name else type(step).__name__
 
-
-def _database_constraints_for_solver(
-    instance: Instance,
-    table: exp.Table,
-    sv_map: Mapping[str, SolverVar],
-    exact_columns: Set[str],
-    *,
-    constrain_exact_fks: bool = True,
-) -> List[exp.Expression]:
-    return schema_constraints_for_solver_row(
-        instance,
-        table,
-        sv_map,
-        exact_columns=exact_columns,
-        constrain_exact_fks=constrain_exact_fks,
-    )
-
-
-def _not_null_constraints_for_columns(
-    table_schema: Any,
-    sv_map: Mapping[str, SolverVar],
-    column_names: Set[str],
-) -> List[exp.Expression]:
-    constraints: List[exp.Expression] = []
-    for column, column_schema in table_schema.columns.items():
-        if (
-            column.name not in column_names
-            or column.name not in sv_map
-            or column_schema.nullable
-        ):
-            continue
-        constraints.append(
-            exp.Not(this=exp.Is(this=sv_map[column.name], expression=exp.Null()))
-        )
-    return constraints
-
-
 def _row_value(row: Mapping[object, object], column: exp.Identifier) -> object:
     if hasattr(row, "column_values"):
         value = row[column]
@@ -198,6 +168,17 @@ def _row_value(row: Mapping[object, object], column: exp.Identifier) -> object:
     else:
         value = row.get(column.name)
     return value.concrete if isinstance(value, Variable) else value
+
+
+def _solved_expression_value(
+    row: Mapping[object, object],
+    expression: exp.Expression,
+) -> object:
+    while isinstance(expression, exp.Cast):
+        expression = expression.this
+    if isinstance(expression, exp.Column) and isinstance(expression.this, exp.Identifier):
+        return _row_value(row, expression.this)
+    return _MISSING
 
 
 def _solver_var_for_column(
@@ -233,17 +214,25 @@ def _schema_constraints_for_solver_rows(
     table: exp.Table,
     sv_rows: Sequence[Mapping[str, SolverVar]],
     exact_columns_by_row: Sequence[Set[str]],
+    unconstrained_fk_columns_by_row: Sequence[Set[str]] = (),
 ) -> List[exp.Expression]:
     table_schema = instance.database_constraints(table)
     constraints: List[exp.Expression] = []
     required_non_null_by_row: List[Set[str]] = [set() for _ in sv_rows]
-    for sv_map, exact_columns in zip(sv_rows, exact_columns_by_row):
+    if not unconstrained_fk_columns_by_row:
+        unconstrained_fk_columns_by_row = tuple(set() for _ in sv_rows)
+    for sv_map, exact_columns, unconstrained_fk_columns in zip(
+        sv_rows,
+        exact_columns_by_row,
+        unconstrained_fk_columns_by_row,
+    ):
         constraints.extend(
             schema_constraints_for_solver_row(
                 instance,
                 table,
                 sv_map,
                 exact_columns=exact_columns,
+                unconstrained_fk_columns=unconstrained_fk_columns,
             )
         )
 
@@ -271,14 +260,16 @@ def _expression_demand_batch_constraints(
     expression_demands: Sequence[ExpressionDemand],
     sv_rows: Sequence[Mapping[str, SolverVar]],
     dialect: str | None = None,
+    correlated_bindings: Mapping[JoinKeyRef, object] | None = None,
 ) -> List[exp.Expression]:
     del dialect
+    correlated_bindings = correlated_bindings or {}
     constraints: List[exp.Expression] = []
     distinct_by_origin: Dict[str, Dict[int, exp.Expression]] = {}
     equal_by_origin: Dict[Tuple[str, object | None], Dict[int, exp.Expression]] = {}
     order_by_origin: Dict[str, Dict[int, Tuple[exp.Expression, object | None]]] = {}
     for demand in expression_demands:
-        if demand.kind not in {"distinct", "order", "equal"} or demand.rank is None:
+        if demand.kind not in {"distinct", "order", "equal", "literal", "correlated"} or demand.rank is None:
             continue
         if demand.rank < 0 or demand.rank >= len(sv_rows):
             continue
@@ -295,6 +286,31 @@ def _expression_demand_batch_constraints(
             distinct_by_origin.setdefault(origin, {})[demand.rank] = expression
         elif demand.kind == "equal":
             equal_by_origin.setdefault((origin, demand.value), {})[demand.rank] = expression
+        elif demand.kind == "correlated":
+            if isinstance(demand.value, JoinKeyRef) and demand.value in correlated_bindings:
+                constraints.append(
+                    exp.EQ(
+                        this=expression,
+                        expression=_literal_for_value(correlated_bindings[demand.value]),
+                    )
+                )
+            else:
+                constraints.append(
+                    exp.Not(
+                        this=exp.Is(
+                            this=expression,
+                            expression=exp.Null(),
+                        )
+                    )
+                )
+        elif demand.kind == "literal":
+            if demand.value is not None:
+                constraints.append(
+                    exp.EQ(
+                        this=expression,
+                        expression=_literal_for_value(demand.value),
+                    )
+                )
         else:
             order_by_origin.setdefault(origin, {})[demand.rank] = (
                 expression,
@@ -342,15 +358,29 @@ def _solve_table_rows(
     *,
     dialect: str | None,
     expression_demands: Sequence[ExpressionDemand] = (),
+    correlated_bindings: Mapping[JoinKeyRef, object] | None = None,
     timeout_ms: int = 2000,
 ) -> Optional[List[Dict[str, object]]]:
     _solve_table_rows.schema_failure_reason = ""
+    _solve_table_rows.solve_failure_reason = ""
     table_node = instance.resolve_table(table)
     table_schema = instance.database_constraints(table_node)
     sv_rows: List[Dict[str, SolverVar]] = []
     exact_columns_by_row: List[Set[str]] = []
+    unconstrained_fk_columns_by_row: List[Set[str]] = []
     constraints: List[exp.Expression] = []
     base_index = len(instance.get_rows(table_node))
+    unique_columns = {
+        column.name
+        for group in table_schema.uniqueness_groups()
+        for column in group
+    }
+    fresh_fk_parent_pool_columns = _fresh_fk_parent_pool_columns(
+        instance,
+        table_node,
+        row_specs,
+        unique_columns,
+    )
 
     for offset, row in enumerate(row_specs):
         sv_map = {
@@ -386,6 +416,7 @@ def _solve_table_rows(
                     exact_columns.add(column.this.name)
             constraints.append(_rewrite_columns_to_solver_vars(predicate, sv_map))
         exact_columns_by_row.append(exact_columns)
+        unconstrained_fk_columns_by_row.append(fresh_fk_parent_pool_columns)
 
     try:
         constraints.extend(
@@ -394,22 +425,30 @@ def _solve_table_rows(
                 table_node,
                 sv_rows,
                 exact_columns_by_row,
+                unconstrained_fk_columns_by_row,
             )
         )
     except SchemaConstraintLoweringError as exc:
         _solve_table_rows.schema_failure_reason = exc.reason
         return None
     constraints.extend(
-        _expression_demand_batch_constraints(
-            expression_demands,
-            sv_rows,
-            dialect,
+            _expression_demand_batch_constraints(
+                expression_demands,
+                sv_rows,
+                dialect,
+                correlated_bindings,
+            )
+        )
+    result = Solver(dialect=dialect or instance.dialect, timeout_ms=timeout_ms).solve(
+        Problem(
+            constraints=constraints,
+            variables={sv for sv_map in sv_rows for sv in sv_map.values()},
         )
     )
-    result = Solver(dialect=dialect or instance.dialect, timeout_ms=timeout_ms).solve(
-        Problem(constraints=constraints)
-    )
     if not result.sat:
+        _solve_table_rows.solve_failure_reason = (
+            f"demand_{result.status}:{table_node.name}:{result.reason or 'unknown'}"
+        )
         return None
 
     solved_rows: List[Dict[str, object]] = []
@@ -424,6 +463,42 @@ def _solve_table_rows(
                 solved[column.name] = result.assignments[sv]
         solved_rows.append(solved)
     return solved_rows
+
+
+def _fresh_fk_parent_pool_columns(
+    instance: Instance,
+    table: exp.Table,
+    rows: Sequence[Mapping[object, object]],
+    unique_columns: Set[str],
+) -> Set[str]:
+    table_schema = instance.database_constraints(table)
+    columns: Set[str] = set()
+    for fk in table_schema.foreign_keys:
+        if len(fk.source_columns) != 1 or len(fk.target_columns) != 1:
+            continue
+        source_column = fk.source_columns[0]
+        target_column = fk.target_columns[0]
+        source = source_column.name
+        if source not in unique_columns:
+            continue
+        values = [
+            _row_value(row, source_column)
+            for row in rows
+            if _row_value(row, source_column) is not None
+        ]
+        if len(values) < len(rows):
+            existing_source_values = {
+                _row_value(existing, source_column)
+                for existing in instance.get_rows(table)
+            }
+            target_table = instance.resolve_table(fk.target_table)
+            unused_target_values = {
+                _row_value(parent, target_column)
+                for parent in instance.get_rows(target_table)
+            } - existing_source_values
+            if len(unused_target_values) < len(rows) - len(values):
+                columns.add(source)
+    return columns
 
 
 def _parent_row_satisfies(
@@ -718,28 +793,24 @@ class FilterEncodeStep(EncodeStep):
             return
         if not context.pipeline._ensure_scalar_subquery_values(fs, context.cache):
             return
-        subquery_schemas = context.subquery_schemas_for(fs)
-        condition = self._condition_with_scalar_subqueries(
+        conditions = context.pipeline._conditions_with_scalar_subquery_values(
             fs.condition,
-            subquery_schemas,
-            require_ready=True,
+            context.cache,
         )
-        if condition.find(ScalarSubqueryRef):
+        if not conditions:
             return
-        count = demand.count
-        if any(_schema_is_single(schema) for schema in subquery_schemas) and count > 1:
-            count = 1
-        context.lower(
-            child,
-            SchemaDemand(
-                count=count,
-                predicates=demand.predicates + (condition,),
-                order_keys=demand.order_keys,
-                distinct=demand.distinct,
-                group_demands=demand.group_demands,
-                expression_demands=demand.expression_demands,
-            ),
-        )
+        for condition in conditions:
+            context.lower(
+                child,
+                SchemaDemand(
+                    count=demand.count,
+                    predicates=demand.predicates + (condition,),
+                    order_keys=demand.order_keys,
+                    distinct=demand.distinct,
+                    group_demands=demand.group_demands,
+                    expression_demands=demand.expression_demands,
+                ),
+            )
 
     def _condition_with_scalar_subqueries(
         self,
@@ -1006,11 +1077,15 @@ class AggregateEncodeStep(EncodeStep):
         child = children[0]
         step: Aggregate = self.step
         group_exprs = tuple(step.group or ())
+        group_sources = tuple(
+            expression.this if isinstance(expression, exp.Alias) else expression
+            for expression in group_exprs
+        )
         aggregations = tuple(step.aggregations or ())
 
         grouped: Dict[Tuple[Any, ...], List[Row]] = {}
         for row in child.rows:
-            key = tuple(_expr_value(expr, row) for expr in group_exprs)
+            key = tuple(_expr_value(expr, row) for expr in group_sources)
             grouped.setdefault(key, []).append(row)
         if not grouped and not group_exprs:
             grouped[()] = []
@@ -1166,30 +1241,11 @@ class SortEncodeStep(EncodeStep):
         context: DemandContext,
     ) -> None:
         del output_schema
-        child = context.single_dependency(self.step)
-        required_count = _sort_required_child_count(
+        context.pipeline._materialize_sort_demand(
             self.step,
             demand,
             child_schemas[0],
-            int(getattr(context.bounds, "order_competitors", 0) or 0),
-        )
-        if required_count <= 0:
-            return
-        context.lower(
-            child,
-            SchemaDemand(
-                count=required_count,
-                predicates=demand.predicates,
-                order_keys=tuple(self.step.key or ()) + demand.order_keys,
-                distinct=demand.distinct,
-                group_demands=demand.group_demands,
-                expression_demands=demand.expression_demands
-                + _order_expression_demands(
-                    self.step.key or (),
-                    required_count,
-                    context.dialect,
-                ),
-            ),
+            context.cache,
         )
 
 
@@ -1399,13 +1455,12 @@ def _cell_value(value: Any) -> Any:
 
 
 def _expr_value(expr: exp.Expression, row: Row) -> Any:
+    if expr in row:
+        return _cell_value(row[expr])
     try:
         return concrete(expr, Environment.from_row(_row_mapping(row)))
     except Exception:
-        try:
-            return row[expr]
-        except KeyError:
-            return None
+        return None
 
 
 def _projection_output_item(
@@ -1473,44 +1528,30 @@ def _projection_expression_with_scalar_subqueries(
     return rewritten
 
 
-def _aggregate_key(
-    aggregate: exp.Expression,
-    dialect: str | None,
-) -> exp.Column:
-    return exp.Column(
-        this=exp.Identifier(
-            this=_aggregate_name(aggregate, dialect),
-            quoted=True,
-        )
-    )
-
-
 def _aggregate_output_keys(
     aggregations: Sequence[exp.Expression],
     dialect: str | None,
 ) -> Tuple[exp.Column, ...]:
     compatible_keys = tuple(
-        _aggregate_output_key(aggregate, dialect) for aggregate in aggregations
+        _quoted_column(_aggregate_output_name(aggregate, dialect))
+        for aggregate in aggregations
     )
     counts: Dict[str, int] = {}
     for key in compatible_keys:
         name = key.name.casefold()
         counts[name] = counts.get(name, 0) + 1
     return tuple(
-        _aggregate_key(aggregate, dialect)
+        _quoted_column(_aggregate_name(aggregate, dialect))
         if counts[compatible_key.name.casefold()] > 1
         else compatible_key
         for aggregate, compatible_key in zip(aggregations, compatible_keys)
     )
 
 
-def _aggregate_output_key(
-    aggregate: exp.Expression,
-    dialect: str | None,
-) -> exp.Column:
+def _quoted_column(name: str) -> exp.Column:
     return exp.Column(
         this=exp.Identifier(
-            this=_aggregate_output_name(aggregate, dialect),
+            this=name,
             quoted=True,
         )
     )
@@ -1627,7 +1668,7 @@ def _aggregate_expression_map(
         unaliased = expression.this if isinstance(expression, exp.Alias) else expression
         mapping[key.name.casefold()] = unaliased
         mapping[_expression_key(key, dialect)] = unaliased
-        canonical_key = _aggregate_key(expression, dialect)
+        canonical_key = _quoted_column(_aggregate_name(expression, dialect))
         mapping[canonical_key.name.casefold()] = unaliased
         mapping[_expression_key(canonical_key, dialect)] = unaliased
         mapping[_expression_key(unaliased, dialect)] = unaliased
@@ -3135,6 +3176,52 @@ def _order_expression_demands(
     return tuple(demands)
 
 
+def _order_expression_demands_for_sort(
+    sort: Sort,
+    schema: DerivedSchema,
+    count: int,
+    dialect: str | None = None,
+) -> Tuple[ExpressionDemand, ...]:
+    order_keys = sort.key or ()
+    if not order_keys or not schema.rows:
+        return _order_expression_demands(order_keys, count, dialect)
+    sorted_rows = _sorted_rows_for_step(sort, schema.rows)
+    fetch = sort.fetch or 1
+    selected = sorted_rows[:fetch]
+    if not selected:
+        return _order_expression_demands(order_keys, count, dialect)
+    selected_keys = {_sort_key_tuple(sort, row) for row in selected}
+    selected_ids = {id(row) for row in selected}
+    has_tie = any(
+        id(row) not in selected_ids and _sort_key_tuple(sort, row) in selected_keys
+        for row in sorted_rows
+    )
+    if has_tie:
+        return _order_expression_demands(order_keys, count, dialect)
+    reference = selected[0]
+    demands: List[ExpressionDemand] = []
+    for ordered in order_keys:
+        expr = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+        if not _expression_uses_only_schema_columns(expr, schema, dialect):
+            return _order_expression_demands(order_keys, count, dialect)
+        value = _expr_value(expr, reference)
+        if value is None:
+            return _order_expression_demands(order_keys, count, dialect)
+        for rank in range(count):
+            demands.append(
+                ExpressionDemand(
+                    expression=deepcopy(expr),
+                    kind="literal",
+                    value=value,
+                    rank=rank,
+                    origin=ordered.sql(dialect=dialect)
+                    if isinstance(ordered, exp.Expression)
+                    else str(ordered),
+                )
+            )
+    return tuple(demands)
+
+
 def _order_rank_value(rank: int, count: int, descending: bool) -> object:
     if count > 1 and rank == count - 1:
         return count if descending else 1
@@ -3146,7 +3233,7 @@ def _expression_demand_predicates(
 ) -> Tuple[exp.Expression, ...]:
     expression = demand.expression
     value = demand.value
-    if demand.kind == "equal":
+    if demand.kind in {"equal", "correlated"}:
         return ()
     if demand.kind == "predicate_expression":
         return (deepcopy(expression),)
@@ -3313,41 +3400,6 @@ def _normalize_expression_key(text: str) -> str:
         .replace(" ", "")
     )
 
-
-def _strip_generated_casts(text: str) -> str:
-    key = _normalize_expression_key(text)
-    while True:
-        start = key.find("cast(")
-        if start < 0:
-            return key
-        inner_start = start + len("cast(")
-        depth = 0
-        as_index: int | None = None
-        index = inner_start
-        while index < len(key):
-            char = key[index]
-            if char == "(":
-                depth += 1
-                index += 1
-                continue
-            if char == ")":
-                if depth == 0:
-                    break
-                depth -= 1
-                index += 1
-                continue
-            if depth == 0 and key.startswith("as", index):
-                as_index = index
-                break
-            index += 1
-        if as_index is None:
-            return key
-        end = key.find(")", as_index)
-        if end < 0:
-            return key
-        key = key[:start] + key[inner_start:as_index] + key[end + 1 :]
-
-
 def _split_predicate_by_schema(
     predicate: exp.Expression,
     left_schema: DerivedSchema,
@@ -3446,7 +3498,7 @@ def _sort_required_child_count(
     if competitor_count and not has_competitor:
         missing += competitor_count
     if not has_tie:
-        missing += 1
+        missing = max(missing, 2)
     return missing
 
 
@@ -3487,6 +3539,42 @@ def _sort_key_tuple(sort: Sort, row: Row) -> Tuple[Any, ...]:
     )
 
 
+def _sort_tie_scalar_values(
+    subquery_root: Step,
+    cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    dialect: str | None,
+) -> Tuple[object, ...]:
+    if not isinstance(subquery_root, Projection) or len(subquery_root.dependencies) != 1:
+        return ()
+    sort = next(iter(subquery_root.dependencies))
+    if not isinstance(sort, Sort) or len(sort.dependencies) != 1:
+        return ()
+    if not subquery_root.projections:
+        return ()
+    sort_child = next(iter(sort.dependencies))
+    child_schema = _schema_for(cache, sort_child)
+    sorted_rows = _sorted_rows_for_step(sort, child_schema.rows)
+    fetch = sort.fetch or 1
+    selected = sorted_rows[:fetch]
+    if not selected:
+        return ()
+    selected_keys = {_sort_key_tuple(sort, row) for row in selected}
+    selected_ids = {id(row) for row in selected}
+    tied_rows = [
+        row
+        for row in sorted_rows
+        if id(row) not in selected_ids and _sort_key_tuple(sort, row) in selected_keys
+    ]
+    if not tied_rows:
+        return ()
+    projection = subquery_root.projections[0]
+    expression = projection.this if isinstance(projection, exp.Alias) else projection
+    if not _expression_uses_only_schema_columns(expression, child_schema, dialect):
+        return ()
+    values = [_expr_value(expression, row) for row in selected + tied_rows]
+    return tuple(dict.fromkeys(value for value in values if value is not None))
+
+
 def _split_order_keys_by_schema(
     order_keys: Tuple[exp.Expression, ...],
     left_schema: DerivedSchema,
@@ -3502,6 +3590,43 @@ def _split_order_keys_by_schema(
             left.append(_expression_in_schema_scope(key, left_schema, dialect))
         elif columns and all(_schema_has_column(right_schema, column, dialect) for column in columns):
             right.append(_expression_in_schema_scope(key, right_schema, dialect))
+    return tuple(left), tuple(right)
+
+
+def _split_expression_demands_by_schema(
+    expression_demands: Sequence[ExpressionDemand],
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    dialect: str | None = None,
+) -> Tuple[Tuple[ExpressionDemand, ...], Tuple[ExpressionDemand, ...]]:
+    left: List[ExpressionDemand] = []
+    right: List[ExpressionDemand] = []
+    for demand in expression_demands:
+        expression = demand.expression
+        expr = expression.this if isinstance(expression, exp.Ordered) else expression
+        columns = tuple(expr.find_all(exp.Column))
+        if columns and all(_schema_has_column(left_schema, column, dialect) for column in columns):
+            left.append(
+                ExpressionDemand(
+                    expression=_expression_in_schema_scope(expression, left_schema, dialect),
+                    kind=demand.kind,
+                    value=demand.value,
+                    rank=demand.rank,
+                    descending=demand.descending,
+                    origin=demand.origin,
+                )
+            )
+        elif columns and all(_schema_has_column(right_schema, column, dialect) for column in columns):
+            right.append(
+                ExpressionDemand(
+                    expression=_expression_in_schema_scope(expression, right_schema, dialect),
+                    kind=demand.kind,
+                    value=demand.value,
+                    rank=demand.rank,
+                    descending=demand.descending,
+                    origin=demand.origin,
+                )
+            )
     return tuple(left), tuple(right)
 
 
@@ -3549,6 +3674,19 @@ def _schema_side_for_column(
     if _schema_has_column(right_schema, column, dialect):
         return "right"
     return None
+
+
+def _unambiguous_schema_side_for_column(
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    column: exp.Column,
+    dialect: str | None = None,
+) -> str | None:
+    in_left = _schema_has_column(left_schema, column, dialect)
+    in_right = _schema_has_column(right_schema, column, dialect)
+    if in_left == in_right:
+        return None
+    return "left" if in_left else "right"
 
 
 def _solve_join_key_value(
@@ -3725,6 +3863,66 @@ def _schema_column_values(
     return values
 
 
+def _schema_key_tuples(
+    schema: DerivedSchema,
+    columns: Sequence[exp.Column],
+    dialect: str | None = None,
+) -> Tuple[Tuple[object, ...], ...]:
+    visible_columns = tuple(
+        _visible_schema_column(schema, column, dialect)
+        for column in columns
+    )
+    if any(column is None for column in visible_columns):
+        return ()
+    values: List[Tuple[object, ...]] = []
+    for row in schema.rows:
+        row_values: List[object] = []
+        for column in visible_columns:
+            if column is None:
+                return ()
+            try:
+                value = concrete(row[column])
+            except KeyError:
+                break
+            if value is None:
+                break
+            row_values.append(value)
+        if len(row_values) == len(visible_columns):
+            values.append(tuple(row_values))
+    return tuple(dict.fromkeys(values))
+
+
+def _join_key_pairs_for_schemas(
+    join: Join,
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    dialect: str | None = None,
+) -> Tuple[Tuple[exp.Column, exp.Column], ...]:
+    key_pairs: List[Tuple[exp.Column, exp.Column]] = []
+    for left, right in join.on_keys:
+        if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+            return ()
+        left_target = _unambiguous_schema_side_for_column(
+            left_schema,
+            right_schema,
+            left,
+            dialect,
+        )
+        right_target = _unambiguous_schema_side_for_column(
+            left_schema,
+            right_schema,
+            right,
+            dialect,
+        )
+        if left_target is None or right_target is None or left_target == right_target:
+            return ()
+        if left_target == "left":
+            key_pairs.append((left, right))
+        else:
+            key_pairs.append((right, left))
+    return tuple(key_pairs)
+
+
 def _join_has_no_match(
     join: Join,
     cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
@@ -3754,6 +3952,33 @@ def _visible_schema_column(
         if _identifier_equal(candidate.this, column.this, dialect):
             return candidate
     return None
+
+
+def _join_side_needs_parallel_rows(
+    schema: DerivedSchema,
+    join_key: exp.Column,
+    count: int,
+    dialect: str | None,
+) -> bool:
+    if count <= 1:
+        return False
+    visible = _visible_schema_column(schema, join_key, dialect) or join_key
+    return schema.is_unique(visible)
+
+
+def _append_row_predicates(
+    predicates_by_index: Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...],
+    row_index: int,
+    predicates: Tuple[exp.Expression, ...],
+) -> Tuple[Tuple[int, Tuple[exp.Expression, ...]], ...]:
+    if not predicates:
+        return predicates_by_index
+    merged: Dict[int, List[exp.Expression]] = {
+        index: list(existing)
+        for index, existing in predicates_by_index
+    }
+    merged.setdefault(row_index, []).extend(predicates)
+    return tuple((index, tuple(values)) for index, values in sorted(merged.items()))
 
 
 def _non_matching_value(
@@ -3856,6 +4081,7 @@ def _apply_predicate_assignments(
     predicate: exp.Expression,
     seed: int,
 ) -> None:
+    _release_predicate_columns_for_solver(instance, alias_rows, aliases, predicate)
     for atom in _conjuncts(predicate):
         if isinstance(atom, exp.EQ):
             left = atom.this
@@ -3874,12 +4100,6 @@ def _apply_predicate_assignments(
             high = _numeric_value(atom.args.get("high"))
             if isinstance(atom.this, exp.Column) and low is not None and high is not None:
                 _assign_column(instance, alias_rows, aliases, atom.this, int((low + high) / 2))
-        elif isinstance(atom, (exp.GT, exp.GTE, exp.LT, exp.LTE)):
-            greater = isinstance(atom, (exp.GT, exp.GTE))
-            if isinstance(atom.this, exp.Column) and isinstance(atom.expression, exp.Literal):
-                base = _numeric_value(atom.expression)
-                if base is not None:
-                    _assign_column(instance, alias_rows, aliases, atom.this, base + 1 if greater else base - 1)
         elif isinstance(atom, exp.Like):
             if isinstance(atom.this, exp.Column) and isinstance(atom.expression, exp.Literal):
                 pattern = str(atom.expression.this)
@@ -3890,10 +4110,44 @@ def _apply_predicate_assignments(
                 _assign_column(instance, alias_rows, aliases, atom.this, None)
 
 
+def _release_predicate_columns_for_solver(
+    instance: Instance,
+    alias_rows: Dict[str, Dict[str, object]],
+    aliases: Mapping[str, exp.Table],
+    predicate: exp.Expression,
+) -> None:
+    for column in predicate.find_all(exp.Column):
+        alias = _alias_for_column(instance, aliases, column)
+        if alias is None or alias not in alias_rows:
+            continue
+        table = aliases[alias]
+        resolved = instance.resolve_column(table, column.name)
+        alias_rows[alias].pop(resolved.name, None)
+        alias_rows[alias].pop(column.name, None)
+
+
 def _conjuncts(expression: exp.Expression) -> Tuple[exp.Expression, ...]:
     if isinstance(expression, exp.And):
         return _conjuncts(expression.this) + _conjuncts(expression.expression)
     return (expression,)
+
+
+def _alias_for_column(
+    instance: Instance,
+    aliases: Mapping[str, exp.Table],
+    column: exp.Column,
+) -> str | None:
+    alias = (column.table or "").casefold()
+    if alias:
+        return alias if alias in aliases else None
+    matches = []
+    for candidate_alias, table in aliases.items():
+        if column.name.casefold() in {
+            name.casefold()
+            for name in instance.column_names(table)
+        }:
+            matches.append(candidate_alias)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _assign_column(
@@ -3903,9 +4157,7 @@ def _assign_column(
     column: exp.Column,
     value: object,
 ) -> None:
-    alias = (column.table or "").casefold()
-    if not alias and len(aliases) == 1:
-        alias = next(iter(aliases))
+    alias = _alias_for_column(instance, aliases, column)
     table = aliases.get(alias)
     if table is None or alias not in alias_rows:
         return
@@ -4088,16 +4340,20 @@ class EncodePipeline:
     def __init__(
         self,
         plan: Plan,
-        instance: Optional[Instance] = None,
+        instance: Instance,
         bounds: Any = None,
+        base_row_counts: Mapping[str, int] | None = None,
     ) -> None:
         self.plan = plan
         self.instance = instance
         self.bounds = bounds
         self.dialect = plan.dialect
-        self._allocator = RowAllocator(instance) if instance is not None else None
+        self._allocator = RowAllocator(instance)
+        self._base_row_counts = dict(base_row_counts or {})
         self._operator_registry: Dict[type, type] = dict(self._DEFAULT_REGISTRY)
         self.schema_failure_reason = ""
+        self.demand_failure_reasons: List[str] = []
+        self._correlated_bindings: Dict[JoinKeyRef, object] = {}
 
     def register_operator(self, step_type: type, operator_class: type) -> None:
         self._operator_registry[step_type] = operator_class
@@ -4107,6 +4363,10 @@ class EncodePipeline:
             if isinstance(step, step_type):
                 return op_cls(step, instance=self.instance)
         raise ValueError(f"No operator registered for step type {type(step).__name__}")
+
+    def _record_demand_failure(self, reason: str) -> None:
+        if reason and reason not in self.demand_failure_reasons:
+            self.demand_failure_reasons.append(reason)
 
     def _subquery_roots(self, step: Step) -> Tuple[Step, ...]:
         exprs: List[exp.Expression] = []
@@ -4155,7 +4415,10 @@ class EncodePipeline:
         for ref, subquery_root in zip(refs, roots):
             schema = _schema_for(cache, subquery_root)
             parent_expr = _scalar_ref_parent_expr(expression, ref)
-            if _scalar_schema_ready_for_predicate(schema, parent_expr):
+            if (
+                _scalar_schema_ready_for_predicate(schema, parent_expr)
+                and not self._scalar_subquery_needs_order_tie(subquery_root, cache)
+            ):
                 continue
             before = self._row_counts()
             self._lower_demand(subquery_root, self._root_demand(subquery_root), cache)
@@ -4172,6 +4435,55 @@ class EncodePipeline:
             _schema_for(cache, subquery_root)
             for subquery_root in self._subquery_roots_for_expression(expression)
         )
+
+    def _conditions_with_scalar_subquery_values(
+        self,
+        expression: exp.Expression,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> Tuple[exp.Expression, ...]:
+        refs = list(expression.find_all(ScalarSubqueryRef))
+        if not refs:
+            return (expression,)
+        roots = self._subquery_roots_for_expression(expression)
+        choices: List[Tuple[object, ...]] = []
+        for ref, subquery_root in zip(refs, roots):
+            schema = _schema_for(cache, subquery_root)
+            parent_expr = _scalar_ref_parent_expr(expression, ref)
+            if not _scalar_schema_ready_for_predicate(schema, parent_expr):
+                return ()
+            values = self._scalar_values_for_ref(subquery_root, schema, cache)
+            if not values:
+                return ()
+            choices.append(values)
+
+        combinations: List[Tuple[object, ...]] = [()]
+        for values in choices:
+            combinations = [
+                prefix + (value,)
+                for prefix in combinations
+                for value in values
+            ]
+
+        conditions: List[exp.Expression] = []
+        for values in combinations:
+            rewritten = deepcopy(expression)
+            for ref, value in zip(list(rewritten.find_all(ScalarSubqueryRef)), values):
+                ref.replace(_literal_for_value(value))
+            conditions.append(rewritten)
+        return tuple(conditions)
+
+    def _scalar_values_for_ref(
+        self,
+        subquery_root: Step,
+        schema: DerivedSchema,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> Tuple[object, ...]:
+        values: List[object] = []
+        values.extend(_sort_tie_scalar_values(subquery_root, cache, self.dialect))
+        value = _scalar_schema_value(schema)
+        if value is not _MISSING:
+            values.append(value)
+        return tuple(dict.fromkeys(value for value in values if value is not _MISSING))
 
     def _filter_conditions_for_step(
         self,
@@ -4220,7 +4532,10 @@ class EncodePipeline:
         for ref, subquery_root in zip(refs, roots):
             schema = _schema_for(cache, subquery_root)
             parent_expr = _scalar_ref_parent_expr(step.condition, ref)
-            if _scalar_schema_ready_for_predicate(schema, parent_expr):
+            if (
+                _scalar_schema_ready_for_predicate(schema, parent_expr)
+                and not self._scalar_subquery_needs_order_tie(subquery_root, cache)
+            ):
                 continue
             before = self._row_counts()
             self._lower_demand(subquery_root, self._root_demand(subquery_root), cache)
@@ -4228,9 +4543,37 @@ class EncodePipeline:
                 changed = True
         return not changed
 
+    def _scalar_subquery_needs_order_tie(
+        self,
+        subquery_root: Step,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> bool:
+        if not isinstance(subquery_root, Projection) or len(subquery_root.dependencies) != 1:
+            return False
+        sort = next(iter(subquery_root.dependencies))
+        if not isinstance(sort, Sort) or not sort.key or sort.fetch is None:
+            return False
+        if not self._step_has_generated_rows(sort):
+            return False
+        sort_schema = _schema_for(cache, sort)
+        if not sort_schema.rows:
+            return False
+        sorted_rows = _sorted_rows_for_step(sort, sort_schema.rows)
+        selected = sorted_rows[: sort.fetch]
+        return not _sort_has_rank_tie(sort, sorted_rows, selected)
+
+    def _step_has_generated_rows(self, root: Step) -> bool:
+        for scan in leaf_table_scans(root):
+            table = self.instance.resolve_table(scan.table)
+            if len(self.instance.get_rows(table)) > self._base_row_counts.get(table.name, 0):
+                return True
+        return False
+
     def forward(self) -> DerivedSchema:
         schema: DerivedSchema | None = None
-        for _iteration in range(max(int(getattr(self.bounds, "max_iterations", 0) or 0) + 3, 3)):
+        for _iteration in range(max(int(getattr(self.bounds, "max_iterations", 0) or 0) + 4, 4)):
+            self.schema_failure_reason = ""
+            self.demand_failure_reasons = []
             cache: Dict[Step, tuple[DerivedSchema, CoverageTreeNode]] = {}
 
             def process(node: Step, path: str) -> tuple[DerivedSchema, CoverageTreeNode]:
@@ -4250,7 +4593,7 @@ class EncodePipeline:
                         subquery_root,
                         f"{path}.subq{index}",
                     )
-                    if self.instance is not None and not subquery_schema.rows:
+                    if not subquery_schema.rows:
                         before = self._row_counts()
                         self._lower_demand(
                             subquery_root,
@@ -4284,9 +4627,6 @@ class EncodePipeline:
                 return step_schema, tree
 
             schema = self._forward_from_root(self.plan.root, "root", process=process)
-            if self.instance is None:
-                return schema
-
             before = self._row_counts()
             root_demand = self._root_demand(self.plan.root)
             if (
@@ -4318,8 +4658,6 @@ class EncodePipeline:
         return schema if schema is not None else self._forward_from_root(self.plan.root, "root")
 
     def _row_counts(self) -> Dict[exp.Table, int]:
-        if self.instance is None:
-            return {}
         return {
             table: len(self.instance.get_rows(table))
             for table in self.instance.schema.fk_safe_table_order()
@@ -4360,8 +4698,6 @@ class EncodePipeline:
         demand: SchemaDemand,
         cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
     ) -> None:
-        if self.instance is None or self._allocator is None:
-            return
         op = self._build_operator(node)
         child_schemas = tuple(_schema_for(cache, child) for child in node.dependencies)
         op.lower_demand(
@@ -4377,8 +4713,6 @@ class EncodePipeline:
         *,
         reason: str,
     ) -> bool:
-        if self.instance is None:
-            return False
         token = self.instance.checkpoint()
         try:
             self.instance.create_rows(rows_by_table)
@@ -4388,6 +4722,25 @@ class EncodePipeline:
             self.schema_failure_reason = reason
             logger.info("%s:%s", reason, exc)
             return False
+
+    def _bind_correlated_demands(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        expression_demands: Sequence[ExpressionDemand],
+    ) -> None:
+        for demand in expression_demands:
+            if (
+                demand.kind != "correlated"
+                or not isinstance(demand.value, JoinKeyRef)
+                or demand.rank is None
+                or demand.value in self._correlated_bindings
+                or demand.rank < 0
+                or demand.rank >= len(rows)
+            ):
+                continue
+            value = _solved_expression_value(rows[demand.rank], demand.expression)
+            if value is not _MISSING and value is not None:
+                self._correlated_bindings[demand.value] = value
 
     def _materialize_having_demand(
         self,
@@ -4472,144 +4825,201 @@ class EncodePipeline:
                 cache,
             )
             return
-        used_join_values: Dict[Tuple[str, str], List[object]] = {}
-        for rank in range(demand.count):
-            left_predicates: List[exp.Expression] = []
-            right_predicates: List[exp.Expression] = []
-            left_context: List[exp.Expression] = []
-            right_context: List[exp.Expression] = []
-            if join.condition is not None:
-                left_part, right_part = _split_predicate_by_schema(
-                    join.condition,
-                    left_schema,
-                    right_schema,
-                    self.dialect,
-                )
-                left_context.extend(left_part)
-                right_context.extend(right_part)
-            demand_predicates: List[exp.Expression] = []
-            for predicate in demand.predicates:
-                if predicate.find(ScalarSubqueryRef):
-                    if not self._ensure_scalar_expression_values(predicate, cache):
-                        return
-                    predicate = _expression_with_scalar_subqueries(
-                        predicate,
-                        self._scalar_schemas_for_expression(predicate, cache),
-                        require_ready=True,
-                    )
-                    if predicate.find(ScalarSubqueryRef):
-                        continue
-                demand_predicates.append(predicate)
-            for predicate in demand_predicates:
-                left_part, right_part = _split_predicate_by_schema(
-                    predicate,
-                    left_schema,
-                    right_schema,
-                    self.dialect,
-                )
-                left_context.extend(left_part)
-                right_context.extend(right_part)
-            left_context.extend(
-                self._filter_conditions_for_step(left_dep, left_schema, cache)
-            )
-            right_context.extend(
-                self._filter_conditions_for_step(right_dep, right_schema, cache)
-            )
-            for left, right in join.on_keys:
-                if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                    left_target = _schema_side_for_column(
-                        left_schema,
-                        right_schema,
-                        left,
-                        self.dialect,
-                    )
-                    right_target = _schema_side_for_column(
-                        left_schema,
-                        right_schema,
-                        right,
-                        self.dialect,
-                    )
-                    left_side_schema = left_schema if left_target == "left" else right_schema
-                    right_side_schema = left_schema if right_target == "left" else right_schema
-                    left_side_predicates = left_context if left_target == "left" else right_context
-                    right_side_predicates = left_context if right_target == "left" else right_context
-                    join_key = (
-                        left.sql(dialect=self.dialect),
-                        right.sql(dialect=self.dialect),
-                    )
-                    avoid_values: Sequence[object] = ()
-                    if not _predicates_reference_join_key(
-                        left_side_predicates,
-                        left_side_schema,
-                        left,
-                        self.dialect,
-                    ) and not _predicates_reference_join_key(
-                        right_side_predicates,
-                        right_side_schema,
-                        right,
-                        self.dialect,
-                    ):
-                        avoid_values = tuple(
-                            list(used_join_values.get(join_key, ()))
-                            + list(_schema_column_values(left_side_schema, left, self.dialect))
-                            + list(_schema_column_values(right_side_schema, right, self.dialect))
-                        )
-                    value = _solve_join_key_value(
-                        left_side_schema,
-                        right_side_schema,
-                        left,
-                        right,
-                        left_side_predicates,
-                        right_side_predicates,
-                        avoid_values,
-                        self.dialect,
-                    )
-                    if value is None:
-                        return
-                    used_join_values.setdefault(join_key, []).append(value)
-                    if left_target == "left":
-                        left_predicates.append(_column_eq_literal(left, value))
-                    elif left_target == "right":
-                        right_predicates.append(_column_eq_literal(left, value))
-                    if right_target == "left":
-                        left_predicates.append(_column_eq_literal(right, value))
-                    elif right_target == "right":
-                        right_predicates.append(_column_eq_literal(right, value))
-            left_predicates.extend(left_context)
-            right_predicates.extend(right_context)
-            left_order, right_order = _split_order_keys_by_schema(
-                demand.order_keys,
+        self._lower_correlated_join_demand(
+            join,
+            demand,
+            left_dep,
+            left_schema,
+            right_dep,
+            right_schema,
+            cache,
+        )
+
+    def _lower_correlated_join_demand(
+        self,
+        join: Join,
+        demand: SchemaDemand,
+        left_dep: Step,
+        left_schema: DerivedSchema,
+        right_dep: Step,
+        right_schema: DerivedSchema,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> None:
+        key_pairs = _join_key_pairs_for_schemas(
+            join,
+            left_schema,
+            right_schema,
+            self.dialect,
+        )
+        if not key_pairs:
+            return
+        join_schema = _schema_for(cache, join)
+        missing = max(demand.count - len(join_schema.rows), 0)
+        if missing <= 0:
+            return
+
+        left_predicates: List[exp.Expression] = []
+        right_predicates: List[exp.Expression] = []
+        if join.condition is not None:
+            left_part, right_part = _split_predicate_by_schema(
+                join.condition,
                 left_schema,
                 right_schema,
                 self.dialect,
             )
-            child_demands = [
+            left_predicates.extend(left_part)
+            right_predicates.extend(right_part)
+
+        demand_predicates: List[exp.Expression] = []
+        for predicate in demand.predicates:
+            if predicate.find(ScalarSubqueryRef):
+                if not self._ensure_scalar_expression_values(predicate, cache):
+                    return
+                predicate = _expression_with_scalar_subqueries(
+                    predicate,
+                    self._scalar_schemas_for_expression(predicate, cache),
+                    require_ready=True,
+                )
+                if predicate.find(ScalarSubqueryRef):
+                    continue
+            demand_predicates.append(predicate)
+        for predicate in demand_predicates:
+            left_part, right_part = _split_predicate_by_schema(
+                predicate,
+                left_schema,
+                right_schema,
+                self.dialect,
+            )
+            left_predicates.extend(left_part)
+            right_predicates.extend(right_part)
+        left_predicates.extend(
+            self._filter_conditions_for_step(left_dep, left_schema, cache)
+        )
+        right_predicates.extend(
+            self._filter_conditions_for_step(right_dep, right_schema, cache)
+        )
+
+        left_expression_demands, right_expression_demands = _split_expression_demands_by_schema(
+            demand.expression_demands,
+            left_schema,
+            right_schema,
+            self.dialect,
+        )
+        left_order, right_order = _split_order_keys_by_schema(
+            demand.order_keys,
+            left_schema,
+            right_schema,
+            self.dialect,
+        )
+        left_keys = tuple(left for left, _right in key_pairs)
+        right_keys = tuple(right for _left, right in key_pairs)
+        left_tuples = _schema_key_tuples(left_schema, left_keys, self.dialect)
+        right_tuples = _schema_key_tuples(right_schema, right_keys, self.dialect)
+
+        left_demands: List[ExpressionDemand] = list(left_expression_demands)
+        right_demands: List[ExpressionDemand] = list(right_expression_demands)
+        left_count = 0
+        right_count = 0
+
+        def add_pair(
+            pair_rank: int,
+            values: Tuple[object, ...] | None,
+            materialize_left: bool,
+            materialize_right: bool,
+        ) -> None:
+            nonlocal left_count, right_count
+            refs = tuple(
+                JoinKeyRef(
+                    origin=(left_key, right_key),
+                    pair_rank=pair_rank,
+                    key_index=key_index,
+                )
+                for key_index, (left_key, right_key) in enumerate(key_pairs)
+            )
+            if values is not None:
+                for ref, value in zip(refs, values):
+                    self._correlated_bindings[ref] = value
+            if materialize_left:
+                local_rank = left_count
+                left_count += 1
+                for ref, (left_key, _right_key) in zip(refs, key_pairs):
+                    left_demands.append(
+                        ExpressionDemand(
+                            expression=_expression_in_schema_scope(
+                                left_key,
+                                left_schema,
+                                self.dialect,
+                            ),
+                            kind="correlated",
+                            value=ref,
+                            rank=local_rank,
+                            origin="join_key",
+                        )
+                    )
+            if materialize_right:
+                local_rank = right_count
+                right_count += 1
+                for ref, (_left_key, right_key) in zip(refs, key_pairs):
+                    right_demands.append(
+                        ExpressionDemand(
+                            expression=_expression_in_schema_scope(
+                                right_key,
+                                right_schema,
+                                self.dialect,
+                            ),
+                            kind="correlated",
+                            value=ref,
+                            rank=local_rank,
+                            origin="join_key",
+                        )
+                    )
+
+        left_values = tuple(value for value in left_tuples if value not in right_tuples)
+        right_values = tuple(value for value in right_tuples if value not in left_tuples)
+        planned = 0
+        while planned < missing:
+            if planned < len(right_values):
+                add_pair(planned, right_values[planned], True, False)
+            elif planned < len(left_values):
+                add_pair(planned, left_values[planned], False, True)
+            else:
+                add_pair(planned, None, True, True)
+            planned += 1
+
+        child_demands = []
+        if left_count:
+            child_demands.append(
                 (
                     left_dep,
                     left_schema,
                     SchemaDemand(
-                        count=1,
+                        count=left_count,
                         predicates=tuple(left_predicates),
                         order_keys=left_order,
                         distinct=demand.distinct,
+                        expression_demands=tuple(left_demands),
                     ),
-                ),
+                )
+            )
+        if right_count:
+            child_demands.append(
                 (
                     right_dep,
                     right_schema,
                     SchemaDemand(
-                        count=1,
+                        count=right_count,
                         predicates=tuple(right_predicates),
                         order_keys=right_order,
                         distinct=demand.distinct,
+                        expression_demands=tuple(right_demands),
                     ),
-                ),
-            ]
-            for dependency, _schema, child_demand in sorted(
-                child_demands,
-                key=lambda item: _schema_table_order(self.instance, item[1]),
-            ):
-                self._lower_demand(dependency, child_demand, cache)
+                )
+            )
+        for dependency, _schema, child_demand in sorted(
+            child_demands,
+            key=lambda item: _schema_table_order(self.instance, item[1]),
+        ):
+            self._lower_demand(dependency, child_demand, cache)
 
     def _materialize_join_group_demands(
         self,
@@ -4719,6 +5129,8 @@ class EncodePipeline:
                             self.dialect,
                         )
                     )
+            left_count = 1 if left_group_keys and not right_group_keys else group.row_count
+            right_count = 1 if right_group_keys and not left_group_keys else group.row_count
             for left, right in join.on_keys:
                 if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
                     continue
@@ -4736,44 +5148,82 @@ class EncodePipeline:
                 )
                 left_side_schema = left_schema if left_target == "left" else right_schema
                 right_side_schema = left_schema if right_target == "left" else right_schema
+                if (
+                    left_group_keys
+                    and not right_group_keys
+                    and _join_side_needs_parallel_rows(
+                        right_side_schema,
+                        right,
+                        group.row_count,
+                        self.dialect,
+                    )
+                ):
+                    left_count = group.row_count
+                if (
+                    right_group_keys
+                    and not left_group_keys
+                    and _join_side_needs_parallel_rows(
+                        left_side_schema,
+                        left,
+                        group.row_count,
+                        self.dialect,
+                    )
+                ):
+                    right_count = group.row_count
                 join_key = (
                     left.sql(dialect=self.dialect),
                     right.sql(dialect=self.dialect),
                 )
-                avoid_values = tuple(
-                    list(used_join_values.get(join_key, ()))
-                    + list(_schema_column_values(left_side_schema, left, self.dialect))
-                    + list(_schema_column_values(right_side_schema, right, self.dialect))
-                )
-                value = _solve_join_key_value(
-                    left_side_schema,
-                    right_side_schema,
-                    left,
-                    right,
-                    left_predicates if left_target == "left" else right_predicates,
-                    left_predicates if right_target == "left" else right_predicates,
-                    avoid_values,
-                    self.dialect,
-                )
-                if value is None:
-                    continue
-                used_join_values.setdefault(join_key, []).append(value)
-                if left_target == "left":
-                    left_predicates.append(_column_eq_literal(left, value))
-                elif left_target == "right":
-                    right_predicates.append(_column_eq_literal(left, value))
-                if right_target == "left":
-                    left_predicates.append(_column_eq_literal(right, value))
-                elif right_target == "right":
-                    right_predicates.append(_column_eq_literal(right, value))
+                join_value_count = group.row_count if left_count > 1 and right_count > 1 else 1
+                for row_index in range(join_value_count):
+                    avoid_values = tuple(
+                        list(used_join_values.get(join_key, ()))
+                        + list(_schema_column_values(left_side_schema, left, self.dialect))
+                        + list(_schema_column_values(right_side_schema, right, self.dialect))
+                    )
+                    value = _solve_join_key_value(
+                        left_side_schema,
+                        right_side_schema,
+                        left,
+                        right,
+                        left_predicates if left_target == "left" else right_predicates,
+                        left_predicates if right_target == "left" else right_predicates,
+                        avoid_values,
+                        self.dialect,
+                    )
+                    if value is None:
+                        continue
+                    used_join_values.setdefault(join_key, []).append(value)
+                    left_join_predicates: List[exp.Expression] = []
+                    right_join_predicates: List[exp.Expression] = []
+                    if left_target == "left":
+                        left_join_predicates.append(_column_eq_literal(left, value))
+                    elif left_target == "right":
+                        right_join_predicates.append(_column_eq_literal(left, value))
+                    if right_target == "left":
+                        left_join_predicates.append(_column_eq_literal(right, value))
+                    elif right_target == "right":
+                        right_join_predicates.append(_column_eq_literal(right, value))
+                    if join_value_count == 1:
+                        left_predicates.extend(left_join_predicates)
+                        right_predicates.extend(right_join_predicates)
+                    else:
+                        left_row_predicates_by_index = _append_row_predicates(
+                            left_row_predicates_by_index,
+                            row_index,
+                            tuple(left_join_predicates),
+                        )
+                        right_row_predicates_by_index = _append_row_predicates(
+                            right_row_predicates_by_index,
+                            row_index,
+                            tuple(right_join_predicates),
+                        )
             left_order, right_order = _split_order_keys_by_schema(
                 demand.order_keys,
                 left_schema,
                 right_schema,
                 self.dialect,
             )
-            left_count = 1 if left_group_keys and not right_group_keys else group.row_count
-            right_count = 1 if right_group_keys and not left_group_keys else group.row_count
             child_demands = [
                 (
                     left_dep,
@@ -4858,7 +5308,7 @@ class EncodePipeline:
                             predicate,
                         )
                     )
-                    for predicate in predicates:
+                    for predicate in (_and_all(predicates),):
                         _apply_predicate_assignments(
                             self.instance,
                             alias_rows,
@@ -4876,15 +5326,22 @@ class EncodePipeline:
                     row_predicates,
                     dialect=self.dialect,
                     expression_demands=demand.expression_demands,
+                    correlated_bindings=self._correlated_bindings,
                 )
                 if solved_rows:
                     table_name = self.instance.resolve_table(table).name
-                    self._try_create_rows(
+                    if self._try_create_rows(
                         _rows_with_required_fk_parents(self.instance, table, solved_rows),
                         reason=f"schema_constraint_materialization_failed:{table_name}",
-                    )
+                    ):
+                        self._bind_correlated_demands(
+                            solved_rows,
+                            demand.expression_demands,
+                        )
                 elif getattr(_solve_table_rows, "schema_failure_reason", ""):
                     self.schema_failure_reason = _solve_table_rows.schema_failure_reason
+                elif failure_reason := getattr(_solve_table_rows, "solve_failure_reason", ""):
+                    self._record_demand_failure(failure_reason)
             return
         distinct_column: str | None = None
         distinct_values: Tuple[object, ...] = ()
@@ -4915,7 +5372,7 @@ class EncodePipeline:
                     predicate,
                 )
             )
-            for predicate in predicates:
+            for predicate in (_and_all(predicates),):
                 _apply_predicate_assignments(
                     self.instance,
                     alias_rows,
@@ -4939,15 +5396,22 @@ class EncodePipeline:
                 row_predicates,
                 dialect=self.dialect,
                 expression_demands=demand.expression_demands,
+                correlated_bindings=self._correlated_bindings,
             )
             if solved_rows:
                 table_name = self.instance.resolve_table(table).name
-                self._try_create_rows(
+                if self._try_create_rows(
                     _rows_with_required_fk_parents(self.instance, table, solved_rows),
                     reason=f"schema_constraint_materialization_failed:{table_name}",
-                )
+                ):
+                    self._bind_correlated_demands(
+                        solved_rows,
+                        demand.expression_demands,
+                    )
             elif getattr(_solve_table_rows, "schema_failure_reason", ""):
                 self.schema_failure_reason = _solve_table_rows.schema_failure_reason
+            elif failure_reason := getattr(_solve_table_rows, "solve_failure_reason", ""):
+                self._record_demand_failure(failure_reason)
 
     def _materialize_coverage_demands(
         self,
@@ -4963,7 +5427,57 @@ class EncodePipeline:
                 changed = self._materialize_aggregate_coverage_demand(step, cache) or changed
             elif isinstance(step, Join):
                 changed = self._materialize_join_coverage_demand(step, schema, cache) or changed
+            elif isinstance(step, Sort) and step in _reachable_steps(self.plan.root):
+                child = _single_dependency(step)
+                changed = self._materialize_sort_demand(
+                    step,
+                    self._root_demand(step),
+                    _schema_for(cache, child),
+                    cache,
+                ) or changed
         return changed
+
+    def _materialize_sort_demand(
+        self,
+        step: Sort,
+        demand: SchemaDemand,
+        child_schema: DerivedSchema,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> bool:
+        required_count = _sort_required_child_count(
+            step,
+            demand,
+            child_schema,
+            int(getattr(self.bounds, "order_competitors", 0) or 0),
+        )
+        if required_count <= 0:
+            return False
+        child = _single_dependency(step)
+        child_count = (
+            required_count
+            if isinstance(child, TableScan)
+            else len(child_schema.rows) + required_count
+        )
+        before = self._row_counts()
+        self._lower_demand(
+            child,
+            SchemaDemand(
+                count=child_count,
+                predicates=demand.predicates,
+                order_keys=tuple(step.key or ()) + demand.order_keys,
+                distinct=demand.distinct,
+                group_demands=demand.group_demands,
+                expression_demands=demand.expression_demands
+                + _order_expression_demands_for_sort(
+                    step,
+                    child_schema,
+                    required_count,
+                    self.dialect,
+                ),
+            ),
+            cache,
+        )
+        return self._row_counts() != before
 
     def _materialize_projection_case_coverage_demand(
         self,
@@ -5003,7 +5517,37 @@ class EncodePipeline:
         cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
     ) -> bool:
         if step.condition.find(ScalarSubqueryRef):
-            return False
+            if not self._ensure_scalar_subquery_values(step, cache):
+                return False
+            scalar_conditions = self._conditions_with_scalar_subquery_values(
+                step.condition,
+                cache,
+            )
+            if not scalar_conditions:
+                return False
+            changed = False
+            for condition in scalar_conditions:
+                child_schema = _schema_for(cache, _single_dependency(step))
+                if True in _filter_outcomes(child_schema, condition):
+                    continue
+                changed = self._materialize_filter_condition_coverage_demand(
+                    step,
+                    condition,
+                    cache,
+                ) or changed
+            return changed
+        return self._materialize_filter_condition_coverage_demand(
+            step,
+            step.condition,
+            cache,
+        )
+
+    def _materialize_filter_condition_coverage_demand(
+        self,
+        step: Filter,
+        condition: exp.Expression,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> bool:
         child = _single_dependency(step)
         if isinstance(child, Aggregate):
             return self._materialize_having_demand(
@@ -5013,17 +5557,17 @@ class EncodePipeline:
                 cache,
             )
         child_schema = _schema_for(cache, child)
-        outcomes = _filter_outcomes(child_schema, step.condition)
+        outcomes = _filter_outcomes(child_schema, condition)
         demands: List[SchemaDemand] = []
         if True not in outcomes:
-            demands.append(SchemaDemand(count=1, predicates=(step.condition,)))
+            demands.append(SchemaDemand(count=1, predicates=(condition,)))
         if False not in outcomes:
-            false_condition = _false_condition(step.condition)
+            false_condition = _false_condition(condition)
             if false_condition is not None:
                 demands.append(SchemaDemand(count=1, predicates=(false_condition,)))
         if None not in outcomes:
             null_condition = _null_condition_for_schema(
-                step.condition,
+                condition,
                 child_schema,
                 self.dialect,
             )
