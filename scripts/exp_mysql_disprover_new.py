@@ -534,7 +534,6 @@ def run_disprove_experiment(
                             "elapsed_time": timeout,
                         }
                     except ProcessExpired as e:
-                        # This catches the Rust panic without killing the manager process!
                         records_by_index[index] = {
                             "index": index,
                             "sql1": sql1,
