@@ -10,10 +10,10 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+from parseval.domain.exceptions import ConstraintViolationError
 from parseval.instance import Instance
-from parseval.instance.core import ConstraintViolationError
 from parseval.instance.exporter import InstanceSnapshot, TableBatch
-from parseval.instance.loader import DatabaseTarget, InstanceLoader
+from parseval.instance.io import InstanceLoader
 
 
 SCHEMA = """
@@ -68,11 +68,12 @@ class InstanceLoaderTests(unittest.TestCase):
             ),
         )
 
-        with patch("parseval.instance.loader.DBManager", return_value=FakeDBManager()):
+        with patch("parseval.instance.io.DBManager", return_value=FakeDBManager()):
             InstanceLoader().load(
                 snapshot,
-                DatabaseTarget("sqlite:///:memory:", "sqlite"),
+                "postgresql://localhost/test",
                 FakeSerializer(),
+                "postgres",
             )
 
         self.assertEqual(
@@ -203,7 +204,8 @@ class InstanceLoaderTests(unittest.TestCase):
             name="temporal_case",
             dialect="sqlite",
         )
-        row = instance.create_row("events", {"id": 1}).created["events"][0]
+        table = instance.resolve_table("events")
+        row = instance.create_row(table, {"id": 1}).created[table][0]
         self.assertIsInstance(row["occurred_on"].concrete, date)
         self.assertIsInstance(row["happened_at"].concrete, (datetime, date))
         self.assertIsInstance(row["happened_time"].concrete, (time, date, str))
@@ -222,10 +224,10 @@ class InstanceLoaderTests(unittest.TestCase):
 
         _, kwargs = load.call_args
         self.assertEqual(
-            kwargs["target"].connection_string,
+            kwargs["connection_string"],
             "sqlite:////tmp/target_case.sqlite",
         )
-        self.assertEqual(kwargs["target"].dialect, "sqlite")
+        self.assertEqual(kwargs["dialect"], "sqlite")
 
     def test_composite_primary_key_columns_are_not_treated_as_individually_unique(self):
         schema = """

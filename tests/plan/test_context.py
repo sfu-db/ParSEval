@@ -94,7 +94,7 @@ class ContextMetadataTests(unittest.TestCase):
         self.assertEqual(subset.obligations, schema.obligations)
         self.assertEqual(subset.evidence, schema.evidence)
         self.assertEqual(subset.expression_bindings, schema.expression_bindings)
-        self.assertEqual(subset.row_provenance, schema.row_provenance)
+        self.assertEqual(subset.row_provenance, {})
         self.assertEqual(len(subset), 1)
 
 if __name__ == "__main__":

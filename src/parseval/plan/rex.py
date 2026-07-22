@@ -435,6 +435,23 @@ def concrete(
     return _eval(expr, env)
 
 
+def concrete_supported(expr: exp.Expression) -> bool:
+    """Return whether concrete evaluation has an implementation for the AST."""
+    for node in expr.walk():
+        if isinstance(node, (exp.DataType, exp.Identifier)):
+            continue
+        if isinstance(node, exp.Anonymous):
+            if node.name.upper() not in _ANONYMOUS_HANDLERS and node.name.upper() != "STRFTIME":
+                return False
+            continue
+        if any(cls in _HANDLERS for cls in type(node).__mro__):
+            continue
+        key = getattr(node, "key", "").upper()
+        if key not in _SQLGLOT_ENV:
+            return False
+    return True
+
+
 def _eval(node: Any, env: Environment) -> Any:
     if node is None:
         return None
@@ -1576,11 +1593,11 @@ _ANONYMOUS_HANDLERS = {
 }
 
 
-# ----- paren -----
+# ----- transparent wrappers -----
 
 
-@handler(exp.Paren)
-def _eval_paren(node: exp.Paren, env: Environment) -> Any:
+@handler(exp.Paren, exp.Alias)
+def _eval_transparent_wrapper(node: exp.Expression, env: Environment) -> Any:
     return _eval(node.this, env)
 
 

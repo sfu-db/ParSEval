@@ -65,6 +65,11 @@ def coerce_comparison_pair(
     if temporal is not None:
         return temporal
 
+    if left_family in _TEMPORAL_FAMILIES and right_family == "int":
+        return left, SMTValue(right.expr, left.typeinfo, right.is_null_literal)
+    if right_family in _TEMPORAL_FAMILIES and left_family == "int":
+        return SMTValue(left.expr, right.typeinfo, left.is_null_literal), right
+
     if isinstance(left_expr, SolverVar) and _is_literal(right_expr):
         return left, _encode_literal_for_target(right_expr, left, dialect, ctx)
     if isinstance(right_expr, SolverVar) and _is_literal(left_expr):

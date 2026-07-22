@@ -67,7 +67,6 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         result = disprove(
             gold_sql, pred_sql, ddls, connection_string, "sqlite",
             semantics="bag",
-            max_iterations=15,
             timeout=timeout,
         )
         record["verdict"] = result.verdict.value

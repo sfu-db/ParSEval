@@ -23,11 +23,10 @@ class Solver:
         timeout_ms: int = 5000,
         seed: int = 42,
     ) -> None:
-        del seed
         self.dialect = dialect
         self.timeout_ms = timeout_ms
         self._csp = CspBackend(dialect=dialect)
-        self._smt = SmtBackend(timeout_ms=timeout_ms, dialect=dialect)
+        self._smt = SmtBackend(timeout_ms=timeout_ms, dialect=dialect, seed=seed)
 
     def solve(self, problem: Problem) -> Result:
         if not isinstance(problem, Problem):

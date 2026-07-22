@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import unittest
+from random import Random
 
 from sqlglot import exp, parse_one
 
+from parseval.generator.budget import GenerationBudget
+from parseval.generator.config import GenerationConfig
 from parseval.generator.symbolic.operator import (
     GroupDemand,
+    _AtomicRowRequest,
     _aggregate_expression_map,
-    _ensure_aggregate_group_key_values,
+    _aggregate_group_key_expression_demands,
+    _expand_group_key_expression_demands,
     _expression_key,
+    _group_demand_for_having,
     _projection_expression_map,
+    _solve_atomic_row_requests,
+    _with_random_aggregate_null_rows,
 )
+from parseval.instance import Instance
 from parseval.plan.context import DerivedSchema
 from parseval.plan.explain import Aggregate, Projection
 
@@ -20,6 +29,57 @@ def expression(sql: str) -> exp.Expression:
 
 
 class TestSymbolicOperatorKeys(unittest.TestCase):
+    def test_random_aggregate_null_rows_expand_existing_group_demand(self):
+        select = parse_one(
+            "SELECT region, COUNT(a), SUM(b), COUNT(c) FROM scores GROUP BY region",
+            dialect="sqlite",
+        )
+        aggregate = Aggregate()
+        aggregate.aggregations = list(select.expressions[1:])
+        a = exp.column("a")
+        b = exp.column("b")
+        c = exp.column("c")
+        child = DerivedSchema(
+            columns=(a, b, c),
+            nullables={a: True, b: True, c: False},
+        )
+
+        groups = _with_random_aggregate_null_rows(
+            aggregate,
+            (GroupDemand(group_index=0, row_count=2),),
+            child,
+            Random(142),
+            max_rows=10,
+            dialect="sqlite",
+        )
+
+        self.assertEqual(5, groups[0].row_count)
+        predicates = {
+            index: tuple(predicate.sql(dialect="sqlite") for predicate in row_predicates)
+            for index, row_predicates in groups[0].row_predicates_by_index
+        }
+        self.assertEqual(("a IS NULL", "NOT b IS NULL"), predicates[2])
+        self.assertEqual(("a IS NULL", "NOT b IS NULL"), predicates[3])
+        self.assertEqual(("NOT a IS NULL", "b IS NULL"), predicates[4])
+
+    def test_random_aggregate_null_rows_preserve_baseline_under_row_limit(self):
+        aggregate = Aggregate()
+        aggregate.aggregations = [expression("COUNT(a)")]
+        a = exp.column("a")
+        child = DerivedSchema(columns=(a,), nullables={a: True})
+
+        groups = _with_random_aggregate_null_rows(
+            aggregate,
+            (GroupDemand(group_index=0, row_count=2),),
+            child,
+            Random(142),
+            max_rows=2,
+            dialect="sqlite",
+        )
+
+        self.assertEqual(2, groups[0].row_count)
+        self.assertEqual((), groups[0].row_predicates_by_index)
+
     def test_expression_key_preserves_string_literal_case(self):
         upper = expression("SUM(CASE WHEN name = 'Legal' THEN 1 ELSE 0 END)")
         lower = expression("SUM(CASE WHEN name = 'legal' THEN 1 ELSE 0 END)")
@@ -72,24 +132,107 @@ class TestSymbolicOperatorKeys(unittest.TestCase):
         self.assertIs(mapping[_expression_key(upper, "sqlite")], upper)
         self.assertIs(mapping[_expression_key(lower, "sqlite")], lower)
 
-    def test_group_key_values_keep_literal_case_variants_distinct(self):
+    def test_group_keys_compile_to_solver_relations_without_fixed_values(self):
         upper = expression("CASE WHEN status = 'Legal' THEN 1 ELSE 0 END")
         lower = expression("CASE WHEN status = 'legal' THEN 1 ELSE 0 END")
         aggregate = Aggregate()
         aggregate.group = [upper, lower]
-        demand = GroupDemand(
-            group_index=0,
-            row_count=1,
-            group_key_values=((upper, 1),),
+        groups = (
+            GroupDemand(group_index=0, row_count=2),
+            GroupDemand(group_index=1, row_count=3),
         )
 
-        normalized = _ensure_aggregate_group_key_values(
+        logical = _aggregate_group_key_expression_demands(
             aggregate,
-            (demand,),
+            groups,
             "sqlite",
         )
+        expanded = _expand_group_key_expression_demands(logical, groups)
 
-        self.assertEqual(len(normalized[0].group_key_values), 2)
+        self.assertTrue(all(demand.value is None for demand in expanded))
+        for source in (upper, lower):
+            origin = f"group_key:{source.sql(dialect='sqlite')}"
+            distinct = [
+                demand.rank
+                for demand in expanded
+                if demand.kind == "distinct" and demand.origin == origin
+            ]
+            cohorts = {
+                demand.origin: []
+                for demand in expanded
+                if demand.kind == "equal" and demand.origin.startswith(origin)
+            }
+            for demand in expanded:
+                if demand.origin in cohorts:
+                    cohorts[demand.origin].append(demand.rank)
+            self.assertEqual([0, 2], distinct)
+            self.assertEqual([[0, 1], [2, 3, 4]], sorted(cohorts.values()))
+
+    def test_having_uses_query_threshold_as_solver_constraint(self):
+        aggregate = Aggregate()
+        total = expression("SUM(points)")
+        aggregate.aggregations = [total]
+        condition = exp.GT(this=total.copy(), expression=exp.Literal.number("10"))
+
+        passing = _group_demand_for_having(
+            condition,
+            aggregate,
+            group_index=0,
+            default_row_count=3,
+            pass_group=True,
+            dialect="sqlite",
+        )
+        failing = _group_demand_for_having(
+            condition,
+            aggregate,
+            group_index=1,
+            default_row_count=3,
+            pass_group=False,
+            dialect="sqlite",
+        )
+
+        self.assertIsNotNone(passing)
+        self.assertIsNotNone(failing)
+        self.assertEqual("points > 10", passing.row_predicates[0].sql(dialect="sqlite"))
+        self.assertEqual("points <= 10", failing.row_predicates[0].sql(dialect="sqlite"))
+
+    def test_solver_selects_group_key_values_from_relational_demands(self):
+        instance = Instance(
+            "CREATE TABLE scores (region TEXT)",
+            name="solver_group_keys",
+            dialect="sqlite",
+        )
+        table = instance.resolve_table("scores")
+        aggregate = Aggregate()
+        aggregate.group = [exp.column("region")]
+        groups = (
+            GroupDemand(group_index=0, row_count=2),
+            GroupDemand(group_index=1, row_count=1),
+        )
+        logical = _aggregate_group_key_expression_demands(
+            aggregate,
+            groups,
+            "sqlite",
+        )
+        relational = _expand_group_key_expression_demands(logical, groups)
+        request = _AtomicRowRequest(
+            table=table,
+            row_specs=({}, {}, {}),
+            predicates=((), (), ()),
+            expression_demands=relational,
+        )
+
+        result, decoded, _problem = _solve_atomic_row_requests(
+            instance,
+            (request,),
+            dialect="sqlite",
+            budget=GenerationBudget(GenerationConfig()),
+        )
+
+        self.assertEqual("sat", result.status, result.reason)
+        values = [row["region"] for row in decoded[0]]
+        self.assertEqual(values[0], values[1])
+        self.assertNotEqual(values[0], values[2])
 
 
 if __name__ == "__main__":

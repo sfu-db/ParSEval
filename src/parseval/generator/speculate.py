@@ -8,6 +8,7 @@ database execution. Uses sqlglot AST analysis + the solver module.
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass, field
 from itertools import islice, product
 from typing import Any, Mapping, Sequence
@@ -27,9 +28,9 @@ from parseval.instance import Instance
 from parseval.instance.schema import table_key, normalize_identifier
 from parseval.literals import literal_value
 from parseval.solver import Problem, SolverVar
-from parseval.solver.api import Solver
 from parseval.solver.partition import flatten_conjuncts
-from parseval.generator.bounds import BmcBounds
+from parseval.generator.config import GenerationConfig
+from parseval.generator.budget import GenerationBudget
 from parseval.plan.rex import negate_predicate
 
 logger = logging.getLogger(__name__)
@@ -48,30 +49,6 @@ class RelationScopeInfo:
 
 def _is_outer_join(join: exp.Join) -> bool:
     return join.args.get("side") in ("LEFT", "RIGHT", "FULL")
-
-
-def _int_expression_value(node: exp.Expression | None) -> int | None:
-    if node is None:
-        return None
-    try:
-        return int(node.sql())
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_limit_offset(tree: exp.Select) -> tuple[int | None, int | None]:
-    limit_node = tree.args.get("limit")
-    offset_node = tree.args.get("offset")
-
-    limit_val: int | None = None
-    if limit_node is not None:
-        limit_val = _int_expression_value(limit_node.args.get("expression"))
-
-    offset_val: int | None = None
-    if offset_node is not None:
-        offset_val = _int_expression_value(offset_node.args.get("expression"))
-
-    return limit_val, offset_val
 
 
 def _collect_operation_leaves(tree: exp.Expression) -> list[exp.Select]:
@@ -95,68 +72,66 @@ def speculate(
     query: str,
     dialect: str = "sqlite",
     *,
-    bounds: BmcBounds | None = None,
-    generate_negatives: bool = True,
-) -> Instance | None:
-    """Seed data for *query* so it returns at least one row.
+    config: GenerationConfig = GenerationConfig(),
+    _budget: GenerationBudget | None = None,
+) -> Instance:
+    """Bootstrap candidate data for *query* before target-directed generation.
 
-    When *generate_negatives* is True (default), also seed additional
+    When ``config.bootstrap_negatives`` is true, also seed additional
     rows that violate individual WHERE atoms, providing both matching
     and non-matching data.
 
-    Returns an ``Instance`` with seeded rows, or a base-row-only
-    ``Instance`` if the query is unsatisfiable within the solver's
-    capabilities.
+    The returned rows are unproven candidates. The encode pipeline validates
+    their coverage and generates any missing semantic witnesses.
     """
     instance = Instance(ddls, name="speculative", dialect=dialect)
-    bounds = bounds or BmcBounds()
-
+    budget = _budget or GenerationBudget(config)
     try:
         tree = parse_one(query, dialect=dialect)
     except SqlglotError:
         logger.warning("Failed to parse query")
-        _seed_base_rows(instance)
+        _seed_base_rows(instance, budget=budget)
         return instance
 
     if isinstance(tree, exp.With):
         tree = tree.this
 
     if isinstance(tree, exp.Union):
-        _speculate_set_operation(instance, tree, bounds, generate_negatives, dialect)
+        _speculate_set_operation(instance, tree, config, dialect, budget)
         return instance
 
     if not isinstance(tree, exp.Select):
         logger.warning("Only SELECT queries are supported, got %s", type(tree).__name__)
-        _seed_base_rows(instance)
+        _seed_base_rows(instance, budget=budget)
         return instance
 
-    if not _speculate_select(instance, tree, bounds, generate_negatives, dialect):
+    if not _speculate_select(instance, tree, config, dialect, budget):
         relation_info = _collect_relation_scope_info(tree, instance)
         query_tables: set[exp.Table] = set(relation_info.physical_tables)
         if query_tables:
-            _seed_base_rows(instance, tables=query_tables)
+            _seed_base_rows(instance, tables=query_tables, budget=budget)
         else:
             logger.debug("No tables found in query")
-            _seed_base_rows(instance)
+            _seed_base_rows(instance, budget=budget)
     return instance
 
 
 def _speculate_set_operation(
     instance: Instance,
     tree: exp.Union,
-    bounds: BmcBounds,
-    generate_negatives: bool,
+    config: GenerationConfig,
     dialect: str,
+    budget: GenerationBudget,
 ) -> None:
     """Seed data for a UNION/INTERSECT/EXCEPT set operation.
 
     Processes each leaf SELECT independently, accumulating rows in
-    *instance*.  Falls back to base rows only if all branches fail.
+    *instance*. If no branch is solved, seeds baseline candidates instead.
     """
     leaves = _collect_operation_leaves(tree)
     any_solved = False
     for leaf in leaves:
-        if _speculate_select(instance, leaf, bounds, generate_negatives, dialect):
+        if _speculate_select(instance, leaf, config, dialect, budget):
             any_solved = True
 
     if not any_solved:
@@ -165,22 +140,22 @@ def _speculate_set_operation(
             info = _collect_relation_scope_info(leaf, instance)
             all_tables.update(info.physical_tables)
         if all_tables:
-            _seed_base_rows(instance, tables=all_tables)
+            _seed_base_rows(instance, tables=all_tables, budget=budget)
         else:
-            _seed_base_rows(instance)
+            _seed_base_rows(instance, budget=budget)
 
 
 def _speculate_select(
     instance: Instance,
     tree: exp.Select,
-    bounds: BmcBounds,
-    generate_negatives: bool,
+    config: GenerationConfig,
     dialect: str,
+    budget: GenerationBudget,
 ) -> bool:
     """Seed data for a single SELECT.
 
-    Returns True if a solver solution was found, False if UNSAT (caller
-    should seed base rows as fallback).
+    Returns True if a solver solution was found and False when the caller
+    should seed baseline bootstrap candidates.
     """
     relation_info = _collect_relation_scope_info(tree, instance)
     query_tables: set[exp.Table] = set(relation_info.physical_tables)
@@ -190,7 +165,7 @@ def _speculate_select(
     )
 
     if not col_var_map:
-        _seed_base_rows(instance, tables=query_tables)
+        _seed_base_rows(instance, tables=query_tables, budget=budget)
         return True
 
     where_atoms: list[exp.Expression] = []
@@ -208,23 +183,26 @@ def _speculate_select(
                 if replaced is not None:
                     where_atoms.append(replaced)
 
-    limit_val, offset_val = _extract_limit_offset(tree)
-    min_rows = 3
+    min_rows = config.bootstrap_rows
 
     group = tree.args.get("group")
     has_group_by = group is not None and group.expressions
-    group_count = max(int(getattr(bounds, "groups", 1) or 1), 1)
-    if limit_val is not None and offset_val is not None:
-        min_rows = max(3, min(offset_val + limit_val, MIN_ROWS_CAP))
-    elif limit_val is not None:
-        min_rows = max(3, min(limit_val, MIN_ROWS_CAP))
-    elif offset_val is not None:
-        min_rows = max(3, min(offset_val + 1, MIN_ROWS_CAP))
+    group_count = config.groups
 
     group_column_keys = _extract_group_column_keys(tree, relation_info, instance)
     agg_input_column_keys = _extract_aggregate_input_column_keys(tree, relation_info, instance)
     for key in (*group_column_keys, *agg_input_column_keys):
         _ensure_solver_var(key, instance, col_var_map, table_vars, occurrence_tables)
+
+    null_column_keys: list[ColumnKey] = []
+    for expr in tree.expressions:
+        unwrapped = expr
+        if isinstance(unwrapped, exp.Alias):
+            unwrapped = unwrapped.this
+        if isinstance(unwrapped, exp.Column):
+            key = _resolve_column_key(unwrapped, tree, relation_info, instance)
+            if key is not None and key not in null_column_keys and instance.nullable(key[0], key[2]):
+                null_column_keys.append(key)
 
     not_exists_not_in_items: list[dict[str, Any]] = []
     for drop_optional in (False, True):
@@ -247,11 +225,16 @@ def _speculate_select(
                 constraints, list(equalities),
                 relation_info=relation_info,
                 group_column_keys=group_column_keys,
+                aggregate_input_column_keys=agg_input_column_keys,
                 group_count=group_count,
                 dialect=dialect,
+                budget=budget,
+                bootstrap_rows=min_rows,
             )
             if not seeded:
                 logger.info("speculate_generation_skipped:group_batch_solver_assignment")
+            if config.bootstrap_negatives and len(query_tables) > 1:
+                _seed_base_rows(instance, tables=query_tables, row_count=1, budget=budget)
             return True
 
         if not constraints and not equalities and not not_exists_not_in_items:
@@ -259,6 +242,7 @@ def _speculate_select(
                 instance,
                 row_count=max(1, group_count, min_rows),
                 tables=query_tables,
+                budget=budget,
             )
             if not _prepare_database_constraints(
                 instance, constraints, col_var_map, table_vars, occurrence_tables,
@@ -269,6 +253,7 @@ def _speculate_select(
                 constraints, [],
                 relation_info=relation_info,
                 dialect=dialect,
+                budget=budget,
             )
             return True
 
@@ -283,8 +268,7 @@ def _speculate_select(
             equalities=list(equalities),
             variables=variables,
         )
-        solver = Solver(dialect=dialect)
-        result = solver.solve(problem)
+        result = budget.solve(problem, dialect=dialect)
 
         if result.sat:
             _seed_from_assignments(
@@ -295,23 +279,30 @@ def _speculate_select(
                 dialect=dialect,
                 group_key_column_keys=group_column_keys,
                 aggregate_input_column_keys=agg_input_column_keys,
+                budget=budget,
             )
             _seed_case_arm_rows(
                 instance, tree, col_var_map, table_vars, occurrence_tables,
                 constraints, list(equalities),
                 relation_info=relation_info,
                 dialect=dialect,
+                budget=budget,
             )
             if not_exists_not_in_items:
                 _seed_not_exists_not_in(
                     instance, not_exists_not_in_items, result.assignments,
                     col_var_map, table_vars, occurrence_tables, dialect,
+                    budget,
                 )
-            if generate_negatives and where_atoms:
+            if config.bootstrap_negatives and (where_atoms or null_column_keys):
                 _seed_negative_rows(
                     instance, where_atoms, col_var_map, table_vars, occurrence_tables,
                     list(equalities), dialect,
+                    budget,
+                    null_column_keys=null_column_keys,
                 )
+            if config.bootstrap_negatives and len(query_tables) > 1:
+                _seed_base_rows(instance, tables=query_tables, row_count=1, budget=budget)
             return True
 
         if not_exists_not_in_items and not result.sat:
@@ -1208,6 +1199,7 @@ def _seed_not_exists_not_in(
     table_vars: dict[OccurrenceKey, list[SolverVar]],
     occurrence_tables: dict[OccurrenceKey, exp.Table],
     dialect: str,
+    budget: GenerationBudget,
 ) -> None:
     """Two-phase seeding for NOT EXISTS / NOT IN.
 
@@ -1316,8 +1308,7 @@ def _seed_not_exists_not_in(
                 equalities=[],
                 variables={var for vars in table_subset.values() for var in vars},
             )
-            solver = Solver(dialect=dialect)
-            result = solver.solve(problem)
+            result = budget.solve(problem, dialect=dialect)
 
             if result.sat:
                 occurrence_rows = {
@@ -1332,6 +1323,7 @@ def _seed_not_exists_not_in(
                         instance,
                         rows_by_table,
                         reason="not_exists_not_in_solver",
+                        budget=budget,
                     )
 
 
@@ -1635,7 +1627,12 @@ def _try_create_rows(
     rows_by_table: Mapping[exp.Table, Sequence[Mapping[exp.Identifier | str, Any]]],
     *,
     reason: str,
+    budget: GenerationBudget,
 ) -> bool:
+    budget_reason = budget.row_reason(instance, rows_by_table)
+    if budget_reason:
+        logger.info("speculate_generation_skipped:%s:%s", reason, budget_reason)
+        return False
     token = instance.checkpoint()
     try:
         instance.create_rows(_reserve_unique_values(instance, rows_by_table))
@@ -1675,6 +1672,7 @@ def _seed_case_arm_rows(
     equalities: Sequence[tuple[SolverVar, SolverVar]],
     *,
     relation_info: RelationScopeInfo,
+    budget: GenerationBudget,
     dialect: str = "sqlite",
 ) -> None:
     arm_predicate_sets = _collect_case_arm_predicate_sets(tree)
@@ -1682,8 +1680,6 @@ def _seed_case_arm_rows(
         return
 
     variables = set(col_var_map.values())
-    solver = Solver(dialect=dialect)
-
     for arm_predicates in arm_predicate_sets:
         arm_constraints: list[exp.Expression] = list(constraints)
         for predicate in arm_predicates:
@@ -1703,7 +1699,7 @@ def _seed_case_arm_rows(
                 equalities=list(equalities),
                 variables=variables,
             )
-            result = solver.solve(problem)
+            result = budget.solve(problem, dialect=dialect)
             if not result.sat:
                 continue
 
@@ -1713,6 +1709,7 @@ def _seed_case_arm_rows(
                     result.assignments, table_vars, occurrence_tables,
                 ),
                 reason="case_arm_solver_assignment",
+                budget=budget,
             )
 
 
@@ -1829,25 +1826,8 @@ def _finite_group_target_tuples(
     return []
 
 
-def _group_values_from_assignments(
-    assignments: Mapping[SolverVar, Any],
-    group_column_keys: Sequence[ColumnKey],
-    col_var_map: Mapping[ColumnKey, SolverVar],
-) -> tuple[Any, ...] | None:
-    values: list[Any] = []
-    for key in group_column_keys:
-        var = col_var_map.get(key)
-        if var is None or var not in assignments:
-            return None
-        values.append(assignments[var])
-    return tuple(values)
-
-
 def _int_literal(expr: exp.Expression) -> int | None:
-    try:
-        value = literal_value(expr)
-    except Exception:
-        return None
+    value = literal_value(expr)
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -2076,8 +2056,11 @@ def _seed_group_rows(
     *,
     relation_info: RelationScopeInfo,
     group_column_keys: Sequence[ColumnKey],
+    aggregate_input_column_keys: Sequence[ColumnKey],
     group_count: int,
+    budget: GenerationBudget,
     dialect: str = "sqlite",
+    bootstrap_rows: int = 1,
 ) -> bool:
     group = tree.args.get("group")
     if (
@@ -2106,20 +2089,81 @@ def _seed_group_rows(
         group_count=group_count,
     )
     if having_plan is None:
-        return False
+        target_sizes = [bootstrap_rows] * min(group_count, bootstrap_rows)
+        having_non_null_column_keys = ()
+        having_distinct_column_keys = ()
+    else:
+        having_sizes, having_non_null_column_keys, having_distinct_column_keys = having_plan
+        target_sizes = list(having_sizes[:group_count])
+        if not target_sizes:
+            return False
 
-    having_sizes, having_non_null_column_keys, having_distinct_column_keys = having_plan
-    target_sizes = list(having_sizes[:group_count])
-    if not target_sizes:
-        return False
+    constrained_variable_keys = {
+        variable.var_key
+        for constraint in constraints
+        for variable in constraint.find_all(SolverVar)
+    }
+    nullable_aggregate_keys = tuple(
+        key
+        for key in aggregate_input_column_keys
+        if key in col_var_map
+        and key not in group_column_keys
+        and col_var_map[key].var_key not in constrained_variable_keys
+        and instance.nullable(key[0], key[2])
+    )
+    occurrence_counts: dict[exp.Table, int] = {}
+    for occurrence_table in occurrence_tables.values():
+        table = instance.resolve_table(occurrence_table)
+        occurrence_counts[table] = occurrence_counts.get(table, 0) + 1
+    logical_capacity = budget.config.max_total_rows
+    if occurrence_counts:
+        logical_capacity = min(
+            (
+                budget.config.max_rows_per_table - len(instance.get_rows(table))
+            )
+            // count
+            for table, count in occurrence_counts.items()
+        )
+        total_occurrences = sum(occurrence_counts.values())
+        logical_capacity = min(
+            logical_capacity,
+            (
+                budget.config.max_total_rows
+                - sum(
+                    len(instance.get_rows(table))
+                    for table in instance.schema.fk_safe_table_order()
+                )
+            )
+            // total_occurrences,
+        )
+    remaining_null_rows = max(logical_capacity - sum(target_sizes), 0)
+    randomizer = random.Random(budget.config.seed)
+    row_targets_by_group: list[list[ColumnKey | None]] = []
+    for group_size in target_sizes:
+        targets: list[ColumnKey | None] = [None] * group_size
+        for key in nullable_aggregate_keys:
+            null_count = min(
+                randomizer.randint(1, max(group_size, 1)),
+                remaining_null_rows,
+            )
+            targets.extend([key] * null_count)
+            remaining_null_rows -= null_count
+        row_targets_by_group.append(targets)
 
     batch_constraints: list[exp.Expression] = []
     batch_equalities: list[tuple[SolverVar, SolverVar]] = []
     variables: set[SolverVar] = set()
-    rows: list[tuple[int, dict[ColumnKey, SolverVar], dict[OccurrenceKey, list[SolverVar]]]] = []
+    rows: list[
+        tuple[
+            int,
+            ColumnKey | None,
+            dict[ColumnKey, SolverVar],
+            dict[OccurrenceKey, list[SolverVar]],
+        ]
+    ] = []
 
-    for group_index, group_size in enumerate(target_sizes):
-        for row_index in range(group_size):
+    for group_index, row_targets in enumerate(row_targets_by_group):
+        for row_index, null_key in enumerate(row_targets):
             suffix = f"._g{group_index}_r{row_index}"
             row_col_var_map, row_table_vars = _row_scoped_solver_context(
                 col_var_map,
@@ -2154,6 +2198,8 @@ def _seed_group_rows(
                     exp.Not(this=exp.Is(this=group_var, expression=exp.Null()))
                 )
             for key in having_non_null_column_keys:
+                if key == null_key:
+                    continue
                 count_var = row_col_var_map.get(key)
                 if count_var is None:
                     return False
@@ -2161,13 +2207,29 @@ def _seed_group_rows(
                     exp.Not(this=exp.Is(this=count_var, expression=exp.Null()))
                 )
 
+            if null_key is not None:
+                for key in nullable_aggregate_keys:
+                    aggregate_var = row_col_var_map.get(key)
+                    if aggregate_var is None:
+                        return False
+                    predicate = exp.Is(
+                        this=aggregate_var,
+                        expression=exp.Null(),
+                    )
+                    if key != null_key:
+                        predicate = exp.Not(this=predicate)
+                    batch_constraints.append(predicate)
+
             variables.update(row_col_var_map.values())
-            rows.append((group_index, row_col_var_map, row_table_vars))
+            rows.append((group_index, null_key, row_col_var_map, row_table_vars))
 
     first_row_by_group: dict[int, dict[ColumnKey, SolverVar]] = {}
-    rows_by_group: dict[int, list[dict[ColumnKey, SolverVar]]] = {}
-    for group_index, row_col_var_map, _row_table_vars in rows:
-        rows_by_group.setdefault(group_index, []).append(row_col_var_map)
+    rows_by_group: dict[
+        int,
+        list[tuple[ColumnKey | None, dict[ColumnKey, SolverVar]]],
+    ] = {}
+    for group_index, null_key, row_col_var_map, _row_table_vars in rows:
+        rows_by_group.setdefault(group_index, []).append((null_key, row_col_var_map))
         first = first_row_by_group.setdefault(group_index, row_col_var_map)
         if first is row_col_var_map:
             continue
@@ -2176,7 +2238,11 @@ def _seed_group_rows(
 
     for distinct_key in having_distinct_column_keys:
         for group_rows in rows_by_group.values():
-            distinct_vars = [row_col_var_map[distinct_key] for row_col_var_map in group_rows]
+            distinct_vars = [
+                row_col_var_map[distinct_key]
+                for null_key, row_col_var_map in group_rows
+                if null_key != distinct_key
+            ]
             for left_index, left_var in enumerate(distinct_vars):
                 for right_var in distinct_vars[left_index + 1:]:
                     batch_constraints.append(
@@ -2201,19 +2267,19 @@ def _seed_group_rows(
             if distinct is not None:
                 batch_constraints.append(distinct)
 
-    solver = Solver(dialect=dialect)
-    result = solver.solve(
+    result = budget.solve(
         Problem(
             constraints=batch_constraints,
             equalities=batch_equalities,
             variables=variables,
-        )
+        ),
+        dialect=dialect,
     )
     if not result.sat:
         return False
 
     rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
-    for _group_index, _row_col_var_map, row_table_vars in rows:
+    for _group_index, _null_key, _row_col_var_map, row_table_vars in rows:
         row_rows_by_table = _rows_by_table_from_assignments(
             result.assignments,
             row_table_vars,
@@ -2226,6 +2292,7 @@ def _seed_group_rows(
         instance,
         rows_by_table,
         reason="group_batch_solver_assignment",
+        budget=budget,
     )
 
 
@@ -2238,6 +2305,7 @@ def _seed_from_assignments(
     constraints: list[exp.Expression],
     equalities: list[tuple[SolverVar, SolverVar]],
     *,
+    budget: GenerationBudget,
     group_count: int = 1,
     min_rows: int = 1,
     dialect: str = "sqlite",
@@ -2260,6 +2328,7 @@ def _seed_from_assignments(
                 first_assignments, table_vars, occurrence_tables,
             ),
             reason="solver_assignment",
+            budget=budget,
         )
         return
 
@@ -2269,6 +2338,7 @@ def _seed_from_assignments(
             first_assignments, table_vars, occurrence_tables,
         ),
         reason="solver_assignment",
+        budget=budget,
     ):
         return
 
@@ -2362,8 +2432,7 @@ def _seed_from_assignments(
             equalities=new_equalities,
             variables=set(new_col_var_map.values()),
         )
-        solver = Solver(dialect=dialect)
-        result = solver.solve(problem)
+        result = budget.solve(problem, dialect=dialect)
 
         if not result.sat:
             if strategy != 0:
@@ -2390,6 +2459,7 @@ def _seed_from_assignments(
             instance,
             extra_rows_by_table,
             reason="extra_solver_assignment",
+            budget=budget,
         ):
             extra_idx += 1
             continue
@@ -2504,6 +2574,7 @@ def _check_aware_base_rows(
     table_node: exp.Table,
     *,
     row_count: int,
+    budget: GenerationBudget,
 ) -> list[dict[exp.Identifier, Any]] | None:
     table_schema = instance.database_constraints(table_node)
     check_columns = tuple(
@@ -2536,14 +2607,14 @@ def _check_aware_base_rows(
     )
 
     rows: list[dict[exp.Identifier, Any]] = []
-    solver = Solver(dialect=instance.dialect)
     variables = set(sv_map.values())
     for _ in range(row_count):
-        result = solver.solve(
+        result = budget.solve(
             Problem(
                 constraints=list(constraints),
                 variables=variables,
-            )
+            ),
+            dialect=instance.dialect,
         )
         if not result.sat:
             return []
@@ -2561,6 +2632,7 @@ def _check_aware_base_rows(
 def _seed_base_rows(
     instance: Instance,
     *,
+    budget: GenerationBudget,
     row_count: int = 1,
     tables: set[exp.Table] | None = None,
 ) -> None:
@@ -2570,12 +2642,12 @@ def _seed_base_rows(
         if tables is not None and table_node not in tables:
             continue
         check_rows = _check_aware_base_rows(
-            instance, table_node, row_count=row_count,
+            instance, table_node, row_count=row_count, budget=budget,
         )
         rows_by_table[table_node] = (
             check_rows if check_rows is not None else [{} for _ in range(row_count)]
         )
-    _try_create_rows(instance, rows_by_table, reason="base_rows")
+    _try_create_rows(instance, rows_by_table, reason="base_rows", budget=budget)
 
 
 # ---------------------------------------------------------------------------
@@ -2591,11 +2663,16 @@ def _seed_negative_rows(
     occurrence_tables: dict[OccurrenceKey, exp.Table],
     equalities: list[tuple[SolverVar, SolverVar]],
     dialect: str,
+    budget: GenerationBudget,
+    null_column_keys: list[ColumnKey] = (),
 ) -> None:
     """For each WHERE atom, seed a row that violates just that atom.
 
     For ``A AND B AND C``, this generates rows for ``NOT A AND B AND C``,
     ``A AND NOT B AND C``, and ``A AND B AND NOT C`` (where possible).
+
+    When *null_column_keys* is provided, also seed rows where each nullable
+    projection column is NULL while all WHERE atoms remain satisfied.
     """
     for i, atom in enumerate(where_atoms):
         negated = negate_predicate(atom)
@@ -2614,8 +2691,7 @@ def _seed_negative_rows(
             equalities=list(equalities),
             variables=set(col_var_map.values()),
         )
-        solver = Solver(dialect=dialect)
-        result = solver.solve(problem)
+        result = budget.solve(problem, dialect=dialect)
 
         if result.sat:
             occurrence_rows = {
@@ -2623,4 +2699,44 @@ def _seed_negative_rows(
                 for occurrence, vs in table_vars.items()
             }
             rows_by_table = _rows_by_physical_table(occurrence_rows, occurrence_tables)
-            _try_create_rows(instance, rows_by_table, reason="negative_rows")
+            _try_create_rows(
+                instance,
+                rows_by_table,
+                reason="negative_rows",
+                budget=budget,
+            )
+
+    for key in null_column_keys:
+        var = col_var_map.get(key)
+        if var is None:
+            continue
+
+        constraints: list[exp.Expression] = [
+            exp.Is(this=var.copy(), expression=exp.Null()),
+        ]
+        constraints.extend(where_atoms)
+        try:
+            _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
+            _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
+        except SchemaConstraintLoweringError:
+            continue
+
+        problem = Problem(
+            constraints=constraints,
+            equalities=list(equalities),
+            variables=set(col_var_map.values()),
+        )
+        result = budget.solve(problem, dialect=dialect)
+
+        if result.sat:
+            occurrence_rows = {
+                occurrence: _row_from_assignments(result.assignments, vs)
+                for occurrence, vs in table_vars.items()
+            }
+            rows_by_table = _rows_by_physical_table(occurrence_rows, occurrence_tables)
+            _try_create_rows(
+                instance,
+                rows_by_table,
+                reason="null_rows",
+                budget=budget,
+            )

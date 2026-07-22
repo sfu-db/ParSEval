@@ -139,7 +139,7 @@ class TestSmtBackendProblemApi(unittest.TestCase):
 
     def test_sat_status_does_not_depend_on_decoded_assignments(self):
         class EmptyModelSession:
-            def __init__(self, *, timeout_ms=None, dialect=None):
+            def __init__(self, *, timeout_ms=None, dialect=None, seed=None):
                 self.context = {"variable_to_z3": {}}
 
             def declare_variable(self, name, dtype):
