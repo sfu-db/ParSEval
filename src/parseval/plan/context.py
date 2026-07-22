@@ -133,7 +133,7 @@ class DerivedSchema:
         create_rows: Optional[Mapping[Any, Any]] = None,
         problem: Optional[Any] = None,
         assignments: Optional[Mapping[Any, Any]] = None,
-        bounds: Optional[Any] = None,
+        config: Optional[Any] = None,
         status: str = "sat",
         reason: str = "",
         coverage_ratio: float = 0.0,
@@ -157,7 +157,7 @@ class DerivedSchema:
         self.create_rows: Mapping[Any, Any] = create_rows or {}
         self.problem = problem
         self.assignments: Mapping[Any, Any] = assignments or {}
-        self.bounds = bounds
+        self.config = config
         self.status = status
         self.reason = reason
         self.coverage_ratio = coverage_ratio
@@ -217,11 +217,15 @@ class DerivedSchema:
             obligations=list(self.obligations),
             evidence=dict(self.evidence),
             expression_bindings=dict(self.expression_bindings),
-            row_provenance=dict(self.row_provenance),
+            row_provenance={
+                rowid: dict(provenance)
+                for rowid, provenance in self.row_provenance.items()
+                if rowid in row_ids
+            },
             create_rows=dict(self.create_rows),
             problem=self.problem,
             assignments=dict(self.assignments),
-            bounds=self.bounds,
+            config=self.config,
             status=self.status,
             reason=self.reason,
             coverage_ratio=self.coverage_ratio,

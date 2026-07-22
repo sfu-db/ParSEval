@@ -17,11 +17,11 @@ class TestNoIdentityDependency(unittest.TestCase):
     def test_instance_modules_do_not_import_identity(self):
         import parseval.instance.core as core
         import parseval.instance.exporter as exporter
-        import parseval.instance.loader as loader
+        import parseval.instance.io as io
         import parseval.instance.schema as schema
         import parseval.instance.symbols as symbols
 
-        for mod in (core, exporter, loader, schema, symbols):
+        for mod in (core, exporter, io, schema, symbols):
             for name, val in vars(mod).items():
                 if inspect.ismodule(val) and val.__name__.startswith("parseval.identity"):
                     self.fail(f"{mod.__name__} imports {val.__name__}")

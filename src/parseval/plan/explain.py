@@ -138,8 +138,6 @@ _AGG_CTORS: Dict[str, Callable[..., exp.Expression]] = {
 
 _WINDOW_CTORS: Dict[str, Callable[..., exp.Expression]] = {
     "row_number": lambda _args: exp.RowNumber(),
-    "rank": lambda _args: exp.Rank(),
-    "dense_rank": lambda _args: exp.DenseRank(),
     "sum": lambda args: exp.Sum(this=args[0]),
     "avg": lambda args: exp.Avg(this=args[0]),
     "min": lambda args: exp.Min(this=args[0]),
@@ -539,6 +537,19 @@ def _lower_from_variant(
             )
         return state.register_scalar_subquery(variant.subquery())
 
+    if kind == "InSubquery":
+        if state is None:
+            raise PlanError(
+                f"unsupported DataFusion expr variant {kind!r}: {raw.canonical_name()}"
+            )
+        return UnsupportedExpression(
+            this=kind,
+            expressions=[
+                to_expression(variant.expr(), state=state),
+                state.register_scalar_subquery(variant.subquery()),
+            ],
+        )
+
     raise PlanError(
         f"unsupported DataFusion expr variant {kind!r}: {raw.canonical_name()}"
     )
@@ -902,6 +913,19 @@ class ScalarSubqueryRef(exp.Expression):
         return self.subquery_id
 
 
+class UnsupportedExpression(exp.Expression):
+    """Plan expression retained solely to report an unsupported path."""
+
+    arg_types = {"this": True, "expressions": False}
+
+    @property
+    def variant(self) -> str:
+        return str(self.this)
+
+    def sql(self, *args: Any, **kwargs: Any) -> str:
+        return f"UNSUPPORTED_{self.variant.upper()}"
+
+
 def _generate_scalar_subquery_ref(
     generator: Generator,
     expression: ScalarSubqueryRef,
@@ -910,8 +934,17 @@ def _generate_scalar_subquery_ref(
     return expression.subquery_id
 
 
+def _generate_unsupported_expression(
+    generator: Generator,
+    expression: UnsupportedExpression,
+) -> str:
+    del generator
+    return f"UNSUPPORTED_{expression.variant.upper()}"
+
+
 for _generator_class in (Generator, SQLite.Generator, MySQL.Generator, Postgres.Generator):
     _generator_class.TRANSFORMS[ScalarSubqueryRef] = _generate_scalar_subquery_ref
+    _generator_class.TRANSFORMS[UnsupportedExpression] = _generate_unsupported_expression
 
 
 class TableScan(Step):
@@ -956,6 +989,7 @@ class Join(Step):
         self.on_keys: List[Tuple[exp.Expression, exp.Expression]] = []
         # 4. Non-Equi Join Conditions (e.g., t1.date > t2.date)
         self.condition: Optional[exp.Expression] = None
+        self.subquery_kind: Optional[str] = None
 
     def set_left(self, step: "Step") -> None:
         """Sets the left input and registers the DAG dependency."""
@@ -966,6 +1000,23 @@ class Join(Step):
         """Sets the right input and registers the DAG dependency."""
         self.right = step
         self.add_dependency(step)
+
+
+def normalize_join_type(value: str) -> str:
+    normalized = "".join(character for character in value.upper() if character.isalnum())
+    if normalized.endswith("SEMI"):
+        return "SEMI"
+    if normalized.endswith("ANTI"):
+        return "ANTI"
+    if normalized in {"LEFT", "LEFTOUTER"}:
+        return "LEFT"
+    if normalized in {"RIGHT", "RIGHTOUTER"}:
+        return "RIGHT"
+    if normalized in {"FULL", "FULLOUTER"}:
+        return "FULL"
+    if normalized == "INNER":
+        return "INNER"
+    return normalized
 
 
 class Sort(Step):
@@ -1686,13 +1737,59 @@ def explain(
     logical = df.optimized_logical_plan()
     state = _NodeLowerState(ctx=ctx, dialect=dialect, plan=logical, sql=df_sql)
     root = _from_logical(logical, ctx=ctx, dialect=dialect, sql=df_sql, state=state)
-    return Plan(
+    plan = Plan(
         root,
         sql=df_sql,
         dialect=dialect,
         logical_display=str(logical),
         scalar_subqueries=state.scalar_subqueries,
     )
+    _annotate_subquery_joins(plan, query)
+    return plan
+
+
+def _annotate_subquery_joins(plan: Plan, query: str) -> None:
+    tree = sqlglot.parse_one(query, read=plan.dialect)
+    kinds: list[str] = []
+    for node in tree.walk():
+        if isinstance(node, exp.Exists):
+            kinds.append("not_exists" if isinstance(node.parent, exp.Not) else "exists")
+        elif isinstance(node, exp.In) and node.args.get("query") is not None:
+            kinds.append("not_in" if isinstance(node.parent, exp.Not) else "in")
+
+    joins = [
+        step
+        for step in _all_reachable_steps(plan.root)
+        if isinstance(step, Join) and normalize_join_type(step.join_type) in {"SEMI", "ANTI"}
+    ]
+    compatible = {
+        "SEMI": {"exists", "in"},
+        "ANTI": {"not_exists", "not_in"},
+    }
+    assigned: set[int] = set()
+    for join in joins:
+        right = join.right
+        if not isinstance(right, SubqueryAlias):
+            continue
+        match = re.fullmatch(r"__correlated_sq_(\d+)", right.alias.name)
+        if match is None:
+            continue
+        index = int(match.group(1)) - 1
+        if index < 0 or index >= len(kinds):
+            continue
+        kind = kinds[index]
+        if kind in compatible[normalize_join_type(join.join_type)]:
+            join.subquery_kind = kind
+            assigned.add(index)
+
+    remaining = [kind for index, kind in enumerate(kinds) if index not in assigned]
+    for join in sorted(joins, key=lambda item: item.display):
+        if join.subquery_kind is not None:
+            continue
+        allowed = compatible[normalize_join_type(join.join_type)]
+        index = next((i for i, kind in enumerate(remaining) if kind in allowed), None)
+        if index is not None:
+            join.subquery_kind = remaining.pop(index)
 
 
 def assert_no_bare_string_identifiers(plan: Plan) -> None:

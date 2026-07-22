@@ -23,7 +23,7 @@ from typing import Any, Mapping, Optional, Sequence
 from sqlglot import exp
 
 from parseval.db_manager import get_connection, execute_query
-from parseval.generator.bounds import BmcBounds
+from parseval.generator.config import GenerationConfig
 from parseval.generator.speculate import speculate
 from parseval.instance import Instance
 
@@ -58,7 +58,7 @@ class SpecTask:
     query: dict[str, Any]
     ddl: str
     dialect: str
-    bounds: BmcBounds
+    config: GenerationConfig
     out_dir: str
     timeout: int
 
@@ -161,7 +161,7 @@ def run_speculative(
     *,
     ddl: str,
     dialect: str,
-    bounds: BmcBounds,
+    config: GenerationConfig,
     out_dir: Path,
     timeout: int,
 ) -> SpecRecord:
@@ -177,7 +177,7 @@ def run_speculative(
     inst: Instance | None = None
 
     
-    inst = speculate(ddl, sql, dialect=dialect, bounds=bounds)    
+    inst = speculate(ddl, sql, dialect=dialect, config=config)
     nrows = sum(
         len(inst.get_rows(table_node))
         for table_node in inst.schema.fk_safe_table_order()
@@ -270,7 +270,7 @@ def run_spec_task(task: SpecTask) -> SpecRecord:
         task.query,
         ddl=task.ddl,
         dialect=task.dialect,
-        bounds=task.bounds,
+        config=task.config,
         out_dir=Path(task.out_dir),
         timeout=task.timeout,
     )
@@ -423,14 +423,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--summary-json", type=Path)
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--table-rows", type=int, default=3)
-    parser.add_argument("--join-width", type=int, default=1)
+    parser.add_argument("--bootstrap-rows", type=int, default=3)
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--rows-per-group", type=int, default=3)
     parser.add_argument("--subquery-rows", type=int, default=3)
     parser.add_argument("--order-competitors", type=int, default=1)
-    parser.add_argument("--max-iterations", type=int, default=0)
-    parser.add_argument("--max-table-rows", type=int, default=512)
     parser.add_argument(
         "--mp-start-method",
         choices=("spawn", "forkserver", "fork"),
@@ -467,7 +464,7 @@ def run_batch(
     ddl_by_db: Mapping[str, str],
     out_dir: Path,
     dialect: str,
-    bounds: BmcBounds,
+    config: GenerationConfig,
     timeout: int,
     workers: int,
     mp_start_method: str,
@@ -491,7 +488,7 @@ def run_batch(
                 query=dict(query),
                 ddl=ddl_by_db[db_id],
                 dialect=dialect,
-                bounds=bounds,
+                config=config,
                 out_dir=str(out_dir),
                 timeout=timeout,
             )
@@ -591,15 +588,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if missing:
         raise SystemExit(f"missing_schema_dbs:{missing}")
 
-    bounds = BmcBounds(
-        table_rows=args.table_rows,
-        join_width=args.join_width,
+    config = GenerationConfig(
+        bootstrap_rows=args.bootstrap_rows,
         groups=args.groups,
         rows_per_group=args.rows_per_group,
         subquery_rows=args.subquery_rows,
         order_competitors=args.order_competitors,
-        max_iterations=args.max_iterations,
-        max_table_rows=args.max_table_rows,
     )
 
     records = run_batch(
@@ -607,7 +601,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ddl_by_db=ddl_by_db,
         out_dir=args.out_dir,
         dialect=args.dialect,
-        bounds=bounds,
+        config=config,
         timeout=args.timeout,
         workers=args.workers,
         mp_start_method=args.mp_start_method,

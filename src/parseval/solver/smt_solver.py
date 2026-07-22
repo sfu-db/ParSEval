@@ -108,6 +108,7 @@ class Z3SmtSession:
         ] = None,
         timeout_ms: Optional[int] = None,
         dialect: str = "sqlite",
+        seed: int = 42,
     ):
         """Initialize the SMT solver.
 
@@ -124,6 +125,7 @@ class Z3SmtSession:
         self.solver = z3.Solver(ctx=self.z3ctx)
         if timeout_ms is not None and timeout_ms > 0:
             self.solver.set("timeout", int(timeout_ms))
+        self.solver.set("random_seed", int(seed))
         self.timeout_ms = timeout_ms
         self.model = None
         self.context: Dict[str, Dict[str, Any]] = {}
@@ -494,6 +496,8 @@ class Z3SmtSession:
         right_expr = expression.expression
         left = self._as_value(self._to_z3_expr(left_expr))
         right = self._as_value(self._to_z3_expr(right_expr))
+        if left.is_null_literal or right.is_null_literal:
+            return self._compare_values(left, right, op)
         left, right = coerce_comparison_pair(
             left, right, left_expr, right_expr, self.dialect, self
         )

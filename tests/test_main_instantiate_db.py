@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from parseval.generator import BmcBounds
+from parseval.generator import GenerationConfig
 from parseval.instance import Instance
 from parseval.main import instantiate_db
 from parseval.states import ExecutionResult
@@ -15,7 +15,10 @@ class TestInstantiateDb(unittest.TestCase):
         ddl = "CREATE TABLE users (id INT PRIMARY KEY, age INT);"
         query = "SELECT id FROM users WHERE age > 21"
         connection_string = "sqlite:///tmp/test-main-instantiate.sqlite"
-        expected_bounds = BmcBounds(table_rows=2, max_iterations=0)
+        expected_config = GenerationConfig(
+            bootstrap_rows=2,
+            bootstrap_negatives=False,
+        )
         instance = Instance(ddl, name="generated", dialect="sqlite")
         instance.generation = SimpleNamespace(
             create_rows={
@@ -38,9 +41,7 @@ class TestInstantiateDb(unittest.TestCase):
                 ddl,
                 connection_string,
                 "sqlite",
-                table_rows=2,
-                max_iterations=0,
-                generate_negatives=False,
+                generation_config=expected_config,
                 timeout=7,
             )
 
@@ -48,8 +49,7 @@ class TestInstantiateDb(unittest.TestCase):
             ddl,
             query,
             dialect="sqlite",
-            bounds=expected_bounds,
-            generate_negatives=False,
+            config=expected_config,
         )
         to_db_mock.assert_called_once_with(instance, connection_string, dialect="sqlite")
         execute_mock.assert_called_once_with(query, connection_string, "sqlite", 7)

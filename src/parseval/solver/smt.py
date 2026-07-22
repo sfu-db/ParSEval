@@ -14,15 +14,26 @@ from .types import Problem, Result, SolverVar, collect_problem_variables
 class SmtBackend:
     """Z3-backed solver implementing the Backend protocol."""
 
-    def __init__(self, *, timeout_ms: int = 5000, dialect: str = "sqlite") -> None:
+    def __init__(
+        self,
+        *,
+        timeout_ms: int = 5000,
+        dialect: str = "sqlite",
+        seed: int = 42,
+    ) -> None:
         self.timeout_ms = timeout_ms
         self.dialect = dialect
+        self.seed = seed
 
     def solve(self, problem: Problem) -> Result:
         if not problem.constraints and not problem.equalities:
             return Result(status="sat", assignments={})
 
-        smt = Z3SmtSession(timeout_ms=self.timeout_ms, dialect=self.dialect)
+        smt = Z3SmtSession(
+            timeout_ms=self.timeout_ms,
+            dialect=self.dialect,
+            seed=self.seed,
+        )
         variables = collect_problem_variables(problem)
         encoded_names = {
             variable: f"sv_{index}_{variable.var_key}".replace(".", "_").replace(

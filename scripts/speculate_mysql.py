@@ -25,7 +25,7 @@ import sqlglot
 from sqlglot import exp
 
 from parseval.db_manager import get_connection
-from parseval.generator.bounds import BmcBounds
+from parseval.generator.config import GenerationConfig
 from parseval.generator.speculate import speculate
 from parseval.instance import Instance
 
@@ -216,7 +216,7 @@ def process_speculate_case(
     connection_string: str,
     timeout: int,
     dialect: str = "mysql",
-    bounds: BmcBounds | None = None,
+    config: GenerationConfig | None = None,
 ) -> SpecRecord:
     t0 = time.time()
     tags = sql_shape_tags(sql)
@@ -224,7 +224,7 @@ def process_speculate_case(
     nrows = 0
 
     try:
-        inst = speculate(ddl, sql, dialect=dialect, bounds=bounds)
+        inst = speculate(ddl, sql, dialect=dialect, config=config)
         nrows = sum(
             len(inst.get_rows(table_node))
             for table_node in inst.schema.fk_safe_table_order()
@@ -389,14 +389,11 @@ def run_speculate_experiment(
     start: int = 0,
     workers: int = 1,
     timeout: int = 60,
-    table_rows: int = 3,
-    join_width: int = 1,
+    bootstrap_rows: int = 3,
     groups: int = 2,
     rows_per_group: int = 3,
     subquery_rows: int = 3,
     order_competitors: int = 1,
-    max_iterations: int = 0,
-    max_table_rows: int = 512,
     use_first_of_pair: bool = True,
 ) -> list[SpecRecord]:
     entries = load_jsonlines(data_fp)
@@ -412,15 +409,12 @@ def run_speculate_experiment(
         flush=True,
     )
 
-    bounds = BmcBounds(
-        table_rows=table_rows,
-        join_width=join_width,
+    config = GenerationConfig(
+        bootstrap_rows=bootstrap_rows,
         groups=groups,
         rows_per_group=rows_per_group,
         subquery_rows=subquery_rows,
         order_competitors=order_competitors,
-        max_iterations=max_iterations,
-        max_table_rows=max_table_rows,
     )
 
     tasks = []
@@ -437,7 +431,7 @@ def run_speculate_experiment(
             continue
 
         task_conn = _make_task_connection_string(connection_string, index)
-        tasks.append((index, prepared_sql, ddl, task_conn, timeout, bounds))
+        tasks.append((index, prepared_sql, ddl, task_conn, timeout, config))
 
     if skipped:
         print(f"Skipped {skipped} entries with non-SELECT statements", flush=True)
@@ -545,8 +539,8 @@ def _print_speculate_summary(metrics: dict[str, Any]) -> None:
 
 
 def _process_speculate_task(task: tuple) -> SpecRecord:
-    index, sql, ddl, task_conn, timeout, bounds = task
-    return process_speculate_case(index, sql, ddl, task_conn, timeout, "mysql", bounds)
+    index, sql, ddl, task_conn, timeout, config = task
+    return process_speculate_case(index, sql, ddl, task_conn, timeout, "mysql", config)
 
 
 
@@ -570,15 +564,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
 
-    # BmcBounds (speculate mode only)
-    parser.add_argument("--table-rows", type=int, default=3)
-    parser.add_argument("--join-width", type=int, default=1)
+    # GenerationConfig (speculate mode only)
+    parser.add_argument("--bootstrap-rows", type=int, default=3)
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--rows-per-group", type=int, default=3)
     parser.add_argument("--subquery-rows", type=int, default=3)
     parser.add_argument("--order-competitors", type=int, default=1)
-    parser.add_argument("--max-iterations", type=int, default=0)
-    parser.add_argument("--max-table-rows", type=int, default=512)
     parser.add_argument("--use-first-of-pair", action="store_true", default=True,
                         help="Use the first SQL in each pair for speculate mode")
     parser.add_argument("--no-use-first-of-pair", action="store_false",
@@ -598,14 +589,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         start=args.start,
         workers=args.workers,
         timeout=args.timeout,
-        table_rows=args.table_rows,
-        join_width=args.join_width,
+        bootstrap_rows=args.bootstrap_rows,
         groups=args.groups,
         rows_per_group=args.rows_per_group,
         subquery_rows=args.subquery_rows,
         order_competitors=args.order_competitors,
-        max_iterations=args.max_iterations,
-        max_table_rows=args.max_table_rows,
         use_first_of_pair=args.use_first_of_pair,
     )
 

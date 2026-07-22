@@ -93,6 +93,10 @@ class RunResult:
     coverage: float = 0.0
     error_msg: str = ""
     elapsed_time: float = 0.0
+    solver_calls: int = 0
+    budgets_consumed: Dict[str, int] = field(default_factory=dict)
+    unresolved_reasons: Tuple[str, ...] = ()
+    stage_timings: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -102,6 +106,10 @@ class RunResult:
             "coverage": self.coverage,
             "error_msg": self.error_msg,
             "elapsed_time": self.elapsed_time,
+            "solver_calls": self.solver_calls,
+            "budgets_consumed": self.budgets_consumed,
+            "unresolved_reasons": list(self.unresolved_reasons),
+            "stage_timings": self.stage_timings,
         }
 
 
