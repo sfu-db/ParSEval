@@ -29,6 +29,8 @@ from .smt_types import (
 )
 from parseval.dtype import (
     date_to_epoch_day,
+    enum_values,
+    is_enum_type,
     time_to_seconds,
     datetime_to_epoch_second,
     epoch_day_to_date,
@@ -857,7 +859,11 @@ class Z3SmtSession:
             datatype = getattr(condition, 'datatype', None)
             if datatype is None:
                 if condition.is_string:
-                    datatype = DataType.build("TEXT")
+                    raw_s = condition.this
+                    if isinstance(raw_s, str) and _is_temporal_string(raw_s):
+                        datatype = _infer_temporal_dtype(raw_s)
+                    else:
+                        datatype = DataType.build("TEXT")
                 elif condition.is_int:
                     datatype = DataType.build("INT")
                 else:
@@ -901,6 +907,10 @@ class Z3SmtSession:
             if typeinfo.family == "text":
                 self._ensure_str_printable(z3var)
                 self._ensure_str_length(z3var, 0)
+            if is_enum_type(column.type):
+                allowed = enum_values(column.type)
+                if allowed:
+                    self._ensure_enum_values(z3var, allowed)
         self._domain_constraints_applied = True
 
     def _ensure_str_printable(self, expr: z3.ExprRef):
@@ -944,6 +954,19 @@ class Z3SmtSession:
             upper = datetime_to_epoch_second(datetime(2100, 1, 1, 0, 0, 0))
         self.add(z3.Implies(opt.is_Some(expr), value > lower))
         self.add(z3.Implies(opt.is_Some(expr), value < upper))
+
+    def _ensure_enum_values(self, expr: z3.ExprRef, allowed: tuple[Any, ...]) -> None:
+        """Constrain string values to the declared ENUM members."""
+        if not is_option_expr(expr):
+            return
+        opt = option_of(expr)
+        raw = unwrap_option(expr)
+        self.add(
+            z3.Implies(
+                opt.is_Some(expr),
+                z3.Or(*[raw == z3.StringVal(str(v), ctx=self.z3ctx) for v in allowed]),
+            )
+        )
 
     def z3_to_python(self, model: z3.ModelRef):
         """Extract concrete Python values from a Z3 model for declared variables.

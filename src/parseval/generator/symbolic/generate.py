@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from sqlglot.errors import OptimizeError, SchemaError, UnsupportedError
-
 from parseval.generator.config import GenerationConfig
 from parseval.generator.budget import GenerationBudget
 from parseval.instance import Instance
@@ -26,24 +24,6 @@ def generate(
     evaluates and completes uncovered semantic targets in the same instance.
     """
     budget = GenerationBudget(config)
-    try:
-        plan = explain(ddls, query, dialect=dialect)
-    except (ValueError, SchemaError, OptimizeError, UnsupportedError):
-        plan = None
-    except Exception as exc:
-        # DataFusion currently raises the built-in Exception type for some
-        # planning failures instead of a library-specific exception.
-        if type(exc) is not Exception:
-            raise
-        plan = None
-    if plan is None:
-        return speculate(
-            ddls,
-            query,
-            dialect=dialect,
-            config=config,
-            _budget=budget,
-        )
     instance = speculate(
         ddls,
         query,
@@ -51,13 +31,17 @@ def generate(
         config=config,
         _budget=budget,
     )
-    return _generate_from_plan(
-        plan,
-        instance,
-        config=config,
-        before_counts={},
-        budget=budget,
-    )
+    try:        
+        plan = explain(ddls, query, dialect=dialect)        
+        return _generate_from_plan(
+            plan,
+            instance,
+            config=config,
+            before_counts={},
+            budget=budget,
+        )
+    except Exception as exc:
+        return instance
 
 
 def _generate_from_plan(

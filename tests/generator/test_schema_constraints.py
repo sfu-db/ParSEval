@@ -14,6 +14,28 @@ from parseval.solver.types import SolverVar
 
 
 class TestSchemaConstraintLowering(unittest.TestCase):
+    def test_all_non_nullable_solver_columns_are_constrained(self):
+        instance = Instance(
+            "CREATE TABLE users (id INT, name TEXT NOT NULL);",
+            name="not_null",
+            dialect="sqlite",
+        )
+        table = instance.resolve_table("users")
+        sv_map = {
+            "id": SolverVar(key="users.id"),
+            "name": SolverVar(key="users.name"),
+        }
+
+        constraints = schema_constraints_for_solver_row(instance, table, sv_map)
+
+        self.assertTrue(
+            any(
+                isinstance(constraint, exp.Not)
+                and sv_map["name"] in set(constraint.find_all(SolverVar))
+                for constraint in constraints
+            )
+        )
+
     def test_check_constraint_with_non_query_column_is_lowered(self):
         instance = Instance(
             """

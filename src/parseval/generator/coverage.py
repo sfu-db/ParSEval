@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlglot import exp
 from decimal import Decimal
@@ -37,6 +37,28 @@ class SemanticTarget:
     kind: str
     target: str
     expression: exp.Expression | None = None
+
+
+@dataclass(frozen=True)
+class CoverageObligation:
+    """Result of compiling and validating one semantic outcome path."""
+
+    id: str
+    target_id: str
+    steps: tuple[str, ...]
+    status: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class GenerationState:
+    """Public diagnostics for a complete single-query generation run."""
+
+    status: str
+    obligations: tuple[CoverageObligation, ...]
+    solver_calls: int
+    coverage_ratio: float
+    stage_timings: Mapping[str, float]
 
 @dataclass(frozen=True)
 class CoverageTreeNode:
@@ -428,8 +450,6 @@ def _aggregate_targets(
     step: Aggregate,
 ) -> tuple[SemanticTarget, ...]:
     targets: list[SemanticTarget] = []
-    has_count_star = False
-    has_count_column = False
     for aggregate_index, aggregate in enumerate(step.aggregations):
         expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
         if isinstance(expression, exp.Avg):
@@ -445,11 +465,25 @@ def _aggregate_targets(
             )
         if isinstance(expression, exp.Count):
             source = expression.this
-            if source is None or isinstance(source, (exp.Star, exp.Literal)):
-                has_count_star = True
-            elif not isinstance(source, exp.Distinct):
-                has_count_column = True
-            if isinstance(source, exp.Distinct):
+            is_distinct = isinstance(source, exp.Distinct) or bool(
+                expression.args.get("distinct")
+            )
+            if (
+                source is not None
+                and not isinstance(source, (exp.Star, exp.Literal))
+                and not is_distinct
+            ):
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.agg{aggregate_index}.null_sensitive",
+                        step=step,
+                        step_type=step.type_name,
+                        kind="null_sensitive_aggregate_witness",
+                        target="count_column_null",
+                        expression=expression,
+                    )
+                )
+            if is_distinct:
                 targets.append(
                     SemanticTarget(
                         id=f"{prefix}.agg{aggregate_index}.distinct",
@@ -474,16 +508,6 @@ def _aggregate_targets(
             targets.extend(
                 _case_targets(prefix, step, aggregate_index, expression.this)
             )
-    if has_count_star and has_count_column:
-        targets.append(
-            SemanticTarget(
-                id=f"{prefix}.null_sensitive_count",
-                step=step,
-                step_type=step.type_name,
-                kind="null_sensitive_aggregate_witness",
-                target="count_star_vs_count_column",
-            )
-        )
     return tuple(targets)
 
 

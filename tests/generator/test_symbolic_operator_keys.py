@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from random import Random
 
 from sqlglot import exp, parse_one
 
@@ -17,7 +16,6 @@ from parseval.generator.symbolic.operator import (
     _group_demand_for_having,
     _projection_expression_map,
     _solve_atomic_row_requests,
-    _with_random_aggregate_null_rows,
 )
 from parseval.instance import Instance
 from parseval.plan.context import DerivedSchema
@@ -29,57 +27,6 @@ def expression(sql: str) -> exp.Expression:
 
 
 class TestSymbolicOperatorKeys(unittest.TestCase):
-    def test_random_aggregate_null_rows_expand_existing_group_demand(self):
-        select = parse_one(
-            "SELECT region, COUNT(a), SUM(b), COUNT(c) FROM scores GROUP BY region",
-            dialect="sqlite",
-        )
-        aggregate = Aggregate()
-        aggregate.aggregations = list(select.expressions[1:])
-        a = exp.column("a")
-        b = exp.column("b")
-        c = exp.column("c")
-        child = DerivedSchema(
-            columns=(a, b, c),
-            nullables={a: True, b: True, c: False},
-        )
-
-        groups = _with_random_aggregate_null_rows(
-            aggregate,
-            (GroupDemand(group_index=0, row_count=2),),
-            child,
-            Random(142),
-            max_rows=10,
-            dialect="sqlite",
-        )
-
-        self.assertEqual(5, groups[0].row_count)
-        predicates = {
-            index: tuple(predicate.sql(dialect="sqlite") for predicate in row_predicates)
-            for index, row_predicates in groups[0].row_predicates_by_index
-        }
-        self.assertEqual(("a IS NULL", "NOT b IS NULL"), predicates[2])
-        self.assertEqual(("a IS NULL", "NOT b IS NULL"), predicates[3])
-        self.assertEqual(("NOT a IS NULL", "b IS NULL"), predicates[4])
-
-    def test_random_aggregate_null_rows_preserve_baseline_under_row_limit(self):
-        aggregate = Aggregate()
-        aggregate.aggregations = [expression("COUNT(a)")]
-        a = exp.column("a")
-        child = DerivedSchema(columns=(a,), nullables={a: True})
-
-        groups = _with_random_aggregate_null_rows(
-            aggregate,
-            (GroupDemand(group_index=0, row_count=2),),
-            child,
-            Random(142),
-            max_rows=2,
-            dialect="sqlite",
-        )
-
-        self.assertEqual(2, groups[0].row_count)
-        self.assertEqual((), groups[0].row_predicates_by_index)
-
     def test_expression_key_preserves_string_literal_case(self):
         upper = expression("SUM(CASE WHEN name = 'Legal' THEN 1 ELSE 0 END)")
         lower = expression("SUM(CASE WHEN name = 'legal' THEN 1 ELSE 0 END)")

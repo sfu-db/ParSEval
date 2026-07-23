@@ -842,3 +842,48 @@ def test_repr_step_and_expr() -> None:
     subq_proj_repr = repr_expr(subq_proj)
     assert subq_proj_repr.startswith("ScalarSubqueryRef(")
     assert "Max(" in repr_step(plan.scalar_subqueries[subq_proj.subquery_id])
+
+
+def test_interval_literal_day() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' DAY AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "1" in sql
+
+
+def test_interval_literal_month() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' MONTH AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "1" in sql
+
+
+def test_interval_literal_hour() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '2' HOUR AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "2" in sql
+
+
+def test_interval_literal_year() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' YEAR AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "12" in sql
+
+
+def test_interval_literal_with_nonzero_seconds() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1.5' SECOND AS d", "mysql")
+    assert list(plan.dag)

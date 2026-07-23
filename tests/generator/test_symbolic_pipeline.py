@@ -21,6 +21,28 @@ def cell_value(row, column):
 
 
 class TestSymbolicPipeline(unittest.TestCase):
+    def test_non_nullable_final_column_does_not_request_null_rows(self):
+        ddl = "CREATE TABLE t (a INT NOT NULL)"
+        query = "SELECT a FROM t"
+
+        result = generate(
+            ddl,
+            query,
+            dialect="sqlite",
+            config=GenerationConfig(bootstrap_negatives=False),
+        )
+
+        self.assertTrue(
+            all(cell_value(row, "a") is not None for row in result.get_rows("t"))
+        )
+        self.assertNotIn(
+            "root.final_column0.null",
+            {
+                obligation.target_id
+                for obligation in result.generation.obligations
+            },
+        )
+
     def test_final_columns_repeat_non_null_and_null_values(self):
         ddl = "CREATE TABLE t (a INT, b INT)"
         query = "SELECT a, b FROM t"

@@ -19,6 +19,7 @@ class GenerationConfig:
     max_solver_calls: int = 48
     solver_timeout_ms: int = 1000
     seed: int = 12322
+    max_plan_depth: int | None = None
 
     def __post_init__(self) -> None:
         positive = {
@@ -37,6 +38,8 @@ class GenerationConfig:
             raise ValueError(f"GenerationConfig fields must be positive: {', '.join(invalid)}")
         if self.order_competitors < 0:
             raise ValueError("order_competitors must be non-negative")
+        if self.max_plan_depth is not None and self.max_plan_depth < 0:
+            raise ValueError("max_plan_depth must be non-negative or None")
 
 
 __all__ = ["GenerationConfig"]
