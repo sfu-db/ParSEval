@@ -28,6 +28,8 @@ PREDEFINED_PLANNING_UDFS: Tuple[Tuple[str, int, pa.DataType], ...] = (
     # MySQL date/time
     ("adddate", 2, pa.string()),
     ("subdate", 2, pa.string()),
+    ("date_add", 2, pa.string()),
+    ("date_sub", 2, pa.string()),
     ("datediff", 2, pa.float64()),
     ("timestampdiff", 3, pa.float64()),
     ("str_to_date", 2, pa.string()),

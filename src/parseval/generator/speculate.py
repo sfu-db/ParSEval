@@ -194,6 +194,26 @@ def _speculate_select(
     for key in (*group_column_keys, *agg_input_column_keys):
         _ensure_solver_var(key, instance, col_var_map, table_vars, occurrence_tables)
 
+    # Compute keys for duplicate-value generation
+    seed_duplicate_keys: list[ColumnKey] = list(group_column_keys)
+    for expr in tree.expressions:
+        unwrapped = expr
+        if isinstance(unwrapped, exp.Alias):
+            unwrapped = unwrapped.this
+        if isinstance(unwrapped, exp.Column):
+            key = _resolve_column_key(unwrapped, tree, relation_info, instance)
+            if key is not None and key not in seed_duplicate_keys:
+                table_node, _alias, col_ident = key
+                if not instance.is_unique(table_node, col_ident):
+                    seed_duplicate_keys.append(key)
+    for table_node in query_tables:
+        table_schema = instance.database_constraints(table_node)
+        for fk in table_schema.foreign_keys:
+            for col_ident in fk.source_columns:
+                key = (table_node, None, col_ident)
+                if key in col_var_map and key not in seed_duplicate_keys:
+                    seed_duplicate_keys.append(key)
+
     null_column_keys: list[ColumnKey] = []
     for expr in tree.expressions:
         unwrapped = expr
@@ -238,12 +258,21 @@ def _speculate_select(
             return True
 
         if not constraints and not equalities and not not_exists_not_in_items:
+            base_row_count = max(1, group_count, min_rows)
             _seed_base_rows(
                 instance,
-                row_count=max(1, group_count, min_rows),
+                row_count=base_row_count,
                 tables=query_tables,
                 budget=budget,
+                child_multiplier=2,
             )
+            if base_row_count > 0 and seed_duplicate_keys:
+                _seed_extra_duplicate_rows(
+                    instance, seed_duplicate_keys, col_var_map,
+                    table_vars, occurrence_tables,
+                    extra_count=base_row_count,
+                    budget=budget,
+                )
             if not _prepare_database_constraints(
                 instance, constraints, col_var_map, table_vars, occurrence_tables,
             ):
@@ -277,8 +306,9 @@ def _speculate_select(
                 group_count=group_count,
                 min_rows=min_rows,
                 dialect=dialect,
-                group_key_column_keys=group_column_keys,
+                duplicate_column_keys=seed_duplicate_keys,
                 aggregate_input_column_keys=agg_input_column_keys,
+                null_column_keys=null_column_keys,
                 budget=budget,
             )
             _seed_case_arm_rows(
@@ -1299,6 +1329,7 @@ def _seed_not_exists_not_in(
                     col_var_map,
                     table_subset,
                     subset_occurrence_tables,
+                    include_same_batch_fk_targets=True,
                 )
             except SchemaConstraintLoweringError:
                 continue
@@ -1656,6 +1687,7 @@ def _prepare_database_constraints(
         )
         _add_database_constraints(
             constraints, instance, col_var_map, table_vars, occurrence_tables,
+            include_same_batch_fk_targets=True,
         )
     except SchemaConstraintLoweringError:
         return False
@@ -2309,15 +2341,19 @@ def _seed_from_assignments(
     group_count: int = 1,
     min_rows: int = 1,
     dialect: str = "sqlite",
-    group_key_column_keys: Sequence[ColumnKey] = (),
+    duplicate_column_keys: Sequence[ColumnKey] = (),
     aggregate_input_column_keys: Sequence[ColumnKey] = (),
+    null_column_keys: Sequence[ColumnKey] = (),
 ) -> None:
     """Seed the instance with solver assignments, re-solving for extra rows.
 
-    When *group_key_column_keys* is provided, a portion of extra rows are
-    generated with duplicate group-key values (multiple rows per group).
+    When *duplicate_column_keys* is provided, a portion of extra rows are
+    generated with duplicate column values (multiple matching rows per
+    group or duplicate projection values).
     When *aggregate_input_column_keys* is provided, a portion of extra rows
     set nullable aggregate-input columns to NULL.
+    When *null_column_keys* is provided, a portion of extra rows also set
+    nullable projection/FK columns to NULL.
     """
     total_rows = max(1, group_count, min_rows)
 
@@ -2342,12 +2378,12 @@ def _seed_from_assignments(
     ):
         return
 
-    # Read first-row group-key values from the instance (the instance fills
-    # in random values even when solver assignments are empty).
-    first_row_group_values: dict[ColumnKey, Any] = {}
-    if group_key_column_keys:
-        for gkey in group_key_column_keys:
-            table_node, _alias, col_ident = gkey
+    # Read first-row duplicate-key values from the instance (the instance
+    # fills in random values even when solver assignments are empty).
+    first_row_values: dict[ColumnKey, Any] = {}
+    if duplicate_column_keys:
+        for dkey in duplicate_column_keys:
+            table_node, _alias, col_ident = dkey
             for occurrence in table_vars:
                 if occurrence_tables[occurrence] == table_node:
                     existing = instance.get_rows(table_node)
@@ -2355,9 +2391,9 @@ def _seed_from_assignments(
                         val = existing[0].column_values.get(col_ident)
                         if val is not None and hasattr(val, 'concrete'):
                             val = val.concrete
-                        first_row_group_values[gkey] = val
+                        first_row_values[dkey] = val
                     break
-    can_duplicate = bool(group_key_column_keys) and len(first_row_group_values) == len(group_key_column_keys)
+    can_duplicate = bool(duplicate_column_keys) and len(first_row_values) == len(duplicate_column_keys)
 
     # Pre-compute nullable aggregate-input column keys for the NULL strategy
     nullable_agg_keys: list[ColumnKey] = []
@@ -2366,7 +2402,10 @@ def _seed_from_assignments(
             var = col_var_map.get(akey)
             if var is not None and var.dtype.args.get("nullable") is not False:
                 nullable_agg_keys.append(akey)
-    can_null = bool(nullable_agg_keys)
+    nullable_fk_keys: list[ColumnKey] = [
+        nkey for nkey in null_column_keys if nkey in col_var_map
+    ]
+    can_null = bool(nullable_agg_keys or nullable_fk_keys)
 
     extra_idx = 0
     while extra_idx < total_rows - 1:
@@ -2404,19 +2443,27 @@ def _seed_from_assignments(
                 new_equalities.append((new_a, new_b))
 
         if strategy == 1:
-            for gkey, value in first_row_group_values.items():
-                new_var = new_col_var_map.get(gkey)
-                if new_var is not None:
+            for dkey, value in first_row_values.items():
+                new_var = new_col_var_map.get(dkey)
+                if new_var is not None and value is not None:
                     new_constraints.append(
                         exp.EQ(this=new_var, expression=_literal_for_value(value))
                     )
         elif strategy == 2:
-            for akey in nullable_agg_keys:
-                new_var = new_col_var_map.get(akey)
-                if new_var is not None:
-                    new_constraints.append(
-                        exp.Is(this=new_var, expression=exp.Null())
-                    )
+            if nullable_agg_keys:
+                for akey in nullable_agg_keys:
+                    new_var = new_col_var_map.get(akey)
+                    if new_var is not None:
+                        new_constraints.append(
+                            exp.Is(this=new_var, expression=exp.Null())
+                        )
+            elif nullable_fk_keys:
+                for nkey in nullable_fk_keys:
+                    new_var = new_col_var_map.get(nkey)
+                    if new_var is not None:
+                        new_constraints.append(
+                            exp.Is(this=new_var, expression=exp.Null())
+                        )
 
         _add_database_constraints(
             new_constraints,
@@ -2464,6 +2511,56 @@ def _seed_from_assignments(
             extra_idx += 1
             continue
         extra_idx += 1
+
+
+def _seed_extra_duplicate_rows(
+    instance: Instance,
+    duplicate_keys: Sequence[ColumnKey],
+    col_var_map: dict[ColumnKey, SolverVar],
+    table_vars: dict[OccurrenceKey, list[SolverVar]],
+    occurrence_tables: dict[OccurrenceKey, exp.Table],
+    *,
+    extra_count: int,
+    budget: GenerationBudget,
+) -> None:
+    """Create *extra_count* rows duplicating first-row values for *duplicate_keys*.
+
+    For multi-table queries, ``_ensure_fk_parents`` binds unset FK values
+    to ``target_rows[0]``, producing FK concentration. For single-table
+    queries, the explicit EQ constraints force duplicate column values
+    (making DISTINCT observable).
+    """
+    if extra_count <= 0 or not duplicate_keys:
+        return
+
+    first_values: dict[ColumnKey, Any] = {}
+    for dkey in duplicate_keys:
+        table_node, _alias, col_ident = dkey
+        for occurrence in table_vars:
+            if occurrence_tables[occurrence] == table_node:
+                existing = instance.get_rows(table_node)
+                if existing:
+                    val = existing[0].column_values.get(col_ident)
+                    if val is not None and hasattr(val, 'concrete'):
+                        val = val.concrete
+                    first_values[dkey] = val
+                break
+
+    if not first_values:
+        return
+
+    values_by_table: dict[exp.Table, dict[exp.Identifier, Any]] = {}
+    for dkey, val in first_values.items():
+        table_node, _alias, col_ident = dkey
+        if val is not None:
+            values_by_table.setdefault(table_node, {})[col_ident] = val
+
+    for _ in range(extra_count):
+        rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
+        for table_node in instance.schema.fk_safe_table_order():
+            row_values = values_by_table.get(table_node, {})
+            rows_by_table[table_node] = [dict(row_values)]
+        _try_create_rows(instance, rows_by_table, reason="extra_duplicate_rows", budget=budget)
 
 
 def _literal_for_value(value: Any) -> exp.Expression:
@@ -2635,17 +2732,41 @@ def _seed_base_rows(
     budget: GenerationBudget,
     row_count: int = 1,
     tables: set[exp.Table] | None = None,
+    child_multiplier: int = 1,
 ) -> None:
-    """Create *row_count* base rows per table (query tables only if *tables* is set)."""
+    """Create *row_count* base rows per table (query tables only if *tables* is set).
+
+    When *child_multiplier* > 1, child tables (tables whose FK targets are
+    also in the seeded set) get ``row_count * child_multiplier`` rows,
+    creating FK concentration via ``_ensure_fk_parents``.
+    """
+    active_tables: set[exp.Table] = set(
+        tables or instance.schema.fk_safe_table_order()
+    )
+    child_tables: set[exp.Table] = set()
+    for table_node in instance.schema.fk_safe_table_order():
+        if tables is not None and table_node not in tables:
+            continue
+        table_schema = instance.database_constraints(table_node)
+        for fk in table_schema.foreign_keys:
+            if instance.resolve_table(fk.target_table) in active_tables:
+                child_tables.add(table_node)
+                break
+
     rows_by_table: dict[exp.Table, list[dict[exp.Identifier, Any]]] = {}
     for table_node in instance.schema.fk_safe_table_order():
         if tables is not None and table_node not in tables:
             continue
+        actual_count = (
+            row_count * child_multiplier
+            if table_node in child_tables
+            else row_count
+        )
         check_rows = _check_aware_base_rows(
-            instance, table_node, row_count=row_count, budget=budget,
+            instance, table_node, row_count=actual_count, budget=budget,
         )
         rows_by_table[table_node] = (
-            check_rows if check_rows is not None else [{} for _ in range(row_count)]
+            check_rows if check_rows is not None else [{} for _ in range(actual_count)]
         )
     _try_create_rows(instance, rows_by_table, reason="base_rows", budget=budget)
 
@@ -2682,7 +2803,10 @@ def _seed_negative_rows(
         )
         try:
             _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
-            _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
+            _add_database_constraints(
+                constraints, instance, col_var_map, table_vars, occurrence_tables,
+                include_same_batch_fk_targets=True,
+            )
         except SchemaConstraintLoweringError:
             continue
 
@@ -2717,7 +2841,10 @@ def _seed_negative_rows(
         constraints.extend(where_atoms)
         try:
             _ensure_check_constraint_vars(instance, col_var_map, table_vars, occurrence_tables)
-            _add_database_constraints(constraints, instance, col_var_map, table_vars, occurrence_tables)
+            _add_database_constraints(
+                constraints, instance, col_var_map, table_vars, occurrence_tables,
+                include_same_batch_fk_targets=True,
+            )
         except SchemaConstraintLoweringError:
             continue
 

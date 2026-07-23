@@ -16,6 +16,7 @@ types. Semantic identifiers are always sqlglot expressions — never bare
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -45,6 +46,8 @@ from sqlglot import exp
 import sqlglot
 
 from parseval.plan.session import DataFusionSessionManager
+
+_logger = logging.getLogger(__name__)
 
 
 class PlanError(ValueError):
@@ -147,6 +150,11 @@ _WINDOW_CTORS: Dict[str, Callable[..., exp.Expression]] = {
 
 _UTF8_DISPLAY_RE = re.compile(r'^(?:Utf8(?:View)?)\("(.*)"\)$', re.S)
 _LIMIT_RE = re.compile(r"skip\s*=\s*(\d+).*?fetch\s*=\s*(\d+)", re.I | re.S)
+_NANOS_PER_UNIT: Dict[str, int] = {
+    "HOUR": 3_600_000_000_000,
+    "MINUTE": 60_000_000_000,
+    "SECOND": 1_000_000_000,
+}
 
 # Arrow / DF type names → sqlglot ``DataType.Type`` (not SQL string tokens).
 _DF_TO_SQLGLOT_TYPE: Dict[str, exp.DataType.Type] = {
@@ -170,6 +178,7 @@ _DF_TO_SQLGLOT_TYPE: Dict[str, exp.DataType.Type] = {
     "Time32": exp.DataType.Type.TIME,
     "Time64": exp.DataType.Type.TIME,
     "Duration": exp.DataType.Type.INTERVAL,
+    "Interval": exp.DataType.Type.INTERVAL,
     "Null": exp.DataType.Type.NULL,
 }
 
@@ -310,6 +319,24 @@ def _annotate_exprs(
         _annotate_type(expr, df_type, nullable=nullable)
 
 
+def _parse_interval_struct(text: str) -> tuple[int, int, int] | None:
+    try:
+        brace_start = text.index("{")
+        brace_end = text.rindex("}")
+    except ValueError:
+        return None
+    body = text[brace_start + 1 : brace_end]
+    pairs: dict[str, str] = {}
+    for part in body.split(","):
+        part = part.strip()
+        if ":" in part:
+            key, val = part.split(":", 1)
+            pairs[key.strip()] = val.strip()
+    if not {"months", "days", "nanoseconds"} <= pairs.keys():
+        return None
+    return int(pairs["months"]), int(pairs["days"]), int(pairs["nanoseconds"])
+
+
 def _literal_from_variant(variant: Any, raw: Any) -> exp.Expression:
     """Build a sqlglot literal from a DF ``Literal`` via dtype dispatch."""
     dtype = variant.data_type()
@@ -369,6 +396,45 @@ def _literal_from_variant(variant: Any, raw: Any) -> exp.Expression:
         return _annotate_type(
             exp.Literal.string(f"{hours:02d}:{minutes:02d}:{secs:02d}"),
             base,
+            nullable=False,
+        )
+
+    if base == "Interval":
+        text = str(variant.into_type())
+        if text.upper() == "NULL":
+            raise PlanError(
+                f"unsupported DataFusion literal dtype {dtype!r} ({raw.canonical_name()})"
+            )
+        components = _parse_interval_struct(text)
+        if components is None:
+            return _annotate_type(exp.Literal.string(text), "Interval", nullable=False)
+        months, days, nanoseconds = components
+        if months and not days and not nanoseconds:
+            return _annotate_type(
+                exp.Interval(this=exp.Literal.number(months), unit=exp.Var(this="MONTH")),
+                "Interval",
+                nullable=False,
+            )
+        if days and not months and not nanoseconds:
+            return _annotate_type(
+                exp.Interval(this=exp.Literal.number(days), unit=exp.Var(this="DAY")),
+                "Interval",
+                nullable=False,
+            )
+        for unit, ns_per_unit in _NANOS_PER_UNIT.items():
+            if nanoseconds and nanoseconds % ns_per_unit == 0:
+                value = nanoseconds // ns_per_unit + days * 86400 + months * 2592000
+                return _annotate_type(
+                    exp.Interval(this=exp.Literal.number(value), unit=exp.Var(this=unit)),
+                    "Interval",
+                    nullable=False,
+                )
+        return _annotate_type(
+            exp.Interval(
+                this=exp.Literal.number(nanoseconds // 1_000_000_000 + days * 86400 + months * 2592000),
+                unit=exp.Var(this="SECOND"),
+            ),
+            "Interval",
             nullable=False,
         )
 
@@ -734,6 +800,10 @@ def _find_outer_select(ast: exp.Expression) -> Optional[exp.Select]:
         return _find_outer_select(ast.this)
     if isinstance(ast, exp.Query) and ast.this is not None:
         return _find_outer_select(ast.this)
+    if isinstance(ast, exp.SetOperation):
+        left = _find_outer_select(ast.left) if hasattr(ast, 'left') else None
+        right = _find_outer_select(ast.right) if hasattr(ast, 'right') else None
+        return left or right
     for child in ast.iter_expressions():
         found = _find_outer_select(child)
         if found is not None:
@@ -784,6 +854,14 @@ def _sql_expr_roots_for_plan(ast: exp.Expression, plan: Any) -> List[exp.Express
     if kind == "Window":
         roots.extend(select.expressions or [])
         return roots
+    if kind == "Sort":
+        order = select.args.get("order")
+        if order is not None:
+            if isinstance(order, exp.Order):
+                roots.extend(order.expressions or [])
+            else:
+                roots.append(order)
+        return roots
     if kind == "Values":
         return list(select.expressions or [])
     if kind == "Repartition":
@@ -808,13 +886,14 @@ def _extract_scalar_subquery_sql(
 
 
 def _plannable_sql_fragments(ctx: SessionContext, fragments: Iterable[str]) -> List[str]:
-    candidates = list(fragments)
-    for fragment in candidates:
+    plannable = []
+    for fragment in fragments:
         try:
             ctx.sql(fragment).optimized_logical_plan()
+            plannable.append(fragment)
         except Exception:
-            return []
-    return candidates
+            continue
+    return plannable
 
 
 @dataclass
@@ -842,6 +921,23 @@ class _NodeLowerState:
         )
         return ScalarSubqueryRef(this=exp.to_identifier(subquery_id))
 
+    def _extract_subquery_fragments(self, plan: Any, sql: str) -> List[str]:
+        ast = sqlglot.parse_one(sql, read=self.dialect)
+        emit = DataFusionSessionManager.emit_dialect(self.dialect)
+        fragments: List[str] = []
+        roots = _sql_expr_roots_for_plan(ast, plan)
+        if roots:
+            for root in roots:
+                _walk_sql_expr(
+                    root,
+                    lambda node: fragments.append(node.this.sql(dialect=emit)),
+                )
+        if not fragments:
+            for node in ast.walk(bfs=True):
+                if isinstance(node, exp.Subquery) and node.this is not None:
+                    fragments.append(node.this.sql(dialect=emit))
+        return _plannable_sql_fragments(self.ctx, fragments)
+
     def pop_scalar_sql(self, plan: Any) -> str:
         key = id(plan)
         if key not in self._scalar_sql:
@@ -850,23 +946,23 @@ class _NodeLowerState:
                 source_sql = Unparser(UNPARSER_DIALECTS[self.dialect]).plan_to_sql(
                     plan
                 )
-                fragments = _extract_scalar_subquery_sql(
-                    source_sql,
-                    self.dialect,
-                    plan,
+                fragments = self._extract_subquery_fragments(plan, source_sql)
+            except Exception as exc:
+                _logger.warning(
+                    "Path A (Unparser roundtrip) failed for plan %s: %s",
+                    repr(plan)[:120],
+                    exc,
                 )
-                fragments = _plannable_sql_fragments(self.ctx, fragments)
-            except Exception:
-                fragments = []
             if not fragments and self.sql:
-                fragments = _extract_scalar_subquery_sql(
-                    self.sql,
-                    self.dialect,
-                    plan,
-                )
+                fragments = self._extract_subquery_fragments(plan, self.sql)
             self._scalar_sql[key] = deque(fragments)
         queue = self._scalar_sql[key]
         if not queue:
+            if self.sql:
+                fragments = self._extract_subquery_fragments(plan, self.sql)
+                self._scalar_sql[key] = deque(fragments)
+                if fragments:
+                    return self._scalar_sql[key].popleft()
             raise PlanError("ScalarSubquery SQL fragment queue is empty")
         return queue.popleft()
 

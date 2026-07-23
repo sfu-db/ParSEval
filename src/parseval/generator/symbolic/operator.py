@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import random
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import product
@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TYP
 from sqlglot import exp
 
 from parseval.coercion import CoercionError, coerce_literal_value
-from parseval.domain.exceptions import DomainError
 from parseval.generator.config import GenerationConfig
 from parseval.generator.schema_constraints import (
     _not_null_constraints_for_columns,
@@ -48,7 +47,9 @@ from parseval.plan.explain import (
 )
 from parseval.plan.rex import Environment, Variable, concrete, concrete_supported
 from parseval.generator.coverage import (
+    CoverageObligation,
     CoverageTreeNode,
+    GenerationState,
     SemanticTarget,
     _case_expressions,
     _is_not_null_filter,
@@ -96,6 +97,7 @@ class JoinKeyRef:
 @dataclass(frozen=True)
 class SchemaDemand:
     count: int = 1
+    outcome: str | None = None
     predicates: Tuple[exp.Expression, ...] = ()
     order_keys: Tuple[exp.Expression, ...] = ()
     distinct: bool = False
@@ -110,6 +112,43 @@ class _AtomicRowRequest:
     row_specs: Tuple[Mapping[object, object], ...]
     predicates: Tuple[Tuple[exp.Expression, ...], ...]
     expression_demands: Tuple[ExpressionDemand, ...] = ()
+
+
+@dataclass(frozen=True)
+class OutcomePathDemand:
+    """One recursively lowered operator requirement in an outcome path."""
+
+    step: Step
+    demand: SchemaDemand
+
+
+@dataclass(frozen=True)
+class OutcomePath:
+    """A semantic target plus all descendant demands needed to realize it."""
+
+    id: str
+    target: SemanticTarget
+    variant: str
+    demands: Tuple[OutcomePathDemand, ...]
+    row_requests: Tuple[_AtomicRowRequest, ...]
+
+
+def _outcome_path_depth(path: OutcomePath) -> int:
+    included = {path.target.step, *(demand.step for demand in path.demands)}
+    visiting: Set[Step] = set()
+
+    def depth(step: Step) -> int:
+        if step in visiting:
+            return 0
+        visiting.add(step)
+        children = tuple(
+            child for child in step.dependencies if child in included
+        )
+        result = 0 if not children else 1 + max(depth(child) for child in children)
+        visiting.remove(step)
+        return result
+
+    return depth(path.target.step)
 
 
 @dataclass(frozen=True)
@@ -504,16 +543,7 @@ def _solve_atomic_row_requests(
     correlated_expressions: Dict[JoinKeyRef, List[exp.Expression]] = {}
     equal_expressions: Dict[Tuple[str, str], List[exp.Expression]] = {}
     relation_expressions: Dict[str, List[Tuple[str, str, exp.Expression]]] = {}
-    correlated_ref_counts: Dict[JoinKeyRef, int] = {}
-    for request in requests:
-        for demand in request.expression_demands:
-            if demand.kind == "correlated" and isinstance(demand.value, JoinKeyRef):
-                correlated_ref_counts[demand.value] = correlated_ref_counts.get(demand.value, 0) + 1
-    bindings = {
-        ref: value
-        for ref, value in (correlated_bindings or {}).items()
-        if correlated_ref_counts.get(ref, 0) < 2
-    }
+    bindings = dict(correlated_bindings or {})
     next_index = {
         table: len(instance.get_rows(table))
         for table in instance.schema.fk_safe_table_order()
@@ -603,7 +633,13 @@ def _solve_atomic_row_requests(
         typed_expression_demands = list(typed_expression_demands_tuple)
         request = _AtomicRowRequest(
             table=table,
-            row_specs=_unique_anchored_row_specs(instance, table, normalized_specs),
+            row_specs=_unique_anchored_row_specs(
+                instance,
+                table,
+                normalized_specs,
+                typed_expression_demands,
+                bindings,
+            ),
             predicates=typed_predicates,
             expression_demands=tuple(typed_expression_demands),
         )
@@ -783,6 +819,8 @@ def _unique_anchored_row_specs(
     instance: Instance,
     table: exp.Table,
     row_specs: Sequence[Mapping[object, object]],
+    expression_demands: Sequence[ExpressionDemand],
+    correlated_bindings: Mapping[JoinKeyRef, object],
 ) -> Tuple[Mapping[object, object], ...]:
     table_schema = instance.database_constraints(table)
     anchored = [dict(row) for row in row_specs]
@@ -794,11 +832,29 @@ def _unique_anchored_row_specs(
         for row in instance.get_rows(table)
     ]
     generated: List[Mapping[object, object]] = []
-    for row in anchored:
+    deferred_by_rank: Dict[int, Set[str]] = {}
+    for demand in expression_demands:
+        if (
+            demand.kind != "correlated"
+            or not isinstance(demand.value, JoinKeyRef)
+            or demand.value in correlated_bindings
+            or demand.rank is None
+        ):
+            continue
+        expression = demand.expression
+        if isinstance(expression, (exp.Alias, exp.Ordered)):
+            expression = expression.this
+        if isinstance(expression, exp.Column):
+            deferred_by_rank.setdefault(demand.rank, set()).add(
+                expression.name.casefold()
+            )
+    for rank, row in enumerate(anchored):
         for group in table_schema.uniqueness_groups():
             if len(group) != 1:
                 continue
             column = group[0]
+            if column.name.casefold() in deferred_by_rank.get(rank, set()):
+                continue
             if column in row or column.name in row:
                 continue
             row[column] = instance._domain.next_value(
@@ -855,8 +911,11 @@ def _without_reusable_existing_specs(
                 for column in group
             )
             and all(
-                concrete_supported(predicate)
-                and concrete(predicate, Environment.from_row(row)) is True
+                concrete_supported(_without_alias_nodes(predicate))
+                and concrete(
+                    _without_alias_nodes(predicate),
+                    Environment.from_row(row),
+                ) is True
                 for predicate in row_predicates
             )
             for row in existing
@@ -883,6 +942,12 @@ def _without_reusable_existing_specs(
         tuple(row_specs[index] for index in kept),
         tuple(tuple(predicates[index]) for index in kept),
         remapped_demands,
+    )
+
+
+def _without_alias_nodes(expression: exp.Expression) -> exp.Expression:
+    return deepcopy(expression).transform(
+        lambda node: deepcopy(node.this) if isinstance(node, exp.Alias) else node
     )
 
 
@@ -1365,6 +1430,9 @@ class JoinEncodeStep(EncodeStep):
         context: DemandContext,
     ) -> None:
         del output_schema, child_schemas
+        if demand.outcome is not None:
+            context.pipeline._lower_join_outcome(self.step, demand, context.cache)
+            return
         context.pipeline._materialize_join_demand(self.step, demand, context.cache)
 
     @staticmethod
@@ -1709,19 +1777,6 @@ class AggregateEncodeStep(EncodeStep):
                     1,
                 ),
             )
-        group_demands = list(
-            _with_random_aggregate_null_rows(
-                node,
-                group_demands,
-                child_schema,
-                context.pipeline.randomizer,
-                max_rows=min(
-                    int(getattr(context.config, "max_rows_per_table", 1) or 1),
-                    int(getattr(context.config, "max_total_rows", 1) or 1),
-                ),
-                dialect=context.dialect,
-            )
-        )
         if node.group and group_demands:
             expression_demands = expression_demands + _aggregate_group_key_expression_demands(
                 node,
@@ -2427,16 +2482,6 @@ def _aggregate_arg_expression(expression: exp.Expression) -> exp.Expression | No
     return arg
 
 
-def _count_column_argument(aggregate: Aggregate) -> exp.Expression | None:
-    for item in aggregate.aggregations:
-        expression = item.this if isinstance(item, exp.Alias) else item
-        if not isinstance(expression, exp.Count) or isinstance(expression.this, exp.Distinct):
-            continue
-        argument = _aggregate_arg_expression(expression)
-        if argument is not None:
-            return argument
-    return None
-
 def _predicate_argument_row_state(
     predicates: Sequence[exp.Expression],
     argument: exp.Expression,
@@ -2904,86 +2949,6 @@ def _aggregate_group_demands(
     )
 
 
-def _with_random_aggregate_null_rows(
-    aggregate: Aggregate,
-    group_demands: Sequence[GroupDemand],
-    child_schema: DerivedSchema,
-    randomizer: random.Random,
-    *,
-    max_rows: int,
-    dialect: str | None = None,
-) -> Tuple[GroupDemand, ...]:
-    columns: List[exp.Column] = []
-    seen: Set[str] = set()
-    group_keys = {
-        _expression_key(column, dialect)
-        for expression in aggregate.group
-        for column in _columns_including_self(expression)
-    }
-    for item in aggregate.aggregations:
-        expression = item.this if isinstance(item, exp.Alias) else item
-        for column in expression.find_all(exp.Column):
-            scoped = _expression_in_schema_scope(column, child_schema, dialect)
-            if not isinstance(scoped, exp.Column):
-                continue
-            key = _expression_key(scoped, dialect)
-            if key in seen or key in group_keys or not _schema_column_metadata(
-                child_schema.nullables,
-                scoped,
-                dialect,
-            ):
-                continue
-            seen.add(key)
-            columns.append(scoped)
-
-    if not columns or not group_demands:
-        return tuple(group_demands)
-
-    remaining = max(max_rows - sum(group.row_count for group in group_demands), 0)
-    expanded: List[GroupDemand] = []
-    for group in group_demands:
-        row_count = group.row_count
-        row_predicates_by_index = list(group.row_predicates_by_index)
-        constrained_keys = {
-            _expression_key(column, dialect)
-            for predicate in group.row_predicates
-            for column in predicate.find_all(exp.Column)
-        }
-        eligible = [
-            column
-            for column in columns
-            if _expression_key(column, dialect) not in constrained_keys
-        ]
-        for column in eligible:
-            null_count = min(
-                randomizer.randint(1, max(group.row_count, 1)),
-                remaining,
-            )
-            for _ in range(null_count):
-                predicates: List[exp.Expression] = []
-                for candidate in eligible:
-                    is_null = exp.Is(
-                        this=deepcopy(candidate),
-                        expression=exp.Null(),
-                    )
-                    predicates.append(
-                        is_null if candidate == column else exp.Not(this=is_null)
-                    )
-                row_predicates_by_index.append((row_count, tuple(predicates)))
-                row_count += 1
-            remaining -= null_count
-        expanded.append(
-            GroupDemand(
-                group_index=group.group_index,
-                row_count=row_count,
-                group_key_values=group.group_key_values,
-                row_predicates=group.row_predicates,
-                row_predicates_by_index=tuple(row_predicates_by_index),
-            )
-        )
-    return tuple(expanded)
-
-
 def _aggregate_duplicate_group_demand(
     aggregate: Aggregate,
     child: Step,
@@ -3006,12 +2971,10 @@ def _aggregate_duplicate_group_demand(
         groups[key] = groups.get(key, 0) + 1
     if not groups:
         return None
-    if any(size > 1 for size in groups.values()):
-        return None
-    key, size = max(groups.items(), key=lambda item: item[1])
+    key = next(iter(groups))
     return GroupDemand(
         group_index=0,
-        row_count=size + 1,
+        row_count=2,
         group_key_values=tuple(
             (deepcopy(expression), value)
             for expression, value in zip(group_exprs, key)
@@ -4065,6 +4028,127 @@ def _split_expression_demands_by_schema(
     return tuple(left), tuple(right)
 
 
+def _has_multi_row_equality_demand(
+    demands: Sequence[ExpressionDemand],
+    expression: exp.Expression,
+    dialect: str | None = None,
+) -> bool:
+    expression_key = _expression_key(expression, dialect)
+    ranks_by_origin: Dict[str, Set[int]] = {}
+    for demand in demands:
+        if demand.kind != "equal" or demand.rank is None:
+            continue
+        if _expression_key(demand.expression, dialect) != expression_key:
+            continue
+        origin = demand.origin or expression_key
+        ranks_by_origin.setdefault(origin, set()).add(demand.rank)
+    return any(len(ranks) > 1 for ranks in ranks_by_origin.values())
+
+
+def _join_group_row_counts(
+    row_count: int,
+    join: Join,
+    left_schema: DerivedSchema,
+    right_schema: DerivedSchema,
+    left_demands: Sequence[ExpressionDemand],
+    right_demands: Sequence[ExpressionDemand],
+    variant: str,
+    dialect: str | None = None,
+) -> Tuple[int, int]:
+    """Choose physical child cardinalities for a logical join-row cohort."""
+    logical_count = max(row_count, 1)
+    left_count = logical_count
+    right_count = logical_count
+    join_key_names = {
+        expression.name.casefold()
+        for pair in join.on_keys
+        for expression in pair
+        if isinstance(expression, exp.Column)
+    }
+    if variant == "shared":
+        left_non_join_equal = any(
+            demand.kind == "equal"
+            and demand.rank is not None
+            and isinstance(
+                demand.expression.this
+                if isinstance(demand.expression, exp.Alias)
+                else demand.expression,
+                exp.Column,
+            )
+            and (
+                demand.expression.this
+                if isinstance(demand.expression, exp.Alias)
+                else demand.expression
+            ).name.casefold() not in join_key_names
+            for demand in left_demands
+        )
+        right_non_join_equal = any(
+            demand.kind == "equal"
+            and demand.rank is not None
+            and isinstance(
+                demand.expression.this
+                if isinstance(demand.expression, exp.Alias)
+                else demand.expression,
+                exp.Column,
+            )
+            and (
+                demand.expression.this
+                if isinstance(demand.expression, exp.Alias)
+                else demand.expression
+            ).name.casefold() not in join_key_names
+            for demand in right_demands
+        )
+        if left_non_join_equal:
+            left_count, right_count = 1, logical_count
+        if right_non_join_equal:
+            left_count, right_count = logical_count, 1
+    for left_key, right_key in join.on_keys:
+        left_side = _schema_side_for_column(
+            left_schema, right_schema, left_key, dialect,
+        ) if isinstance(left_key, exp.Column) else None
+        right_side = _schema_side_for_column(
+            left_schema, right_schema, right_key, dialect,
+        ) if isinstance(right_key, exp.Column) else None
+        if left_side == "right" and right_side == "left":
+            left_key, right_key = right_key, left_key
+            left_side, right_side = right_side, left_side
+        if left_side != "left" or right_side != "right":
+            continue
+        if _has_multi_row_equality_demand(left_demands, left_key, dialect):
+            left_unique = bool(
+                _schema_column_metadata(left_schema.uniqueness, left_key, dialect)
+            )
+            left_count = 1 if left_unique else logical_count
+            right_count = logical_count if left_unique else 1
+        if _has_multi_row_equality_demand(right_demands, right_key, dialect):
+            right_unique = bool(
+                _schema_column_metadata(right_schema.uniqueness, right_key, dialect)
+            )
+            right_count = 1 if right_unique else logical_count
+            left_count = logical_count if right_unique else 1
+    return left_count, right_count
+
+
+def _group_key_matches_expression(
+    group_keys: Sequence[Tuple[exp.Expression, object]],
+    expression: exp.Expression,
+    dialect: str | None = None,
+) -> bool:
+    expression = expression.this if isinstance(expression, exp.Alias) else expression
+    expression_key = _expression_key(expression, dialect)
+    for key, _value in group_keys:
+        key = key.this if isinstance(key, exp.Alias) else key
+        if _expression_key(key, dialect) == expression_key:
+            return True
+        if (
+            isinstance(key, exp.Column)
+            and isinstance(expression, exp.Column)
+            and _identifier_equal(key.this, expression.this, dialect)
+        ):
+            return True
+    return False
+
+
 def _join_relation_demands(
     predicate: exp.Expression,
     left_schema: DerivedSchema,
@@ -4371,18 +4455,6 @@ def _visible_schema_column(
     return None
 
 
-def _join_side_needs_parallel_rows(
-    schema: DerivedSchema,
-    join_key: exp.Column,
-    count: int,
-    dialect: str | None,
-) -> bool:
-    if count <= 1:
-        return False
-    visible = _visible_schema_column(schema, join_key, dialect) or join_key
-    return schema.is_unique(visible)
-
-
 def _rank_expression_predicates(
     demands: Sequence[ExpressionDemand],
     rank: int,
@@ -4536,7 +4608,7 @@ def _numeric_value(expression: exp.Expression | None) -> float | None:
 # ------------------------------------------------------------------
 
 class EncodePipeline:
-    """Generate rows for uncovered semantic targets in dependency order."""
+    """Compile and realize complete single-query semantic outcome paths."""
 
     _DEFAULT_REGISTRY: Dict[type, type] = {
         TableScan: ScanEncodeStep,
@@ -4569,15 +4641,15 @@ class EncodePipeline:
         self.plan = plan
         self.instance = instance
         self.config = config
-        self.randomizer = random.Random(config.seed)
         self.budget = budget or GenerationBudget(config)
         self.dialect = plan.dialect
         self._base_row_counts = dict(base_row_counts or {})
-        self.schema_failure_reason = ""
         self.demand_failure_reasons: List[str] = []
         self._correlated_bindings: Dict[JoinKeyRef, object] = {}
         self._materialized_join_group_demands: set[tuple[object, ...]] = set()
         self._pending_row_requests: List[_AtomicRowRequest] | None = None
+        self._path_demands: List[OutcomePathDemand] | None = None
+        self._path_variant = "default"
 
     @property
     def solver_calls(self) -> int:
@@ -4775,6 +4847,7 @@ class EncodePipeline:
         return False
 
     def forward(self) -> DerivedSchema:
+        started_at = time.perf_counter()
         cache: Dict[Step, tuple[DerivedSchema, CoverageTreeNode]] = {}
         process = self._cache_processor(cache)
         schema, _tree = process(self.plan.root, "root")
@@ -4782,50 +4855,151 @@ class EncodePipeline:
         covered = {
             target.id for target in targets if self._target_is_covered(target, cache)
         }
+        obligations: List[CoverageObligation] = []
 
         for target in targets:
-            if target.id in covered or self._budget_reason():
-                continue
+            variants = self._outcome_path_variants(target, cache)
+            for variant in variants:
+                if target.id in covered and len(variants) == 1:
+                    obligations.append(
+                        CoverageObligation(
+                            id=f"{target.id}:{variant}",
+                            target_id=target.id,
+                            steps=(target.step.type_name,),
+                            status="covered",
+                        )
+                    )
+                    continue
+                budget_reason = self._budget_reason()
+                if budget_reason:
+                    obligations.append(
+                        CoverageObligation(
+                            id=f"{target.id}:{variant}",
+                            target_id=target.id,
+                            steps=(target.step.type_name,),
+                            status="exhausted",
+                            reason=budget_reason,
+                        )
+                    )
+                    continue
 
-            token = self.instance.checkpoint()
-            correlated_checkpoint = dict(self._correlated_bindings)
-            join_group_checkpoint = set(self._materialized_join_group_demands)
-            before = self._row_counts()
-            translated, reason = self._attempt_target(target, cache)
-            self._pending_row_requests = None
-            after = self._row_counts()
+                token = self.instance.checkpoint()
+                correlated_checkpoint = dict(self._correlated_bindings)
+                join_group_checkpoint = set(self._materialized_join_group_demands)
+                before = self._row_counts()
+                path, reason = self._compile_outcome_path(target, cache, variant)
+                if path is not None and not reason:
+                    reason = self._materialize_outcome_path(path)
+                after = self._row_counts()
 
-            if after != before:
-                cache.clear()
-                schema, _tree = process(self.plan.root, "root")
+                if after != before:
+                    cache.clear()
+                    schema, _tree = process(self.plan.root, "root")
 
-            preserves_covered = all(
-                self._target_is_covered(existing, cache)
-                for existing in targets
-                if existing.id in covered
-            )
-            keep = (
-                translated
-                and not reason
-                and not self._rows_exceed_budget(after)
-                and bool(schema.rows)
-                and preserves_covered
-                and self._target_is_covered(target, cache)
-            )
-            if not keep:
-                self.instance.rollback(token)
-                self._correlated_bindings = correlated_checkpoint
-                self._materialized_join_group_demands = join_group_checkpoint
-                cache.clear()
-                schema, _tree = process(self.plan.root, "root")
-                continue
+                preserves_covered = all(
+                    self._target_is_covered(existing, cache)
+                    for existing in targets
+                    if existing.id in covered
+                )
+                keep = (
+                    path is not None
+                    and not reason
+                    and not self._rows_exceed_budget(after)
+                    and bool(schema.rows)
+                    and preserves_covered
+                    and self._target_is_covered(target, cache)
+                    and (variant != "parallel" or after != before)
+                )
+                if not keep:
+                    self.instance.rollback(token)
+                    self._correlated_bindings = correlated_checkpoint
+                    self._materialized_join_group_demands = join_group_checkpoint
+                    cache.clear()
+                    schema, _tree = process(self.plan.root, "root")
+                    status = "exhausted" if "exhausted" in reason else "unsupported"
+                    obligations.append(
+                        CoverageObligation(
+                            id=f"{target.id}:{variant}",
+                            target_id=target.id,
+                            steps=tuple(
+                                demand.step.type_name for demand in path.demands
+                            ) if path is not None else (target.step.type_name,),
+                            status=status,
+                            reason=reason or "outcome_path_validation_failed",
+                        )
+                    )
+                    continue
 
-            covered.update(
-                candidate.id
-                for candidate in targets
-                if self._target_is_covered(candidate, cache)
-            )
+                covered.update(
+                    candidate.id
+                    for candidate in targets
+                    if self._target_is_covered(candidate, cache)
+                )
+                obligations.append(
+                    CoverageObligation(
+                        id=path.id,
+                        target_id=target.id,
+                        steps=tuple(demand.step.type_name for demand in path.demands),
+                        status="covered",
+                    )
+                )
+        coverage_ratio = len(covered) / len(targets) if targets else 1.0
+        self.instance.generation = GenerationState(
+            status="sat" if len(covered) == len(targets) else "unknown",
+            obligations=tuple(obligations),
+            solver_calls=self.solver_calls,
+            coverage_ratio=coverage_ratio,
+            stage_timings={"outcome_paths": time.perf_counter() - started_at},
+        )
         return schema
+
+    def _outcome_path_variants(
+        self,
+        target: SemanticTarget,
+        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
+    ) -> Tuple[str, ...]:
+        if not isinstance(target.step, Aggregate):
+            return ("default",)
+        if target.kind == "distinct" and target.target == "duplicate_eliminated":
+            expressions = tuple(target.step.group)
+        elif target.kind == "distinct_aggregate_witness" and target.expression is not None:
+            argument = _aggregate_arg_expression(target.expression)
+            expressions = (argument,) if argument is not None else ()
+        else:
+            return ("default",)
+        child = _single_dependency(target.step)
+        child_schema = _schema_for(cache, child)
+        join_keys = tuple(
+            expression
+            for step in _reachable_steps(child)
+            if isinstance(step, Join)
+            for pair in step.on_keys
+            for expression in pair
+            if isinstance(expression, exp.Column)
+        )
+        for group_expression in expressions:
+            expression = (
+                group_expression.this
+                if isinstance(group_expression, exp.Alias)
+                else group_expression
+            )
+            if not isinstance(expression, exp.Column):
+                continue
+            if bool(
+                _schema_column_metadata(
+                    child_schema.uniqueness,
+                    expression,
+                    self.dialect,
+                )
+            ):
+                continue
+            if any(
+                _identifier_equal(expression.this, join_key.this, self.dialect)
+                for join_key in join_keys
+            ):
+                continue
+            return ("parallel", "shared")
+        return ("shared",)
 
     def _semantic_targets(
         self,
@@ -4839,6 +5013,24 @@ class EncodePipeline:
             if step in scalar_roots:
                 local += scalar_subquery_targets(step, tree.id)
             for target in local:
+                if (
+                    target.kind == "null_sensitive_aggregate_witness"
+                    and isinstance(step, Aggregate)
+                    and target.expression is not None
+                ):
+                    argument = _aggregate_arg_expression(target.expression)
+                    child = _single_dependency(step)
+                    nullable = (
+                        _schema_column_metadata(
+                            _schema_for(cache, child).nullables,
+                            argument,
+                            self.dialect,
+                        )
+                        if argument is not None
+                        else False
+                    )
+                    if nullable is False:
+                        continue
                 if target.id not in seen:
                     seen.add(target.id)
                     targets.append(target)
@@ -4849,16 +5041,22 @@ class EncodePipeline:
                 if isinstance(column, exp.Expression)
                 else exp.column(str(column))
             )
-            targets.extend(
-                (
-                    SemanticTarget(
-                        id=f"root.final_column{index}.duplicate",
-                        step=self.plan.root,
-                        step_type=self.plan.root.type_name,
-                        kind="final_column_duplicate",
-                        target="duplicate_non_null",
-                        expression=expression,
-                    ),
+            targets.append(
+                SemanticTarget(
+                    id=f"root.final_column{index}.duplicate",
+                    step=self.plan.root,
+                    step_type=self.plan.root.type_name,
+                    kind="final_column_duplicate",
+                    target="duplicate_non_null",
+                    expression=expression,
+                )
+            )
+            if _schema_column_metadata(
+                root_schema.nullables,
+                expression,
+                self.dialect,
+            ) is not False:
+                targets.append(
                     SemanticTarget(
                         id=f"root.final_column{index}.null",
                         step=self.plan.root,
@@ -4866,9 +5064,8 @@ class EncodePipeline:
                         kind="final_column_null",
                         target="duplicate_null",
                         expression=expression,
-                    ),
+                    )
                 )
-            )
         return tuple(targets)
 
     def _final_column_candidate(
@@ -5057,23 +5254,46 @@ class EncodePipeline:
         )
         return True
 
-    def _attempt_target(
+    def _compile_outcome_path(
         self,
         target: SemanticTarget,
         cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
-    ) -> tuple[bool, str]:
+        variant: str,
+    ) -> tuple[OutcomePath | None, str]:
         self._pending_row_requests = []
+        self._path_demands = []
+        self._correlated_bindings = {}
+        self._path_variant = variant
         self.demand_failure_reasons = []
-        self.schema_failure_reason = ""
 
         translated, reason = self._lower_target(target, cache)
-        if translated and not reason:
-            reason = self._flush_pending_row_requests()
+        path = (
+            OutcomePath(
+                id=f"{target.id}:{variant}",
+                target=target,
+                variant=variant,
+                demands=tuple(self._path_demands),
+                row_requests=tuple(self._pending_row_requests),
+            )
+            if translated
+            else None
+        )
         self._pending_row_requests = None
-        reason = reason or self.schema_failure_reason or next(
+        self._path_demands = None
+        reason = reason or next(
             iter(self.demand_failure_reasons), ""
         )
-        return translated, reason
+        if (
+            path is not None
+            and self.config.max_plan_depth is not None
+            and _outcome_path_depth(path) > self.config.max_plan_depth
+        ):
+            reason = (
+                "depth_bound_exhausted:"
+                f"required={_outcome_path_depth(path)},"
+                f"max={self.config.max_plan_depth}"
+            )
+        return path, reason
 
     def _cache_processor(
         self,
@@ -5179,29 +5399,11 @@ class EncodePipeline:
             if not self._lower_scalar_subquery_target(target, cache):
                 return False, f"unsupported_scalar_subquery_outcome:{target.target}"
         elif target.kind in {"join", "semi_join", "anti_join"} and isinstance(step, Join):
-            if target.target in {
-                "no_match",
-                "preserved_left",
-                "preserved_right",
-                "semi_no_match",
-                "anti_no_match",
-            }:
-                side = (
-                    "left"
-                    if target.target in {"preserved_left", "semi_no_match", "anti_no_match"}
-                    else "right"
-                    if target.target == "preserved_right"
-                    else None
-                )
-                if not self._materialize_join_coverage_demand(
-                    step,
-                    _schema_for(cache, step),
-                    cache,
-                    side=side,
-                ):
-                    return False, f"unsupported_join_outcome:{target.target}"
-            else:
-                self._lower_demand(step, SchemaDemand(count=1), cache)
+            self._lower_demand(
+                step,
+                SchemaDemand(count=1, outcome=target.target),
+                cache,
+            )
         elif target.kind in {"projection_visible", "group_existence"}:
             self._lower_demand(step, self._root_demand(step), cache)
         elif target.kind in {
@@ -5287,7 +5489,7 @@ class EncodePipeline:
         else:
             return False, f"unsupported_semantic_target:{target.kind}:{target.target}"
 
-        reason = self.schema_failure_reason or next(
+        reason = next(
             iter(self.demand_failure_reasons),
             "",
         )
@@ -5412,8 +5614,11 @@ class EncodePipeline:
                     ),
                 ),
             )
-        if target.kind == "null_sensitive_aggregate_witness":
-            argument = _count_column_argument(aggregate)
+        if (
+            target.kind == "null_sensitive_aggregate_witness"
+            and target.expression is not None
+        ):
+            argument = _aggregate_arg_expression(target.expression)
             if argument is None:
                 return None
             return SchemaDemand(
@@ -5493,22 +5698,26 @@ class EncodePipeline:
         left, right = inputs
         left_key, right_key = join.on_keys[0]
         if target.target == "empty":
-            return self._materialize_join_coverage_demand(
+            self._lower_demand(
                 join,
-                _schema_for(cache, join),
+                SchemaDemand(count=1, outcome="semi_no_match"),
                 cache,
-                side="left",
             )
+            return True
         if target.target == "matching":
-            self._lower_demand(join, SchemaDemand(count=1), cache)
+            self._lower_demand(
+                join,
+                SchemaDemand(count=1, outcome="semi_match"),
+                cache,
+            )
             return True
         if target.target == "non_matching":
-            return self._materialize_join_coverage_demand(
+            self._lower_demand(
                 join,
-                _schema_for(cache, join),
+                SchemaDemand(count=1, outcome="semi_no_match"),
                 cache,
-                side="left",
             )
+            return True
         if target.target == "multi_row":
             origin = f"subquery_multi:{target.id}"
             self._lower_demand(
@@ -5575,11 +5784,10 @@ class EncodePipeline:
                 ),
                 cache,
             )
-            self._materialize_join_coverage_demand(
+            self._lower_demand(
                 join,
-                _schema_for(cache, join),
+                SchemaDemand(count=1, outcome="semi_no_match"),
                 cache,
-                side="left",
             )
             return True
         return False
@@ -5701,13 +5909,14 @@ class EncodePipeline:
         )
         return True
 
-    def _flush_pending_row_requests(self) -> str:
+    def _materialize_outcome_path(self, path: OutcomePath) -> str:
         requests = _with_required_parent_requests(
             self.instance,
-            tuple(self._pending_row_requests or ()),
+            path.row_requests,
         )
         if not requests:
             return ""
+        self._bind_path_anchors(requests)
         batch_budget_reason = self._pending_batch_budget_reason(requests)
         if batch_budget_reason:
             return batch_budget_reason
@@ -5723,14 +5932,71 @@ class EncodePipeline:
         rows_by_table: Dict[exp.Table, List[Mapping[str, object]]] = {}
         for request, rows in zip(requests, rows_by_request):
             rows_by_table.setdefault(request.table, []).extend(rows)
-        if not self._try_create_rows(
-            rows_by_table,
-            reason="atomic_batch_materialization_failed",
-        ):
-            return self.schema_failure_reason or "atomic_batch_materialization_failed"
+        self.instance.create_rows(rows_by_table)
         for request, rows in zip(requests, rows_by_request):
             self._bind_correlated_demands(rows, request.expression_demands)
         return ""
+
+    def _bind_path_anchors(
+        self,
+        requests: Sequence[_AtomicRowRequest],
+    ) -> None:
+        """Bind correlations supplied by identity-anchored reusable rows."""
+        for request in requests:
+            table = self.instance.resolve_table(request.table)
+            table_schema = self.instance.database_constraints(table)
+            existing_rows = [_row_value_dict(row) for row in self.instance.get_rows(table)]
+            for rank, spec in enumerate(request.row_specs):
+                for demand in request.expression_demands:
+                    if (
+                        demand.kind != "correlated"
+                        or not isinstance(demand.value, JoinKeyRef)
+                        or demand.rank != rank
+                    ):
+                        continue
+                    expression = demand.expression
+                    if isinstance(expression, (exp.Alias, exp.Ordered)):
+                        expression = expression.this
+                    if not isinstance(expression, exp.Column):
+                        continue
+                    column = self.instance.resolve_column(table, expression.name)
+                    if column in spec or column.name in spec:
+                        value = _row_value(spec, column)
+                        if value is not None:
+                            self._correlated_bindings[demand.value] = value
+                anchored = next(
+                    (
+                        row
+                        for row in existing_rows
+                        if any(
+                            all(
+                                (column in spec or column.name in spec)
+                                and row.get(column) == _row_value(spec, column)
+                                for column in group
+                            )
+                            for group in table_schema.uniqueness_groups()
+                        )
+                    ),
+                    None,
+                )
+                if anchored is None:
+                    continue
+                for demand in request.expression_demands:
+                    if (
+                        demand.kind != "correlated"
+                        or not isinstance(demand.value, JoinKeyRef)
+                        or demand.rank != rank
+                    ):
+                        continue
+                    expression = demand.expression
+                    if isinstance(expression, (exp.Alias, exp.Ordered)):
+                        expression = expression.this
+                    if not isinstance(expression, exp.Column):
+                        continue
+                    column = self.instance.resolve_column(table, expression.name)
+                    value = anchored.get(column)
+                    if value is not None:
+                        self._correlated_bindings[demand.value] = value
 
     def _pending_batch_budget_reason(
         self,
@@ -6110,9 +6376,13 @@ class EncodePipeline:
             child = _schema_for(cache, _single_dependency(target.step))
             aggregate = target.expression
             source = aggregate.this if isinstance(aggregate, exp.Count) else None
-            if isinstance(source, exp.Distinct) and len(source.expressions) == 1:
+            argument = _aggregate_arg_expression(aggregate)
+            if argument is not None and (
+                isinstance(source, exp.Distinct)
+                or bool(aggregate.args.get("distinct"))
+            ):
                 return any(
-                    _has_duplicate_non_null_argument(source.expressions[0], rows)
+                    _has_duplicate_non_null_argument(argument, rows)
                     for rows in _rows_by_group(target.step, child).values()
                 )
             return False
@@ -6126,9 +6396,13 @@ class EncodePipeline:
                 )
                 for predicate in predicates
             )
-        if target.kind == "null_sensitive_aggregate_witness" and isinstance(target.step, Aggregate):
+        if (
+            target.kind == "null_sensitive_aggregate_witness"
+            and isinstance(target.step, Aggregate)
+            and target.expression is not None
+        ):
             child = _schema_for(cache, _single_dependency(target.step))
-            argument = _count_column_argument(target.step)
+            argument = _aggregate_arg_expression(target.expression)
             return argument is not None and any(
                 any(_expr_value(argument, row) is None for row in rows)
                 and any(_expr_value(argument, row) is not None for row in rows)
@@ -6205,8 +6479,9 @@ class EncodePipeline:
                 f"total={self.config.max_total_rows}"
             )
             return
-        if self._reuse_provenance_prefix(node, demand, cache):
-            return
+        if self._path_demands is None:
+            raise RuntimeError("demand_lowered_outside_outcome_path")
+        self._path_demands.append(OutcomePathDemand(step=node, demand=demand))
         op = self._build_operator(node)
         child_schemas = tuple(_schema_for(cache, child) for child in node.dependencies)
         op.lower_demand(
@@ -6215,76 +6490,6 @@ class EncodePipeline:
             child_schemas,
             DemandContext(self, cache),
         )
-
-    def _reuse_provenance_prefix(
-        self,
-        node: Step,
-        demand: SchemaDemand,
-        cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
-    ) -> bool:
-        if not demand.group_demands:
-            return False
-        schema = _schema_for(cache, node)
-        for group in demand.group_demands:
-            if group.row_count < 2 or not group.group_key_values:
-                continue
-            anchor = next(
-                (
-                    row
-                    for row in schema.rows
-                    if all(
-                        _expr_value(expression, row) == value
-                        for expression, value in group.group_key_values
-                    )
-                ),
-                None,
-            )
-            if anchor is None:
-                continue
-            provenance = schema.row_provenance.get(anchor.rowid, {})
-            for table_name, rowids in provenance.items():
-                table = self.instance.resolve_table(table_name)
-                if self.instance.database_constraints(table).uniqueness_groups():
-                    continue
-                sources = [
-                    row
-                    for rowid in rowids
-                    for row in self.instance.get_rows(table)
-                    if row.rowid == rowid
-                ]
-                if not sources:
-                    continue
-                missing = max(group.row_count - len(rowids), 0)
-                if missing == 0:
-                    return True
-                source = sources[0]
-                row = {
-                    column.name: _cell_value(value)
-                    for column, value in source.items()
-                }
-                self._submit_row_request(
-                    table,
-                    tuple(dict(row) for _ in range(missing)),
-                    tuple(() for _ in range(missing)),
-                )
-                return True
-        return False
-
-    def _try_create_rows(
-        self,
-        rows_by_table: Mapping[exp.Table, Sequence[Mapping[str, object]]],
-        *,
-        reason: str,
-    ) -> bool:
-        token = self.instance.checkpoint()
-        try:
-            self.instance.create_rows(rows_by_table)
-            return True
-        except (DomainError, KeyError) as exc:
-            self.instance.rollback(token)
-            self.schema_failure_reason = reason
-            logger.info("%s:%s", reason, exc)
-            return False
 
     def _bind_correlated_demands(
         self,
@@ -6620,6 +6825,14 @@ class EncodePipeline:
                     self.dialect,
                 )
             )
+            split_left_demands, split_right_demands = _split_expression_demands_by_schema(
+                demand.expression_demands,
+                left_schema,
+                right_schema,
+                self.dialect,
+            )
+            left_expression_demands.extend(split_left_demands)
+            right_expression_demands.extend(split_right_demands)
 
             left_group_keys: List[Tuple[exp.Expression, object]] = []
             right_group_keys: List[Tuple[exp.Expression, object]] = []
@@ -6683,11 +6896,59 @@ class EncodePipeline:
                     )
             left_count = 1 if left_group_keys and not right_group_keys else group.row_count
             right_count = 1 if right_group_keys and not left_group_keys else group.row_count
-            if group.row_count > 1 and group.group_key_values:
+            path_left_count, path_right_count = _join_group_row_counts(
+                group.row_count,
+                join,
+                left_schema,
+                right_schema,
+                left_expression_demands,
+                right_expression_demands,
+                self._path_variant,
+                self.dialect,
+            )
+            if not left_group_keys and not right_group_keys:
+                left_count = path_left_count
+                right_count = path_right_count
+            for left_key, right_key in join.on_keys:
+                if not isinstance(left_key, exp.Column) or not isinstance(right_key, exp.Column):
+                    continue
+                left_target = _schema_side_for_column(
+                    left_schema, right_schema, left_key, self.dialect,
+                )
+                right_target = _schema_side_for_column(
+                    left_schema, right_schema, right_key, self.dialect,
+                )
+                if left_target == "right" and right_target == "left":
+                    left_key, right_key = right_key, left_key
+                    left_target, right_target = right_target, left_target
+                if left_target != "left" or right_target != "right":
+                    continue
+                if _group_key_matches_expression(
+                    left_group_keys, left_key, self.dialect,
+                ):
+                    left_unique = bool(
+                        _schema_column_metadata(
+                            left_schema.uniqueness, left_key, self.dialect,
+                        )
+                    )
+                    left_count = 1 if left_unique else group.row_count
+                    right_count = group.row_count if left_unique else 1
+                if _group_key_matches_expression(
+                    right_group_keys, right_key, self.dialect,
+                ):
+                    right_unique = bool(
+                        _schema_column_metadata(
+                            right_schema.uniqueness, right_key, self.dialect,
+                        )
+                    )
+                    right_count = 1 if right_unique else group.row_count
+                    left_count = group.row_count if right_unique else 1
+            if self._path_variant == "parallel":
                 left_count = group.row_count
                 right_count = group.row_count
             demand_key = (
                 id(join),
+                self._path_variant,
                 tuple(
                     sorted(
                         (table.sql(dialect=self.dialect), count)
@@ -6723,53 +6984,35 @@ class EncodePipeline:
                     right,
                     self.dialect,
                 )
-                left_side_schema = left_schema if left_target == "left" else right_schema
-                right_side_schema = left_schema if right_target == "left" else right_schema
-                if (
-                    left_group_keys
-                    and not right_group_keys
-                    and _join_side_needs_parallel_rows(
-                        right_side_schema,
-                        right,
-                        group.row_count,
-                        self.dialect,
-                    )
-                ):
-                    left_count = group.row_count
-                if (
-                    right_group_keys
-                    and not left_group_keys
-                    and _join_side_needs_parallel_rows(
-                        left_side_schema,
-                        left,
-                        group.row_count,
-                        self.dialect,
-                    )
-                ):
-                    right_count = group.row_count
-                join_value_count = group.row_count if left_count > 1 and right_count > 1 else 1
+                shared_join_value = left_count == 1 or right_count == 1
+                join_value_count = 1 if shared_join_value else group.row_count
                 for row_index in range(join_value_count):
                     ref = JoinKeyRef(
                         origin=(left, right),
                         pair_rank=group.group_index * max(group.row_count, 1) + row_index,
                         key_index=key_index,
                     )
-                    local_rank = row_index if join_value_count > 1 else 0
+                    left_ranks = range(left_count) if shared_join_value else (row_index,)
+                    right_ranks = range(right_count) if shared_join_value else (row_index,)
                     if left_target == "left":
-                        left_expression_demands.append(
-                            ExpressionDemand(left, "correlated", ref, local_rank, origin="join_key")
+                        left_expression_demands.extend(
+                            ExpressionDemand(left, "correlated", ref, rank, origin="join_key")
+                            for rank in left_ranks
                         )
                     elif left_target == "right":
-                        right_expression_demands.append(
-                            ExpressionDemand(left, "correlated", ref, local_rank, origin="join_key")
+                        right_expression_demands.extend(
+                            ExpressionDemand(left, "correlated", ref, rank, origin="join_key")
+                            for rank in right_ranks
                         )
                     if right_target == "left":
-                        left_expression_demands.append(
-                            ExpressionDemand(right, "correlated", ref, local_rank, origin="join_key")
+                        left_expression_demands.extend(
+                            ExpressionDemand(right, "correlated", ref, rank, origin="join_key")
+                            for rank in left_ranks
                         )
                     elif right_target == "right":
-                        right_expression_demands.append(
-                            ExpressionDemand(right, "correlated", ref, local_rank, origin="join_key")
+                        right_expression_demands.extend(
+                            ExpressionDemand(right, "correlated", ref, rank, origin="join_key")
+                            for rank in right_ranks
                         )
             left_order, right_order = _split_order_keys_by_schema(
                 demand.order_keys,
@@ -7001,23 +7244,95 @@ class EncodePipeline:
         )
         return self._row_counts() != before
 
-    def _materialize_join_coverage_demand(
+    def _lower_join_outcome(
         self,
         step: Join,
-        schema: DerivedSchema,
+        demand: SchemaDemand,
         cache: Mapping[Step, tuple[DerivedSchema, CoverageTreeNode]],
-        *,
-        side: str | None = None,
-    ) -> bool:
-        if schema.rows and _join_has_no_match(step, cache, self.dialect, side=side):
-            return False
+    ) -> None:
+        unmatched = {
+            "no_match",
+            "preserved_left",
+            "preserved_right",
+            "semi_no_match",
+            "anti_no_match",
+        }
+        if demand.outcome not in unmatched:
+            self._materialize_join_demand(
+                step,
+                SchemaDemand(
+                    count=demand.count,
+                    predicates=demand.predicates,
+                    order_keys=demand.order_keys,
+                    distinct=demand.distinct,
+                    group_demands=demand.group_demands,
+                    expression_demands=demand.expression_demands,
+                    require_scalar_order_ties=demand.require_scalar_order_ties,
+                ),
+                cache,
+            )
+            return
+        side = (
+            "left"
+            if demand.outcome in {"preserved_left", "semi_no_match", "anti_no_match"}
+            else "right"
+            if demand.outcome == "preserved_right"
+            else None
+        )
         inputs = _join_inputs(step)
         if inputs is None:
-            return False
+            self._record_demand_failure(
+                f"unsupported_join_outcome:{demand.outcome}:missing_inputs"
+            )
+            return
         left_dep, right_dep = inputs
         left_schema = _schema_for(cache, left_dep)
         right_schema = _schema_for(cache, right_dep)
         if not step.on_keys and step.condition is not None:
+            if side in {"left", "right"}:
+                if side == "left":
+                    target_dep, target_schema, other_schema = (
+                        left_dep, left_schema, right_schema,
+                    )
+                else:
+                    target_dep, target_schema, other_schema = (
+                        right_dep, right_schema, left_schema,
+                    )
+                predicates: List[exp.Expression] = list(demand.predicates)
+                for other_row in other_schema.rows:
+                    def bind_other(node: exp.Expression) -> exp.Expression:
+                        if isinstance(node, exp.Column) and _schema_has_column(
+                            other_schema, node, self.dialect,
+                        ):
+                            return _literal_for_value(_expr_value(node, other_row))
+                        return node
+
+                    bound = deepcopy(step.condition).transform(bind_other)
+                    if not _expression_uses_only_schema_columns(
+                        bound, target_schema, self.dialect,
+                    ):
+                        self._record_demand_failure(
+                            f"unsupported_join_outcome:{demand.outcome}:condition_scope"
+                        )
+                        return
+                    false = _truth_condition(
+                        bound, "false", target_schema, self.dialect,
+                    )
+                    null = _truth_condition(
+                        bound, "null", target_schema, self.dialect,
+                    )
+                    if false is None or null is None:
+                        self._record_demand_failure(
+                            f"unsupported_join_outcome:{demand.outcome}:condition"
+                        )
+                        return
+                    predicates.append(_or_all((false, null)))
+                self._lower_demand(
+                    target_dep,
+                    SchemaDemand(count=demand.count, predicates=tuple(predicates)),
+                    cache,
+                )
+                return
             inverse = _false_condition(step.condition)
             relation_demands = (
                 _join_relation_demands(
@@ -7031,7 +7346,10 @@ class EncodePipeline:
                 else None
             )
             if relation_demands is None:
-                return False
+                self._record_demand_failure(
+                    f"unsupported_join_outcome:{demand.outcome}:condition"
+                )
+                return
             self._lower_demand(
                 left_dep,
                 SchemaDemand(count=1, expression_demands=relation_demands[0]),
@@ -7042,12 +7360,18 @@ class EncodePipeline:
                 SchemaDemand(count=1, expression_demands=relation_demands[1]),
                 cache,
             )
-            return True
+            return
         if not step.on_keys:
-            return False
+            self._record_demand_failure(
+                f"unsupported_join_outcome:{demand.outcome}:missing_keys"
+            )
+            return
         left_key, right_key = step.on_keys[0]
         if not isinstance(left_key, exp.Column) or not isinstance(right_key, exp.Column):
-            return False
+            self._record_demand_failure(
+                f"unsupported_join_outcome:{demand.outcome}:key_expression"
+            )
+            return
         candidates = [
             (left_dep, left_schema, left_key, right_schema, right_key),
             (right_dep, right_schema, right_key, left_schema, left_key),
@@ -7061,7 +7385,7 @@ class EncodePipeline:
             key=lambda item: self._join_key_is_foreign_key_source(item[1], item[2]),
         )
         forbidden = _schema_column_values(other_schema, other_key, self.dialect)
-        predicates: List[exp.Expression] = [_not_null_predicate(target_key)]
+        predicates = list(demand.predicates) + [_not_null_predicate(target_key)]
         predicates.extend(
             exp.NEQ(
                 this=deepcopy(target_key),
@@ -7072,10 +7396,9 @@ class EncodePipeline:
         )
         self._lower_demand(
             target_dep,
-            SchemaDemand(count=1, predicates=tuple(predicates)),
+            SchemaDemand(count=demand.count, predicates=tuple(predicates)),
             cache,
         )
-        return True
 
     def _join_key_is_foreign_key_source(
         self,

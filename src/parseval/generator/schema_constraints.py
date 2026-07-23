@@ -31,9 +31,7 @@ def schema_constraints_for_solver_row(
     table_schema = instance.database_constraints(table)
     constraints: list[exp.Expression] = []
     available = set(sv_map)
-    required_non_null: set[str] = set(exact_columns)
-    if not exact_columns:
-        required_non_null.clear()
+    required_non_null = set(available)
 
     if include_checks:
         constraints.extend(_check_constraints_for_solver_row(instance, table, sv_map))
