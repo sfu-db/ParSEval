@@ -40,35 +40,43 @@ result = disprove(
 print(result.verdict)  # Verdict.EQ or Verdict.NEQ
 ```
 
-### Generation Bounds
+### Generation Configuration
 
-Control row counts with `BmcBounds` parameters. Higher values generate more rows but improve coverage.
+Use `GenerationConfig` to bound path enumeration, solving, and generated rows.
 
 ```python
+from parseval import GenerationConfig, instantiate_db
+
 result = instantiate_db(
     sql="SELECT department, COUNT(*) FROM employees GROUP BY department",
     schema="CREATE TABLE employees (id INT, department TEXT, salary INT)",
     connection_string="sqlite:////tmp/test.db",
     dialect="sqlite",
-    groups=6,            # Number of distinct groups to generate
-    rows_per_group=3,    # Rows within each group (for aggregates)
-    result_rows=3,       # Target row count at the root projection
-    table_rows=1,        # Initial row target per table scan    
-    subquery_rows=1,     # Rows per scalar subquery    
-    max_iterations=4,    # Max bounded expansion iterations
+    generation_config=GenerationConfig(
+        groups=6,
+        rows_per_group=3,
+        max_paths=256,
+        max_solver_calls=48,
+    ),
 )
 ```
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `table_rows` | Initial row target per table scan | 1 |
-| `result_rows` | Target row count at the root projection | 3 |
+| `bootstrap_rows` | Speculative rows per table | 3 |
+| `bootstrap_negatives` | Include speculative predicate counterexamples | `True` |
+| `root_rows` | Rows requested at the root | 3 |
 | `groups` | Number of aggregate groups | 3 |
 | `rows_per_group` | Rows per aggregate group | 3 |
 | `subquery_rows` | Rows per scalar subquery | 1 |
-| `max_iterations` | Max iterations for the symbolic expansion loop | 4 |
-| `max_table_rows` | Safety cap for rows per table | 512 |
-| `generate_negatives` | Include rows that violate individual WHERE atoms | True |
+| `order_competitors` | Competing rows for ordering witnesses | 1 |
+| `max_path_depth` | Maximum backward path depth (`None` means full acyclic depth) | `None` |
+| `max_paths` | Maximum enumerated execution paths | 256 |
+| `max_rows_per_table` | Generated-row cap per table | 128 |
+| `max_total_rows` | Generated-row cap across all tables | 512 |
+| `max_solver_calls` | Solver-call budget shared by bootstrap and path solving | 48 |
+| `solver_timeout_ms` | Timeout for each solver call | 1000 |
+| `seed` | Deterministic generation seed | 142 |
 
 ### Connection Strings
 

@@ -23,7 +23,7 @@ from typing import Any, Mapping, Optional, Sequence
 from sqlglot import exp
 
 from parseval.db_manager import get_connection, execute_query
-from parseval.generator.bounds import BmcBounds
+from parseval.generator.config import GenerationConfig
 from parseval.generator.speculate import speculate
 from parseval.instance import Instance
 
@@ -41,7 +41,6 @@ class SpecRecord:
     # Speculative seeder outcome
     seed_status: str          # "sat" | "unsat" | "error" | "timeout"
     seed_reason: str
-    relaxation_needed: int
     elapsed_seconds: float
     sql: str
     instance_row_total: int = field(default=0)
@@ -59,7 +58,7 @@ class SpecTask:
     query: dict[str, Any]
     ddl: str
     dialect: str
-    bounds: BmcBounds
+    config: GenerationConfig
     out_dir: str
     timeout: int
 
@@ -162,7 +161,7 @@ def run_speculative(
     *,
     ddl: str,
     dialect: str,
-    bounds: BmcBounds,
+    config: GenerationConfig,
     out_dir: Path,
     timeout: int,
 ) -> SpecRecord:
@@ -173,24 +172,17 @@ def run_speculative(
     db_path = database_path_for_query(out_dir, db_id=db_id, question_id=question_id)
     connection_string = f"sqlite:///{db_path}"
 
-    started = time.perf_counter()
-    relaxation_used = -1
+    started = time.perf_counter()    
     nrows = 0
     inst: Instance | None = None
 
-    for attempt in range(4):
-        inst = speculate(ddl, sql, dialect=dialect, bounds=bounds)
-        if inst is None:
-            relaxation_used = attempt
-            break
-        nrows = sum(
-            len(inst.get_rows(table_node))
-            for table_node in inst.schema.fk_safe_table_order()
-        )
-        relaxation_used = attempt
-        if nrows > 0:
-            break
-
+    
+    inst = speculate(ddl, sql, dialect=dialect, config=config)
+    nrows = sum(
+        len(inst.get_rows(table_node))
+        for table_node in inst.schema.fk_safe_table_order()
+    )
+    
     elapsed = time.perf_counter() - started
 
     if inst is None:
@@ -198,7 +190,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="error", seed_reason="returned_none",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+            elapsed_seconds=elapsed,
             sql=sql, instance_row_total=0, shape_tags=tags, db_path=str(db_path),
         )
 
@@ -207,7 +199,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="unsat", seed_reason="all_relaxations_exhausted",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=0, shape_tags=tags, db_path=str(db_path),
         )
 
@@ -221,7 +213,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="sat", seed_reason="",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=nrows,
             validation_rows=0, column_count=0,
             db_path=str(db_path), shape_tags=tags,
@@ -244,7 +236,7 @@ def run_speculative(
             dataset_index=dataset_index, question_id=question_id,
             db_id=db_id, difficulty=str(query.get("difficulty", "?")),
             seed_status="sat", seed_reason=f"validation_error:{e}",
-            relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+             elapsed_seconds=elapsed,
             sql=sql, instance_row_total=nrows,
             validation_rows=0, column_count=0,
             db_path=str(db_path), shape_tags=tags,
@@ -257,7 +249,7 @@ def run_speculative(
         dataset_index=dataset_index, question_id=question_id,
         db_id=db_id, difficulty=str(query.get("difficulty", "?")),
         seed_status=seed_status, seed_reason=seed_reason,
-        relaxation_needed=relaxation_used, elapsed_seconds=elapsed,
+         elapsed_seconds=elapsed,
         sql=sql, instance_row_total=nrows,
         validation_rows=validation_rows,
         column_count=column_count,
@@ -278,7 +270,7 @@ def run_spec_task(task: SpecTask) -> SpecRecord:
         task.query,
         ddl=task.ddl,
         dialect=task.dialect,
-        bounds=task.bounds,
+        config=task.config,
         out_dir=Path(task.out_dir),
         timeout=task.timeout,
     )
@@ -314,8 +306,7 @@ def print_spec_record(record: SpecRecord) -> None:
         f"elapsed={record.elapsed_seconds:.3f}s "
         f"seed_rows={record.instance_row_total} "
         f"db_rows={record.validation_rows} "
-        f"cols={record.column_count} "
-        f"relax={record.relaxation_needed} "
+        f"cols={record.column_count} "        
         f"reason={record.seed_reason}",
         file=sys.stderr,
         flush=True,
@@ -334,8 +325,7 @@ def _timeout_record(task: SpecTask, elapsed: float, task_timeout: float) -> Spec
         db_id=db_id,
         difficulty=str(query.get("difficulty", "?")),
         seed_status="timeout",
-        seed_reason=f"exceeded_task_timeout_{task_timeout:.1f}s",
-        relaxation_needed=-1,
+        seed_reason=f"exceeded_task_timeout_{task_timeout:.1f}s",        
         elapsed_seconds=elapsed,
         sql=sql,
         instance_row_total=0,
@@ -357,8 +347,7 @@ def _worker_error_record(task: SpecTask, elapsed: float, exc: BaseException | st
         db_id=db_id,
         difficulty=str(query.get("difficulty", "?")),
         seed_status="error",
-        seed_reason=reason,
-        relaxation_needed=-1,
+        seed_reason=reason,        
         elapsed_seconds=elapsed,
         sql=sql,
         instance_row_total=0,
@@ -390,14 +379,12 @@ def summarize(records: Sequence[SpecRecord]) -> dict[str, Any]:
     from collections import Counter
 
     seed_status_counts: Counter[str] = Counter()
-    tag_counts: Counter[str] = Counter()
-    relaxation_counts: Counter[int] = Counter()
+    tag_counts: Counter[str] = Counter()    
 
     for record in records:
         seed_status_counts[record.seed_status] += 1
         for tag in record.shape_tags:
-            tag_counts[tag] += 1
-        relaxation_counts[record.relaxation_needed] += 1
+            tag_counts[tag] += 1        
 
     sat_records = [r for r in records if r.seed_status == "sat"]
     return {
@@ -413,9 +400,6 @@ def summarize(records: Sequence[SpecRecord]) -> dict[str, Any]:
         "instance_rows_avg": sum(r.instance_row_total for r in sat_records) / len(sat_records) if sat_records else 0.0,
         "validation_rows_avg": sum(r.validation_rows for r in sat_records) / len(sat_records) if sat_records else 0.0,
         "column_count_avg": sum(r.column_count for r in sat_records) / len(sat_records) if sat_records else 0.0,
-        "relaxation_distribution": {
-            str(k): v for k, v in sorted(relaxation_counts.items())
-        },
         "shape_tag_counts": dict(tag_counts.most_common()),
         "records": [asdict(record) for record in records],
     }
@@ -439,14 +423,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--summary-json", type=Path)
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--table-rows", type=int, default=1)
-    parser.add_argument("--join-width", type=int, default=1)
-    parser.add_argument("--groups", type=int, default=1)
-    parser.add_argument("--rows-per-group", type=int, default=1)
-    parser.add_argument("--subquery-rows", type=int, default=1)
+    parser.add_argument("--bootstrap-rows", type=int, default=3)
+    parser.add_argument("--groups", type=int, default=2)
+    parser.add_argument("--rows-per-group", type=int, default=3)
+    parser.add_argument("--subquery-rows", type=int, default=3)
     parser.add_argument("--order-competitors", type=int, default=1)
-    parser.add_argument("--max-iterations", type=int, default=0)
-    parser.add_argument("--max-table-rows", type=int, default=512)
     parser.add_argument(
         "--mp-start-method",
         choices=("spawn", "forkserver", "fork"),
@@ -483,7 +464,7 @@ def run_batch(
     ddl_by_db: Mapping[str, str],
     out_dir: Path,
     dialect: str,
-    bounds: BmcBounds,
+    config: GenerationConfig,
     timeout: int,
     workers: int,
     mp_start_method: str,
@@ -507,7 +488,7 @@ def run_batch(
                 query=dict(query),
                 ddl=ddl_by_db[db_id],
                 dialect=dialect,
-                bounds=bounds,
+                config=config,
                 out_dir=str(out_dir),
                 timeout=timeout,
             )
@@ -607,15 +588,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if missing:
         raise SystemExit(f"missing_schema_dbs:{missing}")
 
-    bounds = BmcBounds(
-        table_rows=args.table_rows,
-        join_width=args.join_width,
+    config = GenerationConfig(
+        bootstrap_rows=args.bootstrap_rows,
         groups=args.groups,
         rows_per_group=args.rows_per_group,
         subquery_rows=args.subquery_rows,
         order_competitors=args.order_competitors,
-        max_iterations=args.max_iterations,
-        max_table_rows=args.max_table_rows,
     )
 
     records = run_batch(
@@ -623,7 +601,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ddl_by_db=ddl_by_db,
         out_dir=args.out_dir,
         dialect=args.dialect,
-        bounds=bounds,
+        config=config,
         timeout=args.timeout,
         workers=args.workers,
         mp_start_method=args.mp_start_method,

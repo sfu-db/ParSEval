@@ -2,11 +2,36 @@
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from unittest.mock import patch
 
+from parseval.generator import GenerationConfig
 from parseval.generator.speculate import speculate
 from parseval.instance import Instance
+
+
+def _replay_sqlite_query(ddls: str, inst: Instance, query: str) -> list[tuple]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(ddls)
+        for table in inst.schema.fk_safe_table_order():
+            rows = inst.get_rows(table)
+            if not rows:
+                continue
+            columns = list(inst.schema.tables[table].columns)
+            placeholders = ", ".join("?" for _ in columns)
+            sql = (
+                f"INSERT INTO {table.name} "
+                f"({', '.join(column.name for column in columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            for row in rows:
+                values = Instance._row_value_dict(row)
+                conn.execute(sql, [values.get(column) for column in columns])
+        return list(conn.execute(query))
+    finally:
+        conn.close()
 
 
 class TestSpeculateSelfJoin(unittest.TestCase):
@@ -117,6 +142,32 @@ CREATE TABLE u (id INT, t_id INT);"""
         total = sum(len(inst.get_rows(t)) for t in inst.schema.fk_safe_table_order())
         self.assertGreater(total, 0)
 
+    def test_not_in_aliased_projection(self):
+        ddls = """CREATE TABLE orders (id INT);
+CREATE TABLE customers (id INT);"""
+        inst = speculate(
+            ddls,
+            "SELECT id FROM orders WHERE id NOT IN "
+            "(SELECT c.id AS customers FROM customers AS c)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("orders")), 0)
+
+    def test_not_in_parenthesized_distinct_projection(self):
+        ddls = """CREATE TABLE orders (id INT);
+CREATE TABLE customers (id INT);"""
+        inst = speculate(
+            ddls,
+            "SELECT id FROM orders WHERE id NOT IN "
+            "(SELECT DISTINCT (customers.id) FROM customers)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("orders")), 0)
+
 
 class TestSpeculateEdgeCases(unittest.TestCase):
     """Edge cases around subqueries."""
@@ -157,6 +208,226 @@ CREATE TABLE c (id INT, b_id INT);"""
         total = sum(len(inst.get_rows(t)) for t in inst.schema.fk_safe_table_order())
         self.assertGreater(total, 0)
 
+class TestSpeculateGroupBy(unittest.TestCase):
+    def test_simple_group_by_gets_multiple_distinct_group_sizes(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(*) FROM t GROUP BY x"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertGreaterEqual(len(grouped), 3)
+        self.assertEqual(len(set(grouped.values())), len(grouped))
+
+    def test_simple_group_by_in_values_get_distinct_group_sizes(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(*) FROM t WHERE x IN (1, 2, 3) GROUP BY x"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertEqual(set(grouped), {1, 2, 3})
+        self.assertEqual(len(set(grouped.values())), len(grouped))
+
+    def test_group_by_having_count_star_gt_one(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(*) FROM t GROUP BY x HAVING COUNT(*) > 1"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertGreater(len(grouped), 0)
+        self.assertTrue(all(count > 1 for count in grouped.values()))
+
+    def test_group_by_having_count_column_preserves_count_and_adds_nulls(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(y) FROM t GROUP BY x HAVING COUNT(y) >= 2"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertGreater(len(grouped), 0)
+        self.assertTrue(all(count >= 2 for count in grouped.values()))
+        rows = _replay_sqlite_query(ddls, inst, "SELECT x, y FROM t")
+        for x in grouped:
+            values = [y for row_x, y in rows if row_x == x]
+            self.assertGreaterEqual(sum(value is not None for value in values), 2)
+            self.assertGreaterEqual(sum(value is None for value in values), 1)
+
+    def test_group_by_adds_separate_null_rows_for_each_nullable_aggregate_column(self):
+        ddls = "CREATE TABLE t (x INT, a INT, b INT, c INT NOT NULL);"
+        query = "SELECT x, COUNT(a), SUM(b), COUNT(c) FROM t GROUP BY x"
+
+        inst = speculate(
+            ddls,
+            query,
+            "sqlite",
+            config=GenerationConfig(bootstrap_negatives=False, seed=142),
+        )
+
+        rows = _replay_sqlite_query(ddls, inst, "SELECT x, a, b, c FROM t")
+        groups = {x for x, _a, _b, _c in rows}
+        self.assertGreater(len(groups), 0)
+        for x in groups:
+            group_rows = [row for row in rows if row[0] == x]
+            self.assertTrue(any(a is None and b is not None for _x, a, b, _c in group_rows))
+            self.assertTrue(any(a is not None and b is None for _x, a, b, _c in group_rows))
+            self.assertTrue(all(not (a is None and b is None) for _x, a, b, _c in group_rows))
+            self.assertTrue(all(c is not None for _x, _a, _b, c in group_rows))
+
+    def test_group_by_null_counts_are_reproducible_from_seed(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(y) FROM t GROUP BY x"
+
+        def null_counts(seed: int) -> list[int]:
+            inst = speculate(
+                ddls,
+                query,
+                "sqlite",
+                config=GenerationConfig(bootstrap_negatives=False, seed=seed),
+            )
+            rows = _replay_sqlite_query(ddls, inst, "SELECT x, y FROM t")
+            return [
+                sum(y is None for row_x, y in rows if row_x == x)
+                for x in sorted({x for x, _y in rows})
+            ]
+
+        self.assertEqual(null_counts(142), null_counts(142))
+        self.assertNotEqual(null_counts(142), null_counts(2))
+
+    def test_group_by_isolates_columns_inside_aggregate_expression(self):
+        ddls = "CREATE TABLE t (x INT, a INT, b INT);"
+        query = "SELECT x, COUNT(a + b) FROM t GROUP BY x"
+
+        inst = speculate(
+            ddls,
+            query,
+            "sqlite",
+            config=GenerationConfig(bootstrap_negatives=False, seed=142),
+        )
+
+        rows = _replay_sqlite_query(ddls, inst, "SELECT x, a, b FROM t")
+        for x in {x for x, _a, _b in rows}:
+            group_rows = [row for row in rows if row[0] == x]
+            self.assertTrue(any(a is None and b is not None for _x, a, b in group_rows))
+            self.assertTrue(any(a is not None and b is None for _x, a, b in group_rows))
+
+    def test_group_by_null_rows_do_not_displace_baseline_under_row_budget(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(y) FROM t GROUP BY x"
+
+        inst = speculate(
+            ddls,
+            query,
+            "sqlite",
+            config=GenerationConfig(
+                bootstrap_negatives=False,
+                max_rows_per_table=6,
+                max_total_rows=6,
+            ),
+        )
+
+        self.assertEqual(6, len(inst.get_rows("t")))
+        self.assertGreater(len(_replay_sqlite_query(ddls, inst, query)), 0)
+
+    def test_group_by_does_not_null_aggregate_input_that_is_also_group_key(self):
+        ddls = "CREATE TABLE t (x INT);"
+        query = "SELECT x, COUNT(x) FROM t GROUP BY x"
+
+        inst = speculate(
+            ddls,
+            query,
+            "sqlite",
+            config=GenerationConfig(bootstrap_negatives=False),
+        )
+
+        rows = _replay_sqlite_query(ddls, inst, "SELECT x FROM t")
+        self.assertGreater(len(rows), 0)
+        self.assertTrue(all(x is not None for (x,) in rows))
+
+    def test_group_by_does_not_null_filter_constrained_aggregate_input(self):
+        ddls = "CREATE TABLE t (x INT, y INT);"
+        query = "SELECT x, COUNT(y) FROM t WHERE y > 0 GROUP BY x"
+
+        inst = speculate(
+            ddls,
+            query,
+            "sqlite",
+            config=GenerationConfig(bootstrap_negatives=False),
+        )
+
+        rows = _replay_sqlite_query(ddls, inst, "SELECT x, y FROM t")
+        self.assertGreater(len(rows), 0)
+        self.assertTrue(all(y > 0 for _x, y in rows))
+
+    def test_group_by_having_count_distinct_with_distinct_projection_and_order(self):
+        ddls = """
+CREATE TABLE Views (
+    article_id INT,
+    author_id INT,
+    viewer_id INT,
+    view_date TEXT
+);
+"""
+        query = """
+SELECT DISTINCT viewer_id AS id
+FROM Views
+GROUP BY view_date, viewer_id
+HAVING COUNT(DISTINCT article_id) > 1
+ORDER BY id
+"""
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(_replay_sqlite_query(ddls, inst, query)), 0)
+        grouped = _replay_sqlite_query(
+            ddls,
+            inst,
+            """
+SELECT view_date, viewer_id, COUNT(DISTINCT article_id)
+FROM Views
+GROUP BY view_date, viewer_id
+HAVING COUNT(DISTINCT article_id) > 1
+""",
+        )
+        self.assertGreater(len(grouped), 0)
+        self.assertTrue(all(count > 1 for _date, _viewer, count in grouped))
+
+    def test_group_by_respects_check_constraint(self):
+        ddls = "CREATE TABLE t (x INT, y INT CHECK (y > 0));"
+        query = "SELECT x, COUNT(*) FROM t GROUP BY x"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertGreaterEqual(len(grouped), 3)
+        values = _replay_sqlite_query(ddls, inst, "SELECT x, y FROM t")
+        self.assertTrue(all(y > 0 for _x, y in values))
+
+    def test_group_by_join_preserves_join_predicate(self):
+        ddls = """
+CREATE TABLE a (id INT, x INT);
+CREATE TABLE b (a_id INT, y INT);
+"""
+        query = """
+SELECT a.x, COUNT(*)
+FROM a JOIN b ON a.id = b.a_id
+GROUP BY a.x
+"""
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        grouped = dict(_replay_sqlite_query(ddls, inst, query))
+        self.assertGreaterEqual(len(grouped), 2)
+        self.assertEqual(len(set(grouped.values())), len(grouped))
+
 
 class TestSpeculateRelationScope(unittest.TestCase):
     def test_cte_alias_is_not_resolved_as_physical_table(self):
@@ -192,8 +463,112 @@ LEFT JOIN activity AS b
         self.assertNotIn("first_login", calls)
         self.assertGreater(len(inst.get_rows("activity")), 0)
 
+    def test_computed_cte_output_does_not_resolve_as_base_column(self):
+        ddls = """
+CREATE TABLE contacts (
+    first_name TEXT,
+    last_name TEXT
+);
+"""
+        inst = speculate(
+            ddls,
+            "WITH locations AS ("
+            "SELECT CONCAT(first_name, last_name) AS city FROM contacts"
+            ") SELECT city FROM locations WHERE city = 'Boston'",
+            "mysql",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("contacts")), 0)
+
+    def test_star_cte_output_resolves_unambiguous_base_column(self):
+        ddls = """
+CREATE TABLE a (id INT, name TEXT);
+CREATE TABLE b (id INT, name TEXT);
+"""
+        inst = speculate(
+            ddls,
+            "WITH expanded AS ("
+            "SELECT a.*, b.name FROM a JOIN b ON a.id = b.id"
+            ") SELECT id FROM expanded WHERE id > 0",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("a")), 0)
+
+    def test_cte_aggregate_keeps_simple_group_output_lineage(self):
+        ddls = "CREATE TABLE contacts (user_id INT, email TEXT);"
+        inst = speculate(
+            ddls,
+            "WITH allcontacts AS ("
+            "SELECT user_id, COUNT(*) AS cnt FROM contacts GROUP BY user_id"
+            ") SELECT allcontacts.user_id FROM allcontacts "
+            "WHERE allcontacts.user_id > 0",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("contacts")), 0)
+
+    def test_two_derived_aliases_of_same_table_keep_occurrences_separate(self):
+        ddls = "CREATE TABLE t (id INT);"
+        inst = speculate(
+            ddls,
+            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM t) "
+            "SELECT a.id FROM a JOIN b ON a.id <> b.id",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreaterEqual(len(inst.get_rows("t")), 2)
+
+    def test_parenthesized_union_branch_is_seeded(self):
+        ddls = "CREATE TABLE t (id INT);"
+        inst = speculate(
+            ddls,
+            "SELECT id FROM t WHERE id > 0 UNION "
+            "(SELECT id FROM t WHERE id < 0)",
+            "sqlite",
+        )
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("t")), 0)
+
 
 class TestSpeculateConstraintCompletion(unittest.TestCase):
+    def test_base_row_seeding_satisfies_date_check_constraint(self):
+        ddls = """
+CREATE TABLE orders (
+    order_date DATE,
+    customer_pref_delivery_date DATE,
+    CHECK (order_date <= customer_pref_delivery_date)
+);
+"""
+        query = "SELECT order_date FROM orders"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("orders")), 0)
+        self.assertGreater(len(_replay_sqlite_query(ddls, inst, query)), 0)
+
+    def test_base_row_seeding_satisfies_numeric_check_constraint(self):
+        ddls = """
+CREATE TABLE ranges (
+    min_value INT,
+    max_value INT,
+    CHECK (min_value <= max_value)
+);
+"""
+        query = "SELECT min_value FROM ranges"
+
+        inst = speculate(ddls, query, "sqlite", config=GenerationConfig(bootstrap_negatives=False))
+
+        self.assertIsNotNone(inst)
+        self.assertGreater(len(inst.get_rows("ranges")), 0)
+        self.assertGreater(len(_replay_sqlite_query(ddls, inst, query)), 0)
+
     def test_check_constraint_with_non_query_column_is_satisfied(self):
         ddls = """
 CREATE TABLE customer (
@@ -232,7 +607,7 @@ CREATE TABLE customer (
             "SELECT name FROM customer "
             "WHERE referee_id <> 2 OR referee_id IS NULL",
             "mysql",
-            generate_negatives=False,
+            config=GenerationConfig(bootstrap_negatives=False),
         )
 
         self.assertIsNotNone(inst)
@@ -279,7 +654,7 @@ CREATE TABLE employee (
             ddls,
             "SELECT employee_id FROM employee WHERE primary_flag = 'Y'",
             "mysql",
-            generate_negatives=False,
+            config=GenerationConfig(bootstrap_negatives=False),
         )
 
         self.assertIsNotNone(inst)
