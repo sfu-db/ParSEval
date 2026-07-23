@@ -7,6 +7,7 @@ from sqlglot import exp
 
 from parseval.dtype import DataType, StorageLiteral
 from parseval.solver.csp import CspBackend
+from parseval.solver.normalization import normalize_expression
 from parseval.solver.types import Problem, SolverVar
 
 
@@ -377,6 +378,15 @@ class CspBackendTests(unittest.TestCase):
         self.assertLessEqual(len(result.assignments[name]), 3)
         self.assertTrue(result.assignments[name].startswith("ABC"))
 
+    def test_sqlite_like_assignment_allows_ascii_case_variant(self):
+        name = var("t.name", "TEXT")
+        constraint = exp.Like(this=name, expression=text("Legal%"))
+
+        result = CspBackend(dialect="sqlite").solve(Problem(constraints=[constraint]))
+
+        self.assertEqual(result.status, "sat")
+        self.assertTrue(result.assignments[name].lower().startswith("legal"))
+
     def test_variable_inequality_uses_finite_search_when_domains_are_bounded(self):
         left = var("t.left", "INT")
         right = var("t.right", "INT")
@@ -432,6 +442,27 @@ class CspBackendTests(unittest.TestCase):
         result = CspBackend().solve(Problem(constraints=[constraint]))
 
         self.assertEqual(result.status, "unsat")
+
+    def test_normalized_mixed_in_does_not_false_unsat_variable_candidate(self):
+        child = var("satscores.cds", "TEXT")
+        parent = var("schools.CDSCode", "TEXT")
+        existing = text("sat_60f9cd")
+        constraint = both(
+            exp.NEQ(this=child, expression=existing.copy()),
+            both(
+                exp.NEQ(this=parent, expression=existing.copy()),
+                exp.In(
+                    this=child,
+                    expressions=[existing.copy(), parent],
+                ),
+            ),
+        )
+
+        result = CspBackend().solve(
+            Problem(constraints=[normalize_expression(constraint)])
+        )
+
+        self.assertEqual("unknown", result.status)
 
     def test_variable_inequality_without_finite_domains_is_unknown(self):
         left = var("t.left", "INT")

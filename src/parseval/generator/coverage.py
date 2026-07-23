@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlglot import exp
 from decimal import Decimal
-from parseval.instance import Instance
-from parseval.plan.rex import Environment, concrete
 from datetime import datetime, date, time
 from parseval.plan.explain import (
     Aggregate,
@@ -17,31 +14,19 @@ from parseval.plan.explain import (
     Limit,
     Plan,
     Projection,
+    RawStep,
+    RecursiveQuery,
     Sort,
     Step,
     TableScan,
-    explain,
+    Union,
+    Unnest,
+    Window,
+    normalize_join_type,
 )
 from parseval.generator.helper import (
-    join_alias_tables,
-    join_order_keys_supported,
     leaf_table_scans,
-    order_expression_value,
-    resolved_order_expressions,
-    single_dependency_join,
-    single_leaf_scan,
-    storage_table_for_join_column,
 )
-from .bounds import BmcBounds
-
-
-@dataclass(frozen=True)
-class CoverageObligation:
-    id: str
-    step_type: str
-    kind: str
-    target: str
-    status: str
 
 
 @dataclass(frozen=True)
@@ -53,15 +38,27 @@ class SemanticTarget:
     target: str
     expression: exp.Expression | None = None
 
-    def obligation(self, status: str) -> CoverageObligation:
-        return CoverageObligation(
-            id=self.id,
-            step_type=self.step_type,
-            kind=self.kind,
-            target=self.target,
-            status=status,
-        )
 
+@dataclass(frozen=True)
+class CoverageObligation:
+    """Result of compiling and validating one semantic outcome path."""
+
+    id: str
+    target_id: str
+    steps: tuple[str, ...]
+    status: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class GenerationState:
+    """Public diagnostics for a complete single-query generation run."""
+
+    status: str
+    obligations: tuple[CoverageObligation, ...]
+    solver_calls: int
+    coverage_ratio: float
+    stage_timings: Mapping[str, float]
 
 @dataclass(frozen=True)
 class CoverageTreeNode:
@@ -70,60 +67,12 @@ class CoverageTreeNode:
     step_type: str
     targets: tuple[SemanticTarget, ...]
     children: tuple["CoverageTreeNode", ...]
-    obligations: tuple[CoverageObligation, ...] = ()
 
     def iter_targets(self) -> tuple[SemanticTarget, ...]:
         targets: list[SemanticTarget] = list(self.targets)
         for child in self.children:
             targets.extend(child.iter_targets())
         return tuple(targets)
-
-    def iter_obligations(self) -> tuple[CoverageObligation, ...]:
-        obligations: list[CoverageObligation] = list(self.obligations)
-        for child in self.children:
-            obligations.extend(child.iter_obligations())
-        return tuple(obligations)
-
-    def with_statuses(self, statuses: Mapping[str, str]) -> "CoverageTreeNode":
-        return CoverageTreeNode(
-            id=self.id,
-            step=self.step,
-            step_type=self.step_type,
-            targets=self.targets,
-            children=tuple(child.with_statuses(statuses) for child in self.children),
-            obligations=tuple(
-                target.obligation(statuses.get(target.id, "unsupported"))
-                for target in self.targets
-            ),
-        )
-
-    def coverage_ratio(self) -> float:
-        return _coverage_ratio(self.iter_obligations())
-
-
-def generate_query_database(
-    ddl: str | Instance,
-    query: str,
-    *,
-    dialect: str = "sqlite",
-    bounds: Optional[BmcBounds] = None,
-) -> Instance | object:
-    """Generate witness rows for ``query`` and return the mutated Instance."""
-    if isinstance(ddl, Instance):
-        instance = ddl
-        plan = explain(instance.ddls, query, instance.dialect)
-        from parseval.generator.symbolic.generate import _generate_from_plan
-
-        _generate_from_plan(
-            plan,
-            instance,
-            bounds=bounds,
-        )
-        return instance.generation
-
-    from parseval.generator.symbolic.generate import generate as symbolic_generate
-
-    return symbolic_generate(ddl, query, dialect=dialect, bounds=bounds)
 
 def _ordered_steps(root: Step) -> tuple[Step, ...]:
     ordered: list[Step] = []
@@ -150,6 +99,16 @@ def _step_semantic_targets(
     step_type = step.type_name
     prefix = f"{path}.{step_type}"
     targets: list[SemanticTarget] = []
+    if isinstance(step, (RawStep, RecursiveQuery, Unnest)):
+        targets.append(
+            SemanticTarget(
+                id=f"{prefix}.unsupported",
+                step=step,
+                step_type=step_type,
+                kind="unsupported_plan_node",
+                target=step_type,
+            )
+        )
     if isinstance(step, TableScan):
         targets.append(
             SemanticTarget(
@@ -197,53 +156,113 @@ def _step_semantic_targets(
                 )
             )
     if isinstance(step, Join):
-        jt = step.join_type.upper()
-        targets.append(
-            SemanticTarget(
-                id=f"{prefix}.match",
-                step=step,
-                step_type=step_type,
-                kind="join",
-                target="match",
+        jt = normalize_join_type(step.join_type)
+        if step.subquery_kind is not None and jt in {"SEMI", "ANTI"}:
+            for outcome in ("matching", "non_matching", "multi_row"):
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.{step.subquery_kind}.{outcome}",
+                        step=step,
+                        step_type=step_type,
+                        kind="subquery",
+                        target=outcome,
+                    )
+                )
+            if step.subquery_kind in {"in", "not_in"}:
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.{step.subquery_kind}.null_operand",
+                        step=step,
+                        step_type=step_type,
+                        kind="subquery",
+                        target="null_operand",
+                    )
+                )
+            if step.subquery_kind == "not_in":
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.not_in.null_poison",
+                        step=step,
+                        step_type=step_type,
+                        kind="subquery",
+                        target="null_poison",
+                    )
+                )
+        elif jt == "SEMI":
+            targets.extend(
+                (
+                    SemanticTarget(
+                        id=f"{prefix}.semi_match",
+                        step=step,
+                        step_type=step_type,
+                        kind="semi_join",
+                        target="semi_match",
+                    ),
+                    SemanticTarget(
+                        id=f"{prefix}.semi_no_match",
+                        step=step,
+                        step_type=step_type,
+                        kind="semi_join",
+                        target="semi_no_match",
+                    ),
+                )
             )
-        )
-        targets.append(
-            SemanticTarget(
-                id=f"{prefix}.no_match",
-                step=step,
-                step_type=step_type,
-                kind="join",
-                target="no_match",
+        elif jt == "ANTI":
+            targets.extend(
+                (
+                    SemanticTarget(
+                        id=f"{prefix}.anti_no_match",
+                        step=step,
+                        step_type=step_type,
+                        kind="anti_join",
+                        target="anti_no_match",
+                    ),
+                    SemanticTarget(
+                        id=f"{prefix}.anti_match_excluded",
+                        step=step,
+                        step_type=step_type,
+                        kind="anti_join",
+                        target="anti_match_excluded",
+                    ),
+                )
             )
-        )
-        if jt in {"LEFT", "RIGHT", "FULL"}:
+        else:
+            targets.extend(
+                (
+                    SemanticTarget(
+                        id=f"{prefix}.match",
+                        step=step,
+                        step_type=step_type,
+                        kind="join",
+                        target="match",
+                    ),
+                    SemanticTarget(
+                        id=f"{prefix}.no_match",
+                        step=step,
+                        step_type=step_type,
+                        kind="join",
+                        target="no_match",
+                    ),
+                )
+            )
+        if jt in {"LEFT", "FULL"}:
             targets.append(
                 SemanticTarget(
-                    id=f"{prefix}.preserved_unmatched",
+                    id=f"{prefix}.preserved_left",
                     step=step,
                     step_type=step_type,
                     kind="join",
-                    target="preserved_unmatched",
+                    target="preserved_left",
                 )
             )
-        if jt == "SEMI":
+        if jt in {"RIGHT", "FULL"}:
             targets.append(
                 SemanticTarget(
-                    id=f"{prefix}.semi_match",
+                    id=f"{prefix}.preserved_right",
                     step=step,
                     step_type=step_type,
-                    kind="semi_join",
-                    target="semi_match",
-                )
-            )
-        if jt == "ANTI":
-            targets.append(
-                SemanticTarget(
-                    id=f"{prefix}.anti_no_match",
-                    step=step,
-                    step_type=step_type,
-                    kind="anti_join",
-                    target="anti_no_match",
+                    kind="join",
+                    target="preserved_right",
                 )
             )
     if isinstance(step, Aggregate):
@@ -257,6 +276,25 @@ def _step_semantic_targets(
             )
         )
         targets.extend(_aggregate_targets(prefix, step))
+        if step.group and not step.aggregations:
+            targets.append(
+                SemanticTarget(
+                    id=f"{prefix}.duplicate_eliminated",
+                    step=step,
+                    step_type=step_type,
+                    kind="distinct",
+                    target="duplicate_eliminated",
+                )
+            )
+            targets.append(
+                SemanticTarget(
+                    id=f"{prefix}.distinct_preserved",
+                    step=step,
+                    step_type=step_type,
+                    kind="distinct",
+                    target="distinct_preserved",
+                )
+            )
     if isinstance(step, Distinct):
         targets.append(
             SemanticTarget(
@@ -276,6 +314,74 @@ def _step_semantic_targets(
                 target="distinct_preserved",
             )
         )
+    if isinstance(step, Union):
+        targets.extend(
+            (
+                SemanticTarget(
+                    id=f"{prefix}.left_only",
+                    step=step,
+                    step_type=step_type,
+                    kind="union",
+                    target="left_only",
+                ),
+                SemanticTarget(
+                    id=f"{prefix}.right_only",
+                    step=step,
+                    step_type=step_type,
+                    kind="union",
+                    target="right_only",
+                ),
+                SemanticTarget(
+                    id=f"{prefix}.overlap",
+                    step=step,
+                    step_type=step_type,
+                    kind="union",
+                    target="overlap",
+                ),
+                SemanticTarget(
+                    id=f"{prefix}.duplicate_{'preserved' if step.is_all else 'eliminated'}",
+                    step=step,
+                    step_type=step_type,
+                    kind="union",
+                    target="duplicate_preserved" if step.is_all else "duplicate_eliminated",
+                ),
+            )
+        )
+    if isinstance(step, Window):
+        for window_index, window in enumerate(step.window_exprs):
+            targets.append(
+                SemanticTarget(
+                    id=f"{prefix}.window{window_index}.row",
+                    step=step,
+                    step_type=step_type,
+                    kind="window",
+                    target="row",
+                    expression=window,
+                )
+            )
+            if window.args.get("partition_by"):
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.window{window_index}.partition_peer",
+                        step=step,
+                        step_type=step_type,
+                        kind="window",
+                        target="partition_peer",
+                        expression=window,
+                    )
+                )
+            order = window.args.get("order")
+            if isinstance(order, exp.Order) and order.expressions:
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.window{window_index}.order_tie",
+                        step=step,
+                        step_type=step_type,
+                        kind="window",
+                        target="order_tie",
+                        expression=window,
+                    )
+                )
     if isinstance(step, Sort):
         targets.append(
             SemanticTarget(
@@ -344,8 +450,6 @@ def _aggregate_targets(
     step: Aggregate,
 ) -> tuple[SemanticTarget, ...]:
     targets: list[SemanticTarget] = []
-    has_count_star = False
-    has_count_column = False
     for aggregate_index, aggregate in enumerate(step.aggregations):
         expression = aggregate.this if isinstance(aggregate, exp.Alias) else aggregate
         if isinstance(expression, exp.Avg):
@@ -361,11 +465,25 @@ def _aggregate_targets(
             )
         if isinstance(expression, exp.Count):
             source = expression.this
-            if source is None or isinstance(source, (exp.Star, exp.Literal)):
-                has_count_star = True
-            elif not isinstance(source, exp.Distinct):
-                has_count_column = True
-            if isinstance(source, exp.Distinct):
+            is_distinct = isinstance(source, exp.Distinct) or bool(
+                expression.args.get("distinct")
+            )
+            if (
+                source is not None
+                and not isinstance(source, (exp.Star, exp.Literal))
+                and not is_distinct
+            ):
+                targets.append(
+                    SemanticTarget(
+                        id=f"{prefix}.agg{aggregate_index}.null_sensitive",
+                        step=step,
+                        step_type=step.type_name,
+                        kind="null_sensitive_aggregate_witness",
+                        target="count_column_null",
+                        expression=expression,
+                    )
+                )
+            if is_distinct:
                 targets.append(
                     SemanticTarget(
                         id=f"{prefix}.agg{aggregate_index}.distinct",
@@ -390,16 +508,6 @@ def _aggregate_targets(
             targets.extend(
                 _case_targets(prefix, step, aggregate_index, expression.this)
             )
-    if has_count_star and has_count_column:
-        targets.append(
-            SemanticTarget(
-                id=f"{prefix}.null_sensitive_count",
-                step=step,
-                step_type=step.type_name,
-                kind="null_sensitive_aggregate_witness",
-                target="count_star_vs_count_column",
-            )
-        )
     return tuple(targets)
 
 
@@ -443,263 +551,6 @@ def _case_expressions(
     return tuple(cases)
 
 
-class SemanticCoverageRecorder:
-    def __init__(self, plan: Plan, instance: Instance) -> None:
-        self._plan = plan
-        self._instance = instance
-
-    def evaluate_tree(
-        self,
-        tree: CoverageTreeNode,
-        statuses: Mapping[str, str] | None = None,
-    ) -> CoverageTreeNode:
-        statuses = {
-            target.id: self._evaluate_target(target)
-            for target in tree.iter_targets()
-        } | dict(statuses or {})
-        return tree.with_statuses(statuses)
-
-    def _evaluate_target(self, target: SemanticTarget) -> str:
-        if target.kind == "base_row" and isinstance(target.step, TableScan):
-            return "covered" if self._instance.get_rows(target.step.table) else "pending"
-        if target.kind in {"filter", "case"} and target.expression is not None:
-            return self._evaluate_predicate_target(target)
-        if target.kind == "join" and isinstance(target.step, Join):
-            return self._evaluate_join_target(target)
-        if target.kind in {
-            "projection_visible",
-            "group_existence",
-            "distinct",
-            "multi_row_aggregate_witness",
-            "distinct_aggregate_witness",
-            "conditional_aggregate_case",
-            "null_sensitive_aggregate_witness",
-        }:
-            return "covered" if _query_has_existing_rows(self._plan, self._instance) else "pending"
-        if target.kind == "ordering" and isinstance(target.step, Sort):
-            return self._evaluate_ordering_target(target)
-        if target.kind == "limit_window" and isinstance(target.step, (Limit, Sort)):
-            return self._evaluate_limit_target(target)
-        return "unsupported"
-
-    def _evaluate_predicate_target(self, target: SemanticTarget) -> str:
-        if target.expression is None:
-            return "unsupported"
-        outcomes = set()
-        for row in _existing_step_rows(self._instance, target.step):
-            try:
-                outcomes.add(concrete(target.expression, Environment.from_row(row)))
-            except Exception:
-                continue
-        if target.kind == "case":
-            if target.target == "default":
-                return "covered" if outcomes else "pending"
-            return "covered" if True in outcomes else "pending"
-        if target.target == "true":
-            return "covered" if True in outcomes else "pending"
-        if target.target == "false":
-            return "covered" if False in outcomes else "unsupported"
-        if target.target == "null":
-            return "covered" if None in outcomes else "unsupported"
-        return "unsupported"
-
-    def _evaluate_join_target(self, target: SemanticTarget) -> str:
-        step = target.step
-        assert isinstance(step, Join)
-        left_rows = _existing_step_rows(self._instance, step.left) if step.left else ()
-        right_rows = _existing_step_rows(self._instance, step.right) if step.right else ()
-        if not left_rows or not right_rows:
-            return "pending" if target.target == "match" else "unsupported"
-        matches: list[tuple[Mapping[exp.Identifier, Any], Mapping[exp.Identifier, Any]]] = []
-        for left, right in product(left_rows, right_rows):
-            if _join_rows_match(step, left, right):
-                matches.append((left, right))
-        if target.target == "match":
-            return "covered" if matches else "pending"
-        if target.target == "no_match":
-            matched_left = {id(left) for left, _right in matches}
-            matched_right = {id(right) for _left, right in matches}
-            has_no_match = any(id(row) not in matched_left for row in left_rows) or any(
-                id(row) not in matched_right for row in right_rows
-            )
-            return "covered" if has_no_match else "unsupported"
-        if target.target == "preserved_unmatched":
-            join_type = step.join_type.upper()
-            matched_left = {id(left) for left, _right in matches}
-            matched_right = {id(right) for _left, right in matches}
-            if join_type == "LEFT":
-                return "covered" if any(id(row) not in matched_left for row in left_rows) else "unsupported"
-            if join_type == "RIGHT":
-                return "covered" if any(id(row) not in matched_right for row in right_rows) else "unsupported"
-            if join_type == "FULL":
-                return (
-                    "covered"
-                    if any(id(row) not in matched_left for row in left_rows)
-                    or any(id(row) not in matched_right for row in right_rows)
-                    else "unsupported"
-                )
-        return "unsupported"
-
-    def _evaluate_ordering_target(self, target: SemanticTarget) -> str:
-        context = _topk_context(self._plan, self._instance, target.step)
-        if context is None:
-            return "unsupported"
-        rows, keys, offset, limit = context
-        if len(rows) < offset + limit or not rows[offset : offset + limit]:
-            return "pending"
-        if target.target == "selected":
-            return "covered"
-        if target.target == "excluded_competitor":
-            return "covered" if len(rows) > offset + limit else "pending"
-        if target.target == "rank_tie":
-            selected = rows[offset : offset + limit]
-            selected_keys = {keys[id(row)] for row in selected}
-            return (
-                "covered"
-                if any(keys[id(row)] in selected_keys and row not in selected for row in rows)
-                else "pending"
-            )
-        return "unsupported"
-
-    def _evaluate_limit_target(self, target: SemanticTarget) -> str:
-        sort = _single_dependency_of_type(target.step, Sort)
-        context = _topk_context(self._plan, self._instance, sort or target.step)
-        if context is None:
-            return "unsupported"
-        rows, _keys, offset, limit = context
-        if target.target == "selected":
-            return "covered" if len(rows[offset : offset + limit]) == limit else "pending"
-        if target.target == "offset_skipped":
-            return "covered" if offset > 0 and len(rows[:offset]) == offset else "pending"
-        return "unsupported"
-
-
-def _topk_context(
-    plan: Plan,
-    instance: Instance,
-    step: Step,
-) -> tuple[list[Mapping[exp.Identifier, Any]], dict[int, tuple[Any, ...]], int, int] | None:
-    sort = step if isinstance(step, Sort) else _single_dependency_of_type(step, Sort)
-    if sort is None or not sort.key:
-        return None
-    scan = single_leaf_scan(sort)
-    if scan is None:
-        return _join_topk_context(plan, instance, sort)
-    order_expressions = resolved_order_expressions(instance, scan.table, sort)
-    if order_expressions is None:
-        return None
-    offset, limit = _sort_window(plan, sort)
-    rows = [Instance._row_value_dict(row) for row in instance.get_rows(scan.table)]
-    if not rows:
-        return [], {}, offset, limit
-    keys: dict[int, tuple[Any, ...]] = {}
-    for row in rows:
-        values = []
-        for expr in order_expressions:
-            try:
-                values.append(concrete(expr, Environment.from_row(row)))
-            except Exception:
-                return None
-        keys[id(row)] = tuple(values)
-    for index, ordered in reversed(tuple(enumerate(sort.key))):
-        descending = isinstance(ordered, exp.Ordered) and bool(ordered.args.get("desc"))
-        rows.sort(key=lambda row: sql_order_key(keys[id(row)][index]), reverse=descending)
-    return rows, keys, offset, limit
-
-
-def _join_topk_context(
-    plan: Plan,
-    instance: Instance,
-    sort: Sort,
-) -> tuple[list[Mapping[exp.Identifier, Any]], dict[int, tuple[Any, ...]], int, int] | None:
-    join = single_dependency_join(sort)
-    if join is None or len(join.on_keys) != 1 or join.condition is not None:
-        return None
-    left_key, right_key = join.on_keys[0]
-    if not isinstance(left_key, exp.Column) or not isinstance(right_key, exp.Column):
-        return None
-    left_table = storage_table_for_join_column(join, left_key, instance)
-    right_table = storage_table_for_join_column(join, right_key, instance)
-    if left_table is None or right_table is None:
-        return None
-    alias_tables = dict(join_alias_tables(join))
-    if not join_order_keys_supported(instance, alias_tables, sort.key):
-        return None
-    left_ident = instance.resolve_column(left_table, left_key.name)
-    right_ident = instance.resolve_column(right_table, right_key.name)
-    rows: list[Mapping[exp.Identifier, Any]] = []
-    for left_row in instance.get_rows(left_table):
-        left_values = Instance._row_value_dict(left_row)
-        left_value = left_values.get(left_ident)
-        for right_row in instance.get_rows(right_table):
-            right_values = Instance._row_value_dict(right_row)
-            if left_value is None or left_value != right_values.get(right_ident):
-                continue
-            rows.append({**left_values, **right_values})
-    if not rows:
-        return [], {}, *_sort_window(plan, sort)
-    keys: dict[int, tuple[Any, ...]] = {}
-    for row in rows:
-        values = []
-        for ordered in sort.key:
-            expr = ordered.this if isinstance(ordered, exp.Ordered) else ordered
-            value = order_expression_value(instance, alias_tables, row, expr)
-            if value is None:
-                return None
-            values.append(value)
-        keys[id(row)] = tuple(values)
-    for index, ordered in reversed(tuple(enumerate(sort.key))):
-        descending = isinstance(ordered, exp.Ordered) and bool(ordered.args.get("desc"))
-        rows.sort(key=lambda row: sql_order_key(keys[id(row)][index]), reverse=descending)
-    offset, limit = _sort_window(plan, sort)
-    return rows, keys, offset, limit
-
-
-def _query_has_existing_rows(plan: Plan, instance: Instance) -> bool:
-    scans = [step for step in _ordered_steps(plan.root) if isinstance(step, TableScan)]
-    return bool(scans) and all(instance.get_rows(step.table) for step in scans)
-
-
-def _existing_step_rows(
-    instance: Instance,
-    step: Step | None,
-) -> tuple[Mapping[exp.Identifier, Any], ...]:
-    scans = tuple(leaf_table_scans(step)) if step is not None else ()
-    if not scans:
-        return ()
-    row_groups: list[list[Mapping[exp.Identifier, Any]]] = []
-    for scan in scans:
-        rows = [Instance._row_value_dict(row) for row in instance.get_rows(scan.table)]
-        if not rows:
-            return ()
-        row_groups.append(rows)
-    return tuple({key: value for row in rows for key, value in row.items()} for rows in product(*row_groups))
-
-
-def _join_rows_match(
-    step: Join,
-    left: Mapping[exp.Identifier, Any],
-    right: Mapping[exp.Identifier, Any],
-) -> bool:
-    for left_key, right_key in step.on_keys:
-        left_value = concrete(left_key, Environment.from_row(left))
-        right_value = concrete(right_key, Environment.from_row(right))
-        if left_value is None or right_value is None or left_value != right_value:
-            return False
-    if step.condition is not None:
-        merged = dict(left)
-        merged.update(right)
-        return concrete(step.condition, Environment.from_row(merged)) is True
-    return bool(step.on_keys)
-
-
-def _single_dependency_of_type(step: Step, step_type: type) -> Any | None:
-    if len(step.dependencies) != 1:
-        return None
-    dependency = next(iter(step.dependencies))
-    return dependency if isinstance(dependency, step_type) else None
-
-
 def _sort_window(plan: Plan, sort: Sort) -> tuple[int, int]:
     offset = 0
     limit = sort.fetch or 1
@@ -711,11 +562,6 @@ def _sort_window(plan: Plan, sort: Sort) -> tuple[int, int]:
     return offset, max(limit, 1)
 
 
-def _coverage_ratio(obligations: Sequence[CoverageObligation]) -> float:
-    if not obligations:
-        return 1.0
-    covered = sum(1 for obligation in obligations if obligation.status == "covered")
-    return covered / len(obligations)
 
 
 def _condition_has_nullable_input(instance: Instance, step: Filter) -> bool:

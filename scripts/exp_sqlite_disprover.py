@@ -4,16 +4,19 @@ Usage::
 
     python scripts/exp_sqlite_disprover.py --workers 16
     python scripts/exp_sqlite_disprover.py --limit 100 --workers 8
+    python scripts/exp_sqlite_disprover.py --workers 16 --inmemory
 """
 
 import json
 import os
 import argparse
 import datetime
+import sqlite3
 import shutil
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed, TimeoutError as FuturesTimeoutError
+from pebble import ProcessPool, ProcessExpired
 import sys
 try:
     from tqdm import tqdm
@@ -41,7 +44,7 @@ def load_preds(preds_fp: str):
     return lines
 
 
-def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout):
+def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri=None):
     t0 = time.time()
     record = {
         "index": index,
@@ -52,13 +55,18 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         "error_msg": "",
         "elapsed_time": 0.0,
     }
+    keeper_conn = None
     try:
         from parseval.main import disprove
+
+        # Keep a shared in-memory SQLite DB alive across disprove's internal
+        # connection open/close cycles (to_db -> execute_query).
+        if memory_uri:
+            keeper_conn = sqlite3.connect(memory_uri, uri=True)
 
         result = disprove(
             gold_sql, pred_sql, ddls, connection_string, "sqlite",
             semantics="bag",
-            max_iterations=15,
             timeout=timeout,
         )
         record["verdict"] = result.verdict.value
@@ -67,14 +75,16 @@ def _process_disprove_case(index, gold_sql, pred_sql, db_id, ddls, connection_st
         record["verdict"] = "syntax_error"
         record["error_msg"] = str(exc)[:200]
     finally:
+        if keeper_conn is not None:
+            keeper_conn.close()
         record["elapsed_time"] = round(time.time() - t0, 4)
     return record
 
 
 def _process_disprove_task(task):
-    index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout = task
+    index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri = task
     return _process_disprove_case(
-        index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout,
+        index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri,
     )
 
 
@@ -87,6 +97,7 @@ def run_disprove_experiment(
     start: int = 0,
     workers: int = 1,
     timeout: int = 60,
+    inmemory: bool = False,
 ):
     schemas = load_schema(schema_fp)
     gold = load_gold(gold_fp)
@@ -97,7 +108,7 @@ def run_disprove_experiment(
         selected = selected[:limit]
 
     os.makedirs(output_dir, exist_ok=True)
-    tmp_dir = tempfile.mkdtemp(prefix="parseval_")
+    tmp_dir = None if inmemory else tempfile.mkdtemp(prefix="parseval_")
 
     tasks = []
     for offset, row in enumerate(selected):
@@ -106,9 +117,15 @@ def run_disprove_experiment(
         pred_sql = preds[index] if index < len(preds) else ""
         db_id = row.get("db_id")
         ddls = ";".join(schemas.get(db_id, []))
-        db_path = os.path.abspath(os.path.join(tmp_dir, f"{db_id}_{index}.db"))
-        connection_string = f"sqlite:///{db_path}"
-        tasks.append((index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout))
+        if inmemory:
+            memory_name = f"parseval_{db_id}_{index}"
+            memory_uri = f"file:{memory_name}?mode=memory&cache=shared"
+            connection_string = f"sqlite:///{memory_uri}&uri=true"
+        else:
+            db_path = os.path.abspath(os.path.join(tmp_dir, f"{db_id}_{index}.db"))
+            connection_string = f"sqlite:///{db_path}"
+            memory_uri = None
+        tasks.append((index, gold_sql, pred_sql, db_id, ddls, connection_string, timeout, memory_uri))
 
     if workers <= 1:
         records = [
@@ -117,19 +134,58 @@ def run_disprove_experiment(
         ]
     else:
         records_by_index = {}
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_process_disprove_task, task) for task in tasks]
+        with ProcessPool(max_workers=workers) as pool:
+            future_to_task = {
+                pool.schedule(_process_disprove_task, args=(task,), timeout=timeout): task
+                for task in tasks
+            }
             for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
+                as_completed(future_to_task),
+                total=len(future_to_task),
                 desc="Disproving BIRD pairs",
                 disable=not sys.stdout.isatty()
             ):
-                record = future.result()
-                records_by_index[record["index"]] = record
+                task = future_to_task[future]
+                index = task[0]
+                gold_sql = task[1]
+                pred_sql = task[2]
+                try:
+                    record = future.result()
+                    records_by_index[record["index"]] = record
+                except FuturesTimeoutError:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "timeout",
+                        "error_msg": f"Task exceeded {timeout} seconds",
+                        "elapsed_time": float(timeout),
+                    }
+                except ProcessExpired as e:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "execution_error",
+                        "error_msg": f"Worker process crashed: {e}",
+                        "elapsed_time": 0.0,
+                    }
+                except Exception as e:
+                    records_by_index[index] = {
+                        "index": index,
+                        "db_id": task[3],
+                        "gold_sql": gold_sql,
+                        "pred_sql": pred_sql,
+                        "verdict": "execution_error",
+                        "error_msg": f"Python Exception: {str(e)[:200]}",
+                        "elapsed_time": 0.0,
+                    }
         records = [records_by_index[index] for index, *_rest in tasks]
 
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if tmp_dir is not None:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     metrics = compute_metrics(records)
 
@@ -207,9 +263,10 @@ if __name__ == "__main__":
     parser.add_argument("--preds_fp", default="data/sqlite/dail.txt")
     parser.add_argument("--output_dir", default="results")
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--timeout", type=int, default=60, help="Query execution timeout per task in seconds")
+    parser.add_argument("--timeout", type=int, default=360, help="Query execution timeout per task in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--inmemory", action="store_true", help="Use SQLite in-memory database per task")
     args = parser.parse_args()
     run_disprove_experiment(
         schema_fp=args.schema_fp,
@@ -220,4 +277,5 @@ if __name__ == "__main__":
         start=args.start,
         workers=args.workers,
         timeout=args.timeout,
+        inmemory=args.inmemory,
     )

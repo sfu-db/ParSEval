@@ -372,7 +372,6 @@ def _process_disprove_case(index, sql1, sql2, ddls, connection_string, timeout):
         result = disprove(
             sql1, sql2, ddls, connection_string, "mysql",
             semantics="bag",
-            max_iterations=25,
             timeout=timeout,
         )
         record["verdict"] = result.verdict.value

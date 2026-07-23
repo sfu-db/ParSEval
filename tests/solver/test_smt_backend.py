@@ -139,7 +139,7 @@ class TestSmtBackendProblemApi(unittest.TestCase):
 
     def test_sat_status_does_not_depend_on_decoded_assignments(self):
         class EmptyModelSession:
-            def __init__(self, *, timeout_ms=None, dialect=None):
+            def __init__(self, *, timeout_ms=None, dialect=None, seed=None):
                 self.context = {"variable_to_z3": {}}
 
             def declare_variable(self, name, dtype):
@@ -288,6 +288,29 @@ class TestSmtBackendProblemApi(unittest.TestCase):
         ]
         self.assertEqual(3, len(set(tuples)))
         self.assertTrue(all(date_value is not None for _id, date_value in tuples))
+
+    def test_solver_preserves_variable_candidates_in_mixed_in_constraints(self):
+        child = var("satscores.cds", "TEXT")
+        parent = var("schools.CDSCode", "TEXT")
+        existing = text("sat_60f9cd")
+        predicate = exp.And(
+            this=exp.NEQ(this=child, expression=existing.copy()),
+            expression=exp.And(
+                this=exp.NEQ(this=parent, expression=existing.copy()),
+                expression=exp.In(
+                    this=child,
+                    expressions=[existing.copy(), parent],
+                ),
+            ),
+        )
+
+        result = Solver().solve(
+            Problem(constraints=[predicate], variables={child, parent})
+        )
+
+        self.assertEqual("sat", result.status, result.reason)
+        self.assertEqual(result.assignments[parent], result.assignments[child])
+        self.assertNotEqual("sat_60f9cd", result.assignments[child])
 
     def test_solver_rejects_non_problem_input(self):
         with self.assertRaises(TypeError):

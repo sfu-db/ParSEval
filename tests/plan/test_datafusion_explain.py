@@ -501,6 +501,29 @@ def test_window_step() -> None:
     assert_no_bare_string_identifiers(plan)
 
 
+@pytest.mark.parametrize(
+    ("function_sql", "function_name"),
+    (("RANK()", "rank"), ("DENSE_RANK()", "dense_rank")),
+)
+def test_rank_window_functions_use_anonymous_expressions(
+    function_sql: str,
+    function_name: str,
+) -> None:
+    plan = explain(
+        DDL_T,
+        f"SELECT a, {function_sql} OVER (PARTITION BY b ORDER BY a) AS position FROM t",
+        "sqlite",
+    )
+
+    win = next(s for s in plan.dag if isinstance(s, Window))
+    window = win.window_exprs[0]
+    assert isinstance(window, exp.Window)
+    assert isinstance(window.this, exp.Anonymous)
+    assert str(window.this.this).lower() == function_name
+    assert window.args.get("partition_by")
+    assert_no_bare_string_identifiers(plan)
+
+
 def test_structural_projection_cast_and_scalar() -> None:
     plan = explain(DDL_T, "SELECT CAST(a AS DOUBLE), abs(a) FROM t", "sqlite")
     proj = next(s for s in plan.dag if isinstance(s, Projection))
@@ -819,3 +842,48 @@ def test_repr_step_and_expr() -> None:
     subq_proj_repr = repr_expr(subq_proj)
     assert subq_proj_repr.startswith("ScalarSubqueryRef(")
     assert "Max(" in repr_step(plan.scalar_subqueries[subq_proj.subquery_id])
+
+
+def test_interval_literal_day() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' DAY AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "1" in sql
+
+
+def test_interval_literal_month() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' MONTH AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "1" in sql
+
+
+def test_interval_literal_hour() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '2' HOUR AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "2" in sql
+
+
+def test_interval_literal_year() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1' YEAR AS d", "mysql")
+    assert list(plan.dag)
+    proj = next(s for s in plan.dag if isinstance(s, Projection))
+    interval = proj.projections[0]
+    sql = interval.sql(dialect="mysql")
+    assert "INTERVAL" in sql.upper()
+    assert "12" in sql
+
+
+def test_interval_literal_with_nonzero_seconds() -> None:
+    plan = explain(DDL_T, "SELECT INTERVAL '1.5' SECOND AS d", "mysql")
+    assert list(plan.dag)

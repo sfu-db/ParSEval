@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import random
 import unittest
 from pathlib import Path
 
@@ -86,8 +85,7 @@ class TestBirdSchemaGenerate(unittest.TestCase):
         if not SCHEMA_JSON.is_file():
             self.skipTest(f"missing {SCHEMA_JSON}")
 
-        rng = random.Random(0)
-        generated = 0
+        generated_tables = 0
         for db_id, ddl in _load_databases(SCHEMA_JSON).items():
             with self.subTest(db=db_id):
                 inst = Instance(ddls=ddl, name=db_id, dialect="sqlite")
@@ -95,39 +93,15 @@ class TestBirdSchemaGenerate(unittest.TestCase):
                 if not tables:
                     continue
 
-                for _ in range(rng.randint(5, 40)):
-                    k_tables = rng.randint(1, len(tables))
-                    selected_tables = rng.sample(tables, k=k_tables)
-                    concretes = {table: {} for table in selected_tables}
-                    inst.create_rows(concretes)
-                    generated += 1
+                inst.create_rows({table: {} for table in tables})
+                for table in tables:
+                    self.assertGreaterEqual(len(inst.get_rows(table)), 1, table_key(table))
+                    _assert_row_complete(inst, table, label=db_id)
+                    generated_tables += 1
 
                 _assert_fk_integrity(inst, label=db_id)
-                from parseval.instance.io import to_db
-                to_db(inst, f"sqlite:///tmp/{db_id}.sqlite", dialect="sqlite")
-        self.assertGreater(generated, 11)
 
-        # generated_tables = 0
-        # databases = _load_databases(SCHEMA_JSON)
-        # self.assertGreater(len(databases), 0)
-
-        # for db_id, ddl in databases.items():
-        #     with self.subTest(db=db_id):
-        #         inst = Instance(ddls=ddl, name=db_id, dialect="sqlite")
-        #         concretes = {table: {} for table in inst.schema.tables}
-        #         results = inst.create_rows(concretes)
-        #         self.assertEqual(set(results), set(concretes))
-        #         for table in inst.schema.tables:
-        #             self.assertGreaterEqual(
-        #                 len(inst.get_rows(table)),
-        #                 1,
-        #                 table_key(table),
-        #             )
-        #             _assert_row_complete(inst, table, label=db_id)
-        #             generated_tables += 1
-        #         _assert_fk_integrity(inst, label=db_id)
-
-        # self.assertGreater(generated_tables, 50)
+        self.assertGreater(generated_tables, 50)
 
     def test_schema_json_second_row_respects_uniques(self):
         """Two empty create_rows rounds stay unique on PK/UNIQUE groups."""
@@ -148,12 +122,11 @@ class TestBirdSchemaGenerate(unittest.TestCase):
                 _assert_unique_groups(inst, label=db_id)
 
     def test_train_schema_json_smoke(self):
-        """Broader train_schema.json: random table subsets, FK integrity, export."""
+        """Every train schema supports one complete, FK-valid table batch."""
         if not TRAIN_SCHEMA_JSON.is_file():
             self.skipTest(f"missing {TRAIN_SCHEMA_JSON}")
 
-        rng = random.Random(0)
-        generated = 0
+        generated_tables = 0
         for db_id, ddl in _load_databases(TRAIN_SCHEMA_JSON).items():
             with self.subTest(db=db_id):
                 inst = Instance(ddls=ddl, name=db_id, dialect="sqlite")
@@ -161,19 +134,15 @@ class TestBirdSchemaGenerate(unittest.TestCase):
                 if not tables:
                     continue
 
-                for _ in range(rng.randint(5, 40)):
-                    k_tables = rng.randint(1, len(tables))
-                    selected_tables = rng.sample(tables, k=k_tables)
-                    concretes = {table: {} for table in selected_tables}
-                    inst.create_rows(concretes)
-                    generated += 1
+                inst.create_rows({table: {} for table in tables})
+                for table in tables:
+                    self.assertGreaterEqual(len(inst.get_rows(table)), 1, table_key(table))
+                    _assert_row_complete(inst, table, label=db_id)
+                    generated_tables += 1
 
                 _assert_fk_integrity(inst, label=db_id)
-                from parseval.instance.io import to_db
 
-                to_db(inst, f"sqlite:///tmp/{db_id}.sqlite", dialect="sqlite")
-
-        self.assertGreater(generated, 50)
+        self.assertGreater(generated_tables, 50)
 
 
 if __name__ == "__main__":

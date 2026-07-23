@@ -629,7 +629,12 @@ def _translate_date_diff(solver, expression, args, *, default_unit: Optional[str
     if d1.typeinfo.family == "date" and d2.typeinfo.family == "date":
         raw_diff = (p1 - p2) * 86400
     else:
-        raw_diff = p1 - p2
+        try:
+            raw_diff = p1 - p2
+        except (TypeError, z3.Z3Exception) as exc:
+            raise UnsupportedSMTError(
+                f"unsupported_date_diff: {d1.typeinfo.family}, {d2.typeinfo.family}"
+            ) from exc
     diff = raw_diff / seconds_per_unit
     guard = z3.And(_value_some(d1), _value_some(d2))
     return _wrap_optional(

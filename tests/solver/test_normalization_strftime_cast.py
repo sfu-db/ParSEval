@@ -84,6 +84,24 @@ class NormalizeStrftimeCastTests(unittest.TestCase):
         self.assertIsInstance(lowered.this, exp.Column)
         self.assertEqual(lowered.this.name, "__common_expr_5")
 
+    def test_normalize_mixed_in_lowers_variable_candidates_to_equality_or(self):
+        child = var("satscores.cds", "TEXT")
+        parent = var("schools.CDSCode", "TEXT")
+        predicate = exp.In(
+            this=child,
+            expressions=[text("sat_60f9cd"), parent],
+        )
+
+        lowered = normalize_expression(predicate)
+
+        self.assertIsInstance(lowered, exp.Or)
+        self.assertIsInstance(lowered.this, exp.In)
+        self.assertEqual(len(lowered.this.expressions), 1)
+        self.assertEqual(lowered.this.expressions[0].this, "sat_60f9cd")
+        self.assertIsInstance(lowered.expression, exp.EQ)
+        self.assertEqual(lowered.expression.this.var_key, child.var_key)
+        self.assertEqual(lowered.expression.expression.var_key, parent.var_key)
+
 
 if __name__ == "__main__":
     unittest.main()

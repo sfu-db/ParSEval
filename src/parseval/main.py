@@ -11,12 +11,11 @@ Usage::
 from __future__ import annotations
 
 import time
-import re
 
-from sqlglot import parse_one
+from sqlglot import exp, parse_one
 
 from parseval.db_manager import execute_query
-from parseval.generator import BmcBounds, generate
+from parseval.generator import GenerationConfig, generate
 from parseval.instance import Instance
 from parseval.instance.io import to_db
 from parseval.logger import log as _log
@@ -36,16 +35,7 @@ def instantiate_db(
     connection_string: str,
     dialect: str = "sqlite",
     *,
-    table_rows: int = 1,
-    join_width: int = 1,
-    result_rows: int = 3,
-    groups: int = 3,
-    rows_per_group: int = 3,
-    subquery_rows: int = 1,
-    order_competitors: int = 0,
-    max_iterations: int = 4,
-    max_table_rows: int = 512,
-    generate_negatives: bool = True,
+    generation_config: GenerationConfig = GenerationConfig(),
     timeout: int = 60,
 ) -> InstantiateResult:
     """Generate a test database instance for a SQL query and persist it.
@@ -59,16 +49,7 @@ def instantiate_db(
         schema: DDL schema string.
         connection_string: Database connection string.
         dialect: SQL dialect (default: "sqlite").
-        table_rows: Initial row target per table.
-        join_width: Join-width generation bound.
-        result_rows: Root result row target.
-        groups: Aggregate group target.
-        rows_per_group: Aggregate rows-per-group target.
-        subquery_rows: Scalar subquery row target.
-        order_competitors: Extra rows for ordering competitors.
-        max_iterations: Max bounded expansion iterations.
-        max_table_rows: Safety cap for generated rows per table.
-        generate_negatives: Whether speculative seeding should include negative rows.
+        generation_config: Generation budgets and witness-shape targets.
         timeout: Query execution timeout in seconds (default: 60).
 
     Returns:
@@ -77,23 +58,11 @@ def instantiate_db(
     t0 = time.time()
     _log.info("instantiate_db: dialect=%s, sql=%.80s", dialect, sql)
     try:
-        bounds = BmcBounds(
-            table_rows=table_rows,
-            join_width=join_width,
-            result_rows=result_rows,
-            groups=groups,
-            rows_per_group=rows_per_group,
-            subquery_rows=subquery_rows,
-            order_competitors=order_competitors,
-            max_iterations=max_iterations,
-            max_table_rows=max_table_rows,
-        )
         instance = generate(
             schema,
             sql,
             dialect=dialect,
-            bounds=bounds,
-            generate_negatives=generate_negatives,
+            config=generation_config,
         )
         generation_state = getattr(instance, "generation", None)
         rows_generated = _rows_generated(instance)
@@ -150,16 +119,7 @@ def disprove(
     dialect: str,
     *,
     semantics: str = "bag",
-    table_rows: int = 1,
-    join_width: int = 1,
-    result_rows: int = 3,
-    groups: int = 3,
-    rows_per_group: int = 3,
-    subquery_rows: int = 1,
-    order_competitors: int = 0,
-    max_iterations: int = 4,
-    max_table_rows: int = 512,
-    generate_negatives: bool = True,
+    generation_config: GenerationConfig = GenerationConfig(),
     timeout: int = 60,
 ) -> DisproveResult:
     """Attempt to disprove equivalence of two SQL queries.
@@ -171,33 +131,13 @@ def disprove(
         connection_string: Database connection string.
         dialect: SQL dialect.
         semantics: How to compare results (BAG or SET).
-        table_rows: Initial row target per table.
-        join_width: Join-width generation bound.
-        result_rows: Root result row target.
-        groups: Aggregate group target.
-        rows_per_group: Aggregate rows-per-group target.
-        subquery_rows: Scalar subquery row target.
-        order_competitors: Extra rows for ordering competitors.
-        max_iterations: Max bounded expansion iterations.
-        max_table_rows: Safety cap for generated rows per table.
-        generate_negatives: Whether speculative seeding should include negative rows.
+        generation_config: Generation budgets and witness-shape targets.
         timeout: Query execution timeout in seconds.
 
     Returns:
         DisproveResult with verdict.
     """
     t0 = time.time()
-    if _normalize_sql(sql1) == _normalize_sql(sql2):
-        _log.info("disprove: textual identity -> EQ, %.3fs", time.time() - t0)
-        return DisproveResult(
-            verdict=Verdict.EQ,
-            semantics=semantics,
-            q1_result=ExecutionResult(query=sql1),
-            q2_result=ExecutionResult(query=sql2),
-            generation=RunResult(success=True, elapsed_time=time.time() - t0),
-            connection_string=connection_string,
-        )
-
     syntax_error = _execution_syntax_error_for_pair(
         schema,
         sql1,
@@ -216,6 +156,17 @@ def disprove(
             t0,
         )
 
+    if _normalize_sql(sql1, dialect) == _normalize_sql(sql2, dialect):
+        _log.info("disprove: textual identity -> EQ, %.3fs", time.time() - t0)
+        return DisproveResult(
+            verdict=Verdict.EQ,
+            semantics=semantics,
+            q1_result=ExecutionResult(query=sql1),
+            q2_result=ExecutionResult(query=sql2),
+            generation=RunResult(success=True, elapsed_time=time.time() - t0),
+            connection_string=connection_string,
+        )
+
     projection_counts = (_final_projection_count(sql1, dialect), _final_projection_count(sql2, dialect))
     if None not in projection_counts and projection_counts[0] != projection_counts[1]:
         return DisproveResult(
@@ -229,17 +180,6 @@ def disprove(
 
     sql1, sql2 = _preprocess_sql_pair(sql1, sql2, dialect)
 
-    bounds = BmcBounds(
-        table_rows=table_rows,
-        join_width=join_width,
-        result_rows=result_rows,
-        groups=groups,
-        rows_per_group=rows_per_group,
-        subquery_rows=subquery_rows,
-        order_competitors=order_competitors,
-        max_iterations=max_iterations,
-        max_table_rows=max_table_rows,
-    )
     first = _run_disprove_candidate(
         sql1,
         sql1,
@@ -247,8 +187,7 @@ def disprove(
         schema,
         connection_string,
         dialect,
-        bounds,
-        generate_negatives,
+        generation_config,
         timeout,
         semantics,
     )
@@ -261,8 +200,7 @@ def disprove(
         schema,
         connection_string,
         dialect,
-        bounds,
-        generate_negatives,
+        generation_config,
         timeout,
         semantics,
     )
@@ -275,37 +213,22 @@ def _run_disprove_candidate(
     schema: str,
     connection_string: str,
     dialect: str,
-    bounds: BmcBounds,
-    generate_negatives: bool,
+    generation_config: GenerationConfig,
     timeout: int,
     semantics: str,
 ) -> DisproveResult:
     t0 = time.time()
-    try:
-        instance = generate(
-            schema,
-            seed_sql,
-            dialect=dialect,
-            bounds=bounds,
-            generate_negatives=generate_negatives,
-        )
-        generation = _run_result_for_instance(instance, t0)
-    except Exception as e:
-        message = str(e)
-        return DisproveResult(
-            verdict=Verdict.UNKNOWN,
-            semantics=semantics,
-            q1_result=ExecutionResult(query=sql1),
-            q2_result=ExecutionResult(query=sql2),
-            generation=RunResult(success=False, error_msg=message, elapsed_time=time.time() - t0),
-            connection_string=connection_string,
-            error_msg=message,
-        )
+    instance = generate(
+        schema,
+        seed_sql,
+        dialect=dialect,
+        config=generation_config,
+    )
+    generation = _run_result_for_instance(instance, t0)
 
     try:
         to_db(instance, connection_string, dialect=dialect)
     except Exception as e:
-        message = f"DB write failed: {e}"
         return DisproveResult(
             verdict=Verdict.UNKNOWN,
             semantics=semantics,
@@ -313,7 +236,7 @@ def _run_disprove_candidate(
             q2_result=ExecutionResult(query=sql2),
             generation=generation,
             connection_string=connection_string,
-            error_msg=message,
+            error_msg=f"DB write failed: {e}",
         )
 
     q1 = execute_query(sql1, connection_string, dialect, timeout)
@@ -333,12 +256,28 @@ def _run_disprove_candidate(
 
 def _run_result_for_instance(instance, started_at: float) -> RunResult:
     generation_state = getattr(instance, "generation", None)
+    unresolved = tuple(
+        dict.fromkeys(
+            obligation.reason
+            for obligation in getattr(generation_state, "obligations", ())
+            if obligation.status in {"unsupported", "exhausted"} and obligation.reason
+        )
+    )
+    generated_rows = _rows_generated(instance)
+    solver_calls = int(getattr(generation_state, "solver_calls", 0) or 0)
     return RunResult(
         success=True,
         status=str(getattr(generation_state, "status", "") or ""),
-        rows_generated=_rows_generated(instance),
+        rows_generated=generated_rows,
         coverage=float(getattr(generation_state, "coverage_ratio", 0.0) or 0.0),
         elapsed_time=time.time() - started_at,
+        solver_calls=solver_calls,
+        budgets_consumed={
+            "solver_calls": solver_calls,
+            "generated_rows": generated_rows,
+        },
+        unresolved_reasons=unresolved,
+        stage_timings=dict(getattr(generation_state, "stage_timings", {}) or {}),
     )
 
 
@@ -387,16 +326,29 @@ def _final_projection_count(sql: str, dialect: str) -> int | None:
         expression = parse_one(sql, dialect=dialect)
     except Exception:
         return None
-    expressions = getattr(expression, "expressions", None)
-    if expressions is None:
+    if not isinstance(expression, exp.Select):
+        return None
+    expressions = expression.expressions
+    if any(
+        isinstance(projection, exp.Star)
+        or isinstance(getattr(projection, "this", None), exp.Star)
+        for projection in expressions
+    ):
         return None
     return len(expressions)
 
 
-def _normalize_sql(sql: str) -> str:
+def _normalize_sql(sql: str, dialect: str = "sqlite") -> str:
     normalized = sql.strip().rstrip(";").strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized.lower()
+    expression = parse_one(normalized, dialect=dialect)
+    expression = expression.copy().transform(_normalize_identifier)
+    return expression.sql(dialect=dialect, normalize=True)
+
+
+def _normalize_identifier(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Identifier):
+        node.set("this", str(node.this).casefold())
+    return node
 
 
 def _preprocess_sql_pair(sql1: str, sql2: str, dialect: str = "sqlite") -> tuple[str, str]:

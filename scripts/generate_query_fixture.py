@@ -9,7 +9,7 @@ from collections import deque
 import multiprocessing as mp
 from queue import Empty
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -22,8 +22,8 @@ from sqlglot import exp
 
 from parseval.db_manager import DBManager
 from parseval.generator import (
-    BmcBounds,
-    generate_query_database,
+    GenerationConfig,
+    generate,
 )
 from parseval.instance import Instance
 from parseval.plan.explain import PlanError
@@ -39,7 +39,7 @@ class PipelineTask:
     ddl: str
     connection_string: str
     db_path: str
-    bounds: BmcBounds
+    config: GenerationConfig
     dialect: str
     timeout: int
     write_db: bool
@@ -56,7 +56,7 @@ def run_pipeline_task(task: PipelineTask) -> PipelineRecord:
         ddl=task.ddl,
         connection_string=task.connection_string,
         db_path=Path(task.db_path),
-        bounds=task.bounds,
+        config=task.config,
         dialect=task.dialect,
         timeout=task.timeout,
         write_db=task.write_db,
@@ -237,13 +237,8 @@ class PipelineRecord:
     validation_rows: int
     inserted_rows: int
     sql: str
-    instance_row_total: int = field(default=0)
-    coverage_ratio: float = field(default=0.0)
-    obligations_total: int = field(default=0)
-    obligations_covered: int = field(default=0)
-    obligations_unsupported: int = field(default=0)
-    obligations_infeasible: int = field(default=0)
-    single_row_violation: bool = field(default=False)
+    instance_row_total: int = 0
+    single_row_violation: bool = False
 
 
 def load_json(path: Path) -> Any:
@@ -338,7 +333,7 @@ def run_query_pipeline(
     ddl: str,
     connection_string: str,
     db_path: Path,
-    bounds: BmcBounds,
+    config: GenerationConfig,
     dialect: str,
     timeout: int,
     write_db: bool,
@@ -349,7 +344,7 @@ def run_query_pipeline(
     started = time.perf_counter()
 
     try:
-        result = generate_query_database(ddl, sql, dialect=dialect, bounds=bounds)
+        result = generate(ddl, sql, dialect=dialect, config=config)
     except PlanError as e:
         return PipelineRecord(
             dataset_index=dataset_index,
@@ -365,60 +360,42 @@ def run_query_pipeline(
             inserted_rows=0,
             instance_row_total=0,
             sql=sql,
-            coverage_ratio=0.0,
-            obligations_total=0,
-            obligations_covered=0,
-            obligations_unsupported=0,
-            obligations_infeasible=0,
         )
 
-    status = result.generation.status
-    reason = result.generation.reason
+    status = "sat"
+    reason = ""
     validation_rows = 0
     inserted_rows = 0
     n_instance_rows = 0
     single_row_violation = False
-    coverage = _coverage_counts(result)
-
-    if result.generation.status == "sat":
-        instance = result
-        n_instance_rows = instance_row_total(instance)
-        validation_rows = (
-            len(result.generation.root_schema.rows)
-            if result.generation.root_schema is not None
-            else 0
+    instance = result
+    n_instance_rows = instance_row_total(instance)
+    if write_db:
+        from parseval.instance import to_db
+        to_db(
+            instance,
+            connection_string,
+            dialect=dialect,
+            truncate_first=True,
         )
-        if write_db:
-            from parseval.instance import to_db
-            to_db(
-                instance,
-                connection_string,
-                dialect=dialect,
-                truncate_first=True,
-            )
 
-            inserted_rows = sum(
-                len(instance.get_rows(table_node))
-                for table_node in instance.tables
-            )
-            # getattr(write_result, "inserted_rows", 0)
-            validation_rows = validate_query(
-                connection_string=connection_string,
-                dialect=dialect,
-                sql=sql,
-                timeout=timeout,
-            )
-            if validation_rows == 0:
-                status = "empty_result"
-                reason = "empty_query_result"
-            elif validation_rows == 1:
-                if not _expects_single_row(sql, dialect, ddl):
-                    single_row_violation = True
-                    status = "single_row_violation"
-                    reason = "unexpected_single_row_result"
-            if validation_rows == 0:
-                status = "empty_result"
-                reason = "empty_query_result"
+        inserted_rows = sum(
+            len(instance.get_rows(table_node))
+            for table_node in instance.tables
+        )
+        validation_rows = validate_query(
+            connection_string=connection_string,
+            dialect=dialect,
+            sql=sql,
+            timeout=timeout,
+        )
+        if validation_rows == 0:
+            status = "empty_result"
+            reason = "empty_query_result"
+        elif validation_rows == 1 and not _expects_single_row(sql, dialect, ddl):
+            single_row_violation = True
+            status = "single_row_violation"
+            reason = "unexpected_single_row_result"
 
     return PipelineRecord(
         dataset_index=dataset_index,
@@ -434,61 +411,23 @@ def run_query_pipeline(
         inserted_rows=inserted_rows,
         instance_row_total=n_instance_rows,
         sql=sql,
-        coverage_ratio=result.generation.coverage_ratio,
-        obligations_total=coverage["total"],
-        obligations_covered=coverage["covered"],
-        obligations_unsupported=coverage["unsupported"],
-        obligations_infeasible=coverage["infeasible"],
         single_row_violation=single_row_violation
     )
 
 
 def summarize(records: Sequence[PipelineRecord]) -> dict[str, Any]:
-    obligations_total = sum(record.obligations_total for record in records)
-    obligations_covered = sum(record.obligations_covered for record in records)
     return {
         "total": len(records),
         "sat": sum(1 for r in records if r.status == "sat"),
         "empty_result": sum(1 for r in records if r.status == "empty_result"),
         "validation_error": sum(1 for r in records if r.status == "validation_error"),
         "plan_error": sum(1 for r in records if r.status == "plan_error"),
-        "bounded_unknown": sum(1 for r in records if r.status == "bounded_unknown"),
         "unknown": sum(1 for r in records if r.status == "unknown"),
         "unsat": sum(1 for r in records if r.status == "unsat"),
-        "coverage_ratio_avg": (
-            sum(record.coverage_ratio for record in records) / len(records)
-            if records
-            else 0.0
-        ),
-        "obligations_total": obligations_total,
-        "obligations_covered": obligations_covered,
-        "obligations_unsupported": sum(
-            record.obligations_unsupported for record in records
-        ),
-        "obligations_infeasible": sum(
-            record.obligations_infeasible for record in records
-        ),
-        "coverage_ratio_obligations": (
-            obligations_covered / obligations_total if obligations_total else 1.0
-        ),
         "single_row_violation": sum(1 for r in records if r.single_row_violation), # NEW SUMMARY KEY
         "worker_error": sum(1 for r in records if r.status == "worker_error"),
         "timeout": sum(1 for r in records if r.status == "timeout"),
         "results": [asdict(record) for record in records],
-    }
-
-
-def _coverage_counts(result: Instance) -> dict[str, int]:
-    obligations = result.generation.obligations
-    return {
-        "total": len(obligations),
-        "covered": sum(1 for item in obligations if item.status == "covered"),
-        "unsupported": sum(
-            1 for item in obligations if item.status == "unsupported"
-        ),
-        "infeasible": sum(
-            1 for item in obligations if item.status == "infeasible"
-        ),
     }
 
 
@@ -520,25 +459,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Persist each generated instance and validate by executing SQL against the DB.",
     )
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--table-rows", type=int, default=1)
-    parser.add_argument("--join-width", type=int, default=1)
-    parser.add_argument("--result-rows", type=int, default=3)
+    parser.add_argument("--bootstrap-rows", type=int, default=3)
+    parser.add_argument("--root-rows", type=int, default=3)
     parser.add_argument("--groups", type=int, default=3)
     parser.add_argument("--rows-per-group", type=int, default=3)
     parser.add_argument("--subquery-rows", type=int, default=1)
     parser.add_argument("--order-competitors", type=int, default=1)
-    parser.add_argument(
-        "--max-iterations",
-        type=int,
-        default=4,
-        help="Unsat search expansions only; structural LIMIT floors still apply at 4.",
-    )
-    parser.add_argument(
-        "--max-table-rows",
-        type=int,
-        default=512,
-        help="Hard cap on plan-derived and expanded table_rows floors.",
-    )
+    parser.add_argument("--max-rows-per-table", type=int, default=128)
+    parser.add_argument("--max-total-rows", type=int, default=512)
+    parser.add_argument("--max-solver-calls", type=int, default=48)
+    parser.add_argument("--solver-timeout-ms", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=142)
     parser.add_argument(
         "--mp-start-method",
         choices=("spawn", "forkserver", "fork"),
@@ -555,7 +486,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=120.0,
         help=(
             "Wall-clock seconds allowed per query's full generation pipeline "
-            "(covers generate_query_database, to_db, and validation). A task "
+            "(covers generate, to_db, and validation). A task "
             "exceeding this is terminated and recorded with status='timeout'. "
             "Set to 0 to disable (wait indefinitely, old behavior)."
         ),
@@ -593,23 +524,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if missing:
         raise SystemExit(f"missing_schema_dbs:{missing}")
 
-    bounds = BmcBounds(
-        table_rows=args.table_rows,
-        join_width=args.join_width,
-        result_rows=args.result_rows,
+    config = GenerationConfig(
+        bootstrap_rows=args.bootstrap_rows,
+        root_rows=args.root_rows,
         groups=args.groups,
         rows_per_group=args.rows_per_group,
         subquery_rows=args.subquery_rows,
         order_competitors=args.order_competitors,
-        max_iterations=args.max_iterations,
-        max_table_rows=args.max_table_rows,
+        max_rows_per_table=args.max_rows_per_table,
+        max_total_rows=args.max_total_rows,
+        max_solver_calls=args.max_solver_calls,
+        solver_timeout_ms=args.solver_timeout_ms,
+        seed=args.seed,
     )
     records = run_batch(
         selected,
         ddl_by_db=ddl_by_db,
         out_dir=args.out_dir,
         connection_template=args.connection_string,
-        bounds=bounds,
+        config=config,
         dialect=args.dialect,
         timeout=args.timeout,
         write_db=args.write_db,
@@ -691,7 +624,7 @@ def run_batch(
     ddl_by_db: Mapping[str, str],
     out_dir: Path,
     connection_template: Optional[str],
-    bounds: BmcBounds,
+    config: GenerationConfig,
     dialect: str,
     timeout: int,
     write_db: bool,
@@ -737,7 +670,7 @@ def run_batch(
                 ddl=ddl_by_db[db_id],
                 connection_string=connection_string,
                 db_path=str(db_path),
-                bounds=bounds,
+                config=config,
                 dialect=dialect,
                 timeout=timeout,
                 write_db=write_db,

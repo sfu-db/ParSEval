@@ -21,13 +21,11 @@ from parseval.instance.schema import table_key
 
 ROOT = Path(__file__).resolve().parents[2]
 LEETCODE_JSONL = ROOT / "data" / "mysql" / "leetcode.jsonlines"
-MYSQL_EXPERIMENT = ROOT / "tests" / "experiment" / "test_mysql.py"
 DEFAULT_MYSQL_CONNECTION = "mysql+pymysql://root:rootpass@localhost:3306/mydb"
+MYSQL_EXPERIMENT = ROOT / "scripts" / "exp_mysql_disprover.py"
 
 
 def _load_mysql_experiment():
-    if not MYSQL_EXPERIMENT.is_file():
-        raise FileNotFoundError(f"mysql_experiment_missing:{MYSQL_EXPERIMENT}")
     spec = importlib.util.spec_from_file_location(
         "parseval_mysql_experiment", MYSQL_EXPERIMENT
     )
@@ -102,7 +100,7 @@ def _expected_constraints(mysql_mod, schema: dict, constraints: list[dict]) -> d
 
     # Mirror build_ddl: only emit FKs whose referenced table is already created
     # (or self-FK). Cyclic / reverse edges that lose the topo race are dropped.
-    deps: dict[str, set[str]] = {t: set() for t in schema}
+    deps: dict[str, set[str]] = {table.casefold(): set() for table in schema}
     for fk_tbl, _fk_col, ref_tbl, _ref_col in foreign_keys:
         if fk_tbl != ref_tbl and fk_tbl in deps and ref_tbl in deps:
             deps[fk_tbl].add(ref_tbl)
@@ -129,9 +127,12 @@ def _assert_constraints_recovered(
     label: str,
 ) -> None:
     """Assert InstanceSchema recovered PK / UNIQUE / FK / CHECK from built DDL."""
+    def identifier(value: str) -> str:
+        return value.casefold()
+
     # Tables
     recovered_tables = {table_key(t) for t in inst.schema.tables}
-    self_tables = set(schema)
+    self_tables = {identifier(table) for table in schema}
     assert recovered_tables == self_tables, (
         f"{label}: tables {recovered_tables!r} != {self_tables!r}"
     )
@@ -139,12 +140,17 @@ def _assert_constraints_recovered(
     # Primary key (first primary group) + extra primaries as UNIQUE
     for table_name, groups in expected["primary_keys"].items():
         table_schema = inst.schema.get_table(table_name)
-        pk = tuple(c.name for c in table_schema.primary_key)
-        assert pk == groups[0], f"{label}.{table_name} PK {pk!r} != {groups[0]!r}"
-        extra = {tuple(c.name for c in g) for g in table_schema.unique_constraints}
+        pk = tuple(identifier(c.name) for c in table_schema.primary_key)
+        expected_pk = tuple(identifier(column) for column in groups[0])
+        assert pk == expected_pk, f"{label}.{table_name} PK {pk!r} != {expected_pk!r}"
+        extra = {
+            tuple(identifier(c.name) for c in group)
+            for group in table_schema.unique_constraints
+        }
         for unique_group in groups[1:]:
-            assert unique_group in extra, (
-                f"{label}.{table_name} missing UNIQUE {unique_group!r} in {extra!r}"
+            expected_unique = tuple(identifier(column) for column in unique_group)
+            assert expected_unique in extra, (
+                f"{label}.{table_name} missing UNIQUE {expected_unique!r} in {extra!r}"
             )
 
     # Foreign keys
@@ -154,13 +160,16 @@ def _assert_constraints_recovered(
             assert len(fk.source_columns) == 1 and len(fk.target_columns) == 1
             recovered_fks.add(
                 (
-                    table_key(fk.source_table),
-                    fk.source_columns[0].name,
-                    table_key(fk.target_table),
-                    fk.target_columns[0].name,
+                    identifier(table_key(fk.source_table)),
+                    identifier(fk.source_columns[0].name),
+                    identifier(table_key(fk.target_table)),
+                    identifier(fk.target_columns[0].name),
                 )
             )
-    expected_fks = set(expected["foreign_keys"])
+    expected_fks = {
+        tuple(identifier(part) for part in foreign_key)
+        for foreign_key in expected["foreign_keys"]
+    }
     assert recovered_fks == expected_fks, (
         f"{label}: FKs {recovered_fks!r} != {expected_fks!r}"
     )

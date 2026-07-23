@@ -451,16 +451,45 @@ class Instance:
         defer = defer_parents or set()
         phantom_out = phantoms if phantoms is not None else set()
         created: dict[exp.Table, list[Row]] = defaultdict(list)
-        for fk in self.get_foreign_keys(table):
+        foreign_keys = list(self.get_foreign_keys(table))
+        source_uses: dict[exp.Identifier, int] = defaultdict(int)
+        for fk in foreign_keys:
+            for source in fk.source_columns:
+                source_uses[source] += 1
+
+        def bind_shared_sources(fk: ForeignKeyConstraint, parent: Row) -> None:
+            for source, target_column in zip(fk.source_columns, fk.target_columns):
+                if source_uses[source] > 1 and values.get(source) is None:
+                    values[source] = parent[target_column].concrete
+
+        for fk in foreign_keys:
             target = self.resolve_table(fk.target_table)
             if target in self._bootstrapping:
                 continue
+
+            proposed = {
+                target_column: values[source]
+                for source, target_column in zip(
+                    fk.source_columns, fk.target_columns
+                )
+                if values.get(source) is not None
+            }
+            existing_position = self._find_existing_row(target, proposed)
+            if existing_position is not None:
+                bind_shared_sources(fk, self.get_row(target, existing_position))
+                continue
+
+            target_rows = self.get_rows(target)
+            if target_rows:
+                if proposed:
+                    result = self.create_row(target, proposed)
+                    self._merge_created(created, result.created)
+                    bind_shared_sources(fk, result.created[target][-1])
+                else:
+                    bind_shared_sources(fk, target_rows[0])
+                continue
+
             if target in defer:
-                if self.get_rows(target):
-                    # Parent already has rows — Domain can bind to them. Do not
-                    # mark bootstrapping or materialize will overwrite with
-                    # synthetic keys that collide with existing unique FKs.
-                    continue
                 # Empty cycle partner listed later: share bootstrap keys.
                 self._bootstrapping.add(target)
                 phantom_out.add(target)
@@ -468,27 +497,14 @@ class Instance:
                 continue
 
             if all(values.get(c) is not None for c in fk.source_columns):
-                parent_vals = {
-                    t: values[s]
-                    for s, t in zip(fk.source_columns, fk.target_columns)
-                }
-                if self._find_existing_row(target, parent_vals) is None:
-                    # No matching parent for this child FK → add one.
-                    result = self.create_row(target, parent_vals)
-                    self._merge_created(created, result.created)
-                continue
-
-            if self.get_rows(target):
+                result = self.create_row(target, proposed)
+                self._merge_created(created, result.created)
                 continue
 
             # Parent table empty and child FK unset → create a parent to bind to.
-            proposed: Dict[exp.Identifier, Any] = {
-                target_col: values[source]
-                for source, target_col in zip(fk.source_columns, fk.target_columns)
-                if source in values and values[source] is not None
-            }
             result = self.create_row(target, proposed)
             self._merge_created(created, result.created)
+            bind_shared_sources(fk, result.created[target][-1])
 
         self._expand_parents_for_unique_fks(table, values, created, defer)
         return created

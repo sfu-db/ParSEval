@@ -35,8 +35,8 @@ class InstanceSnapshotTests(unittest.TestCase):
 
         self.assertEqual([table.table_name for table in snapshot.tables], ["parent", "child"])
         self.assertLess(
-            snapshot.schema_ddl.index("CREATE TABLE parent"),
-            snapshot.schema_ddl.index("CREATE TABLE child"),
+            snapshot.schema_ddl.index('CREATE TABLE "parent"'),
+            snapshot.schema_ddl.index('CREATE TABLE "child"'),
         )
 
     def test_snapshot_preserves_cyclic_foreign_key_relative_order(self):
@@ -61,8 +61,8 @@ class InstanceSnapshotTests(unittest.TestCase):
             ["left_node", "right_node"],
         )
         self.assertLess(
-            snapshot.schema_ddl.index("CREATE TABLE left_node"),
-            snapshot.schema_ddl.index("CREATE TABLE right_node"),
+            snapshot.schema_ddl.index('CREATE TABLE "left_node"'),
+            snapshot.schema_ddl.index('CREATE TABLE "right_node"'),
         )
 
     def test_snapshot_keeps_in_memory_rows_unchanged(self):

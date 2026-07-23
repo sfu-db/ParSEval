@@ -136,6 +136,8 @@ class DomainGenerator:
         for fk in table_schema.foreign_keys:
             target = self.schema.resolve_table(fk.target_table)
             parents = list(parent_rows.get(target, ()))
+            if target == table_schema.table:
+                parents.append(dict(row))
             sources = list(fk.source_columns)
             targets = list(fk.target_columns)
 
