@@ -19,6 +19,7 @@ from .schema import (
     ForeignKeyConstraint,
     InstanceSchema,
     TableSchema,
+    normalize_identifier,
     table_key,
 )
 from .symbols import SymbolIndex
@@ -779,7 +780,6 @@ class Instance:
     def snapshot(self) -> InstanceSnapshot:
         tables: list[TableBatch] = []
         for table_node in self.schema.fk_safe_table_order():
-            tname = table_key(table_node)
             rows = self.get_rows(table_node)
             if rows:
                 columns = tuple(
@@ -790,7 +790,7 @@ class Instance:
                 columns = self.column_names(table_node)
             tables.append(
                 TableBatch(
-                    table_name=tname,
+                    table=table_node.copy(),
                     columns=columns,
                     rows=tuple(
                         {
@@ -825,6 +825,10 @@ class Instance:
         for stmt in parse(raw, read=self.dialect):
             if stmt is None:
                 continue
+            stmt = stmt.transform(
+                lambda node: normalize_identifier(node, self.dialect)
+                if isinstance(node, exp.Identifier) else node
+            )
             parts.append(stmt.sql(dialect=self.dialect, identify=True))
         return ";\n".join(parts) + (";" if parts else "")
 

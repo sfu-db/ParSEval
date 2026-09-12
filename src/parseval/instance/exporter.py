@@ -10,9 +10,13 @@ from sqlglot import exp
 
 @dataclass(frozen=True)
 class TableBatch:
-    table_name: str
+    table: exp.Table
     columns: tuple[str, ...]
     rows: tuple[dict[str, Any], ...]
+
+    @property
+    def table_name(self) -> str:
+        return ".".join(part.name for part in self.table.parts)
 
 
 @dataclass(frozen=True)
@@ -22,34 +26,12 @@ class InstanceSnapshot:
     tables: tuple[TableBatch, ...]
 
 
-class InstanceValueSerializer:
-    """Concrete-value coerce for DB binding / SQL fixtures."""
-
-    def serialize_row(self, table_name: str, row: dict[str, Any]) -> dict[str, Any]:
-        del table_name
-        return {key: self._coerce(value) for key, value in row.items()}
-
-    @staticmethod
-    def _coerce(value: Any) -> Any:
-        if isinstance(value, Decimal):
-            return float(value)
-        if isinstance(value, datetime):
-            return value.isoformat(sep=" ")
-        if isinstance(value, date):
-            return value.isoformat()
-        if isinstance(value, time):
-            return value.isoformat()
-        return value
-
-
 class InstanceExporter:
     def render_sql(
         self,
         snapshot: InstanceSnapshot,
-        serializer: InstanceValueSerializer | None = None,
         dialect: str | None = None,
     ) -> tuple[str, ...]:
-        serializer = serializer or InstanceValueSerializer()
         dialect = dialect or snapshot.dialect
         statements: list[str] = []
         for table in snapshot.tables:
@@ -57,13 +39,10 @@ class InstanceExporter:
                 continue
             statements.append(f"-- Inserting into table: {table.table_name} --")
             for row in table.rows:
-                serialized_row = serializer.serialize_row(table.table_name, row)
-                columns = tuple(serialized_row.keys())
+                columns = table.columns
                 insert = exp.Insert(
                     this=exp.Schema(
-                        this=exp.Table(
-                            this=exp.Identifier(this=table.table_name, quoted=True)
-                        ),
+                        this=table.table.copy(),
                         expressions=[
                             exp.Identifier(this=column, quoted=True)
                             for column in columns
@@ -73,12 +52,21 @@ class InstanceExporter:
                         expressions=[
                             exp.Tuple(
                                 expressions=[
-                                    exp.convert(serialized_row[column])
-                                    for column in columns
+                                    self._literal(row[column]) for column in columns
                                 ]
                             )
                         ]
                     ),
                 )
-                statements.append(f"{insert.sql(dialect=dialect)};\n")
+                statements.append(f"{insert.sql(dialect=dialect, identify=True)};\n")
         return tuple(statements)
+
+    @staticmethod
+    def _literal(value: Any) -> exp.Expression:
+        if isinstance(value, Decimal):
+            return exp.Literal.number(str(value))
+        if isinstance(value, datetime):
+            return exp.Literal.string(value.isoformat(sep=" "))
+        if isinstance(value, (date, time)):
+            return exp.Literal.string(value.isoformat())
+        return exp.convert(value)
