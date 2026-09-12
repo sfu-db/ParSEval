@@ -109,6 +109,17 @@ class Connect:
     def _invalidate_metadata(self) -> None:
         self._metadata = None
 
+    @contextmanager
+    def begin(self) -> Generator[Connection, None, None]:
+        """Keep a database load on one connection and transaction."""
+        with self.engine.begin() as conn:
+            if self.engine.dialect.name == "sqlite":
+                conn.exec_driver_sql("PRAGMA foreign_keys = ON")
+                # sqlite3 legacy transaction mode does not begin for DDL.
+                conn.exec_driver_sql("BEGIN")
+            yield conn
+        self._invalidate_metadata()
+
     @overload
     def execute(
         self,

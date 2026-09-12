@@ -1,257 +1,104 @@
-"""Persistence helpers for :class:`parseval.instance.Instance`.
-
-Extracted from ``Instance.to_db`` so the Instance class itself stays
-focused on in-memory row management. Callers that need to write an
-Instance to a live database or render SQL fixtures import from here.
-"""
+"""Materialize instance snapshots through one database transaction."""
 
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
-
-from .exporter import InstanceExporter, InstanceValueSerializer
 from dataclasses import dataclass
-from sqlglot import exp
-from sqlalchemy.engine import make_url
+from typing import TYPE_CHECKING
+
+from sqlalchemy import MetaData, Table
+from sqlglot import exp, parse
+
 from parseval.db_manager import DBManager
-from .exporter import InstanceSnapshot, InstanceValueSerializer, TableBatch
+from .exporter import InstanceExporter, InstanceSnapshot
+
 if TYPE_CHECKING:
     from .core import Instance
-
 
 
 @dataclass(frozen=True)
 class WriteResult:
     inserted_tables: tuple[str, ...]
     inserted_rows: int
-    statements: tuple[str, ...] = ()
 
 
 class InstanceLoader:
     def load(
         self,
         snapshot: InstanceSnapshot,
-        connection_string,
-        serializer: InstanceValueSerializer,
-        dialect: str ,
-        truncate_first: bool = True,
-        
-    ) -> WriteResult:
-        if dialect == "sqlite":
-            return self._load_sqlite_fast(
-                snapshot,
-                connection_string,
-                serializer=serializer,
-                truncate_first=truncate_first,
-            )
-
-        inserted_tables: list[str] = []
-        inserted_rows = 0
-
-        with DBManager().get_connection(
-            connection_string=connection_string,
-            dialect=dialect,
-        ) as conn:
-            if truncate_first:
-                is_mysql = dialect == "mysql"
-                if is_mysql:
-                    conn.execute("SET FOREIGN_KEY_CHECKS = 0", fetch=None)
-                for table in reversed(snapshot.tables):
-                    conn.drop_table(table.table_name)
-                if is_mysql:
-                    conn.execute("SET FOREIGN_KEY_CHECKS = 1", fetch=None)
-            ddls = [ddl.strip() for ddl in snapshot.schema_ddl.split(";") if ddl.strip()]
-            if ddls:
-                conn.create_tables(*ddls)
-            for table in snapshot.tables:
-                inserted = self._insert_table(
-                    conn,
-                    table,
-                    dialect,
-                    serializer=serializer,
-                )
-                if inserted:
-                    inserted_tables.append(table.table_name)
-                    inserted_rows += inserted
-
-        return WriteResult(
-            inserted_tables=tuple(inserted_tables),
-            inserted_rows=inserted_rows,
-        )
-
-    def _insert_table(
-        self,
-        conn,
-        table: TableBatch,
-        dialect: str,
-        serializer: InstanceValueSerializer,
-    ) -> int:
-        if not table.rows:
-            return 0
-        parameter_names = {
-            column: f"p{index}"
-            for index, column in enumerate(table.columns)
-        }
-        # pymysql uses %(name)s placeholders via exec_driver_sql; others use :name
-        if dialect == "mysql":
-            cols = ", ".join(f"`{c}`" for c in table.columns)
-            phs = ", ".join(f"%({parameter_names[c]})s" for c in table.columns)
-            statement = f"INSERT INTO `{table.table_name}` ({cols}) VALUES ({phs})"
-        else:
-            statement = exp.Insert(
-                this=exp.Schema(
-                    this=self._quoted_table(table.table_name),
-                    expressions=[self._quoted_identifier(column) for column in table.columns],
-                ),
-                expression=exp.Values(
-                    expressions=[
-                        exp.Tuple(
-                            expressions=[
-                                exp.Placeholder(this=parameter_names[column])
-                                for column in table.columns
-                            ]
-                        )
-                    ]
-                ),
-            ).sql(dialect=dialect)
-        payload = [
-            {
-                parameter_names[column]: serialized_row.get(column)
-                for column in table.columns
-            }
-            for serialized_row in (
-                serializer.serialize_row(table.table_name, row) for row in table.rows
-            )
-        ]
-        conn.insert(statement, payload)
-        return len(payload)
-
-    def _load_sqlite_fast(
-        self,
-        snapshot: InstanceSnapshot,
         connection_string: str,
-        *,
-        serializer: InstanceValueSerializer,
-        truncate_first: bool,
+        dialect: str,
+        truncate_first: bool = True,
     ) -> WriteResult:
-        database = make_url(connection_string).database
-        if not database:
-            raise ValueError(f"sqlite_database_missing:{connection_string!r}")
-        if database != ":memory:":
-            path = Path(database)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if truncate_first and path.exists():
-                path.unlink()
+        """Replace snapshot tables, or create missing tables and append rows.
 
+        PostgreSQL and SQLite commit the entire load together. MySQL table DDL
+        commits implicitly; its inserts still share one transaction.
+        """
+        if snapshot.dialect != dialect:
+            raise ValueError("Snapshot and target dialects must match")
+        statements = [stmt for stmt in parse(snapshot.schema_ddl, read=dialect) if stmt]
         inserted_tables: list[str] = []
         inserted_rows = 0
-        with sqlite3.connect(database) as conn:
-            conn.execute("PRAGMA foreign_keys = OFF")
-            if truncate_first and database == ":memory:":
-                for table in reversed(snapshot.tables):
-                    conn.execute(f'DROP TABLE IF EXISTS "{_escape_sqlite_identifier(table.table_name)}"')
-            if snapshot.schema_ddl.strip():
-                conn.executescript(snapshot.schema_ddl)
-            for table in snapshot.tables:
-                inserted = self._insert_sqlite_table(
-                    conn,
-                    table,
-                    serializer=serializer,
-                )
-                if inserted:
-                    inserted_tables.append(table.table_name)
-                    inserted_rows += inserted
-            conn.execute("PRAGMA foreign_keys = ON")
-        return WriteResult(
-            inserted_tables=tuple(inserted_tables),
-            inserted_rows=inserted_rows,
-        )
-
-    def _insert_sqlite_table(
-        self,
-        conn: sqlite3.Connection,
-        table: TableBatch,
-        *,
-        serializer: InstanceValueSerializer,
-    ) -> int:
-        if not table.rows:
-            return 0
-        columns = list(table.columns)
-        col_sql = ", ".join(
-            f'"{_escape_sqlite_identifier(column)}"' for column in columns
-        )
-        placeholders = ", ".join("?" for _column in columns)
-        statement = (
-            f'INSERT INTO "{_escape_sqlite_identifier(table.table_name)}" '
-            f"({col_sql}) VALUES ({placeholders})"
-        )
-        payload = [
-            tuple(serialized_row.get(column) for column in columns)
-            for serialized_row in (
-                serializer.serialize_row(table.table_name, row) for row in table.rows
-            )
-        ]
-        conn.executemany(statement, payload)
-        return len(payload)
-
-    def _quoted_table(self, table_name: str) -> exp.Table:
-        return exp.Table(this=exp.Identifier(this=table_name, quoted=True))
-
-    def _quoted_identifier(self, name: str) -> exp.Identifier:
-        return exp.Identifier(this=name, quoted=True)
-
-
-def _escape_sqlite_identifier(name: str) -> str:
-    return name.replace('"', '""')
+        with DBManager().get_connection(connection_string, dialect) as database:
+            with database.begin() as conn:
+                if truncate_first:
+                    for batch in reversed(snapshot.tables):
+                        drop = exp.Drop(
+                            this=batch.table.copy(), kind="TABLE", exists=True
+                        )
+                        conn.exec_driver_sql(
+                            drop.sql(dialect=dialect, identify=True),
+                            execution_options={"no_parameters": True},
+                        )
+                for statement in statements:
+                    if not truncate_first and isinstance(statement, exp.Create):
+                        statement.set("exists", True)
+                    conn.exec_driver_sql(
+                        statement.sql(dialect=dialect, identify=True),
+                        execution_options={"no_parameters": True},
+                    )
+                metadata = MetaData()
+                for batch in snapshot.tables:
+                    if not batch.rows:
+                        continue
+                    table = Table(
+                        batch.table.name,
+                        metadata,
+                        schema=batch.table.db or None,
+                        quote=True,
+                        quote_schema=True,
+                        autoload_with=conn,
+                        resolve_fks=False,
+                    )
+                    conn.execute(table.insert(), list(batch.rows))
+                    inserted_tables.append(batch.table_name)
+                    inserted_rows += len(batch.rows)
+        return WriteResult(tuple(inserted_tables), inserted_rows)
 
 
 def to_db(
-    instance: "Instance",
+    instance: Instance,
     connection_string: str,
-    dialect: Optional[str] = None,
+    dialect: str | None = None,
     truncate_first: bool = True,
     return_inserted: bool = False,
-) -> Union[str, None]:
-    """Write ``instance``'s current rows to a live database.
+) -> str | WriteResult:
+    """Write the snapshot, optionally returning its rendered INSERT statements.
 
-    This keeps live database writes separate from the in-memory
-    row-management code in :class:`Instance`.
-
-    Parameters
-    ----------
-    instance : Instance
-        The in-memory instance to persist.
-    connection_string : str
-        SQLAlchemy-style connection string (e.g. ``sqlite:///path``).
-    dialect : str, optional
-        SQL dialect for the target. Defaults to ``instance.dialect``.
-    truncate_first : bool
-        Whether to drop existing tables before inserting.
-    return_inserted : bool
-        If True, return the rendered INSERT SQL instead of the write result.
+    ``truncate_first`` replaces only the snapshot's tables. When false, missing
+    tables are created and rows are appended to existing tables.
     """
     dialect = dialect or instance.dialect
     snapshot = instance.snapshot()
-    
-    serializer = InstanceValueSerializer()
     result = InstanceLoader().load(
         snapshot=snapshot,
         connection_string=connection_string,
-        dialect = dialect,
-        serializer=serializer,
+        dialect=dialect,
         truncate_first=truncate_first,
     )
     if return_inserted:
-        return "\n".join(
-            InstanceExporter().render_sql(
-                snapshot,
-                serializer=serializer,
-                dialect=dialect,
-            )
-        )
+        return "\n".join(InstanceExporter().render_sql(snapshot, dialect=dialect))
     return result
 
 
-__all__ = ["to_db"]
+__all__ = ["InstanceLoader", "WriteResult", "to_db"]
