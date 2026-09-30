@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional
 
-from parseval.dtype import DataType, TypeFamily, enum_values
+from parseval.dtype import DataType, TypeFamily
 
 from .generic import GenericTypeAdapter
 
@@ -15,40 +16,15 @@ class MySQLTypeAdapter(GenericTypeAdapter):
 
     def profile(self, datatype: DataType, dialect: Optional[str]):
         profile = super().profile(datatype, dialect)
-        metadata = dict(profile.metadata)
-        allowed_values = enum_values(datatype)
-        if allowed_values is not None:
-            metadata["allowed_values"] = allowed_values
-            profile = type(profile)(
-                datatype=profile.datatype,
-                dialect=profile.dialect,
-                family=profile.family,
-                exact_type=profile.exact_type,
-                length=profile.length,
-                precision=profile.precision,
-                scale=profile.scale,
-                unsigned=profile.unsigned,
-                timezone=profile.timezone,
-                metadata=metadata,
-            )
-        if datatype.is_type(DataType.Type.TINYINT) and profile.length == 1:
-            return type(profile)(
-                datatype=profile.datatype,
-                dialect=profile.dialect,
-                family=TypeFamily.BOOLEAN,
-                exact_type=profile.exact_type,
-                length=profile.length,
-                precision=profile.precision,
-                scale=profile.scale,
-                unsigned=profile.unsigned,
-                timezone=profile.timezone,
-                metadata=profile.metadata,
-            )
+        if datatype.is_type(DataType.Type.CHAR, DataType.Type.NCHAR) and profile.length is None:
+            profile = replace(profile, maximum_length=1)
+        if datatype.is_type(DataType.Type.TINYINT) and profile.display_width == 1:
+            profile = replace(profile, family=TypeFamily.BOOLEAN)
         return profile
 
     def coerce_in(self, value: Any, profile) -> Any:
         coerced = super().coerce_in(value, profile)
-        allowed_values = profile.metadata.get("allowed_values")
+        allowed_values = profile.allowed_values
         if allowed_values is not None and coerced is not None and coerced not in allowed_values:
             raise ValueError(
                 f"Value {coerced!r} is not allowed for {profile.datatype.sql(dialect=profile.dialect)}"

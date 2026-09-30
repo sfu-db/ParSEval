@@ -10,7 +10,8 @@ from parseval.dtype import (
     TypeFamily,
     TypeProfile,
     StorageLiteral,
-    is_enum_type,
+    enum_values,
+    type_family,
 )
 
 from .base import TypeAdapter
@@ -23,19 +24,20 @@ class GenericTypeAdapter(TypeAdapter):
         return 1
 
     def profile(self, datatype: DataType, dialect: Optional[str]) -> TypeProfile:
-        expressions = datatype.args.get("expressions") or []
-        numbers = []
-        for expr in expressions:
-            try:
-                if getattr(expr, "this", None) is not None and hasattr(expr.this, "this"):
-                    numbers.append(int(expr.this.this))
-            except (TypeError, ValueError):
-                continue
-        length = numbers[0] if len(numbers) == 1 else None
-        precision = numbers[0] if len(numbers) >= 1 and datatype.is_type(*DataType.REAL_TYPES, DataType.Type.DECIMAL) else None
-        scale = numbers[1] if len(numbers) >= 2 and datatype.is_type(*DataType.REAL_TYPES, DataType.Type.DECIMAL) else None
-        exact_type = datatype.this.value if hasattr(datatype.this, "value") else str(datatype.this)
-        family = self._family_for(datatype)
+        def parameter(index: int) -> Optional[int]:
+            # SQLGlot represents numeric type arguments as DataTypeParam(Literal).
+            if index >= len(datatype.expressions):
+                return None
+            return int(datatype.expressions[index].this.this)
+
+        family = type_family(datatype)
+        length = (
+            parameter(0)
+            if datatype.is_type(
+                *DataType.TEXT_TYPES, DataType.Type.BINARY, DataType.Type.VARBINARY
+            )
+            else None
+        )
         timezone = datatype.is_type(
             DataType.Type.TIMESTAMPTZ,
             DataType.Type.TIMESTAMPLTZ,
@@ -45,10 +47,18 @@ class GenericTypeAdapter(TypeAdapter):
             datatype=datatype,
             dialect=dialect,
             family=family,
-            exact_type=exact_type,
+            exact_type=datatype.this.value,
             length=length,
-            precision=precision,
-            scale=scale,
+            maximum_length=length if family == TypeFamily.TEXT else None,
+            precision=parameter(0) if family == TypeFamily.DECIMAL else None,
+            scale=parameter(1) if family == TypeFamily.DECIMAL else None,
+            temporal_precision=(
+                parameter(0)
+                if family in (TypeFamily.TIME, TypeFamily.DATETIME)
+                else None
+            ),
+            display_width=parameter(0) if family == TypeFamily.INTEGER else None,
+            allowed_values=enum_values(datatype),
             timezone=timezone,
         )
 
@@ -134,33 +144,3 @@ class GenericTypeAdapter(TypeAdapter):
                 return float(value)
             return value
         return super().coerce_out(value, profile)
-
-    def _family_for(self, datatype: DataType) -> TypeFamily:
-        if is_enum_type(datatype):
-            return TypeFamily.TEXT
-        if datatype.is_type(DataType.Type.UUID):
-            return TypeFamily.UUID
-        if datatype.is_type(DataType.Type.BOOLEAN):
-            return TypeFamily.BOOLEAN
-        if datatype.is_type(*DataType.INTEGER_TYPES):
-            return TypeFamily.INTEGER
-        if datatype.is_type(*DataType.REAL_TYPES):
-            return TypeFamily.DECIMAL
-        if datatype.is_type(DataType.Type.DATE, DataType.Type.DATE32):
-            return TypeFamily.DATE
-        if datatype.is_type(
-            DataType.Type.DATETIME,
-            DataType.Type.DATETIME64,
-            DataType.Type.TIMESTAMP,
-            DataType.Type.TIMESTAMP_S,
-            DataType.Type.TIMESTAMP_MS,
-            DataType.Type.TIMESTAMP_NS,
-            DataType.Type.TIMESTAMPTZ,
-            DataType.Type.TIMESTAMPLTZ,
-        ):
-            return TypeFamily.DATETIME
-        if datatype.is_type(DataType.Type.TIME, DataType.Type.TIMETZ):
-            return TypeFamily.TIME
-        if datatype.is_type(*DataType.TEXT_TYPES):
-            return TypeFamily.TEXT
-        return TypeFamily.UNKNOWN

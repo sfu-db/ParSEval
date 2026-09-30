@@ -29,8 +29,7 @@ from .smt_types import (
 )
 from parseval.dtype import (
     date_to_epoch_day,
-    enum_values,
-    is_enum_type,
+    TypeService,
     time_to_seconds,
     datetime_to_epoch_second,
     epoch_day_to_date,
@@ -124,6 +123,7 @@ class Z3SmtSession:
         self.verbose = verbose
         self.z3ctx = z3ctx
         self.dialect = dialect
+        self.type_service = TypeService()
         self.solver = z3.Solver(ctx=self.z3ctx)
         if timeout_ms is not None and timeout_ms > 0:
             self.solver.set("timeout", int(timeout_ms))
@@ -891,7 +891,7 @@ class Z3SmtSession:
         )
 
     def _apply_domain_constraints(self) -> None:
-        """Apply printable-ASCII and temporal-bound constraints to all variables.
+        """Apply type domains, printable-ASCII and temporal-bound constraints.
 
         Called once before the first ``solver.check()``.
         """
@@ -902,15 +902,15 @@ class Z3SmtSession:
             if column is None:
                 continue
             typeinfo = normalize_dtype(column.type, self.z3ctx)
+            profile = self.type_service.profile_datatype(column.type, self.dialect)
             if typeinfo.family in {"date", "time", "datetime", "timestamp"}:
                 self._ensure_temporal_bounds(z3var, typeinfo)
             if typeinfo.family == "text":
                 self._ensure_str_printable(z3var)
-                self._ensure_str_length(z3var, 0)
-            if is_enum_type(column.type):
-                allowed = enum_values(column.type)
-                if allowed:
-                    self._ensure_enum_values(z3var, allowed)
+                if profile.maximum_length is not None:
+                    self._ensure_str_length(z3var, profile.maximum_length)
+            if profile.allowed_values is not None:
+                self._ensure_enum_values(z3var, profile.allowed_values)
         self._domain_constraints_applied = True
 
     def _ensure_str_printable(self, expr: z3.ExprRef):
@@ -920,25 +920,14 @@ class Z3SmtSession:
             ascii_printable = z3.Range(chr(32), chr(126))
             self.add(z3.InRe(raw, z3.Star(ascii_printable)))
 
-    def _ensure_str_length(self, expr: z3.ExprRef, length: int):
-        """Constrain string values to be non-empty and longer than ``length``."""
-        if is_option_expr(expr):
-            raw = unwrap_option(expr)
-            if isinstance(raw.sort(), z3.SeqSortRef):
-                opt = option_of(expr)
-                self.add(
-                    z3.Implies(
-                        opt.is_Some(expr),
-                        z3.And(
-                            z3.Length(raw) > z3.IntVal(length, ctx=self.z3ctx),
-                            z3.Or(
-                                z3.Length(raw) == 0,
-                                z3.SubString(raw, 0, 1)
-                                != z3.StringVal(" ", ctx=self.z3ctx),
-                            ),
-                        ),
-                    )
-                )
+    def _ensure_str_length(self, expr: z3.ExprRef, maximum: int):
+        """Constrain non-NULL strings to the type profile's character limit."""
+        self.add(
+            z3.Implies(
+                option_of(expr).is_Some(expr),
+                z3.Length(unwrap_option(expr)) <= maximum,
+            )
+        )
 
     def _ensure_temporal_bounds(self, expr: z3.ExprRef, typeinfo: SMTTypeInfo):
         """Constrain temporal values to the range 1900-01-01 to 2100-01-01."""
@@ -984,8 +973,6 @@ class Z3SmtSession:
                 var_name,
             )
             variable = self.context["z3_to_variable"][var_name]
-            if concrete == "":
-                continue
             result[var_name] = concrete
             logger.info(
                 f"Variable {var_name} with Z3 value {concrete} and data type {DataType.build(variable.type)}"

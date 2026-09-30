@@ -4,22 +4,21 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from parseval.main import disprove, instantiate_db
-    from parseval.states import (
-        DisproveResult,
-        InstantiateResult,
-        Semantics,
-        Verdict,
+    from parseval.catalog import Catalog
+    from parseval.generator import (
+        GenerationConfig,
+        GenerationResult,
+        Generator,
+        generate,
     )
 
 
 _EXPORTS = {
-    "instantiate_db": ("parseval.main", "instantiate_db"),
-    "disprove": ("parseval.main", "disprove"),
-    "DisproveResult": ("parseval.states", "DisproveResult"),
-    "InstantiateResult": ("parseval.states", "InstantiateResult"),
-    "Semantics": ("parseval.states", "Semantics"),
-    "Verdict": ("parseval.states", "Verdict"),
+    "Catalog": ("parseval.catalog", "Catalog"),
+    "GenerationConfig": ("parseval.generator", "GenerationConfig"),
+    "GenerationResult": ("parseval.generator", "GenerationResult"),
+    "Generator": ("parseval.generator", "Generator"),
+    "generate": ("parseval.generator", "generate"),
 }
 
 __all__ = list(_EXPORTS)

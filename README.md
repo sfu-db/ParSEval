@@ -1,136 +1,69 @@
-# ParSEval: Plan-aware Test Database Generation for SQL Equivalence Evaluation
+# ParSEval
 
-ParSEval generates minimal test database instances that exercise all execution branches of a SQL query's logical plan. It uses branch-coverage-driven symbolic reasoning, speculative data generation, and SMT solving (Z3) to produce databases that make queries return non-empty, distinguishing results.
+ParSEval compiles SQL into a typed U-expression and generates small concrete
+database instances that exercise semantic outcomes such as predicate truth,
+NULL behavior, multiplicity, join contributions, and aggregate input sizes.
+Generated SMT models are replayed with an independent concrete evaluator
+before they count as coverage.
 
-## Quick Start
+## Quick start
 
 ```bash
-uv venv
 uv sync
-uv pip install -e .
+uv run pytest
 ```
 
-### Generate a Test Database
-
 ```python
-from parseval import instantiate_db
+from parseval import Catalog, GenerationConfig, generate
 
-result = instantiate_db(
-    sql="SELECT name FROM users WHERE age > 25",
-    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
-    connection_string="sqlite:////tmp/test.db",
+catalog = Catalog.from_ddl(
+    "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
     dialect="sqlite",
 )
-print(result.success, result.generation.rows_generated)
-```
-
-### Disprove Query Equivalence
-
-```python
-from parseval import disprove
-
-result = disprove(
-    sql1="SELECT name FROM users WHERE age > 25",
-    sql2="SELECT name FROM users WHERE age >= 26",
-    schema="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
-    connection_string="sqlite:////tmp/test.db",
-    dialect="sqlite",
-    semantics="bag",  # or Semantics.SET
+result = generate(
+    "SELECT name FROM users WHERE age > 25",
+    catalog,
+    config=GenerationConfig(timeout_ms=1_000, max_attempts=20),
 )
-print(result.verdict)  # Verdict.EQ or Verdict.NEQ
+
+print(result.coverage.ratio)
+for case in result.counterexamples:
+    print(case.instance)
 ```
 
-### Generation Configuration
+`GenerationConfig` controls the semantic group-size boundary, SMT timeout,
+symbolic support, encoding steps, materialized rows, number of target attempts,
+and model minimization. Solver outcomes remain explicit: `bounded_unsat` means
+only that the configured finite search was exhausted.
 
-Use `GenerationConfig` to bound path enumeration, solving, and generated rows.
+## Architecture
 
-```python
-from parseval import GenerationConfig, instantiate_db
+- `parser/` lowers DDL and SQL into typed relational terms.
+- `uexpr/` compiles, normalizes, and concretely evaluates U-expressions.
+- `coverage/` discovers witnessed semantic obligations and reports evidence.
+- `smt/` encodes bounded weighted database instances in Z3.
+- `generator/` schedules targets, invokes SMT, validates models, and expands
+  the frontier.
+- `instance/` stores concrete bag-valued database states.
 
-result = instantiate_db(
-    sql="SELECT department, COUNT(*) FROM employees GROUP BY department",
-    schema="CREATE TABLE employees (id INT, department TEXT, salary INT)",
-    connection_string="sqlite:////tmp/test.db",
-    dialect="sqlite",
-    generation_config=GenerationConfig(
-        groups=6,
-        rows_per_group=3,
-        max_paths=256,
-        max_solver_calls=48,
-    ),
-)
-```
+The legacy plan/CSP solver remains isolated from the term-native pipeline and
+is not used by `generate`.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `bootstrap_rows` | Speculative rows per table | 3 |
-| `bootstrap_negatives` | Include speculative predicate counterexamples | `True` |
-| `root_rows` | Rows requested at the root | 3 |
-| `groups` | Number of aggregate groups | 3 |
-| `rows_per_group` | Rows per aggregate group | 3 |
-| `subquery_rows` | Rows per scalar subquery | 1 |
-| `order_competitors` | Competing rows for ordering witnesses | 1 |
-| `max_path_depth` | Maximum backward path depth (`None` means full acyclic depth) | `None` |
-| `max_paths` | Maximum enumerated execution paths | 256 |
-| `max_rows_per_table` | Generated-row cap per table | 128 |
-| `max_total_rows` | Generated-row cap across all tables | 512 |
-| `max_solver_calls` | Solver-call budget shared by bootstrap and path solving | 48 |
-| `solver_timeout_ms` | Timeout for each solver call | 1000 |
-| `seed` | Deterministic generation seed | 142 |
+## PostgreSQL corpus experiment
 
-### Connection Strings
-
-```python
-# SQLite
-connection_string="sqlite:////tmp/test.db"
-
-# MySQL
-connection_string="mysql+pymysql://user:password@localhost:3306/mydb"
-
-# PostgreSQL
-connection_string="postgresql://user:password@localhost:5432/mydb"
-```
-
-## Solver Backend
-
-To speed up the constraint solving, the solver (`solver/`) follows a cascade strategy: partition the constraint problem by variable independence, then try the CSP backend first, falling back to the SMT (Z3) backend for each component. Supports type constraints (INT, TEXT, DATE, TIME, TIMESTAMP, BOOLEAN), NULL semantics, string domains, and temporal bounds.
-
-## File Structure
-
-```
-src/parseval/
-├── main.py              # Public API: instantiate_db, disprove
-├── states.py            # Result types (Verdict, DisproveResult, etc.)
-│
-├── generator/           # Plan-aware data generation│
-├── solver/              # Solver orchestration (CSP → SMT cascade)
-│
-├── plan/
-│   ├── explain.py       # DataFusion-based query plan extraction
-│   ├── context.py       # DerivedSchema, Row — intermediate representations
-│   ├── rex.py           # Symbol, Variable, Environment — row expression eval
-│   ├── session.py       # Session-level plan analysis
-│   └── helper.py        # Plan AST helpers
-│
-├── instance/            # Schema parsing and management
-└── domain/              # Type-aware value spaces and domain constraints
-```
-
-## Running Experiments
+`data/postgres.csv` contains paired real-world queries. The benchmark generates
+instances for both queries, validates them with the U-expression evaluator,
+and independently materializes each instance in a temporary SQLite database.
+PostgreSQL queries are transpiled for SQLite; portability failures are reported
+separately from generation and semantic replay failures.
 
 ```bash
-python scripts/exp_sqlite_disprover.py \
-    --schema_fp data/sqlite/schema.json \
-    --gold_fp data/sqlite/dev.json \
-    --preds_fp data/sqlite/dail.txt \
-    --output_dir results
+uv run python scripts/benchmark_postgres_coverage.py \
+  --limit 10 \
+  --solver-timeout-ms 1000 \
+  --max-attempts 12 \
+  --case-timeout-s 60 \
+  --output results.jsonl
 ```
 
-## Updates
-- Update the query parser to Datafusion. 
-- See the `dev` branch for the latest features and ongoing development.
-- See the `webui` branch for the frontend web interface of ParSEval.
-
-## Experimental Results
-
-Experiment outputs are available on GitHub Actions. Open the repository's **Actions** tab, choose the relevant workflow (for example, **Run SQLite Experiment** or **Run MySQL Experiment**), and select the latest successful run. You can download the generated result and metric files from the run's **Artifacts** section. Current false positives in the experimental results are caused by the aggregation `DISTINCT` pattern and will be fixed soon.
+Use `--index`, `--dbid`, or `--mode inventory` to select smaller experiments.

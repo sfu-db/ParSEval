@@ -1,58 +1,36 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/alpine
 {
-	"name": "parseval-dev"
-	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	// "image": "mcr.microsoft.com/devcontainers/base:alpine-3.21"
-	,
-	"dockerComposeFile": "docker-compose.yml",
-	"service": "dev",
-	"workspaceFolder": "/workspace" ///${localWorkspaceFolderBasename}
-	// ,"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
-	// Configure tool-specific properties.
-	,
-	"customizations": {
-		"vscode": {
-			"settings": {
-				"python.formatting.provider": "black",
-				"python.linting.enabled": true,
-				"python.linting.pylintEnabled": true,
-				"editor.formatOnSave": true,
-				"terminal.integrated.profiles.linux": {
-					"zsh": {
-						"path": "/usr/bin/zsh",
-						"args": [
-							"-l"
-						]
-					}
-				},
-				"terminal.integrated.defaultProfile.linux": "zsh"
-			},
-			"extensions": [
-				"ms-python.python",
-				"ms-python.black-formatter",
-				"ms-python.isort",
-				"alexcvzz.vscode-sqlite"
-			]
-		}
-	},
-	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
-	"remoteUser": "root",
-	// Features to add to the dev container. More info: https://containers.dev/features.
-	"features": {
-		"ghcr.io/devcontainers/features/git:1": {}
-	},
-	// "source=${env:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
-	"mounts": [],
-	"remoteEnv": {
-		// "SSH_AUTH_SOCK": "/ssh-agent"
-	}
-	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
-	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "uname -a",
-	// Configure tool-specific properties.
-	// "customizations": {},
-	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
-	// "remoteUser": "root"
+  "name": "parseval",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "dev",
+  "initializeCommand": "sh -c 'printf \"USER_UID=%s\\nUSER_GID=%s\\n\" \"$(id -u)\" \"$(id -g)\" > .devcontainer/.env'",
+
+  "workspaceFolder": "/workspaces/parseval",
+  "remoteEnv": {
+
+    "VIRTUAL_ENV": "/opt/venv",
+    "PATH": "/opt/venv/bin:${containerEnv:PATH}",
+    "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+    "CARGO_HOME": "/home/user/.cargo",
+    "RUSTUP_HOME": "/home/user/.rustup"
+
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker",
+        "dbaeumer.vscode-eslint"
+      ],
+      "settings": {
+
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+
+        "python.terminal.activateEnvironment": false
+      }
+    }
+  },
+  "updateRemoteUserUID": false,
+  "remoteUser": "user"
 }

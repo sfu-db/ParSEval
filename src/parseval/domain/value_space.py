@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 import hashlib
+from itertools import product
 import random as _random
 import re
 import string as _string
 from typing import Any, Dict, Optional, Set
 
-from parseval.dtype import TypeFamily, parse_date, parse_datetime, parse_time
+from parseval.dtype import TypeFamily, TypeProfile, parse_date, parse_datetime, parse_time
 
 
 @dataclass
@@ -29,6 +30,20 @@ class ValueSpace:
     like_case_insensitive: bool = False
     max_length: Optional[int] = None
     temporal_components: Dict[str, "ValueSpace"] = field(default_factory=dict)
+
+    @classmethod
+    def from_profile(cls, profile: TypeProfile) -> "ValueSpace":
+        """Seed a domain from the same normalized type used by coercion."""
+        return cls(
+            family=profile.family,
+            allowed=(
+                set(profile.allowed_values)
+                if profile.allowed_values is not None
+                else None
+            ),
+            max_length=profile.maximum_length,
+            like_case_insensitive=profile.dialect == "sqlite",
+        )
 
     def is_empty(self) -> bool:
         if self.must_null and self.not_null:
@@ -239,7 +254,9 @@ class ValueSpace:
         return None
 
     def _pick_text(self, hint: Any = None, rng: _random.Random | None = None) -> Optional[str]:
-        length = min(self.max_length or 10, 10)
+        length = min(self.max_length, 10) if self.max_length is not None else 10
+        if length == 0:
+            return "" if self._candidate_valid("") else None
         has_numeric_min = self.min_val is not None and isinstance(self.min_val, (int, float))
         has_numeric_max = self.max_val is not None and isinstance(self.max_val, (int, float))
         if has_numeric_min or has_numeric_max:
@@ -280,7 +297,7 @@ class ValueSpace:
             base = "v"
         if rng is not None:
             for _ in range(50):
-                budget = rng.randint(1, length)
+                budget = rng.randint(0, length)
                 prefix = base[:budget]
                 remaining = length - len(prefix)
                 if remaining > 0:
@@ -291,13 +308,13 @@ class ValueSpace:
                 if candidate not in self.not_equals and self._candidate_valid(candidate):
                     return candidate
             return None
-        i = 1
-        while base in self.not_equals:
-            base = f"val_{i}"[:length]
-            if not base:
-                base = "v"
-            i += 1
-        return base if self._candidate_valid(base) else None
+        if base not in self.not_equals:
+            return base if self._candidate_valid(base) else None
+        for letters in product(_string.ascii_lowercase, repeat=length):
+            candidate = "".join(letters)
+            if candidate not in self.not_equals:
+                return candidate if self._candidate_valid(candidate) else None
+        return None
 
     def _pick_temporal(self, rng: _random.Random | None = None) -> Any:
         if self.like_pattern:

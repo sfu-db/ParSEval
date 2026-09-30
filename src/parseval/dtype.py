@@ -7,42 +7,6 @@ from sqlglot.expressions import DataType as sqlglot_datatype
 
 from enum import Enum
 
-def precision(self) -> Optional[int]:
-    """
-    Get the precision of the data type.
-
-    Precision is typically used for numeric types like DECIMAL to specify
-    the total number of digits.
-
-    Returns:
-        Optional[int]: The precision of the data type, or None if not specified.
-    """
-    return self.args.get("precision")
-
-def scale(self) -> Optional[int]:
-    """
-    Get the scale of the data type.
-
-    Scale is typically used for numeric types like DECIMAL to specify
-    the number of digits after the decimal point.
-
-    Returns:
-        Optional[int]: The scale of the data type, or None if not specified.
-    """
-    return self.args.get("scale")
-
-def length(self) -> Optional[int]:
-    """
-    Get the length of the data type.
-
-    Length is typically used for string types like VARCHAR to specify
-    the maximum number of characters.
-
-    Returns:
-        Optional[int]: The length of the data type, or None if not specified.
-    """
-    return self.args.get("length")
-
 def nullable(self) -> Optional[bool]:
     """
     Get whether the data type allows NULL values.
@@ -57,9 +21,6 @@ def nullable(self) -> Optional[bool]:
 def default(self) -> Optional[Any]:
     return self.args.get("default")
 
-setattr(sqlglot_datatype, "precision", property(precision))
-setattr(sqlglot_datatype, "scale", property(scale))
-setattr(sqlglot_datatype, "length", property(length))
 setattr(sqlglot_datatype, "nullable", property(nullable))
 setattr(sqlglot_datatype, "default", property(default))
 
@@ -82,15 +43,25 @@ class TypeFamily(str, Enum):
 
 @dataclass(frozen=True)
 class TypeProfile:
-    """A normalized snapshot of SQL datatype characteristics."""
+    """Type parameters and their dialect-specific domain constraints.
+
+    ``length`` is the declared character/binary size; ``maximum_length`` is
+    the effective character limit used by generation and solving. They differ
+    for dialect defaults (bare CHAR) and ignored declarations (SQLite).
+    Numeric, temporal, and display parameters never imply a character limit.
+    """
 
     datatype: DataType
     dialect: Optional[str]
     family: TypeFamily
     exact_type: str
     length: Optional[int] = None
+    maximum_length: Optional[int] = None
     precision: Optional[int] = None
     scale: Optional[int] = None
+    temporal_precision: Optional[int] = None
+    display_width: Optional[int] = None
+    allowed_values: Optional[tuple[Any, ...]] = None
     unsigned: Optional[bool] = None
     timezone: Optional[bool] = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -105,27 +76,21 @@ class TypeService:
 
             registry = TypeAdapterRegistry.with_builtin_adapters()
         self.registry = registry
-        self._profile_cache: dict[tuple[str, Optional[str]], TypeProfile] = {}
+        self._profile_cache: dict[tuple[DataType, Optional[str]], TypeProfile] = {}
 
     def profile(self, column_spec) -> TypeProfile:
         """Resolve the TypeProfile for a ColumnSpec, caching the result."""
-        datatype = DataType.build(column_spec.datatype)
-        dialect = getattr(column_spec, "dialect", None)
-        key = (datatype.sql(dialect=dialect), dialect)
-        if key not in self._profile_cache:
-            adapter = self.registry.resolve(datatype, dialect)
-            self._profile_cache[key] = adapter.profile(datatype, dialect)
-        return self._profile_cache[key]
+        return self.profile_datatype(column_spec.datatype, column_spec.dialect)
 
     def profile_datatype(
         self, datatype: DataType, dialect: Optional[str] = None
     ) -> TypeProfile:
         """Resolve the TypeProfile for a raw DataType, caching the result."""
-        datatype = DataType.build(datatype)
-        key = (datatype.sql(dialect=dialect), dialect)
+        datatype = DataType.build(datatype, dialect=dialect)
+        key = (datatype.copy(), dialect)
         if key not in self._profile_cache:
             adapter = self.registry.resolve(datatype, dialect)
-            self._profile_cache[key] = adapter.profile(datatype, dialect)
+            self._profile_cache[key] = adapter.profile(datatype.copy(), dialect)
         return self._profile_cache[key]
 
 class StorageLiteral(str):
@@ -324,7 +289,7 @@ def infer_type_from_value(value: Any) -> DataType:
     if isinstance(value, float):
         return DataType.build("FLOAT")
     if isinstance(value, str):
-        return DataType.build("TEXT", length=len(value))
+        return DataType.build("TEXT")
     if isinstance(value, dt_time):
         return DataType.build("TIME")
     if isinstance(value, datetime):

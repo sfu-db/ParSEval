@@ -10,7 +10,7 @@ from sqlglot import exp
 
 from parseval.dtype import (
     TypeFamily,
-    enum_values,
+    TypeService,
     parse_date,
     parse_datetime,
     type_family,
@@ -79,6 +79,7 @@ class CspBackend:
 
     def __init__(self, *, dialect: str = "sqlite") -> None:
         self.dialect = dialect
+        self.type_service = TypeService()
 
     def solve(self, problem: Problem) -> Result:
         if not problem.constraints and not problem.equalities:
@@ -265,14 +266,8 @@ class CspBackend:
 
     def _space_for_var(self, var: SolverVar) -> ValueSpace:
         dtype = var.dtype
-        space = ValueSpace(family=type_family(dtype))
-        space.like_case_insensitive = self.dialect == "sqlite"
-        allowed_values = enum_values(dtype)
-        if allowed_values is not None:
-            space.allowed = set(allowed_values)
-        length = getattr(dtype, "length", None)
-        if isinstance(length, int):
-            space.max_length = length
+        profile = self.type_service.profile_datatype(dtype, self.dialect)
+        space = ValueSpace.from_profile(profile)
         if getattr(dtype, "nullable", None) is False:
             space.not_null = True
         return space
@@ -912,8 +907,8 @@ class CspBackend:
         right: SolverVar,
         op: str,
     ) -> bool:
-        ls = spaces.setdefault(left, ValueSpace(family=type_family(left.dtype)))
-        rs = spaces.setdefault(right, ValueSpace(family=type_family(right.dtype)))
+        ls = spaces[left]
+        rs = spaces[right]
         if op == "=":
             if ls.equals is not None:
                 rs.narrow_eq(ls.equals)
