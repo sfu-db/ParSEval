@@ -9,11 +9,13 @@ from parseval.errors import ErrorCode, IRValidationError, expect, fail
 from parseval.terms import TermArena
 from parseval.terms.builder import IRBuilder, TermRef
 from parseval.terms import terms as nodes
-from parseval.terms.names import Identifier, QualifiedName
-from parseval.terms.schema import Schema
-from parseval.terms.sorts import ScalarSort
+from parseval.identifiers import Identifier, QualifiedName
+from parseval.terms.decls import RowShape
+from parseval.terms.sorts import (
+    ScalarSort,
+    TypeKind,
+)
 from parseval.terms.terms import LiteralPayload
-from parseval.terms.types import TypeKind
 
 from .scope import ColumnBinder
 
@@ -49,7 +51,7 @@ class LoweringSession:
 
     def schema_for_sorts(self, sorts: tuple[ScalarSort, ...]):
         return self.catalog.context.intern_schema(
-            Schema(sorts)
+            RowShape(sorts)
         )
 
     def term_scalar_sort(self, term: TermRef) -> ScalarSort:

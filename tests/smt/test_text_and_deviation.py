@@ -12,7 +12,7 @@ from parseval.terms.arena import TermArena
 from parseval.terms.builder import IRBuilder
 from parseval.terms.context import AggregateSpec
 from parseval.terms.sorts import ScalarSort
-from parseval.terms.types import STRING, DATE, INTEGER, FLOAT
+from parseval.terms.sorts import STRING, DATE, INTEGER, FLOAT
 
 
 def encoder():
@@ -113,7 +113,7 @@ def test_weighted_deviation(operator, values, squared, is_null):
 
 def test_distinct_filtered_deviation():
     from parseval.terms.builder import AggregateCall
-    from parseval.terms.schema import Schema
+    from parseval.terms.decls import RowShape
     c = Catalog.from_ddl('CREATE TABLE t(x INT)', dialect='postgres')
     relation, info = next(iter(c.context.relations()))
     a = TermArena(c.context)
@@ -121,7 +121,7 @@ def test_distinct_filtered_deviation():
     db = SymbolicInstance(c, {relation: 4})
     e = UExprEncoder(a, db)
     spec = c.context.intern_aggregate(AggregateSpec(ScalarSort(INTEGER, True), ScalarSort(FLOAT, True), operator='stddev_pop'))
-    out = c.context.intern_schema(Schema((ScalarSort(FLOAT, True),)))
+    out = c.context.intern_schema(RowShape((ScalarSort(FLOAT, True),)))
     folded = b.global_fold(b.base(relation), (AggregateCall(spec, lambda r: b.field(r, 0),
         filter=lambda r: b.lt3(b.literal(0, INTEGER), b.field(r, 0)), distinct=True),), out)
     result = e.bag(b.finish(folded), _Environment())[0].row.values[0]

@@ -10,8 +10,8 @@ from sqlglot import exp
 
 from parseval.errors import ErrorCode, fail
 from parseval.terms.context import Volatility
-from parseval.terms.sorts import ScalarSort
-from parseval.terms.types import (
+from parseval.terms.sorts import (
+    ScalarSort,
     BOOLEAN,
     DATE,
     DECIMAL,

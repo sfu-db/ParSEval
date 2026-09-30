@@ -25,7 +25,7 @@ from .names import (
     RelationId,
     SchemaId,
 )
-from .schema import RelationSpec, Schema
+from .decls import RelationSpec, RowShape
 from .sorts import ScalarSort
 
 IdentityT = TypeVar("IdentityT")
@@ -93,8 +93,8 @@ class Context:
 
     def __init__(self, *, dialect: str | None = None) -> None:
         self.dialect = dialect
-        self._schemas: list[Schema] = []
-        self._schema_ids: dict[Schema, SchemaId] = {}
+        self._schemas: list[RowShape] = []
+        self._schema_ids: dict[RowShape, SchemaId] = {}
         self._relations: dict[RelationId, RelationSpec] = {}
         self._functions: dict[FunctionId, ScalarFunctionSpec] = {}
         self._function_ids: dict[ScalarFunctionSpec, FunctionId] = {}
@@ -104,7 +104,7 @@ class Context:
         self._collations: set[CollationId] = set()
         self._next_ids: dict[type, int] = {}
 
-    def intern_schema(self, schema: Schema) -> SchemaId:
+    def intern_schema(self, schema: RowShape) -> SchemaId:
         existing = self._schema_ids.get(schema)
         if existing is not None:
             return existing
@@ -113,25 +113,25 @@ class Context:
         self._schema_ids[schema] = schema_id
         return schema_id
 
-    def schema(self, schema_id: SchemaId) -> Schema:
+    def schema(self, schema_id: SchemaId) -> RowShape:
         try:
             return self._schemas[schema_id.value]
         except IndexError as error:
             raise KeyError(f"Unknown schema: {schema_id!r}") from error
 
-    def schemas(self) -> Iterator[tuple[SchemaId, Schema]]:
+    def schemas(self) -> Iterator[tuple[SchemaId, RowShape]]:
         for index, schema in enumerate(self._schemas):
             yield SchemaId(index), schema
 
     def concat_schema(self, left: SchemaId, right: SchemaId) -> SchemaId:
         left_schema = self.schema(left)
         right_schema = self.schema(right)
-        return self.intern_schema(Schema(left_schema.fields + right_schema.fields))
+        return self.intern_schema(RowShape(left_schema.fields + right_schema.fields))
 
     def nullable_schema(self, schema_id: SchemaId) -> SchemaId:
         schema = self.schema(schema_id)
         return self.intern_schema(
-            Schema(
+            RowShape(
                 tuple(
                     ScalarSort(field.sql_type, nullable=True) for field in schema.fields
                 )

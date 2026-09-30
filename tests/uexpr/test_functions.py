@@ -10,7 +10,7 @@ from parseval.terms.builder import IRBuilder
 from parseval.terms.context import AggregateKind, AggregateSpec, ScalarFunctionSpec
 from parseval.terms.names import AggregateSpecId, FunctionId
 from parseval.terms.sorts import ScalarSort
-from parseval.terms.types import INTEGER
+from parseval.terms.sorts import INTEGER
 from parseval.uexpr import EvaluationError, UExprEvaluator, strict
 
 

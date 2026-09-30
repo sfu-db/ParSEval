@@ -12,15 +12,18 @@ from parseval.errors import IRValidationError, expect
 from . import terms
 from .context import Context, Volatility
 from .sorts import (
+    BOOLEAN,
     MULTIPLICITY,
     PREDICATE,
     BagSort,
+    IntervalValue,
     RelationSort,
     RowFunctionSort,
     RowSort,
     ScalarSort,
     SeqSort,
     Sort,
+    TypeKind,
     is_relation_sort,
 )
 from .terms import (
@@ -43,7 +46,6 @@ from .terms import (
     WindowFunctionKind,
     WindowPayload,
 )
-from .types import BOOLEAN, IntervalValue, TypeKind
 
 T = TypeVar("T")
 

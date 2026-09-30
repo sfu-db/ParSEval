@@ -9,9 +9,12 @@ from sqlglot import exp
 
 from parseval.errors import CatalogError, DDLImportError, ErrorCode, fail
 from parseval.terms.context import AggregateKind, AggregateSpec
-from parseval.terms.names import CollationId, Identifier, name_key
-from parseval.terms.sorts import BagSort, ScalarSort, SeqSort
-from parseval.terms.types import (
+from parseval.identifiers import Identifier, name_key
+from parseval.terms.names import CollationId
+from parseval.terms.sorts import (
+    BagSort,
+    ScalarSort,
+    SeqSort,
     FLOAT,
     INTEGER,
     STRING,

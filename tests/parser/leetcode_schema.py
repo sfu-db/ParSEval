@@ -1,4 +1,9 @@
-"""Adapters for external benchmark schema formats."""
+"""Convert LeetCode JSON schemas into MySQL DDL for catalog tests.
+
+The benchmark represents column references as ``table__column`` and keeps
+keys and row-local checks in a separate JSON tree. Cross-table checks and
+other non-DDL assumptions are intentionally ignored.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +15,7 @@ def mysql_schema_to_ddl(
     schema: Mapping[str, Mapping[str, str]],
     constraints: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
-    """Convert the LeetCode JSON schema format into MySQL DDL.
-
-    The benchmark represents column references as ``table__column`` and keeps
-    keys and row-local checks in a separate JSON tree. Cross-table checks and
-    other non-DDL assumptions are intentionally ignored.
-    """
+    """Convert the LeetCode JSON schema format into MySQL DDL."""
 
     normalized = {
         _identifier(table): {

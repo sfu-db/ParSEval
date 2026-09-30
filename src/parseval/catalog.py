@@ -23,21 +23,23 @@ from parseval.terms.constraints import (
     UnsupportedConstraintDecl,
 )
 from parseval.terms.context import AggregateSpec, ScalarFunctionSpec, Volatility
+from parseval.identifiers import (
+    Identifier,
+    NameInput,
+    NameKey,
+    QualifiedName,
+    name_key,
+)
 from parseval.terms.names import (
     AggregateSpecId,
     CollationId,
     ColumnId,
     ConstraintId,
     FunctionId,
-    Identifier,
-    NameInput,
-    NameKey,
-    QualifiedName,
     RelationId,
     SchemaId,
-    name_key,
 )
-from parseval.terms.schema import ColumnSpec, RelationSpec, Schema
+from parseval.terms.decls import ColumnSpec, RelationSpec, RowShape
 from parseval.terms.sorts import PREDICATE, RowFunctionSort, ScalarSort, Sort
 from parseval.terms.walk import post_order
 
@@ -164,7 +166,7 @@ class Catalog:
             ColumnSpec(self.context.allocate_id(ColumnId), c.sort, c.collation)
             for c in columns
         )
-        schema = self.context.intern_schema(Schema(tuple(c.sort for c in specs)))
+        schema = self.context.intern_schema(RowShape(tuple(c.sort for c in specs)))
         not_null = tuple(
             NotNullDecl(self._metadata(), relation, c.id)
             for c in specs

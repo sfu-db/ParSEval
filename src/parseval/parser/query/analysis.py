@@ -9,7 +9,7 @@ from sqlglot import exp
 from parseval.parser.dialect import SQLDialect
 from parseval.parser.scope import FieldSlot
 from parseval.parser.syntax import aggregate_expression, strip_alias
-from parseval.terms.names import Identifier
+from parseval.identifiers import Identifier
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,7 +3,7 @@
 from .arena import TermArena, TermView
 from .builder import AggregateCall, IRBuilder, OrderKey, WindowCall
 from .context import Context
-from .schema import Schema
+from .decls import RowShape
 from .terms import TermId
 from .verify import verify_closed, verify_uexpr
 
@@ -12,7 +12,7 @@ __all__ = [
     "Context",
     "IRBuilder",
     "OrderKey",
-    "Schema",
+    "RowShape",
     "TermArena",
     "TermId",
     "TermView",

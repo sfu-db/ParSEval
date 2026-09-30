@@ -13,7 +13,7 @@ from parseval.terms import terms as nodes
 from parseval.terms.constraints import (
     CheckDecl, ForeignKeyDecl, GeneratedColumnDecl, PrimaryKeyDecl, UniqueDecl,
 )
-from parseval.terms.types import TypeKind
+from parseval.terms.sorts import TypeKind
 from parseval.terms.walk import post_order
 from parseval.uexpr.observation import GroupCardinalityCondition
 from parseval.uexpr.witness import UnitWitnessPlan

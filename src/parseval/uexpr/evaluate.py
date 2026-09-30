@@ -29,7 +29,12 @@ from parseval.terms.constraints import (
     UniqueDecl,
 )
 from parseval.terms.context import AggregateSpec, ScalarFunctionSpec
-from parseval.terms.names import AggregateSpecId, FunctionId, ParameterId, SchemaId
+from parseval.terms.names import (
+    AggregateSpecId,
+    FunctionId,
+    ParameterId,
+    SchemaId,
+)
 from parseval.terms.sorts import BagSort, RowFunctionSort, RowSort, SeqSort
 from parseval.terms.terms import (
     AggregateMode,

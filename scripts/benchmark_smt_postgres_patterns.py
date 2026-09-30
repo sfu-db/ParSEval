@@ -20,9 +20,9 @@ from parseval.smt import Solver, SolveStatus
 from parseval.terms.arena import TermArena
 from parseval.terms.builder import IRBuilder, AggregateCall, WindowCall
 from parseval.terms.context import AggregateKind, AggregateSpec
-from parseval.terms.schema import Schema
+from parseval.terms.decls import RowShape
 from parseval.terms.sorts import RowSort, ScalarSort
-from parseval.terms.types import INTEGER, STRING, DECIMAL, DATE
+from parseval.terms.sorts import INTEGER, STRING, DECIMAL, DATE
 from parseval.terms.terms import WindowFunctionKind, WindowFrame, WindowFrameMode, WindowBoundary, WindowBoundaryKind
 from parseval.uexpr import validate_instance
 from parseval.uexpr.observation import WeightCondition, BagCardinalityCondition
@@ -50,7 +50,7 @@ def build_case(name, size):
     def aggregate(source,kind,argument=None,distinct=False):
         out=ScalarSort(DECIMAL if kind=='avg' else INTEGER,kind!='count')
         spec=ctx.intern_aggregate(AggregateSpec(None if argument is None else ScalarSort(INTEGER,True),out,kind=AggregateKind(kind) if kind!='stddev' else None,operator=kind))
-        out_schema=ctx.intern_schema(Schema((out,)))
+        out_schema=ctx.intern_schema(RowShape((out,)))
         return b.global_fold(source,(AggregateCall(spec,argument,distinct=distinct),),out_schema),out_schema
     def aggregate_value(source,kind,expected_value,argument=lambda r:b.field(r,0),distinct=False):
         folded,fs=aggregate(source,kind,argument,distinct)
@@ -66,8 +66,8 @@ def build_case(name, size):
         joined=b.bag_lam(schema,lambda out:b.mul(b.at(bases[0],out),chain(1,out,out)))
         term=aggregate_value(joined,'count',size,distinct=True)
     elif name=='group_sum_case':
-        keys=ctx.intern_schema(Schema((ScalarSort(INTEGER,True),)))
-        out=ctx.intern_schema(Schema((ScalarSort(INTEGER,True),ScalarSort(INTEGER,True))))
+        keys=ctx.intern_schema(RowShape((ScalarSort(INTEGER,True),)))
+        out=ctx.intern_schema(RowShape((ScalarSort(INTEGER,True),ScalarSort(INTEGER,True))))
         spec=ctx.intern_aggregate(AggregateSpec(ScalarSort(INTEGER,True),ScalarSort(INTEGER,True),kind=AggregateKind.SUM,operator='sum'))
         term=b.group_fold(bases[0],lambda r:b.row(keys,(b.field(r,0),)),(AggregateCall(spec,lambda r:b.case(b.lt3(b.literal(0,INTEGER),b.field(r,1)),b.field(r,1),b.null(INTEGER))),),out)
         for value in range(size):
@@ -90,7 +90,7 @@ def build_case(name, size):
         if name=='order_limit':
             term=b.forget_order(b.take(b.literal(size,INTEGER),b.order_by(bases[0],(b.order_key(lambda r:b.field(r,0)),))))
         else:
-            out=ctx.intern_schema(Schema((*ctx.schema(schema).fields,ScalarSort(INTEGER))))
+            out=ctx.intern_schema(RowShape((*ctx.schema(schema).fields,ScalarSort(INTEGER))))
             frame=WindowFrame(WindowFrameMode.ROWS,WindowBoundary(WindowBoundaryKind.UNBOUNDED_PRECEDING),WindowBoundary(WindowBoundaryKind.CURRENT_ROW))
             term=b.window(bases[0],(WindowCall(WindowFunctionKind.ROW_NUMBER,ScalarSort(INTEGER),(),(),(),frame),),out)
         conditions.append(BagCardinalityCondition(b.finish(term),1));expected=SolveStatus.UNSUPPORTED

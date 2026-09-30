@@ -22,6 +22,7 @@ from .sorts import (
     RowFunctionSort,
     RowSort,
     ScalarSort,
+    ScalarType,
     is_relation_sort,
     relation_schema,
 )
@@ -49,7 +50,6 @@ from .terms import (
     WindowFunctionKind,
     WindowPayload,
 )
-from .types import ScalarType
 
 
 @dataclass(frozen=True, slots=True)

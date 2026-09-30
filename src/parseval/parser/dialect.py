@@ -8,9 +8,9 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from parseval.errors import CatalogError, DDLImportError
-from parseval.terms.names import Identifier, NameInput, QualifiedName
-from parseval.terms.sorts import ScalarSort
-from parseval.terms.types import (
+from parseval.identifiers import Identifier, NameInput, QualifiedName
+from parseval.terms.sorts import (
+    ScalarSort,
     BOOLEAN,
     DATE,
     DECIMAL,

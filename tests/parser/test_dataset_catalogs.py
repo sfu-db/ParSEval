@@ -8,9 +8,9 @@ from pathlib import Path
 
 from sqlglot import exp
 
+from leetcode_schema import mysql_schema_to_ddl
 from parseval.catalog import Catalog
 from parseval.parser.dialect import SQLDialect
-from parseval.parser.datasets import mysql_schema_to_ddl
 from parseval.terms.constraints import UnsupportedConstraintDecl
 
 ROOT = Path(__file__).resolve().parents[2]

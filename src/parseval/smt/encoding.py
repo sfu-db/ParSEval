@@ -12,7 +12,11 @@ from parseval.terms import terms as nodes
 from parseval.terms.arena import TermArena
 from parseval.terms.context import AggregateKind
 from parseval.terms.names import SchemaId
-from parseval.terms.sorts import RowSort, ScalarSort
+from parseval.terms.sorts import (
+    RowSort,
+    ScalarSort,
+    ScalarType,
+)
 from parseval.terms.terms import (
     AggregateMode,
     BaseRelationPayload,
@@ -23,7 +27,6 @@ from parseval.terms.terms import (
     TermId,
     VariablePayload,
 )
-from parseval.terms.types import ScalarType
 from parseval.uexpr.observation import (
     BagCardinalityCondition,
     GroupCardinalityCondition,

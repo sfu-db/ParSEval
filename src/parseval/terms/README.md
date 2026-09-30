@@ -7,22 +7,22 @@ coercion, and relational-to-U-expression lowering belong outside this module.
 ## Construction
 
 Use `Context` for semantic declarations and context-local ID allocation, `TermArena` for immutable shared nodes,
-and `IRBuilder` for constructing expressions. A `Schema` contains `ScalarSort`
+and `IRBuilder` for constructing expressions. A `RowShape` contains `ScalarSort`
 fields; SQL column names belong to `parseval.catalog` metadata.
-`terms.schema` also contains `ColumnSpec` and `RelationSpec`; typed integrity
-constraints live in `terms.constraints`. See [catalog construction](../parser/README.md). Declaration IDs are local
+`terms.decls` also contains `ColumnSpec` and `RelationSpec`; typed integrity
+constraints live in `terms.constraints`. Surface SQL identifiers live in
+`parseval.identifiers`. See [catalog construction](../parser/README.md). Declaration IDs are local
 to a context, and term IDs are local to an arena.
 
 ```python
-from parseval.terms import Context, IRBuilder, Schema, TermArena, verify_uexpr
-from parseval.terms.schema import ColumnSpec, RelationSpec
+from parseval.terms import Context, IRBuilder, RowShape, TermArena, verify_uexpr
+from parseval.terms.decls import ColumnSpec, RelationSpec
 from parseval.terms.names import ColumnId, RelationId
-from parseval.terms.sorts import RowSort, ScalarSort
-from parseval.terms.types import INTEGER
+from parseval.terms.sorts import INTEGER, RowSort, ScalarSort
 
 context = Context()
 field = ScalarSort(INTEGER)
-schema = context.intern_schema(Schema((field,)))
+schema = context.intern_schema(RowShape((field,)))
 context.register_relation(
     RelationId(0),
     RelationSpec(schema, (ColumnSpec(ColumnId(0), field),)),

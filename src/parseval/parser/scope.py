@@ -8,7 +8,8 @@ from sqlglot import exp
 from parseval.errors import ErrorCode, fail
 from parseval.parser.dialect import SQLDialect
 from parseval.terms.builder import TermRef
-from parseval.terms.names import CollationId, Identifier, NameKey, SchemaId
+from parseval.identifiers import Identifier, NameKey
+from parseval.terms.names import CollationId, SchemaId
 from parseval.terms.sorts import ScalarSort
 
 from .syntax import strip_alias

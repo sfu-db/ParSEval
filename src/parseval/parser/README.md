@@ -42,7 +42,7 @@ relation = builder.base(table.relation)
 
 `Catalog` owns SQL names, declared type text, default expressions, and the arena
 for checked schema expressions. `Context` owns semantic declarations and allocates
-context-local IDs. `terms.schema.Schema` is an anonymous row shape: equal shapes
+context-local IDs. `terms.decls.RowShape` is an anonymous row shape: equal shapes
 can be shared by different base relations. Column positions come from
 `RelationSpec.column_position(ColumnId)`; SQL aliases belong to query scopes.
 

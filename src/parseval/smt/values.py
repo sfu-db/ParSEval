@@ -10,7 +10,7 @@ import z3
 
 from parseval.terms.context import Context
 from parseval.terms.names import SchemaId
-from parseval.terms.types import ScalarType, TypeKind
+from parseval.terms.sorts import ScalarType, TypeKind
 from parseval.uexpr.evaluate import BagEntry
 
 TRUE = z3.IntVal(1)

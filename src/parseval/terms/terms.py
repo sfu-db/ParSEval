@@ -14,7 +14,7 @@ from .names import (
     SchemaId,
 )
 from .sorts import ScalarSort, Sort
-from .types import ScalarType
+from .sorts import ScalarType
 
 
 @dataclass(frozen=True, slots=True, order=True)

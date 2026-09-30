@@ -13,9 +13,13 @@ from parseval.terms.terms import (
     FoldPayload,
     TermId,
 )
-from parseval.terms.schema import Schema
-from parseval.terms.sorts import RowFunctionSort, RowSort, ScalarSort
-from parseval.terms.types import INTEGER
+from parseval.terms.decls import RowShape
+from parseval.terms.sorts import (
+    RowFunctionSort,
+    RowSort,
+    ScalarSort,
+    INTEGER,
+)
 
 if TYPE_CHECKING:
     from .lowering import LoweringEnvironment, UExprCompiler
@@ -83,7 +87,7 @@ class AggregateTranslator:
                 projected_fields.append(ScalarSort(INTEGER, nullable=False))
 
         projected_schema = self.source.context.intern_schema(
-            Schema(tuple(projected_fields))
+            RowShape(tuple(projected_fields))
         )
 
         def project(row: TermRef) -> TermRef:

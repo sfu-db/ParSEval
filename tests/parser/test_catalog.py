@@ -5,7 +5,7 @@ from sqlglot import exp
 
 from parseval.catalog import Catalog, ColumnDecl
 from parseval.errors import CatalogError, DDLImportError, IRValidationError
-from parseval.terms import Context, IRBuilder, Schema, TermArena, verify_uexpr
+from parseval.terms import Context, IRBuilder, RowShape, TermArena, verify_uexpr
 from parseval.terms.constraints import (
     CatalogExpression,
     CheckDecl,
@@ -25,16 +25,23 @@ from parseval.terms.context import (
     ScalarFunctionSpec,
     Volatility,
 )
+from parseval.identifiers import Identifier
 from parseval.terms.names import (
     CallSiteId,
     ColumnId,
     ConstraintId,
-    Identifier,
     RelationId,
 )
-from parseval.terms.schema import ColumnSpec, RelationSpec
-from parseval.terms.sorts import PREDICATE, BagSort, RowSort, ScalarSort
-from parseval.terms.types import INTEGER, STRING, TypeKind
+from parseval.terms.decls import ColumnSpec, RelationSpec
+from parseval.terms.sorts import (
+    INTEGER,
+    PREDICATE,
+    STRING,
+    BagSort,
+    RowSort,
+    ScalarSort,
+    TypeKind,
+)
 
 
 def constraints(table, kind):
@@ -329,7 +336,7 @@ def test_failed_programmatic_registration_does_not_publish_a_table():
 def test_context_allocates_after_explicit_id_registration():
     context = Context()
     field = ScalarSort(INTEGER)
-    schema = context.intern_schema(Schema((field,)))
+    schema = context.intern_schema(RowShape((field,)))
     context.register_relation(
         RelationId(20), RelationSpec(schema, (ColumnSpec(ColumnId(50), field),))
     )

@@ -29,7 +29,7 @@ from parseval.terms.constraints import (
     ForeignKeyMatch,
     NullConflictPolicy,
 )
-from parseval.terms.names import Identifier, QualifiedName, name_key
+from parseval.identifiers import Identifier, QualifiedName, name_key
 from parseval.terms.sorts import ScalarSort
 
 

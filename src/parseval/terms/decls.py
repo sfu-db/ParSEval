@@ -10,7 +10,7 @@ from .sorts import ScalarSort
 
 
 @dataclass(frozen=True, slots=True)
-class Schema:
+class RowShape:
     """Structural row shape; SQL names are owned by the catalog."""
 
     fields: tuple[ScalarSort, ...]
@@ -19,7 +19,7 @@ class Schema:
         if not isinstance(self.fields, tuple) or not all(
             isinstance(field, ScalarSort) for field in self.fields
         ):
-            raise TypeError("Schema.fields must be a tuple of ScalarSort values")
+            raise TypeError("RowShape.fields must be a tuple of ScalarSort values")
 
 
 @dataclass(frozen=True, slots=True)

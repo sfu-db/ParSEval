@@ -8,9 +8,11 @@ from typing import cast
 from parseval.terms import terms as nodes
 from parseval.terms.arena import TermArena
 from parseval.terms.names import SchemaId
-from parseval.terms.sorts import SeqSort
+from parseval.terms.sorts import (
+    SeqSort,
+    INTEGER,
+)
 from parseval.terms.terms import LiteralPayload, OrderKeySpec, OrderPayload, TermId
-from parseval.terms.types import INTEGER
 
 
 @dataclass(frozen=True, slots=True)

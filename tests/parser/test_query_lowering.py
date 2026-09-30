@@ -5,7 +5,7 @@ from parseval.errors import CatalogError
 from parseval.parser.query import lower_query
 from parseval.terms import TermArena
 from parseval.terms.sorts import BagSort, ScalarSort
-from parseval.terms.types import (
+from parseval.terms.sorts import (
     BOOLEAN,
     FLOAT,
     INTEGER,

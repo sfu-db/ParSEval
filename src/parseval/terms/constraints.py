@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TypeAlias
 
-from .names import ColumnId, ConstraintId, Identifier, RelationId
+from parseval.identifiers import Identifier
+from .names import ColumnId, ConstraintId, RelationId
 from .terms import TermId
 
 

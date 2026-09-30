@@ -9,7 +9,7 @@ from parseval.errors import UExprTranslationError
 from parseval.terms import terms as nodes
 from parseval.terms.builder import TermRef
 from parseval.terms.names import SchemaId
-from parseval.terms.schema import Schema
+from parseval.terms.decls import RowShape
 from parseval.terms.terms import (
     BaseRelationPayload,
     TermId,
@@ -233,7 +233,7 @@ class BagWeightTranslator:
                     nullable_right=True,
                 )
                 nullable_inner_schema = self.source.context.intern_schema(
-                    Schema(
+                    RowShape(
                         tuple(
                             ScalarSort(field.sql_type, True)
                             for field in self.source.context.schema(inner_schema).fields

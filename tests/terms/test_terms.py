@@ -14,9 +14,13 @@ from parseval.terms.names import (
     SchemaId,
 )
 from parseval.terms.printer import format_arena, format_term
-from parseval.terms.schema import ColumnSpec, RelationSpec, Schema
-from parseval.terms.sorts import PREDICATE, BagSort, RowSort, ScalarSort, SeqSort
-from parseval.terms.types import (
+from parseval.terms.decls import ColumnSpec, RelationSpec, RowShape
+from parseval.terms.sorts import (
+    PREDICATE,
+    BagSort,
+    RowSort,
+    ScalarSort,
+    SeqSort,
     BOOLEAN,
     INTEGER,
     TIME,
@@ -93,7 +97,7 @@ class TermsTests(unittest.TestCase):
         self.builder = IRBuilder(self.arena)
 
     def schema(self, *fields):
-        return self.context.intern_schema(Schema(tuple(fields)))
+        return self.context.intern_schema(RowShape(tuple(fields)))
 
     def test_add_preserves_multiplicity(self):
         b = self.builder
@@ -113,7 +117,7 @@ class TermsTests(unittest.TestCase):
 
     def test_substitution_does_not_capture_free_relation_variable(self):
         a = self.arena
-        schema = self.context.intern_schema(Schema((ScalarSort(INTEGER, True),)))
+        schema = self.context.intern_schema(RowShape((ScalarSort(INTEGER, True),)))
         free_relation = a.rel_var(0, BagSort(schema))
         scalar = a.intern_checked(n.Scalarize, (free_relation,))
         replacement = a.intern_checked(n.Row, (scalar,), n.SchemaPayload(schema))
