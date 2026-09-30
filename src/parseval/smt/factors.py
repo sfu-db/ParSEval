@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import z3
 
 from parseval.terms import terms as nodes
-from parseval.uexpr.witness import ScanVariable, WitnessPlan
+from parseval.coverage.witness import ScanVariable, WitnessPlan
 from .values import _sum
 
 

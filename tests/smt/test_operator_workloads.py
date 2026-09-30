@@ -11,7 +11,7 @@ from parseval.smt.instance import SymbolicInstance
 from parseval.smt.solver import Solver, SolveStatus
 from parseval.terms.builder import IRBuilder
 from parseval.terms.sorts import RowSort
-from parseval.uexpr import validate_instance
+from parseval.coverage.evaluate import validate_instance
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "benchmark_smt_operators.py"

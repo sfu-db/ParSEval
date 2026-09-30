@@ -11,7 +11,7 @@ import z3
 from parseval.terms.context import Context
 from parseval.terms.names import SchemaId
 from parseval.terms.sorts import ScalarType, TypeKind
-from parseval.uexpr.evaluate import BagEntry
+from parseval.coverage.evaluate import BagEntry
 
 TRUE = z3.IntVal(1)
 FALSE = z3.IntVal(0)

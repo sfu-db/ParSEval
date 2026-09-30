@@ -8,12 +8,12 @@ from parseval.instance import Instance
 from parseval.terms.arena import TermArena
 from parseval.terms.terms import TermId
 from parseval.uexpr.espnf import ProductTermView, inspect_bag_espnf
-from parseval.uexpr.evaluate import UExprEvaluator
-from parseval.uexpr.observation import (
+from .evaluate import UExprEvaluator
+from .observation import (
     BagCardinalityCondition, GroupCardinalityCondition, Condition, NullCondition, PredicateCondition,
     WeightCondition,
 )
-from parseval.uexpr.witness import (
+from .witness import (
     UnitWitnessPlan, WitnessPlan, support_plans,
 )
 
@@ -62,7 +62,7 @@ class CoverageExplorer:
         return CoverageSnapshot(observed, frontier)
 
     def covers(self, instance: Instance, target: CoverageTarget) -> bool:
-        from .evaluate import target_is_covered
+        from .measure import target_is_covered
 
         return target_is_covered(
             self.arena,

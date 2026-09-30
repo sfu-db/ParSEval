@@ -16,7 +16,7 @@ from parseval.instance import Instance
 from parseval.parser.query import lower_query
 from parseval.smt import SolveStatus, Solver
 from parseval.terms.arena import TermArena
-from parseval.uexpr.evaluate import UExprEvaluator, validate_instance
+from parseval.coverage.evaluate import UExprEvaluator, validate_instance
 from parseval.uexpr.lowering import UExprCompiler
 
 from .config import GenerationConfig

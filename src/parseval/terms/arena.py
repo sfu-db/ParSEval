@@ -84,6 +84,26 @@ class TermArena:
         self[root]
         return TermView(self, root)
 
+    def post_order(self, roots: Iterable[TermId]) -> Iterator[TermId]:
+        """Deterministic DAG post-order; each node is yielded once."""
+
+        seen: set[TermId] = set()
+        for root in roots:
+            self[root]
+            stack: list[tuple[TermId, bool]] = [(root, False)]
+            while stack:
+                term_id, expanded = stack.pop()
+                if term_id in seen:
+                    continue
+                if expanded:
+                    seen.add(term_id)
+                    yield term_id
+                    continue
+                stack.append((term_id, True))
+                for child in reversed(self[term_id].children):
+                    if child not in seen:
+                        stack.append((child, False))
+
     def intern_checked(
         self,
         node_type: type[terms.TermNode],

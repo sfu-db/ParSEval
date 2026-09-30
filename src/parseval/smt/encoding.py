@@ -27,7 +27,8 @@ from parseval.terms.terms import (
     TermId,
     VariablePayload,
 )
-from parseval.uexpr.observation import (
+from parseval.coverage.evaluate import BagEntry
+from parseval.coverage.observation import (
     BagCardinalityCondition,
     GroupCardinalityCondition,
     Condition,
@@ -35,9 +36,7 @@ from parseval.uexpr.observation import (
     PredicateCondition,
     WeightCondition,
 )
-from parseval.uexpr.evaluate import BagEntry
-
-from parseval.uexpr.witness import (
+from parseval.coverage.witness import (
     UnitWitnessPlan,
     WitnessPlan,
     ScanVariable,

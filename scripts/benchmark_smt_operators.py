@@ -17,8 +17,8 @@ from parseval.smt.solver import Solver, SolveStatus
 from parseval.terms.arena import TermArena
 from parseval.terms.builder import IRBuilder
 from parseval.terms.sorts import RowSort
-from parseval.uexpr.observation import WeightCondition
-from parseval.uexpr.witness import UnitWitnessPlan
+from parseval.coverage.observation import WeightCondition
+from parseval.coverage.witness import UnitWitnessPlan
 
 
 CASES = (

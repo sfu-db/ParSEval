@@ -40,9 +40,6 @@ from .terms import (
     TermId,
     VariablePayload,
 )
-from .walk import post_order
-
-
 @dataclass(frozen=True, slots=True)
 class PrinterOptions:
     """Formatting choices for :func:`format_term`."""
@@ -520,7 +517,7 @@ def format_arena(
     """Return a deterministic node listing for debugging the hash-consed DAG."""
 
     ids = (
-        tuple(post_order(arena, (root,)))
+        tuple(arena.post_order((root,)))
         if root is not None
         else tuple(term_id for term_id, _ in arena.terms())
     )

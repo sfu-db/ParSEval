@@ -4,14 +4,14 @@ from parseval.catalog import Catalog
 from parseval.instance import Instance, Row
 from parseval.parser.query import lower_query
 from parseval.terms.arena import TermArena
-from parseval.uexpr import (
+from parseval.coverage.evaluate import (
     BagEntry,
     BagValue,
     SequenceValue,
-    UExprCompiler,
     UExprEvaluator,
     validate_instance,
 )
+from parseval.uexpr import UExprCompiler
 
 
 def _evaluate(ddl: str, sql: str, rows, *, evaluator_class=UExprEvaluator):

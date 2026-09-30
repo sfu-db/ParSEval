@@ -39,7 +39,7 @@ only that the configured finite search was exhausted.
 ## Architecture
 
 - `parser/` lowers DDL and SQL into typed relational terms.
-- `uexpr/` compiles, normalizes, and concretely evaluates U-expressions.
+- `uexpr/` compiles and normalizes U-expressions. `coverage/` evaluates them and searches for finite witnesses.
 - `coverage/` discovers witnessed semantic obligations and reports evidence.
 - `smt/` encodes bounded weighted database instances in Z3.
 - `generator/` schedules targets, invokes SMT, validates models, and expands

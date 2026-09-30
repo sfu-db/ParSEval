@@ -7,7 +7,7 @@ from parseval.terms.binding import row_binders_in_child, relation_binders_in_chi
 from parseval.terms.builder import IRBuilder
 from parseval.uexpr.espnf import inspect_bag_espnf
 from parseval.uexpr.normalize import to_espnf
-from parseval.uexpr.witness import WitnessPlan, plan_product
+from parseval.coverage.witness import WitnessPlan, plan_product
 
 
 class PreparedTerms:

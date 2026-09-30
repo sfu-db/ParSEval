@@ -28,7 +28,6 @@ from parseval.terms.sorts import (
     parse_iso_temporal_value,
 )
 from parseval.terms.verify import verify_closed, verify_uexpr
-from parseval.terms.walk import post_order
 
 
 class TermsTests(unittest.TestCase):
@@ -148,7 +147,7 @@ class TermsTests(unittest.TestCase):
         result = substitute_row(a, body, replacement)
         variables = [
             a[t]
-            for t in post_order(a, (result,))
+            for t in a.post_order((result,))
             if isinstance(a[t], (n.RowVar, n.RelVar))
         ]
         self.assertEqual(
@@ -168,7 +167,7 @@ class TermsTests(unittest.TestCase):
         result = substitute_row(a, root, replacement)
         depths = {
             a[t].payload.depth
-            for t in post_order(a, (result,))
+            for t in a.post_order((result,))
             if isinstance(a[t], n.RelVar)
         }
         self.assertEqual(depths, {0, 1})
@@ -346,7 +345,7 @@ class TermsTests(unittest.TestCase):
         self.assertNotIn("free_row", format_term(a, root))
         self.assertIn("sum", str(a.view(root)))
         self.assertIn("bag.lambda", format_arena(a, root))
-        reached = list(post_order(a, (root, root)))
+        reached = list(a.post_order((root, root)))
         self.assertEqual(len(reached), len(set(reached)))
         with self.assertRaises(IRValidationError):
             verify_uexpr(a, b.filter(base, lambda _: b.true3()))

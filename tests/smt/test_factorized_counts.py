@@ -16,7 +16,7 @@ from parseval.terms import terms as nodes
 from parseval.terms.arena import TermArena
 from parseval.terms.builder import IRBuilder
 from parseval.terms.sorts import BagSort, RowSort
-from parseval.uexpr import UExprEvaluator
+from parseval.coverage.evaluate import UExprEvaluator
 
 from test_operator_workloads import benchmark
 from test_weighted_encoding import compile_query

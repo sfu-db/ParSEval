@@ -41,9 +41,6 @@ from parseval.terms.names import (
 )
 from parseval.terms.decls import ColumnSpec, RelationSpec, RowShape
 from parseval.terms.sorts import PREDICATE, RowFunctionSort, ScalarSort, Sort
-from parseval.terms.walk import post_order
-
-
 @dataclass(frozen=True, slots=True)
 class ColumnDecl:
     """Input column before allocation of its semantic identity."""
@@ -384,7 +381,7 @@ class Catalog:
         generated = {
             c.column for c in table.constraints if isinstance(c, GeneratedColumnDecl)
         } | {target.id}
-        for term in post_order(self.constraint_arena, (expression.term,)):
+        for term in self.constraint_arena.post_order((expression.term,)):
             node = self.constraint_arena[term]
             if (
                 isinstance(node, terms.Field)
@@ -396,7 +393,7 @@ class Catalog:
         # Also reject a newly generated column referenced by an earlier one.
         for item in table.constraints:
             if isinstance(item, GeneratedColumnDecl):
-                for term in post_order(self.constraint_arena, (item.expression.term,)):
+                for term in self.constraint_arena.post_order((item.expression.term,)):
                     node = self.constraint_arena[term]
                     if (
                         isinstance(node, terms.Field)
@@ -615,7 +612,7 @@ class Catalog:
             terms.Or3,
             terms.Not3,
         )
-        for term in post_order(self.constraint_arena, (expression.term,)):
+        for term in self.constraint_arena.post_order((expression.term,)):
             node = self.constraint_arena[term]
             if not isinstance(node, allowed):
                 raise CatalogError(

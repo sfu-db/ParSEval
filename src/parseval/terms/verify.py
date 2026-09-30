@@ -9,12 +9,11 @@ from .arena import TermArena
 from .binding import relation_binders_in_child, row_binders_in_child
 from .sorts import RelationSort, RowFunctionSort, RowSort, Sort
 from .terms import TermId
-from .walk import post_order
 
 
 def verify_uexpr(arena: TermArena, root: TermId) -> Sort:
     """Require a closed U-expression, including aggregate and order extensions."""
-    for term_id in post_order(arena, (root,)):
+    for term_id in arena.post_order((root,)):
         node = arena[term_id]
         expect(
             type(node) in nodes.UEXPR_NODES,

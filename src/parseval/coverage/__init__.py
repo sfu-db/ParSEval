@@ -1,6 +1,6 @@
 """Instance-guided decision coverage for U-expressions."""
 
-from .evaluate import measure_coverage, target_is_covered
+from .measure import measure_coverage, target_is_covered
 from .explore import (
     CoverageExplorer,
     CoverageSnapshot,

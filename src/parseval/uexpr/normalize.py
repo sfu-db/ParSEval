@@ -11,7 +11,6 @@ from parseval.terms.binding import shift_vars, substitute_row, swap_row_vars
 from parseval.terms.names import SchemaId
 from parseval.terms.sorts import RowSort, SeqSort
 from parseval.terms.terms import FieldPayload, RowLambdaPayload, TermId
-from parseval.terms.walk import post_order
 
 from .order import normalize_order_term
 
@@ -59,7 +58,7 @@ def _fixed_point(
     memo: dict[TermId, TermId] = {}
 
     def visit(term: TermId) -> TermId:
-        for current in post_order(arena, (term,)):
+        for current in arena.post_order((term,)):
             if current not in memo:
                 memo[current] = rewrite(
                     current,

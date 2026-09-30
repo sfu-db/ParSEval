@@ -8,7 +8,7 @@ from parseval.terms import terms as nodes
 from parseval.terms.arena import TermArena
 from parseval.terms.terms import TermId
 from parseval.uexpr.espnf import ProductTermView
-from parseval.uexpr.observation import (
+from .observation import (
     Condition, PredicateCondition, TruthOutcome, WeightCondition,
 )
 

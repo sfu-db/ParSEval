@@ -14,9 +14,8 @@ from parseval.terms.constraints import (
     CheckDecl, ForeignKeyDecl, GeneratedColumnDecl, PrimaryKeyDecl, UniqueDecl,
 )
 from parseval.terms.sorts import TypeKind
-from parseval.terms.walk import post_order
-from parseval.uexpr.observation import GroupCardinalityCondition
-from parseval.uexpr.witness import UnitWitnessPlan
+from parseval.coverage.observation import GroupCardinalityCondition
+from parseval.coverage.witness import UnitWitnessPlan
 
 from .values import UnsupportedEncodingError
 
@@ -38,7 +37,7 @@ def plan_completion(encoder, target, environment):
     if obligation.relations:
         return {}
     roots = tuple(condition.term for condition in obligation.conditions)
-    terms = tuple(post_order(encoder.arena, roots))
+    terms = tuple(encoder.arena.post_order(roots))
     if any(isinstance(encoder.arena[t], (nodes.LetRel, nodes.RelVar, nodes.Squash,
                                         nodes.UNot, nodes.Scalarize, nodes.InSubquery)) for t in terms):
         return {}

@@ -1,12 +1,12 @@
 from parseval.catalog import Catalog
 from parseval.coverage import next_paths
-from parseval.uexpr.observation import PredicateCondition, TruthOutcome
+from parseval.coverage.observation import PredicateCondition, TruthOutcome
 from parseval.generator import GenerationConfig, SolveStatus, generate
 from parseval.instance import Instance
 from parseval.parser.query import lower_query
 from parseval.terms.arena import TermArena
 from parseval.uexpr import UExprCompiler
-from parseval.uexpr import validate_instance
+from parseval.coverage.evaluate import validate_instance
 
 
 def test_generation_covers_nullable_filter_outcomes():

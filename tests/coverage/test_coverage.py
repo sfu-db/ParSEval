@@ -16,11 +16,11 @@ from parseval.terms.builder import IRBuilder
 from parseval.terms.sorts import RowSort
 from parseval.terms.terms import TermId
 from parseval.terms import terms as nodes
-from parseval.terms.walk import post_order
-from parseval.uexpr import UExprCompiler, UExprEvaluator
-from parseval.uexpr.observation import (
+from parseval.coverage.evaluate import UExprEvaluator
+from parseval.coverage.observation import (
     NullCondition, PredicateCondition, TruthOutcome, WeightCondition,
 )
+from parseval.uexpr import UExprCompiler
 
 
 def _query(sql: str, catalog: Catalog) -> tuple[TermArena, TermId]:
@@ -249,13 +249,13 @@ def test_typed_predicate_and_null_conditions_share_concrete_and_smt_semantics():
     arena, root = _query("SELECT a FROM t WHERE a > 3", catalog)
     seed = next_paths(arena, root, Instance.empty(catalog))[0]
     indicator = next(
-        factor for factor in post_order(arena, (root,))
+        factor for factor in arena.post_order((root,))
         if isinstance(arena[factor], nodes.Indicator)
         and not isinstance(arena[arena[factor].children[0]], nodes.RowIdentityEq)
     )
     predicate = arena[indicator].children[0]
     field = next(
-        term for term in post_order(arena, (predicate,))
+        term for term in arena.post_order((predicate,))
         if isinstance(arena[term], nodes.Field)
     )
     target = CoverageTarget(

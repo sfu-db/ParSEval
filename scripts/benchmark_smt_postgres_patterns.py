@@ -24,9 +24,9 @@ from parseval.terms.decls import RowShape
 from parseval.terms.sorts import RowSort, ScalarSort
 from parseval.terms.sorts import INTEGER, STRING, DECIMAL, DATE
 from parseval.terms.terms import WindowFunctionKind, WindowFrame, WindowFrameMode, WindowBoundary, WindowBoundaryKind
-from parseval.uexpr import validate_instance
-from parseval.uexpr.observation import WeightCondition, BagCardinalityCondition
-from parseval.uexpr.witness import UnitWitnessPlan
+from parseval.coverage.evaluate import validate_instance
+from parseval.coverage.observation import WeightCondition, BagCardinalityCondition
+from parseval.coverage.witness import UnitWitnessPlan
 
 SOURCES = {
     'join_exists_distinct': 'so CSV index 154 q2: six-table join, correlated EXISTS, COUNT(DISTINCT)',

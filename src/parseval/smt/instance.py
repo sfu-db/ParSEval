@@ -7,7 +7,7 @@ import z3
 from parseval.catalog import Catalog
 from parseval.instance import Instance
 from parseval.terms.names import RelationId, SchemaId
-from parseval.uexpr.evaluate import BagEntry
+from parseval.coverage.evaluate import BagEntry
 from .budget import Budget, BudgetExceeded
 from .values import SymbolicEntry, SymbolicRow, SymbolicValue, _decode, _z3_sort
 

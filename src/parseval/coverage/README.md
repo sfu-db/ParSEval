@@ -1,4 +1,32 @@
-# Instance-guided U-expression coverage
+# Concrete evaluation and coverage
+
+`UExprEvaluator(arena, instance).evaluate_query(root)` returns a `BagValue` or
+`SequenceValue`. The evaluator, runtime values, witness plans, and coverage
+conditions live in this package. Expression nodes, sorts, and function
+signatures remain in `parseval.terms`. Compilation and E-SPNF normalization
+remain in `parseval.uexpr`.
+
+`BagValue.entries` contains `BagEntry(row, multiplicity)` values. Use
+`expanded_rows()` when individual duplicate occurrences are needed.
+`SequenceValue.rows` preserves result order.
+
+Override the evaluator's class dictionaries to customize callbacks:
+
+```python
+from parseval.coverage.evaluate import UExprEvaluator, strict
+
+class CustomEvaluator(UExprEvaluator):
+    SCALAR_FUNCTIONS = {
+        **UExprEvaluator.SCALAR_FUNCTIONS,
+        "my_double": strict(lambda args: args[0] * 2),
+    }
+```
+
+`measure_coverage`, `target_is_covered`, and `validate_instance` accept
+`evaluator_class=CustomEvaluator`. Callbacks extend concrete function execution
+only. They do not add symbolic SMT encodings or compiler rewrite rules.
+
+## Instance-guided coverage
 
 A coverage target is a witnessed obligation: one finite row or unit binding
 must reach a semantic site and satisfy typed conditions there. The concrete

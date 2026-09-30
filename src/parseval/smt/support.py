@@ -2,9 +2,8 @@
 
 from parseval.terms import terms as nodes
 from parseval.terms.constraints import ForeignKeyDecl
-from parseval.terms.walk import post_order
-from parseval.uexpr.witness import UnitWitnessPlan
-from parseval.uexpr.observation import GroupCardinalityCondition
+from parseval.coverage.observation import GroupCardinalityCondition
+from parseval.coverage.witness import UnitWitnessPlan
 
 
 def target_roots(target):
@@ -25,7 +24,7 @@ def target_roots(target):
 def support_bounds(catalog, arena, target, seed, max_support):
     required = {
         arena[term].payload.relation
-        for term in post_order(arena, target_roots(target))
+        for term in arena.post_order(target_roots(target))
         if isinstance(arena[term], nodes.Base)
     }
     # Referenced parents can themselves have outgoing foreign keys.

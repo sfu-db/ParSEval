@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from parseval.terms.terms import TermId
-from parseval.uexpr.observation import Condition
-from parseval.uexpr.witness import UnitWitnessPlan, WitnessPlan
+from .observation import Condition
+from .witness import UnitWitnessPlan, WitnessPlan
 
 
 @dataclass(frozen=True, slots=True)

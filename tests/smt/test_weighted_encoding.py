@@ -16,7 +16,8 @@ from parseval.smt.instance import SymbolicInstance
 from parseval.smt.solver import Solver, SolveStatus
 from parseval.smt.values import _decode, _literal
 from parseval.terms.arena import TermArena
-from parseval.uexpr import UExprCompiler, UExprEvaluator, validate_instance
+from parseval.coverage.evaluate import UExprEvaluator, validate_instance
+from parseval.uexpr import UExprCompiler
 
 
 def compile_query(ddl, sql):

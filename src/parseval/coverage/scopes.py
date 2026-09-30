@@ -13,10 +13,9 @@ from parseval.terms.builder import IRBuilder
 from parseval.terms.sorts import BagSort, RowSort, SeqSort
 from parseval.terms.terms import TermId
 from parseval.terms.verify import verify_closed
-from parseval.terms.walk import post_order
 from parseval.uexpr.espnf import inspect_bag_espnf
 from parseval.uexpr.normalize import to_espnf
-from parseval.uexpr.witness import WitnessPlan, support_plans
+from .witness import WitnessPlan, support_plans
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +227,7 @@ def _coverable_bag(arena: TermArena, term: TermId) -> bool:
 
 def fingerprint(arena: TermArena, root: TermId) -> str:
     memo: dict[TermId, str] = {}
-    for term in post_order(arena, (root,)):
+    for term in arena.post_order((root,)):
         node = arena[term]
         children = ",".join(memo[child] for child in node.children)
         memo[term] = sha256(

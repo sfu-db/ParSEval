@@ -11,7 +11,7 @@ from parseval.terms.context import AggregateKind, AggregateSpec, ScalarFunctionS
 from parseval.terms.names import AggregateSpecId, FunctionId
 from parseval.terms.sorts import ScalarSort
 from parseval.terms.sorts import INTEGER
-from parseval.uexpr import EvaluationError, UExprEvaluator, strict
+from parseval.coverage.evaluate import EvaluationError, UExprEvaluator, strict
 
 
 def _scalar(functions, operator, *values):

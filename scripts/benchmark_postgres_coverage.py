@@ -54,14 +54,14 @@ def _compile(sql: str, catalog: Any) -> tuple[Any, Any]:
 
 
 def _rows(value: Any) -> tuple[tuple[object, ...], ...]:
-    from parseval.uexpr import BagValue
+    from parseval.coverage.evaluate import BagValue
 
     rows = value.expanded_rows() if isinstance(value, BagValue) else value.rows
     return tuple(row.values for row in rows)
 
 
 def _same_bag(left: tuple[tuple[object, ...], ...], right: tuple[tuple[object, ...], ...]) -> bool:
-    from parseval.uexpr.evaluate import row_identity_equal
+    from parseval.coverage.evaluate import row_identity_equal
 
     if len(left) != len(right):
         return False
@@ -191,7 +191,7 @@ def run_case(
     from parseval.coverage import explore_paths, unsupported_scopes
     from parseval.generator import GenerationConfig, generate
     from parseval.instance import Instance
-    from parseval.uexpr import UExprEvaluator
+    from parseval.coverage.evaluate import UExprEvaluator
 
     result: dict[str, Any] = {
         "index": row["index"],

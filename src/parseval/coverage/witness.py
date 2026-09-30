@@ -11,7 +11,7 @@ from parseval.terms.arena import TermArena
 from parseval.terms.names import SchemaId
 from parseval.terms.terms import TermId
 
-from .espnf import ProductTermView
+from parseval.uexpr.espnf import ProductTermView
 
 
 class UnsafeProductError(ValueError):

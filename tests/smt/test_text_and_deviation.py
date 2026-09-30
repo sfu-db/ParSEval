@@ -137,8 +137,8 @@ def test_solver_generates_lowercase_witness():
     from parseval.coverage import target_is_covered
     from parseval.smt import Solver, SolveStatus
     from parseval.terms.sorts import RowSort
-    from parseval.uexpr.observation import WeightCondition
-    from parseval.uexpr.witness import UnitWitnessPlan
+    from parseval.coverage.observation import WeightCondition
+    from parseval.coverage.witness import UnitWitnessPlan
     c = Catalog.from_ddl('CREATE TABLE t(s TEXT)', dialect='postgres')
     relation, info = next(iter(c.context.relations()))
     a = TermArena(c.context)
