@@ -1,25 +1,14 @@
-"""Coverage-directed concrete instance generation."""
+"""Concolic generation of databases covering a query's U-semiring branches."""
 
 from .config import GenerationConfig
-from .engine import Generator
-from .generate import (
-    CounterExample,
-    GenerationResult,
-    InvalidModelError,
-    TargetResult,
-    generate,
-)
-from ..smt.solver import SolveResult, SolveStatus, Solver
+from .generate import Session, generate
+from .model import Attempt, CoverageReport, GenerationResult
 
 __all__ = (
-    "CounterExample",
+    "Attempt",
+    "CoverageReport",
     "GenerationConfig",
     "GenerationResult",
-    "Generator",
-    "InvalidModelError",
-    "SolveResult",
-    "SolveStatus",
-    "Solver",
-    "TargetResult",
+    "Session",
     "generate",
 )

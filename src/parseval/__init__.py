@@ -8,17 +8,19 @@ if TYPE_CHECKING:
     from parseval.generator import (
         GenerationConfig,
         GenerationResult,
-        Generator,
         generate,
     )
+    from parseval.db_manager import DBManager
+    from parseval.instantiate import instantiate_db
 
 
 _EXPORTS = {
     "Catalog": ("parseval.catalog", "Catalog"),
     "GenerationConfig": ("parseval.generator", "GenerationConfig"),
     "GenerationResult": ("parseval.generator", "GenerationResult"),
-    "Generator": ("parseval.generator", "Generator"),
     "generate": ("parseval.generator", "generate"),
+    "DBManager": ("parseval.db_manager", "DBManager"),
+    "instantiate_db": ("parseval.instantiate", "instantiate_db"),
 }
 
 __all__ = list(_EXPORTS)

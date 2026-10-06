@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, time
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
+import calendar
 from decimal import Decimal
 from enum import Enum
 import re
@@ -32,9 +33,17 @@ class TypeKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ScalarType:
+    """Internal scalar type, optionally refined by column storage limits.
+
+    Expression sorts use ``value_type`` so a column's storage limits do not
+    constrain values computed from it. Precision and scale remain semantic.
+    """
+
     kind: TypeKind
     precision: int | None = None
     scale: int | None = None
+    max_length: int | None = None
+    integer_bits: int | None = None
 
     def __post_init__(self) -> None:
         expect(
@@ -64,6 +73,25 @@ class ScalarType:
             "SQL type scale cannot exceed precision",
             error=ScalarTypeError,
         )
+        expect(
+            self.max_length is None
+            or (self.kind is TypeKind.STRING and self.max_length >= 0),
+            "Maximum length requires a string type and must be nonnegative",
+            error=ScalarTypeError,
+        )
+        expect(
+            self.integer_bits is None
+            or (self.kind is TypeKind.INTEGER and self.integer_bits > 0),
+            "Integer width requires an integer type and must be positive",
+            error=ScalarTypeError,
+        )
+
+    @property
+    def value_type(self) -> ScalarType:
+        """The expression type without column-specific storage restrictions."""
+        if self.max_length is None and self.integer_bits is None:
+            return self
+        return replace(self, max_length=None, integer_bits=None)
 
 
 BOOLEAN = ScalarType(TypeKind.BOOLEAN)
@@ -117,6 +145,9 @@ class IntervalValue:
         )
         return cls(days=days, microseconds=microseconds)
 
+    def __neg__(self) -> IntervalValue:
+        return IntervalValue(-self.months, -self.days, -self.microseconds)
+
     def __add__(self, other: IntervalValue) -> IntervalValue:
         if not isinstance(other, IntervalValue):
             return NotImplemented
@@ -125,6 +156,18 @@ class IntervalValue:
             self.days + other.days,
             self.microseconds + other.microseconds,
         )
+
+
+def shift_temporal(value: date | datetime, interval: IntervalValue) -> datetime:
+    """Add a calendar interval. Months are applied before days, and the day is clamped."""
+
+    base = value if isinstance(value, datetime) else datetime.combine(value, time())
+    month_index = base.year * 12 + (base.month - 1) + interval.months
+    year, month0 = divmod(month_index, 12)
+    month = month0 + 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    shifted = base.replace(year=year, month=month, day=day)
+    return shifted + timedelta(days=interval.days, microseconds=interval.microseconds)
 
 
 def parse_interval_value(value: str) -> IntervalValue:
@@ -153,8 +196,10 @@ def parse_iso_temporal_value(
     if match is not None:
         year, month, day, suffix = match.groups()
         text = f"{year}-{int(month):02d}-{int(day):02d}{suffix}"
+    # Fractional seconds of any precision, as SQL text allows ("08.0").
+    text = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d+)", lambda m: f"{m[1]}.{(m[2] + '000000')[:6]}", text)
     if sql_type.kind is TypeKind.DATE:
-        return date.fromisoformat(text)
+        return date.fromisoformat(text) if len(text) == 10 else datetime.fromisoformat(text).date()
     if sql_type.kind is TypeKind.TIME:
         return time.fromisoformat(text)
     if sql_type.kind is TypeKind.TIMESTAMP:

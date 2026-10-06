@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeAlias
 
 from parseval.identifiers import Identifier
 from .names import ColumnId, ConstraintId, RelationId
@@ -118,14 +117,3 @@ class UnsupportedConstraintDecl(ConstraintDecl):
     def __post_init__(self) -> None:
         if self.metadata.proof_active:
             raise ValueError("unsupported constraints must be proof-inactive")
-
-
-IntegrityConstraint: TypeAlias = (
-    NotNullDecl
-    | PrimaryKeyDecl
-    | UniqueDecl
-    | ForeignKeyDecl
-    | CheckDecl
-    | GeneratedColumnDecl
-    | UnsupportedConstraintDecl
-)

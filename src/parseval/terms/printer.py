@@ -191,10 +191,11 @@ class UExprPrinter:
             return self._binary(
                 "in_subquery", children, row_names, relation_names, level
             )
-        if node_type is nodes.And3:
-            return self._binary("and3", children, row_names, relation_names, level)
-        if node_type is nodes.Or3:
-            return self._binary("or3", children, row_names, relation_names, level)
+        if node_type in (nodes.And3, nodes.Or3):
+            symbol = " and3 " if node_type is nodes.And3 else " or3 "
+            return "(" + symbol.join(
+                self._format(child, row_names, relation_names, level + 1) for child in children
+            ) + ")"
         if node_type is nodes.Not3:
             value = self._format(children[0], row_names, relation_names, level + 1)
             return f"not3({value})"

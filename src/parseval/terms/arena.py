@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from decimal import Decimal
 from itertools import count
 from math import isfinite
 from typing import Iterable, Iterator, TypeVar, cast
@@ -176,20 +175,26 @@ class TermArena:
         children: tuple[TermId, ...],
         child_nodes: tuple[TermNode, ...],
     ) -> TermId:
+        """Flat, duplicate-free, ordered SQL conjunction or disjunction.
+
+        Like Add and Mul, nested operands of the same kind are flattened,
+        so long IN lists stay shallow. Duplicates are removed: three-valued
+        AND and OR are idempotent.
+        """
         identity = terms.True3 if node_type is terms.And3 else terms.False3
         absorbing = terms.False3 if node_type is terms.And3 else terms.True3
-        for node in child_nodes:
+        remaining: set[TermId] = set()
+        for child, node in zip(children, child_nodes, strict=True):
             if type(node) is absorbing:
                 return self.intern_checked(absorbing)
-        remaining = tuple(
-            child
-            for child, node in zip(children, child_nodes, strict=True)
-            if type(node) is not identity
-        )
+            if type(node) is node_type:
+                remaining.update(node.children)
+            elif type(node) is not identity:
+                remaining.add(child)
         if not remaining:
             return self.intern_checked(identity)
         if len(remaining) == 1:
-            return remaining[0]
+            return next(iter(remaining))
         ordered = tuple(sorted(remaining, key=lambda term: term.index))
         return self._intern_node(node_type(PREDICATE, ordered))
 
@@ -361,9 +366,9 @@ class TermArena:
             return PREDICATE
 
         if node_type in (terms.And3, terms.Or3):
-            _arity(node_type, children, 2)
-            _expect_sort(node_type, child_sorts[0], PREDICATE)
-            _expect_sort(node_type, child_sorts[1], PREDICATE)
+            expect(len(children) >= 2, f"{node_type.key} needs at least two operands")
+            for child_sort in child_sorts:
+                _expect_sort(node_type, child_sort, PREDICATE)
             return PREDICATE
 
         if node_type is terms.Not3:
@@ -952,12 +957,11 @@ def _validate_literal(value: object, kind: TypeKind) -> None:
         valid = isinstance(value, bool)
     elif kind is TypeKind.INTEGER:
         valid = isinstance(value, int) and not isinstance(value, bool)
-    elif kind is TypeKind.FLOAT:
+    elif kind in (TypeKind.FLOAT, TypeKind.DECIMAL):
+        # DECIMAL shares the binary64 float carrier with FLOAT.
         valid = isinstance(value, (int, float)) and not isinstance(value, bool)
         if isinstance(value, float) and not isfinite(value):
             valid = False
-    elif kind is TypeKind.DECIMAL:
-        valid = isinstance(value, Decimal) and value.is_finite()
     elif kind is TypeKind.STRING:
         valid = isinstance(value, str)
     elif kind is TypeKind.DATE:
@@ -994,15 +998,6 @@ class TermView:
         from .printer import format_term
 
         return format_term(
-            self.arena,
-            self.root,
-        )
-
-    def dump(self) -> str:
-        """Return the reachable hash-consed DAG representation."""
-        from .printer import format_arena
-
-        return format_arena(
             self.arena,
             self.root,
         )

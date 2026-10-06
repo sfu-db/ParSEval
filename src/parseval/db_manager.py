@@ -1,20 +1,18 @@
-"""
-db_manager.py
-Database connection manager using SQLAlchemy connection URLs.
+"""Database backends: connect, create tables, load instances, execute queries.
 
-Each call creates and owns its SQLAlchemy engine for the lifetime of the
-connection context.  Temporary database workflows can drop and recreate
-databases without stale cached engine or initialisation state.
+    database = DBManager("postgresql://user:password@host/db", "postgres")
+    with database.connect() as conn:
+        conn.create_tables(ddl)
+        conn.load(instance)
+        rows = conn.execute("SELECT * FROM users")
 
-Usage:
-    with get_connection("sqlite:////path/to/mydb.sqlite", dialect="sqlite") as conn:
-        conn.create_tables(ddl_string)
-        rows = conn.execute("SELECT * FROM users", fetch="all")
-
-    # class-based (for a custom logger threaded through all calls)
-    mgr = DBManager(log=my_logger)
-    with mgr.get_connection("sqlite:////path/to/mydb.sqlite", dialect="sqlite") as conn:
+    # A fresh database, dropped afterwards, for replaying one instance:
+    with database.scratch() as conn:
         ...
+
+Instances are loaded with foreign-key checks on: tables in foreign-key order,
+and the rows of a self-referencing table parents first, so the backend
+validates the data as it arrives.
 """
 
 from __future__ import annotations
@@ -24,80 +22,36 @@ import os
 import random
 import threading
 import time
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from threading import Lock
-from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Literal
+from uuid import uuid4
 
+import sqlglot
 from sqlglot import exp
-from sqlalchemy import Connection, Engine, MetaData, URL, create_engine, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import Connection, Engine, MetaData, Table, create_engine, text
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.pool import NullPool, StaticPool
 from sqlalchemy.schema import CreateTable
 
+from parseval.instance import Instance
+from parseval.terms.constraints import ForeignKeyDecl
+from parseval.terms.sorts import IntervalValue
 
-# ---------------------------------------------------------------------------
-# Dialect mappings + quoting helpers
-# ---------------------------------------------------------------------------
+Dialect = Literal["sqlite", "mysql", "postgres"]
+Fetch = Literal["all", "one", "random"] | int | None
 
-_DIALECT_TO_BACKEND = {
-    "sqlite": "sqlite",
-    "mysql": "mysql",
-    "postgres": "postgresql",
-}
+_BACKENDS = {"sqlite": "sqlite", "mysql": "mysql", "postgres": "postgresql"}
 
-_DIALECT_TO_SQLGLOT = {
-    "sqlite": "sqlite",
-    "mysql": "mysql",
-    "postgres": "postgres",
-}
-
-
-def _quote_postgres_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
-
-
-def _quote_mysql_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
-
-
-def dispose_all() -> None:
-    """
-    Compatibility hook for callers that used to clear cached engines.
-
-    Engines are no longer cached by this module, so there is no module-level
-    state to dispose.
-    """
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Connect — SQL execution wrapper
-# ---------------------------------------------------------------------------
 
 class Connect:
-    """
-    Executes SQL against a given SQLAlchemy engine.
+    """Executes SQL against one engine; obtain it from :class:`DBManager`."""
 
-    Do **not** instantiate directly; use :func:`get_connection` or
-    :meth:`DBManager.get_connection`.
-    """
-
-    def __init__(self, engine: Engine, log: Optional[logging.Logger] = None) -> None:
+    def __init__(self, engine: Engine, dialect: Dialect, log: logging.Logger | None = None) -> None:
         self.engine = engine
-        self._log = log or logging.getLogger("qrank.db.connect")
-        self._metadata: Optional[MetaData] = None
-
-    def __enter__(self) -> "Connect":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self._log.debug(
-            "Closed connection to %s",
-            self.engine.url.render_as_string(hide_password=True),
-        )
+        self.dialect = dialect
+        self._log = log or logging.getLogger("parseval.db")
+        self._metadata: MetaData | None = None
 
     @property
     def metadata(self) -> MetaData:
@@ -106,504 +60,343 @@ class Connect:
             self._metadata.reflect(bind=self.engine)
         return self._metadata
 
-    def _invalidate_metadata(self) -> None:
-        self._metadata = None
-
     @contextmanager
     def begin(self) -> Generator[Connection, None, None]:
-        """Keep a database load on one connection and transaction."""
-        with self.engine.begin() as conn:
-            if self.engine.dialect.name == "sqlite":
-                conn.exec_driver_sql("PRAGMA foreign_keys = ON")
-                # sqlite3 legacy transaction mode does not begin for DDL.
-                conn.exec_driver_sql("BEGIN")
-            yield conn
-        self._invalidate_metadata()
+        """One connection and transaction; SQLite enforces foreign keys in it."""
+        with self.engine.begin() as connection:
+            if self.dialect == "sqlite":
+                connection.exec_driver_sql("PRAGMA foreign_keys = ON")
+            yield connection
+        self._metadata = None
 
-    @overload
-    def execute(
-        self,
-        stmt: str,
-        parameters: Optional[Any] = ...,
-        fetch: None = ...,
-        with_column_names: bool = ...,
-        timeout: int = ...,
-    ) -> None: ...
-
-    @overload
-    def execute(
-        self,
-        stmt: str,
-        parameters: Optional[Any] = ...,
-        fetch: Union[Literal["all", "one", "random"], int] = ...,
-        with_column_names: bool = ...,
-        timeout: int = ...,
-    ) -> List[Tuple[Any, ...]]: ...
+    # Statements.
 
     def execute(
         self,
         stmt: str,
-        parameters: Optional[Any] = None,
-        fetch: Optional[Union[Literal["all", "one", "random"], int]] = "all",
+        parameters: Any = None,
+        fetch: Fetch = "all",
         with_column_names: bool = False,
-        timeout: int = 15,
-    ) -> Optional[List[Tuple[Any, ...]]]:
-        is_sqlite = self.engine.url.get_backend_name() == "sqlite"
-        results: Optional[List[Tuple[Any, ...]]] = None
-        raw_conn = None
-        guard: Optional["Connect._TimeoutGuard"] = None
-        cancelled: Optional[Any] = None
+        with_column_types: bool = False,
+        timeout: float = 15,
+    ) -> list[tuple] | None:
+        """Run one statement within ``timeout`` seconds; fetch rows unless ``fetch`` is None.
 
-        deadline = time.monotonic() + timeout
-
-        with self.engine.begin() as conn:
-            if is_sqlite:
-                guard = Connect._TimeoutGuard()
-                raw_conn, cancelled = self._arm_sqlite_timeout(conn, timeout, guard=guard)
-            self._log.debug(
-                "Preparing to execute query with timeout %d seconds: %.120s",
-                timeout,
-                stmt,
-            )
-            try:
+        The rows are preceded by the column names, then the driver's column
+        type codes, when asked for.
+        """
+        with self.begin() as connection:
+            with self._deadline(connection, timeout):
                 if parameters is None:
-                    cursor_result = conn.exec_driver_sql(
-                        stmt, execution_options={"no_parameters": True}
-                    )
+                    result = connection.exec_driver_sql(stmt, execution_options={"no_parameters": True})
                 else:
-                    cursor_result = conn.exec_driver_sql(stmt, parameters)
-                if (
-                    fetch is not None
-                    and cursor_result is not None
-                    and (cancelled is None or not cancelled.is_set())
-                ):
-                    results = self._fetch(cursor_result, fetch, deadline, with_column_names)
-            except TimeoutError:
-                raise
-            except Exception as exc:
-                if is_sqlite and "interrupted" in str(exc).lower():
-                    self._log.error(
-                        "Error executing query: %s. after %d, Error: %s",
-                        stmt[:120],
-                        timeout,
-                        str(exc),
-                    )
-                raise
-            finally:
-                if guard is not None:
-                    guard.disarm()
-                if raw_conn is not None:
-                    try:
-                        if cancelled is not None:
-                            cancelled.set()
-                    except Exception:
-                        ...
-                    try:
-                        raw_conn.set_progress_handler(None, 0)
-                    except Exception:
-                        pass
-        return results
+                    result = connection.exec_driver_sql(stmt, parameters)
+                if fetch is None or not result.returns_rows:
+                    return None
+                types = tuple(column[1] for column in result.cursor.description)
+                rows = _fetch(result, fetch)
+                if with_column_types:
+                    rows.insert(0, types)
+                if with_column_names:
+                    rows.insert(0, tuple(result.keys()))
+                return rows
 
-    class _TimeoutGuard:
-        def __init__(self) -> None:
-            self._lock = Lock()
-            self._armed = True
-
-        def is_armed(self) -> bool:
-            with self._lock:
-                return self._armed
-
-        def disarm(self) -> None:
-            with self._lock:
-                self._armed = False
-
-    @staticmethod
-    def _arm_sqlite_timeout(conn: Connection, timeout: int, guard: "_TimeoutGuard"):
-        raw_conn = conn.connection.dbapi_connection
-        deadline = time.monotonic() + timeout
-        cancelled = threading.Event()
-
-        def _timer_interrupt() -> None:
-            if not cancelled.wait(timeout=timeout) and guard.is_armed():
-                try:
-                    raw_conn.interrupt()
-                except Exception:
-                    pass
-
-        threading.Thread(target=_timer_interrupt, daemon=True).start()
-
-        def _progress():
-            return 1 if time.monotonic() > deadline else 0
-
-        raw_conn.set_progress_handler(_progress, 100)
-        return raw_conn, cancelled
-
-    @staticmethod
-    def _fetch(
-        cursor_result,
-        fetch: Union[Literal["all", "one", "random"], int],
-        deadline: Optional[float] = None,
-        with_column_names: Optional[bool] = False,
-    ) -> List[Tuple[Any, ...]]:
-        chunk_size = 50
-
-        def _check() -> bool:
-            return deadline is not None and time.monotonic() > deadline
-
-        if fetch in {"one", 1}:
-            row = cursor_result.fetchone()
-            rows: list = [row] if row is not None else []
-        elif fetch == "random":
-            sample = cursor_result.fetchmany(chunk_size)
-            rows = [random.choice(sample)] if sample else []
-        elif fetch == "all" or (isinstance(fetch, int) and fetch > 1):
-            remaining = fetch if isinstance(fetch, int) else None
-            rows = []
-            while not _check():
-                batch_limit = min(chunk_size, remaining) if remaining else chunk_size
-                batch = cursor_result.fetchmany(batch_limit)
-                if not batch:
-                    break
-                rows.extend(batch)
-                if remaining is not None:
-                    remaining -= len(batch)
-                    if remaining <= 0:
-                        break
+    @contextmanager
+    def _deadline(self, connection: Connection, timeout: float) -> Generator[None, None, None]:
+        """Each backend's own statement timeout."""
+        if self.dialect == "postgres":
+            connection.exec_driver_sql(f"SET LOCAL statement_timeout = {int(timeout * 1000)}")
+            yield
+        elif self.dialect == "mysql":
+            connection.exec_driver_sql(f"SET SESSION max_execution_time = {int(timeout * 1000)}")
+            yield
         else:
-            rows = []
-
-        records: List[Tuple[Any, ...]] = [tuple(row) for row in rows]
-        if with_column_names and records and hasattr(cursor_result, "keys"):
-            records.insert(0, tuple(cursor_result.keys()))
-        return records
+            raw = connection.connection.dbapi_connection
+            deadline = time.monotonic() + timeout
+            done = threading.Event()
+            # The progress handler interrupts running bytecode; the timer also
+            # interrupts a statement waiting outside it.
+            timer = threading.Timer(timeout, lambda: done.is_set() or raw.interrupt())
+            raw.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            timer.start()
+            try:
+                yield
+            finally:
+                done.set()
+                timer.cancel()
+                raw.set_progress_handler(None, 0)
 
     def create_tables(self, *ddls: str) -> None:
-        for ddl in ddls:
-            self.execute(ddl, fetch=None)
-        self._invalidate_metadata()
+        """Run DDL scripts: tables in foreign-key order, as backends such as
+        PostgreSQL require, then the other statements in their order."""
+        statements = [statement for ddl in ddls for statement in sqlglot.parse(ddl, read=self.dialect) if statement]
+        with self.begin() as connection:
+            for statement in _creation_order(statements):
+                connection.exec_driver_sql(statement.sql(dialect=self.dialect))
 
-    def clear_tables(self, *table_names: str) -> None:
-        for name in table_names:
-            self.execute(self._render_delete_table(name), fetch=None)
+    def drop_table(self, name: str) -> None:
+        self.metadata.tables[name].drop(self.engine)
+        self._metadata = None
 
-    def drop_table(self, table_name: str) -> None:
-        self.execute(self._render_drop_table(table_name), fetch=None)
-        self._invalidate_metadata()
+    def clear_tables(self, *names: str) -> None:
+        with self.begin() as connection:
+            for name in names:
+                connection.execute(self.metadata.tables[name].delete())
 
-    def insert(self, stmt: str, data: List[Dict[str, Any]]) -> None:
+    def insert(self, stmt: str, data: list[dict[str, Any]]) -> None:
         self.execute(stmt, parameters=data, fetch=None)
 
-    def get_schema(self) -> str:
-        ddls: List[str] = []
-        for table in self.metadata.tables.values():
-            ddl = str(
-                CreateTable(table).compile(compile_kwargs={"literal_binds": True})
-            )
-            ddls.append(ddl)
-        return ";\n".join(ddls)
+    # Instances.
 
-    def get_table_rows(self, table_name: str) -> Optional[List[Tuple[Any, ...]]]:
-        table = self.metadata.tables[table_name]
-        stmt = str(table.select().compile(compile_kwargs={"literal_binds": True}))
-        return self.execute(stmt=stmt, fetch="all", with_column_names=True)
+    def load(self, instance: Instance) -> None:
+        """Insert the stored rows of an instance into existing tables, in one transaction."""
+        catalog = instance.catalog
+        tables = {table.relation: table for table in catalog.tables()}
+        with self.begin() as connection:
+            for relation in _foreign_key_order(tables):
+                decl = tables[relation]
+                rows = _parents_first(decl, instance.rows(relation))
+                if not rows:
+                    continue
+                table = self._table(decl)
+                names = [self._name(table.columns.keys(), binding.name.text) for binding in decl.columns]
+                # A plain INSERT stores exactly the instance's values; the
+                # table construct would treat an integer key as autoincrement.
+                quote = self.engine.dialect.identifier_preparer
+                insert = text(
+                    f"INSERT INTO {quote.format_table(table)} ({', '.join(map(quote.quote, names))}) "
+                    f"VALUES ({', '.join(f':p{index}' for index in range(len(names)))})"
+                )
+                connection.execute(
+                    insert, [{f"p{index}": self._value(value) for index, value in enumerate(row)} for row in rows]
+                )
 
-    def get_all_table_rows(self) -> Dict[str, Optional[List[Tuple[Any, ...]]]]:
-        return {name: self.get_table_rows(name) for name in self.metadata.tables}
+    def _table(self, decl) -> Table:
+        *schema, name = (part.text for part in decl.name.parts)
+        schema = schema[-1] if schema else None
+        if schema is not None and not any(table.schema == schema for table in self.metadata.tables.values()):
+            self.metadata.reflect(bind=self.engine, schema=schema)
+        tables = {table.name: table for table in self.metadata.tables.values() if table.schema == schema}
+        return tables[self._name(tables, name)]
 
-    def export_database(self) -> List[str]:
-        statements: List[str] = [self.get_schema()]
-        for table in self.metadata.tables.values():
-            with self.engine.connect() as conn:
-                rows = conn.execute(table.select()).fetchall()
-            if not rows:
-                continue
-            values = [row._asdict() for row in rows]
-            insert_stmt = (
-                table.insert()
-                .values(values)
-                .compile(compile_kwargs={"literal_binds": True})
-            )
-            statements.append(str(insert_stmt))
-        return statements
-
-    def _render_delete_table(self, table_name: str) -> str:
-        return exp.delete(self._table_identifier(table_name)).sql(
-            dialect=self._sqlglot_dialect
-        )
-
-    def _render_drop_table(self, table_name: str) -> str:
-        cascade = self._sqlglot_dialect == "postgres"
-        return exp.Drop(
-            this=self._table_identifier(table_name),
-            kind="TABLE",
-            exists=True,
-            cascade=cascade,
-        ).sql(dialect=self._sqlglot_dialect)
-
-    @property
-    def _sqlglot_dialect(self) -> str:
-        backend_name = self.engine.url.get_backend_name()
-        for dialect, backend in _DIALECT_TO_BACKEND.items():
-            if backend == backend_name:
-                return _DIALECT_TO_SQLGLOT[dialect]
-        return backend_name
+    def _name(self, names, name: str) -> str:
+        """The backend's spelling of a catalog name: SQLite and MySQL compare
+        names without case, PostgreSQL as the catalog folded them."""
+        if name in names or self.dialect == "postgres":
+            return name
+        return next(candidate for candidate in names if candidate.casefold() == name.casefold())
 
     @staticmethod
-    def _table_identifier(table_name: str) -> exp.Table:
-        return exp.Table(this=exp.Identifier(this=table_name, quoted=True))
+    def _value(value):
+        """Drivers adapt Python values; intervals keep their months as text."""
+        if isinstance(value, IntervalValue):
+            return f"{value.months} mons {value.days} days {value.microseconds} microseconds"
+        return value
+
+    # Inspection.
+
+    def get_schema(self) -> str:
+        return ";\n".join(str(CreateTable(table).compile(self.engine)) for table in self.metadata.tables.values())
+
+    def get_table_rows(self, name: str) -> list[tuple]:
+        with self.begin() as connection:
+            result = connection.execute(self.metadata.tables[name].select())
+            return [tuple(result.keys()), *map(tuple, result)]
+
+    def get_all_table_rows(self) -> dict[str, list[tuple]]:
+        return {name: self.get_table_rows(name) for name in self.metadata.tables}
 
 
-# ---------------------------------------------------------------------------
-# Backend providers
-# ---------------------------------------------------------------------------
-
-class _BackendProvider:
-    dialect: str
-    backend_name: str
-
-    def ensure_database(self, url: URL) -> None:
-        raise NotImplementedError
-
-    def create_engine(
-        self,
-        url: URL,
-        *,
-        pool_size: int,
-        max_overflow: int,
-        pool_timeout: int,
-        pool_recycle: int,
-        connect_timeout: int,
-    ) -> Engine:
-        raise NotImplementedError
+def _fetch(result, fetch: Fetch) -> list[tuple]:
+    if fetch in ("one", 1):
+        row = result.fetchone()
+        return [] if row is None else [tuple(row)]
+    if fetch == "random":
+        rows = result.fetchall()
+        return [tuple(random.choice(rows))] if rows else []
+    rows = result.fetchall() if fetch == "all" else result.fetchmany(fetch)
+    return [tuple(row) for row in rows]
 
 
-class _SQLiteProvider(_BackendProvider):
-    dialect = "sqlite"
-    backend_name = "sqlite"
+def _creation_order(statements: list) -> list:
+    """CREATE TABLE statements with referenced tables first, then the rest."""
+    def name(table: exp.Table) -> str:
+        return table.name.casefold()
 
-    def ensure_database(self, url: URL) -> None:
-        database = url.database
-        if database in (None, "", ":memory:"):
+    creates = {
+        name(statement.this.find(exp.Table)): statement
+        for statement in statements
+        if isinstance(statement, exp.Create) and statement.kind == "TABLE"
+    }
+    references = {
+        table: {name(reference.this.find(exp.Table)) for reference in statement.find_all(exp.Reference)} & creates.keys()
+        for table, statement in creates.items()
+    }
+    order = _topological(references, lambda table: table)
+    return [creates[table] for table in order] + [statement for statement in statements if statement not in creates.values()]
+
+
+def _topological(edges: dict, label) -> list:
+    """Nodes with every node they point to first; a cycle cannot be ordered."""
+    order, state = [], {}
+
+    def visit(node, path):
+        if state.get(node) == "done":
             return
-        parent = os.path.dirname(database)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        if not os.path.exists(database):
-            open(database, "a").close()
+        if state.get(node) == "open":
+            raise ValueError("Foreign keys form a cycle: " + " -> ".join(map(label, (*path, node))))
+        state[node] = "open"
+        for other in edges[node]:
+            if other != node:
+                visit(other, (*path, node))
+        state[node] = "done"
+        order.append(node)
 
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
-        is_memory = url.database in (None, ":memory:")
-        connect_args: Dict[str, Any] = {
-            "check_same_thread": False,
-            "timeout": connect_timeout,
-        }
-        if is_memory:
-            return create_engine(url, poolclass=StaticPool, connect_args=connect_args)
-        return create_engine(url, poolclass=NullPool, connect_args=connect_args)
+    for node in edges:
+        visit(node, ())
+    return order
 
 
-class _MySQLProvider(_BackendProvider):
-    dialect = "mysql"
-    backend_name = "mysql"
-
-    def ensure_database(self, url: URL) -> None:
-        if not url.database:
-            raise ValueError("MySQL connection string must include a database name")
-        admin_url = url.set(database="")
-        engine = create_engine(admin_url)
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text(f"CREATE DATABASE IF NOT EXISTS {_quote_mysql_identifier(url.database)}")
-                )
-        finally:
-            engine.dispose()
-
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
-        return create_engine(
-            url,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=True,
-            connect_args={"connect_timeout": connect_timeout},
-        )
+def _foreign_key_order(tables: dict) -> list:
+    """Relations with every referenced relation first."""
+    edges = {
+        relation: {item.target_relation for item in table.constraints if isinstance(item, ForeignKeyDecl)}
+        for relation, table in tables.items()
+    }
+    return _topological(edges, lambda relation: tables[relation].name.qualified_name)
 
 
-class _PostgresProvider(_BackendProvider):
-    dialect = "postgres"
-    backend_name = "postgresql"
-
-    def ensure_database(self, url: URL) -> None:
-        if not url.database:
-            raise ValueError("Postgres connection string must include a database name")
-        admin_url = url.set(database="postgres")
-        engine = create_engine(admin_url)
-        try:
-            with engine.connect() as conn:
-                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                result = conn.execute(
-                    text("SELECT 1 FROM pg_database WHERE datname = :name"),
-                    {"name": url.database},
-                )
-                if not result.fetchone():
-                    conn.execute(
-                        text(f"CREATE DATABASE {_quote_postgres_identifier(url.database)}")
-                    )
-        finally:
-            engine.dispose()
-
-    def create_engine(self, url, *, pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout) -> Engine:
-        return create_engine(
-            url,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=True,
-            connect_args={"connect_timeout": connect_timeout},
-        )
+def _parents_first(table, rows: Sequence[tuple]) -> list[tuple]:
+    """Rows of a self-referencing table ordered so a referenced row comes first."""
+    links = [
+        ([table.spec.column_position(column) for column in item.source],
+         [table.spec.column_position(column) for column in item.target])
+        for item in table.constraints
+        if isinstance(item, ForeignKeyDecl) and item.target_relation == table.relation
+    ]
+    if not links:
+        return list(rows)
+    pending, placed, order = list(rows), set(), []
+    while pending:
+        ready = [
+            row for row in pending
+            if all(
+                None in (key := tuple(row[p] for p in source))
+                or key == tuple(row[p] for p in target)
+                or (tuple(target), key) in placed
+                for source, target in links
+            )
+        ]
+        if not ready:
+            raise ValueError(f"Rows of {table.name.qualified_name} reference each other in a cycle")
+        for row in ready:
+            pending.remove(row)
+            order.append(row)
+            placed.update((tuple(target), tuple(row[p] for p in target)) for _, target in links)
+    return order
 
 
-# ---------------------------------------------------------------------------
-# Module-level provider registry + internal helpers
-# ---------------------------------------------------------------------------
-
-_providers: Dict[str, _BackendProvider] = {
-    "sqlite": _SQLiteProvider(),
-    "mysql": _MySQLProvider(),
-    "postgres": _PostgresProvider(),
-}
+# Backends.
 
 
-def _normalize_target(
-    connection_string: str,
-    dialect: str,
-) -> Tuple[URL, _BackendProvider]:
-    provider = _providers.get(dialect)
-    if provider is None:
-        raise ValueError(
-            f"Unsupported dialect '{dialect}'. Supported: {list(_providers)}"
-        )
-    url = make_url(connection_string)
-    backend_name = url.get_backend_name()
-    expected_backend = _DIALECT_TO_BACKEND[dialect]
-    if backend_name != expected_backend:
-        raise ValueError(
-            f"Connection string backend '{backend_name}' does not match dialect '{dialect}'"
-        )
-    return url, provider
+def _ensure(url: URL, dialect: Dialect) -> None:
+    """Create the database of a URL if it does not exist."""
+    if dialect == "sqlite":
+        if url.database not in (None, "", ":memory:"):
+            os.makedirs(os.path.dirname(os.path.abspath(url.database)), exist_ok=True)
+        return
+    if not url.database:
+        raise ValueError(f"A {dialect} URL must name a database")
+    with _admin(url, dialect) as connection:
+        if dialect == "postgres":
+            exists = connection.execute(text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": url.database})
+            if not exists.first():
+                connection.exec_driver_sql(f"CREATE DATABASE {_quote(url.database, dialect)}")
+        else:
+            connection.exec_driver_sql(f"CREATE DATABASE IF NOT EXISTS {_quote(url.database, dialect)}")
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _drop(url: URL, dialect: Dialect) -> None:
+    if dialect == "sqlite":
+        if url.database not in (None, "", ":memory:") and os.path.exists(url.database):
+            os.remove(url.database)
+        return
+    with _admin(url, dialect) as connection:
+        force = " WITH (FORCE)" if dialect == "postgres" else ""
+        connection.exec_driver_sql(f"DROP DATABASE IF EXISTS {_quote(url.database, dialect)}{force}")
+
 
 @contextmanager
-def get_connection(
-    connection_string: str,
-    dialect: Literal["sqlite", "mysql", "postgres"],
-    pool_size: int = 10,
-    max_overflow: int = 20,
-    pool_timeout: int = 15,
-    pool_recycle: int = 60,
-    connect_timeout: int = 25,
-    create_if_missing: bool = True,
-    log: Optional[logging.Logger] = None,
-) -> Generator[Connect, None, None]:
-    """
-    Yield a :class:`Connect` instance bound to the requested database.
-
-    The returned connection context owns its engine.  The database is ensured
-    for each call when ``create_if_missing`` is true, and the engine is disposed
-    when the context exits.
-    """
-    _log = log or logging.getLogger("qrank.db")
-    url, provider = _normalize_target(connection_string, dialect)
-
-    if create_if_missing:
-        provider.ensure_database(url)
-
-    engine = provider.create_engine(
-        url,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_timeout=pool_timeout,
-        pool_recycle=pool_recycle,
-        connect_timeout=connect_timeout,
-    )
-    _log.debug(
-        "Created engine for %s",
-        url.render_as_string(hide_password=True),
-    )
+def _admin(url: URL, dialect: Dialect) -> Generator[Connection, None, None]:
+    """An autocommit connection to the server's maintenance database."""
+    engine = create_engine(url.set(database="postgres" if dialect == "postgres" else ""), poolclass=NullPool)
     try:
-        yield Connect(engine=engine, log=_log)
+        with engine.connect() as connection:
+            yield connection.execution_options(isolation_level="AUTOCOMMIT")
     finally:
         engine.dispose()
 
 
+def _quote(identifier: str, dialect: Dialect) -> str:
+    mark = "`" if dialect == "mysql" else '"'
+    return mark + identifier.replace(mark, mark * 2) + mark
+
+
+def _engine(url: URL, dialect: Dialect, connect_timeout: int) -> Engine:
+    if dialect == "sqlite":
+        args = {"check_same_thread": False, "timeout": connect_timeout}
+        pool = StaticPool if url.database in (None, "", ":memory:") else NullPool
+        return create_engine(url, poolclass=pool, connect_args=args)
+    return create_engine(url, poolclass=NullPool, connect_args={"connect_timeout": connect_timeout})
+
+
 class DBManager:
-    """
-    Thin factory for :class:`Connect` instances.
+    """A database server or file, given by an SQLAlchemy URL and its dialect.
 
-    No singleton, no shared state on the instance.  Each connection context owns
-    and disposes its engine.
-
-    The only reason to use DBManager over get_connection() directly is to bind
-    a custom logger once and have it applied to every connection from that manager.
+    ``connect`` opens the URL's database, creating it if missing; ``scratch``
+    opens a new database on the same server, dropped afterwards. Each opened
+    connection owns its engine.
     """
 
-    def __init__(self, log: Optional[logging.Logger] = None) -> None:
-        self._log = log or logging.getLogger("qrank.db")
+    def __init__(
+        self, connection_string: str, dialect: Dialect, *,
+        connect_timeout: int = 25, log: logging.Logger | None = None,
+    ) -> None:
+        if dialect not in _BACKENDS:
+            raise ValueError(f"Unsupported dialect {dialect!r}; supported: {sorted(_BACKENDS)}")
+        url = make_url(connection_string)
+        if url.get_backend_name() != _BACKENDS[dialect]:
+            raise ValueError(f"URL backend {url.get_backend_name()!r} does not match dialect {dialect!r}")
+        self.url = url
+        self.dialect = dialect
+        self.connect_timeout = connect_timeout
+        self._log = log or logging.getLogger("parseval.db")
 
     @contextmanager
-    def get_connection(
-        self,
-        connection_string: str,
-        dialect: Literal["sqlite", "mysql", "postgres"],
-        pool_size: int = 10,
-        max_overflow: int = 20,
-        pool_timeout: int = 15,
-        pool_recycle: int = 60,
-        connect_timeout: int = 25,
-        create_if_missing: bool = True,
-    ) -> Generator[Connect, None, None]:
-        with get_connection(
-            connection_string=connection_string,
-            dialect=dialect,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            connect_timeout=connect_timeout,
-            create_if_missing=create_if_missing,
-            log=self._log,
-        ) as conn:
-            yield conn
+    def connect(self, *, create_if_missing: bool = True) -> Generator[Connect, None, None]:
+        if create_if_missing:
+            _ensure(self.url, self.dialect)
+        with self._open(self.url) as connection:
+            yield connection
+
+    @contextmanager
+    def scratch(self) -> Generator[Connect, None, None]:
+        """A new, uniquely named database, dropped afterwards; in memory for SQLite."""
+        url = self.url.set(database=":memory:" if self.dialect == "sqlite" else "parseval_" + uuid4().hex)
+        try:
+            _ensure(url, self.dialect)
+            with self._open(url) as connection:
+                yield connection
+        finally:
+            _drop(url, self.dialect)
+
+    @contextmanager
+    def _open(self, url: URL) -> Generator[Connect, None, None]:
+        engine = _engine(url, self.dialect, self.connect_timeout)
+        try:
+            yield Connect(engine, self.dialect, self._log)
+        finally:
+            engine.dispose()
 
 
-def execute_query(
-    sql: str,
-    connection_string: str,
-    dialect: str = "sqlite",
-    timeout: int = 60,
-) -> "ExecutionResult":
-    """Execute a query and return an ExecutionResult."""
-    from parseval.states import ExecutionResult
-
-    t0 = time.time()
-    try:
-        with get_connection(connection_string, dialect) as conn:
-            rows = conn.execute(sql, fetch="all", timeout=timeout)
-            return ExecutionResult(
-                query=sql,
-                rows=rows or [],
-                elapsed_time=time.time() - t0,
-            )
-    except Exception as e:
-        return ExecutionResult(
-            query=sql,
-            error_msg=str(e),
-            elapsed_time=time.time() - t0,
-        )
+__all__ = ["Connect", "DBManager"]

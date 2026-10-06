@@ -1,149 +1,66 @@
-"""Value objects shared by coverage discovery, replay, and generation."""
+"""Branch sites of a U-expression and their outcomes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
 
 from parseval.terms.terms import TermId
-from .observation import Condition
-from .witness import UnitWitnessPlan, WitnessPlan
 
 
-@dataclass(frozen=True, slots=True)
-class CoverageSite:
-    """One occurrence in the compiled term, including its use context."""
+@dataclass(frozen=True, slots=True, order=True)
+class Target:
+    """One outcome of one U-semiring decision, such as a predicate being FALSE."""
 
-    term: TermId
-    path: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class WitnessedObligation:
-    """Existential finite support and local U-expression conditions."""
-
-    plan: WitnessPlan | UnitWitnessPlan
-    conditions: tuple[Condition, ...]
-    relations: tuple[TermId, ...] = ()
-    contexts: tuple[WitnessPlan, ...] = ()
+    site: int
+    outcome: str
 
 
-@dataclass(frozen=True, slots=True)
-class CoverageTarget:
-    """A semantic outcome reachable through a finite witness."""
+class Sites:
+    """Stable identities for term occurrences in one compiled query.
 
-    id: str
-    site: CoverageSite
-    obligation: WitnessedObligation
-    label: str = "productive"
-
-
-class CoverageStatus(str, Enum):
-    """What generation established for one discovered target.
-
-    ``BOUNDED_UNSAT`` deliberately does not mean infeasible.  It only records
-    that the configured finite SMT search was exhausted.
+    A site is a path of child positions from the query root. Hash-consing
+    shares equal subterms, so a TermId alone cannot distinguish occurrences.
     """
 
-    COVERED = "covered"
-    BOUNDED_UNSAT = "bounded_unsat"
-    UNKNOWN = "unknown"
-    UNSUPPORTED = "unsupported"
+    ROOT = 0
+
+    def __init__(self) -> None:
+        self._children: dict[tuple[int, int], int] = {}
+        self._paths: list[tuple[int, ...]] = [()]
+        self.terms: dict[int, TermId] = {}
+
+    def child(self, site: int, index: int) -> int:
+        key = (site, index)
+        child = self._children.get(key)
+        if child is None:
+            child = self._children[key] = len(self._paths)
+            self._paths.append((*self._paths[site], index))
+        return child
+
+    def path(self, site: int) -> tuple[int, ...]:
+        return self._paths[site]
 
 
-@dataclass(frozen=True, slots=True)
-class CoverageOutcome:
-    """Terminal information for a target that was observed or attempted."""
+@dataclass(slots=True)
+class Coverage:
+    """Outcomes reached while executing one instance.
 
-    target: str
-    status: CoverageStatus
-    reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CoverageReport:
-    """Coverage inventory plus evidence collected for its targets.
-
-    ``complete`` remains a capability statement: all encountered scopes have
-    a complete finite witness analysis.  Use ``fully_covered`` to ask whether
-    every discovered target has a concrete witness.
+    ``covered`` outcomes are produced by stored rows. A ``stable`` outcome is
+    produced independently of candidate rows. ``witnesses`` hold, for covered
+    outcomes that depend on candidate rows, predicates over open inputs that
+    keep them covered; ``candidates`` hold predicates that would cover an
+    outcome that is not covered yet.
     """
 
-    targets: frozenset[str]
-    covered: frozenset[str]
-    unsupported_scopes: tuple[str, ...] = ()
-    outcomes: tuple[CoverageOutcome, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.covered <= self.targets:
-            raise ValueError("covered targets must belong to the target inventory")
-        identities = tuple(outcome.target for outcome in self.outcomes)
-        if len(identities) != len(set(identities)):
-            raise ValueError("coverage outcomes must have unique target identities")
-        if not set(identities) <= self.targets:
-            raise ValueError("coverage outcomes must belong to the target inventory")
+    reached: set[Target] = field(default_factory=set)
+    covered: set[Target] = field(default_factory=set)
+    stable: set[Target] = field(default_factory=set)
+    witnesses: dict[Target, list[TermId]] = field(default_factory=dict)
+    candidates: dict[Target, list[TermId]] = field(default_factory=dict)
 
     @property
-    def uncovered(self) -> frozenset[str]:
-        return self.targets - self.covered
-
-    @property
-    def ratio(self) -> float:
-        return (
-            len(self.covered) / len(self.targets)
-            if self.targets
-            else 1.0
-        )
-
-    @property
-    def complete(self) -> bool:
-        return not self.unsupported_scopes
-
-    @property
-    def fully_covered(self) -> bool:
-        return self.covered == self.targets and self.complete
-
-    @property
-    def bounded_unsat(self) -> frozenset[str]:
-        return self._with_status(CoverageStatus.BOUNDED_UNSAT)
-
-    @property
-    def unknown(self) -> frozenset[str]:
-        return self._with_status(CoverageStatus.UNKNOWN)
-
-    @property
-    def unsupported(self) -> frozenset[str]:
-        return self._with_status(CoverageStatus.UNSUPPORTED)
-
-    @property
-    def not_attempted(self) -> frozenset[str]:
-        decided = frozenset(outcome.target for outcome in self.outcomes)
-        return self.targets - decided
-
-    @property
-    def unresolved(self) -> frozenset[str]:
-        """Targets without concrete coverage evidence."""
-
-        return self.targets - self.covered
-
-    def outcome(self, target: str) -> CoverageOutcome | None:
-        return next(
-            (outcome for outcome in self.outcomes if outcome.target == target),
-            None,
-        )
-
-    def _with_status(self, status: CoverageStatus) -> frozenset[str]:
-        return frozenset(
-            outcome.target for outcome in self.outcomes
-            if outcome.status is status
-        )
+    def uncovered(self) -> set[Target]:
+        return self.reached - self.covered
 
 
-__all__ = [
-    "CoverageOutcome",
-    "CoverageReport",
-    "CoverageSite",
-    "CoverageStatus",
-    "CoverageTarget",
-    "WitnessedObligation",
-]
+__all__ = ["Coverage", "Sites", "Target"]

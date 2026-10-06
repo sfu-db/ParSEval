@@ -40,7 +40,7 @@ from parseval.terms.names import (
     SchemaId,
 )
 from parseval.terms.decls import ColumnSpec, RelationSpec, RowShape
-from parseval.terms.sorts import PREDICATE, RowFunctionSort, ScalarSort, Sort
+from parseval.terms.sorts import PREDICATE, RowFunctionSort, ScalarSort, ScalarType, Sort
 @dataclass(frozen=True, slots=True)
 class ColumnDecl:
     """Input column before allocation of its semantic identity."""
@@ -57,6 +57,7 @@ class ColumnBinding:
     id: ColumnId
     name: Identifier
     declared_type: str
+    storage_type: ScalarType
     default_sql: str | None = None
 
 
@@ -150,6 +151,7 @@ class Catalog:
         if not columns or len({c.name.text for c in columns}) != len(columns):
             raise CatalogError("Table columns must be nonempty and have unique names")
         declared_types = []
+        storage_types = []
         for column in columns:
             if not isinstance(column.sort, ScalarSort):
                 raise CatalogError("Column sort must be ScalarSort")
@@ -158,9 +160,16 @@ class Catalog:
             declared_types.append(
                 column.declared_type or self.dialect.type_sql(column.sort.sql_type)
             )
+            storage_types.append(
+                self.dialect.storage_type(declared_types[-1], column.sort.sql_type)
+            )
         relation = self.context.allocate_id(RelationId)
         specs = tuple(
-            ColumnSpec(self.context.allocate_id(ColumnId), c.sort, c.collation)
+            ColumnSpec(
+                self.context.allocate_id(ColumnId),
+                ScalarSort(c.sort.sql_type.value_type, c.sort.nullable),
+                c.collation,
+            )
             for c in columns
         )
         schema = self.context.intern_schema(RowShape(tuple(c.sort for c in specs)))
@@ -175,8 +184,10 @@ class Catalog:
             relation,
             self.context,
             tuple(
-                ColumnBinding(spec.id, column.name, declared, column.default_sql)
-                for spec, column, declared in zip(specs, columns, declared_types)
+                ColumnBinding(spec.id, column.name, declared, storage, column.default_sql)
+                for spec, column, declared, storage in zip(
+                    specs, columns, declared_types, storage_types, strict=True,
+                )
             ),
             source_sql,
         )

@@ -1,56 +1,39 @@
-# SMT model
+# Solving for candidate rows
 
-`Solver.solve` encodes coverage obligations over weighted, finite relation support.
-A SAT result supplies a concrete instance. `bounded_unsat` applies only within the
-configured support, physical-row bounds, and the modeled scalar domains below;
-it is not a proof of unrestricted SQL infeasibility. Budget exhaustion or an
-incomplete Z3 check returns UNKNOWN.
+`solve(valuation, requirements, ...)` finds values of open inputs making one
+predicate of every requirement TRUE. Requirements are folded Terms over the
+inputs of candidate rows (see `parseval.instance.Valuation`).
 
-## Text and dates
+1. `closure` adds the integrity constraints of every row whose inputs a
+   requirement mentions, until no new input appears.
+2. Requirements are partitioned into components that share no input.
+3. Each component goes to the CSP (`csp.py`) and, if that is inconclusive or
+   outside its fragment, to Z3 (`translate.py`).
 
-- LIKE accepts literal and symbolic patterns, with `%`, `_`, and backslash
-  escaping. Both operands propagate NULL to UNKNOWN. Wildcards include newlines.
-  A trailing unescaped backslash is excluded as an invalid pattern.
-- ILIKE and LOWER use **ASCII case semantics**. Non-NULL inputs participating in
-  these operations are constrained to ASCII. This is a deliberate restricted
-  search domain, not full Unicode or locale-aware case conversion. In particular,
-  bounded-UNSAT does not rule out non-ASCII witnesses.
-- Literal LIKE/ILIKE patterns use Z3 regular expressions. Dynamic patterns and
-  LOWER use recursive string functions with no fixed length cap. Difficult string
-  synthesis can return UNKNOWN within the solver deadline.
-- `cast_string_to_date` accepts canonical `YYYY-MM-DD`, years 0001–9999, using
-  proleptic Gregorian leap-year and month-length rules. It produces the ordinal
-  used by the existing DATE representation. NULL stays NULL. Invalid dates and
-  alternate formats are excluded from non-NULL inputs; SQL error execution,
-  DateStyle-dependent formats, BC years and infinity are not modeled.
+## CSP
 
-## Modeled standard deviation
+Predicates are normalized into positive formulas over atoms: an input
+compared with a constant or another input, NULL tests, LIKE patterns, and
+*tests*, predicates over a single input checked by execution. TRUE, FALSE and
+UNKNOWN are pushed to the atoms exactly; weights over 0/1 multiplicities
+become formulas stating which weights are positive; CASE operands are lifted
+(`P(CASE c a b)` is `(c AND P(a)) OR (NOT c AND P(b))`). The search applies
+unit propagation over disjunctions, branches on the one with fewest options,
+narrows a value space per input and verifies the picked assignment by
+execution. It is bounded by its branch count, not by a clock. When every
+branch is contradictory the requirements are UNSAT, which is a proof because
+normalization is exact. Relations between several inputs other than (dis)equality,
+arithmetic over several inputs and symbolic positions go to Z3.
 
-`stddev`/`stddev_samp` and `stddev_pop` use exact real arithmetic, not a database's
-floating-point implementation. With non-NULL weighted moments
+## Z3
 
-```
-n = sum(weight)
-s = sum(weight * value)
-q = sum(weight * value * value)
-```
-
-the nonnegative result `d` satisfies:
-
-```
-sample:     d*d*n*(n-1) = n*q - s*s     (n > 1)
-population: d*d*n*n     = n*q - s*s     (n > 0)
-```
-
-Otherwise the result is NULL. DISTINCT and aggregate FILTER are applied before
-these moments. Zero-weight entries do not contribute. Irrational results remain
-algebraic reals inside Z3. Nonlinear solving can return UNKNOWN. The concrete
-validation evaluator uses numerical square roots; exact equality around irrational
-results is therefore not a database-equivalence guarantee.
-
-These operators are available to direct IR callers. SQL frontend recognition is
-a separate concern; adding SMT encodings does not imply every SQL spelling or
-dialect is lowered by the parser.
-
-Run `python -m pytest tests/smt/test_text_and_deviation.py -q` for direct encoding
-checks, and `scripts/benchmark_smt_postgres_patterns.py` for witness workloads.
+Scalars are a value and a NULL flag; predicates are TRUE and UNKNOWN flags;
+every Term has a definedness condition, and CASE requires only the selected
+arm's. DATE is a day ordinal, TIMESTAMP and TIME are microseconds; calendar
+fields use the civil-from-days algorithm with constant divisions, and
+`strftime` compared with a constant of the same format is compared field by
+field. Strings use the sequence solver; order against a constant and LIKE
+with leading/trailing `%` have direct encodings. Each check runs a few short
+restarts with different seeds and prefers candidate multiplicities of zero
+through an unsat-core loop. Generated non-NULL strings have at least
+`min_string_length` characters.

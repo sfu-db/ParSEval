@@ -26,7 +26,6 @@ class ErrorCode(str, Enum):
     CATALOG_ERROR = "catalog_error"
     DDL_IMPORT = "ddl_import"
     IR_VALIDATION = "ir_validation"
-    IR_CODEC = "ir_codec"
     UEXPR_TRANSLATION = "uexpr_translation"
     INTERNAL_ERROR = "internal_error"
 
@@ -69,20 +68,6 @@ class Diagnostic:
         if self.sql:
             pieces.append(f"sql={self.sql}")
         return "; ".join(pieces)
-
-    def to_json(self) -> dict[str, str]:
-        result = {
-            "code": self.code.value,
-            "kind": self.kind.value,
-            "phase": self.phase.value,
-            "severity": self.severity.value,
-            "message": self.message,
-        }
-        if self.node_type is not None:
-            result["node_type"] = self.node_type
-        if self.sql is not None:
-            result["sql"] = self.sql
-        return result
 
 
 class SubEqError(Exception):
@@ -129,10 +114,6 @@ class IRValidationError(_DomainError):
     code = ErrorCode.IR_VALIDATION
     kind = ErrorKind.INVALID_INPUT
     phase = ErrorPhase.INPUT
-
-
-class IRCodecError(IRValidationError):
-    code = ErrorCode.IR_CODEC
 
 
 class UExprTranslationError(_DomainError):
@@ -218,7 +199,6 @@ __all__ = [
     "ErrorCode",
     "ErrorKind",
     "ErrorPhase",
-    "IRCodecError",
     "IRValidationError",
     "SubEqError",
     "UExprTranslationError",

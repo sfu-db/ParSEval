@@ -112,8 +112,10 @@ Catalogs imported from DDL load a conservative builtin scalar core: `ABS`,
 Unrecognized and anonymous functions remain unsupported until they have an
 explicit semantic declaration.
 
-DDL parsing retains original type spelling where engine semantics require it,
-notably to distinguish SQLite `INTEGER PRIMARY KEY` from `INT PRIMARY KEY`.
+DDL parsing retains original type spelling, from which storage limits come.
+Primary-key columns are NOT NULL in every dialect: SQLite accepts NULL in a
+primary key that is not an `INTEGER` rowid alias, a bug kept for
+compatibility that generated data never relies on.
 PostgreSQL identifiers preserve quoted case. MySQL uses case-sensitive table
 names and case-insensitive column names; server-specific
 `lower_case_table_names` settings are not modeled.

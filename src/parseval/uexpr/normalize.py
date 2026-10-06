@@ -20,12 +20,16 @@ TermRewrite = Callable[[TermId, tuple[TermId, ...]], TermId]
 def simplify_uexpr(arena: TermArena, root: TermId) -> TermId:
     """Simplify a U-expression while preserving its factorized structure.
 
-    This pass performs beta reduction, row-projection simplification, and order
-    normalization. It intentionally does not distribute products over sums.
+    This pass performs beta reduction, row-projection simplification, order
+    normalization, and hoists summations out of products (``X * sum t. Y`` is
+    ``sum t. X * Y``), so the factors of a join meet in one product and
+    execution can filter and probe as soon as their rows are bound. It
+    intentionally does not distribute products over sums, and keeps every
+    squash and complement, so each decision of the query remains.
     """
 
-    return _fixed_point(arena, root, lambda term, children: _simplify_term(
-        arena, term, children
+    return _fixed_point(arena, root, lambda term, children: _hoist_sum(
+        arena, _simplify_term(arena, term, children)
     ))
 
 
@@ -142,17 +146,7 @@ def _normalize_spnf_term(arena: TermArena, term: TermId) -> TermId:
                 nodes.Mul,
                 (*remainder, arena.intern_checked(nodes.UNot, (combined,))),
             )
-        for position, factor in enumerate(node.children):
-            factor_node = arena[factor]
-            remainder = (*node.children[:position], *node.children[position + 1 :])
-            if isinstance(factor_node, nodes.Sum):
-                schema, body = _sum_body(arena, factor)
-                shifted = tuple(
-                    shift_vars(arena, item, row_delta=1) for item in remainder
-                )
-                product = arena.intern_checked(nodes.Mul, (*shifted, body))
-                return _sum(arena, schema, product)
-        return term
+        return _hoist_sum(arena, term)
     if not isinstance(node, nodes.Sum):
         return term
 
@@ -171,6 +165,21 @@ def _normalize_spnf_term(arena: TermArena, term: TermId) -> TermId:
                 inner_schema,
                 _sum(arena, schema, swap_row_vars(arena, inner_body)),
             )
+    return term
+
+
+def _hoist_sum(arena: TermArena, term: TermId) -> TermId:
+    """A product with a summation factor as a summation of the product:
+    ``X * sum t. Y`` is ``sum t. X' * Y``, X' shifted past the new binder."""
+    node = arena[term]
+    if not isinstance(node, nodes.Mul):
+        return term
+    for position, factor in enumerate(node.children):
+        if isinstance(arena[factor], nodes.Sum):
+            schema, body = _sum_body(arena, factor)
+            remainder = (*node.children[:position], *node.children[position + 1 :])
+            shifted = tuple(shift_vars(arena, item, row_delta=1) for item in remainder)
+            return _sum(arena, schema, arena.intern_checked(nodes.Mul, (*shifted, body)))
     return term
 
 

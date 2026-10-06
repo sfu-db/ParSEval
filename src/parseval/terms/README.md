@@ -14,6 +14,13 @@ constraints live in `terms.constraints`. Surface SQL identifiers live in
 `parseval.identifiers`. See [catalog construction](../parser/README.md). Declaration IDs are local
 to a context, and term IDs are local to an arena.
 
+`ScalarType` carries the value kind and decimal precision/scale. Catalog column
+bindings also use it to hold `max_length` and `integer_bits` storage limits,
+resolved by `SQLDialect` at registration. SMT schema constraints and concrete
+validation consume that internal type directly. Expression sorts use its
+`value_type`, which omits column storage limits so computed values can exceed
+the size of their inputs.
+
 ```python
 from parseval.terms import Context, IRBuilder, RowShape, TermArena, verify_uexpr
 from parseval.terms.decls import ColumnSpec, RelationSpec

@@ -2,11 +2,13 @@ import pytest
 
 from parseval.catalog import Catalog
 from parseval.errors import CatalogError
+from parseval.instance import Instance, Machine, Sequence, Valuation
 from parseval.parser.query import lower_query
 from parseval.terms import TermArena
 from parseval.terms.sorts import BagSort, ScalarSort
 from parseval.terms.sorts import (
     BOOLEAN,
+    DECIMAL,
     FLOAT,
     INTEGER,
     INTERVAL,
@@ -16,6 +18,41 @@ from parseval.terms.sorts import (
     TypeKind,
 )
 from parseval.uexpr import UExprCompiler
+
+
+@pytest.mark.parametrize("sql,limited,unlimited", [
+    ("SELECT a FROM t ORDER BY a LIMIT 1", [1], [1, 2, 3]),
+    ("SELECT a FROM t ORDER BY a DESC LIMIT 1 OFFSET 1", [2], [2, 1]),
+    ("(SELECT a FROM t ORDER BY a LIMIT 1)", [1], [1, 2, 3]),
+    ("SELECT a FROM (SELECT a FROM t ORDER BY a LIMIT 2) AS x ORDER BY a LIMIT 1",
+     [1], [1, 2]),
+    ("WITH x AS (SELECT a FROM t ORDER BY a LIMIT 2) SELECT a FROM x ORDER BY a LIMIT 1",
+     [1], [1, 2]),
+    ("SELECT a, (SELECT a FROM t ORDER BY a LIMIT 1) FROM t ORDER BY a LIMIT 1",
+     [1], [1, 2, 3]),
+])
+@pytest.mark.parametrize("ignore_root_limit", [False, True])
+def test_outer_limit_is_optional_without_changing_nested_limits_or_order(
+    sql, limited, unlimited, ignore_root_limit,
+):
+    catalog = Catalog.from_ddl("CREATE TABLE t(a INT)")
+    table, = catalog.tables()
+    instance = Instance(catalog)
+    for value in (3, 1, 2):
+        instance, _ = instance.insert(table.relation, (value,))
+    options = {"ignore_root_limit": True} if ignore_root_limit else {}
+    query = lower_query(sql, catalog, **options)
+    root = UExprCompiler(query.arena, instance.arena).compile(query.root).simplified_root
+    valuation = Valuation(instance)
+    machine = Machine(valuation)
+    relation = machine.run(root).relation
+    rows = [tuple(valuation.concrete(cell) for cell in row.cells) for row in machine.occurrences(relation)]
+    values = [row[0] for row in rows]
+    expected = unlimited if ignore_root_limit else limited
+    # A result whose root order is forgotten is a bag.
+    assert values == expected if isinstance(relation, Sequence) else sorted(values) == sorted(expected)
+    if len(query.columns) == 2:
+        assert all(row[1] == 1 for row in rows)
 
 
 def test_base_table_source_uses_catalog_column_specs():
@@ -240,10 +277,10 @@ def test_postgres_decimal_aggregates_and_arithmetic_are_typed_as_decimal():
     )
 
     amount_decimal = ScalarSort(ScalarType(TypeKind.DECIMAL, 8, 2), True)
-    cast_decimal = ScalarSort(ScalarType(TypeKind.DECIMAL, 12, 2), True)
+    # PostgreSQL averages numerics without rounding to the argument's scale.
     assert [column.sort for column in aggregates.columns] == [
         amount_decimal,
-        cast_decimal,
+        ScalarSort(DECIMAL, True),
     ]
     assert [column.sort for column in arithmetic.columns] == [
         amount_decimal,

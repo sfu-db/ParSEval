@@ -778,8 +778,6 @@ NODE_TYPES: tuple[type[TermNode], ...] = (
     AntiJoin,
 )
 
-NODE_TYPES_BY_KEY = {node_type.key: node_type for node_type in NODE_TYPES}
-
 
 SQL_EXPR_NODES: frozenset[type[TermNode]] = frozenset(
     node_type for node_type in NODE_TYPES if issubclass(node_type, SQLExpr)

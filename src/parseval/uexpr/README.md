@@ -5,5 +5,5 @@
 applies the size-preserving sum-product rules. `inspect_bag_espnf` reads the
 resulting bag structure.
 
-Concrete evaluation, witness plans, and coverage conditions live in
-`parseval.coverage`.
+Concolic execution of U-expressions lives in `parseval.instance`, and branch
+coverage in `parseval.coverage`.

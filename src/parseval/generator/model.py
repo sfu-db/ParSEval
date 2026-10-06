@@ -1,50 +1,45 @@
-"""Results produced by the coverage-directed generation engine."""
+"""Results of concolic database generation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from parseval.coverage import CoverageReport, CoverageTarget
+from parseval.coverage import Target
 from parseval.instance import Instance
-from parseval.smt import SolveResult
-
-
-class InvalidModelError(RuntimeError):
-    """The independent evaluator rejected a purported satisfying model."""
+from parseval.smt import Status
 
 
 @dataclass(frozen=True, slots=True)
-class CounterExample:
-    """A concrete database and all known targets it covers."""
+class Attempt:
+    """One solve for an uncovered outcome and how it ended."""
 
-    instance: Instance
-    covered: frozenset[str]
+    target: Target
+    label: str
+    status: Status
+    accepted: bool
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class TargetResult:
-    """The bounded solver result for one attempted target."""
+class CoverageReport:
+    """Outcomes of the final database; ``failed`` maps labels to solve statuses."""
 
-    target: CoverageTarget
-    solve: SolveResult
+    reached: tuple[str, ...]
+    covered: tuple[str, ...]
+    failed: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def ratio(self) -> float:
+        return len(self.covered) / len(self.reached) if self.reached else 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
-    """Concrete witnesses, coverage evidence, and solver diagnostics."""
-
-    counterexamples: tuple[CounterExample, ...]
+    instance: Instance | None
+    nonempty: bool
     coverage: CoverageReport
-    results: tuple[TargetResult, ...]
-
-    @property
-    def instances(self) -> tuple[Instance, ...]:
-        return tuple(case.instance for case in self.counterexamples)
+    attempts: tuple[Attempt, ...]
+    unsupported: str | None = None
 
 
-__all__ = [
-    "CounterExample",
-    "GenerationResult",
-    "InvalidModelError",
-    "TargetResult",
-]
+__all__ = ["Attempt", "CoverageReport", "GenerationResult"]

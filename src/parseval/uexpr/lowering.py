@@ -55,8 +55,6 @@ class CompiledUExpr:
     """Roots produced while translating one compact query."""
 
     simplified_root: TermId
-    translated_root: TermId
-    source_root: TermId
     sort: Sort
 
 
@@ -91,7 +89,7 @@ class UExprCompiler:
                 "Compact-to-U translation changed the root sort: "
                 f"{source_sort!r} != {target_sort!r}"
             )
-        return CompiledUExpr(simplified, translated, root, source_sort)
+        return CompiledUExpr(simplified, source_sort)
 
     def translate(self, term: TermId, environment: LoweringEnvironment) -> TermRef:
         key = (

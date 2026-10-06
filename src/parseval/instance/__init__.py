@@ -1,10 +1,23 @@
-"""Concrete database instances used by evaluation and generation."""
+"""Concolic database instances and U-expression execution over them."""
 
-from .model import Instance, Row, RowValue, ScalarValue
+from .machine import Execution, Machine, Observer, TimeLimit, UnsupportedQuery
+from .model import Instance, Slot
+from .relations import Bag, Entry, RowValue, Sequence
+from .valuation import ExecutionError, Failure, Valuation
 
 __all__ = (
+    "Bag",
+    "Entry",
+    "Execution",
+    "ExecutionError",
+    "Failure",
     "Instance",
-    "Row",
+    "Machine",
+    "Observer",
     "RowValue",
-    "ScalarValue",
+    "Sequence",
+    "Slot",
+    "TimeLimit",
+    "UnsupportedQuery",
+    "Valuation",
 )

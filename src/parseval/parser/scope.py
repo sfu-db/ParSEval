@@ -68,7 +68,6 @@ class ColumnBinder:
         parts = tuple(
             self.dialect.identifier(
                 expression.args[key],
-                is_table=True,
             ).text
             for key in ("catalog", "db", "table")
             if expression.args.get(key) is not None

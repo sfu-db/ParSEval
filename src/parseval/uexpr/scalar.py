@@ -135,22 +135,3 @@ class ScalarTranslator:
                 *(self.field(right, index) for index in range(right_width)),
             ),
         )
-
-    def split_row(
-        self,
-        row: TermRef,
-        left_schema: SchemaId,
-        right_schema: SchemaId,
-    ) -> tuple[TermRef, TermRef]:
-        left_width = len(self.source.context.schema(left_schema).fields)
-        right_width = len(self.source.context.schema(right_schema).fields)
-        return (
-            self.make_row(
-                left_schema,
-                (self.field(row, index) for index in range(left_width)),
-            ),
-            self.make_row(
-                right_schema,
-                (self.field(row, left_width + index) for index in range(right_width)),
-            ),
-        )

@@ -1,413 +1,188 @@
-"""Exercise coverage generation on the paired queries in data/postgres.csv.
+"""Time data generation for each query in data/postgres.csv.
 
-Examples:
-    python scripts/benchmark_postgres_coverage.py --limit 5
-    python scripts/benchmark_postgres_coverage.py --mode inventory --limit 5
-    python scripts/benchmark_postgres_coverage.py --dbid tpch --limit 0 --output results.jsonl
-    python scripts/benchmark_postgres_coverage.py --index 596
+Each SQL statement is one input. A row records how long generation took and,
+when requested, where the SQLite database was written.
 
-The comparison is of SQL bags. A difference is a concrete witness for NEQ;
-failure to find one does not prove EQ. Each CSV row runs in a separate process
-so the wall-clock timeout includes parsing, generation, and concrete replay.
+Example:
+    python scripts/benchmark_postgres_coverage.py --limit 0 --sqlite-dir results/postgres-sqlite
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import multiprocessing as mp
-import sqlite3
+import os
 import sys
-import tempfile
 import time
 from collections import Counter
-from datetime import date, datetime, time as time_value
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "postgres.csv"
+QUERIES = ("q1", "q2")
 
 
 def _error(error: Exception) -> dict[str, str]:
     return {"type": type(error).__name__, "message": str(error)[:500]}
 
 
-def _target_key(identity: str) -> str:
-    """Return a compact stable key for an internal coverage identity."""
-
-    return hashlib.blake2s(identity.encode(), digest_size=6).hexdigest()
-
-
-def _compile(sql: str, catalog: Any) -> tuple[Any, Any]:
-    from parseval.parser.query import lower_query
-    from parseval.terms.arena import TermArena
-    from parseval.uexpr import UExprCompiler
-
-    query = lower_query(sql, catalog)
-    arena = TermArena(query.arena.context)
-    root = UExprCompiler(query.arena, arena).compile(query.root).simplified_root
-    return arena, root
-
-
-def _rows(value: Any) -> tuple[tuple[object, ...], ...]:
-    from parseval.coverage.evaluate import BagValue
-
-    rows = value.expanded_rows() if isinstance(value, BagValue) else value.rows
-    return tuple(row.values for row in rows)
-
-
-def _same_bag(left: tuple[tuple[object, ...], ...], right: tuple[tuple[object, ...], ...]) -> bool:
-    from parseval.coverage.evaluate import row_identity_equal
-
-    if len(left) != len(right):
-        return False
-    unmatched = [tuple(_sqlite_scalar(value) for value in row) for row in right]
-    for values in left:
-        row = tuple(_sqlite_scalar(value) for value in values)
-        match = next(
-            (index for index, other in enumerate(unmatched) if row_identity_equal(row, other)),
-            None,
-        )
-        if match is None:
-            return False
-        unmatched.pop(match)
-    return True
-
-
-def _sqlite_scalar(value: object) -> object:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (date, datetime, time_value)):
-        return value.isoformat()
-    if value is None or isinstance(value, (int, float, str, bytes)):
-        return value
-    return str(value)
-
-
-def _sqlite_query(sql: str, dialect: str) -> str:
-    """Transpile a corpus query and flatten PostgreSQL schema qualifiers."""
-
-    from sqlglot import exp, parse_one
-
-    expression = parse_one(sql, read=dialect)
-
-    def rewrite(node: exp.Expression) -> exp.Expression:
-        if isinstance(node, (exp.Add, exp.Sub)) and isinstance(
-            node.expression, exp.Interval
-        ):
-            interval = node.expression
-            amount = interval.this.name
-            unit = interval.args["unit"].name.lower()
-            sign = "+" if isinstance(node, exp.Add) else "-"
-            return exp.Anonymous(
-                this="DATE",
-                expressions=(
-                    node.this.copy(),
-                    exp.Literal.string(f"{sign}{amount} {unit}"),
-                ),
-            )
-        return node
-
-    expression = expression.transform(rewrite)
-    for table in expression.find_all(exp.Table):
-        table.set("catalog", None)
-        table.set("db", None)
-    return expression.sql(dialect="sqlite")
-
-
-def _sqlite_type(kind: object) -> str:
-    name = getattr(kind, "value", str(kind))
-    if name in {"boolean", "integer"}:
-        return "INTEGER"
-    if name in {"float", "decimal"}:
-        return "REAL"
-    if name == "opaque":
-        return "BLOB"
-    return "TEXT"
-
-
-def _sqlite_replay(
-    catalog: Any,
-    instance: Any,
-    queries: dict[str, str],
-) -> dict[str, tuple[tuple[object, ...], ...]]:
-    """Materialize one generated instance in an isolated SQLite database."""
-
-    names: set[str] = set()
-    with tempfile.NamedTemporaryFile(suffix=".sqlite") as database:
-        connection = sqlite3.connect(database.name)
-        try:
-            for table in catalog.tables():
-                table_name = table.name.parts[-1].text
-                if table_name.casefold() in names:
-                    raise ValueError(
-                        f"SQLite replay cannot flatten duplicate table name {table_name!r}"
-                    )
-                names.add(table_name.casefold())
-                columns = []
-                for binding in table.columns:
-                    specification = table.column_spec(binding.id)
-                    column_name = binding.name.text.replace('"', '""')
-                    columns.append(
-                        f'"{column_name}" {_sqlite_type(specification.sort.sql_type.kind)}'
-                    )
-                quoted_table = table_name.replace('"', '""')
-                connection.execute(
-                    f'CREATE TABLE "{quoted_table}" ({", ".join(columns)})'
-                )
-                rows = instance.rows(table.relation)
-                if rows:
-                    placeholders = ", ".join("?" for _ in table.columns)
-                    connection.executemany(
-                        f'INSERT INTO "{quoted_table}" VALUES ({placeholders})',
-                        tuple(
-                            tuple(_sqlite_scalar(value) for value in row.values)
-                            for row in rows
-                        ),
-                    )
-            connection.commit()
-            return {
-                name: tuple(connection.execute(sql).fetchall())
-                for name, sql in queries.items()
-            }
-        finally:
-            connection.close()
-
-
-def run_case(
+def run_query(
     row: dict[str, str],
+    query_name: str,
     solver_timeout_ms: int,
-    max_attempts: int | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
-    mode: str = "generate",
+    sqlite_dir: Path | None = None,
+    postgres_dsn: str | None = None,
+    time_limit_s: float | None = None,
 ) -> dict[str, Any]:
-    from parseval.catalog import Catalog
-    from parseval.coverage import explore_paths, unsupported_scopes
-    from parseval.generator import GenerationConfig, generate
-    from parseval.instance import Instance
-    from parseval.coverage.evaluate import UExprEvaluator
+    """Generate and replay one database for an original dataset SQL statement."""
 
-    result: dict[str, Any] = {
-        "index": row["index"],
-        "dbid": row["dbid"],
-        "ground_truth": row["ground_truth"],
-        "queries": {},
-        "comparison": {
-            "status": "not_run",
-            "tested_instances": 0,
-            "bag_difference_found": False,
-        },
-        "sqlite_replay": {
-            "status": "not_run",
-            "tested_instances": 0,
-            "query_executions": 0,
-            "semantic_mismatches": 0,
-            "bag_difference_found": False,
-        },
-    }
+    from experiments.sqlite import write_sqlite
+    from parseval.catalog import Catalog
+    from parseval.generator import GenerationConfig, generate
+
     started = time.monotonic()
+    result: dict[str, Any] = {
+        "dbid": row["dbid"],
+        "index": row["index"],
+        "query": query_name,
+    }
     try:
         catalog = Catalog.from_ddl(row["schema_ddl"], dialect=row["dialect"])
-    except Exception as error:
-        result["catalog_error"] = _error(error)
+        if progress:
+            progress("generate", {"query": query_name})
+
+        def on_attempt(attempt: Any) -> None:
+            if progress:
+                progress("solve", {"query": query_name, "target": attempt.label})
+
+        def save(instance: Any) -> None:
+            # Each accepted version replaces the previous one, so a run that
+            # hits the case timeout still leaves its latest database.
+            if sqlite_dir is None:
+                return
+            relative = Path(row["dbid"]) / row["index"] / query_name / "0.sqlite"
+            write_sqlite(instance, sqlite_dir / relative, overwrite=True)
+            result["sqlite"] = [relative.as_posix()]
+
+        generated = generate(
+            row[query_name],
+            catalog,
+            config=GenerationConfig(
+                timeout_ms=solver_timeout_ms,
+                time_limit_s=time_limit_s,
+                # Benchmarks set PARSEVAL_NO_SPECULATION to measure generation without it.
+                speculate=not os.environ.get("PARSEVAL_NO_SPECULATION"),
+            ),
+            on_attempt=on_attempt if progress else None,
+            on_instance=save,
+        )
+        instances = () if generated.instance is None else (generated.instance,)
         result["elapsed_s"] = round(time.monotonic() - started, 3)
-        return result
-    if progress:
-        progress("catalog", {})
-
-    compiled: dict[str, tuple[Any, Any]] = {}
-    instances = [Instance.empty(catalog)]
-    for name in ("q1", "q2"):
-        query_result: dict[str, Any] = {}
-        result["queries"][name] = query_result
-        query_started = time.monotonic()
-        try:
-            if progress:
-                progress(f"{name}.compile", {"query": name})
-            compiled[name] = _compile(row[name], catalog)
-            if progress:
-                progress(f"{name}.initial_explore", {"query": name})
-            arena, root = compiled[name]
-            initial_observed, initial_neighbors = explore_paths(
-                arena, root, Instance.empty(catalog)
-            )
-            query_result["initial_observed"] = len(initial_observed)
-            query_result["initial_neighbors"] = len(initial_neighbors)
-            query_result["unsupported_scopes"] = list(unsupported_scopes(arena, root))
-            if mode == "inventory":
-                query_result["status"] = "inventory_only"
-            else:
-                if progress:
-                    progress(f"{name}.generate", {"query": name})
-
-                def on_generation_progress(
-                    phase: str, target: Any, attempt: int
-                ) -> None:
-                    details = {
-                        "query": name,
-                        "attempt": attempt,
-                        "target": _target_key(target.id),
-                        "label": target.label,
-                    }
-                    if progress:
-                        progress(f"{name}.{phase}", details)
-
-                generated = generate(
-                    row[name],
-                    catalog,
-                    config=GenerationConfig(
-                        timeout_ms=solver_timeout_ms,
-                        max_attempts=max_attempts,
-                    ),
-                    on_progress=on_generation_progress if progress else None,
-                )
-                counts = Counter(item.solve.status.value for item in generated.results)
-                query_result.update(
-                    targets=len(generated.coverage.targets),
-                    covered=len(generated.coverage.covered),
-                    coverage_ratio=round(generated.coverage.ratio, 4),
-                    fully_covered=generated.coverage.fully_covered,
-                    bounded_unsat=len(generated.coverage.bounded_unsat),
-                    unknown=len(generated.coverage.unknown),
-                    unsupported=len(generated.coverage.unsupported),
-                    not_attempted=len(generated.coverage.not_attempted),
-                    unsupported_scopes=list(generated.coverage.unsupported_scopes),
-                    solver_statuses=dict(counts),
-                    generated_instances=len(generated.counterexamples),
-                )
-                instances.extend(case.instance for case in generated.counterexamples)
-        except Exception as error:
-            query_result["error"] = _error(error)
-        query_result["elapsed_s"] = round(time.monotonic() - query_started, 3)
-        if progress:
-            progress(f"{name}.done", {"query": name})
-
-    if len(compiled) == 2 and mode == "generate":
-        if progress:
-            progress("comparison", {})
-        result["comparison"]["status"] = "inconclusive"
-        for instance in instances:
-            try:
-                left_arena, left_root = compiled["q1"]
-                right_arena, right_root = compiled["q2"]
-                left = _rows(UExprEvaluator(left_arena, instance).evaluate_query(left_root))
-                right = _rows(UExprEvaluator(right_arena, instance).evaluate_query(right_root))
-            except Exception as error:
-                result["comparison"].setdefault("evaluation_error", _error(error))
-                continue
-            result["comparison"]["tested_instances"] += 1
-            if not _same_bag(left, right):
-                result["comparison"].update(
-                    status="difference_found",
-                    bag_difference_found=True,
-                    witness_rows={
-                        relation.value: len(instance.rows(relation))
-                        for relation, _ in catalog.context.relations()
-                        if instance.rows(relation)
-                    },
-                    q1_result_rows=len(left),
-                    q2_result_rows=len(right),
-                )
-                break
-        if (
-            not result["comparison"]["bag_difference_found"]
-            and result["comparison"]["tested_instances"]
-            and "evaluation_error" not in result["comparison"]
-            and all("error" not in query for query in result["queries"].values())
-        ):
-            result["comparison"]["status"] = "no_difference_found"
-
-        sqlite_result = result["sqlite_replay"]
-        if progress:
-            progress("sqlite_replay", {})
-        try:
-            translated = {
-                name: _sqlite_query(row[name], row["dialect"])
-                for name in ("q1", "q2")
-            }
-        except Exception as error:
-            sqlite_result.update(status="transpile_error", error=_error(error))
-        else:
-            sqlite_result["status"] = "completed"
-            for instance in instances:
-                try:
-                    concrete = _sqlite_replay(catalog, instance, translated)
-                except Exception as error:
-                    sqlite_result.update(status="execution_error", error=_error(error))
-                    break
-                sqlite_result["tested_instances"] += 1
-                sqlite_result["query_executions"] += 2
-                replay_failed = False
-                for name in ("q1", "q2"):
-                    try:
-                        arena, root = compiled[name]
-                        expected = _rows(
-                            UExprEvaluator(arena, instance).evaluate_query(root)
-                        )
-                    except Exception as error:
-                        sqlite_result.update(
-                            status="semantic_replay_error",
-                            error=_error(error),
-                        )
-                        replay_failed = True
-                        break
-                    if not _same_bag(expected, concrete[name]):
-                        sqlite_result["semantic_mismatches"] += 1
-                if replay_failed:
-                    break
-                if not _same_bag(concrete["q1"], concrete["q2"]):
-                    sqlite_result["bag_difference_found"] = True
-                    break
-
-    result["elapsed_s"] = round(time.monotonic() - started, 3)
+        result["instances"] = int(generated.instance is not None)
+        result["populated"] = bool(generated.instance and generated.instance.row_count)
+        from experiments.outcomes import corpus_outcomes
+        result["query_outcomes"] = (
+            corpus_outcomes(row[query_name], catalog, instances)
+            if instances
+            else []
+        )
+        result["productive"] = any(outcome["output_rows"] > 0
+                                   for outcome in result["query_outcomes"])
+        result["coverage"] = {
+            "reached": len(generated.coverage.reached),
+            "covered": len(generated.coverage.covered),
+            "failed": generated.coverage.failed,
+        }
+        result["solves"] = [
+            {"target": attempt.label, "status": attempt.status.value,
+             "accepted": attempt.accepted, "reason": attempt.reason}
+            for attempt in generated.attempts
+        ]
+        result["unsupported_generation"] = generated.unsupported is not None
+        if generated.unsupported is not None:
+            result["unsupported"] = generated.unsupported
+        result["validation"] = "concrete_ir"
+        if postgres_dsn is not None:
+            from experiments.postgres import validate_corpus
+            result["postgres"] = validate_corpus(row[query_name], row["schema_ddl"],
+                                                 catalog, instances, postgres_dsn)
+            result["validation"] = "postgres"
+    except Exception as error:
+        result["elapsed_s"] = round(time.monotonic() - started, 3)
+        result["instances"] = 0
+        result["populated"] = False
+        result["productive"] = False
+        result["error"] = _error(error)
     return result
 
 
 def _worker(
-    connection: Any, row: dict[str, str], solver_timeout_ms: int,
-    max_attempts: int | None, mode: str,
+    connection: Any,
+    row: dict[str, str],
+    query_name: str,
+    solver_timeout_ms: int,
+    sqlite_dir: str | None,
+    postgres_dsn: str | None,
+    time_limit_s: float,
 ) -> None:
     try:
         def progress(stage: str, details: dict[str, Any]) -> None:
             connection.send({"phase": stage, "details": details})
 
         connection.send({
-            "result": run_case(
-                row, solver_timeout_ms, max_attempts, progress, mode
+            "result": run_query(
+                row,
+                query_name,
+                solver_timeout_ms,
+                progress,
+                None if sqlite_dir is None else Path(sqlite_dir),
+                postgres_dsn,
+                time_limit_s,
             )
         })
     except BaseException as error:
         connection.send({"result": {
-            "index": row.get("index"),
             "dbid": row.get("dbid"),
-            "ground_truth": row.get("ground_truth"),
-            "worker_error": {"type": type(error).__name__, "message": str(error)[:500]},
+            "index": row.get("index"),
+            "query": query_name,
+            "instances": 0,
+            "error": {"type": type(error).__name__, "message": str(error)[:500]},
         }})
     finally:
         connection.close()
 
 
 def run_with_timeout(
-    row: dict[str, str], solver_timeout_ms: int, case_timeout_s: float,
-    max_attempts: int | None = None, mode: str = "generate",
+    row: dict[str, str],
+    query_name: str,
+    solver_timeout_ms: int,
+    case_timeout_s: float,
+    sqlite_dir: Path | None = None,
+    postgres_dsn: str | None = None,
 ) -> dict[str, Any]:
     context = mp.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     process = context.Process(
         target=_worker,
-        args=(sender, row, solver_timeout_ms, max_attempts, mode),
+        args=(
+            sender,
+            row,
+            query_name,
+            solver_timeout_ms,
+            None if sqlite_dir is None else str(sqlite_dir),
+            postgres_dsn,
+            # Generation returns its best database in time for outcomes and replay.
+            case_timeout_s * 0.75,
+        ),
     )
     process.start()
     sender.close()
     deadline = time.monotonic() + case_timeout_s
     phase = "startup"
-    details: dict[str, Any] = {}
     try:
         while receiver.poll(max(0, deadline - time.monotonic())):
             try:
@@ -417,19 +192,29 @@ def run_with_timeout(
             if "result" in message:
                 return message["result"]
             phase = message["phase"]
-            details = message["details"]
+        process.join(timeout=0.05)
         if process.is_alive():
-            return {
-                "index": row["index"], "dbid": row["dbid"],
-                "ground_truth": row["ground_truth"],
+            record = {
+                "dbid": row["dbid"],
+                "index": row["index"],
+                "query": query_name,
                 "status": "timeout",
                 "phase": phase,
                 "elapsed_s": round(case_timeout_s, 3),
-                **details,
+                "instances": 0,
             }
+            if sqlite_dir is not None:
+                relative = Path(row["dbid"]) / row["index"] / query_name
+                saved = sorted((sqlite_dir / relative).glob("*.sqlite"))
+                record["sqlite"] = [str(path.relative_to(sqlite_dir)) for path in saved]
+                record["instances"] = len(saved)
+            return record
         return {
-            "index": row["index"], "dbid": row["dbid"],
-            "ground_truth": row["ground_truth"], "worker_exit_code": process.exitcode,
+            "dbid": row["dbid"],
+            "index": row["index"],
+            "query": query_name,
+            "instances": 0,
+            "error": {"type": "WorkerExit", "message": str(process.exitcode)},
         }
     finally:
         if process.is_alive():
@@ -441,31 +226,51 @@ def run_with_timeout(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DATA)
-    parser.add_argument("--output", type=Path, help="Write per-case JSON Lines here (default: stdout)")
-    parser.add_argument(
-        "--mode", choices=("generate", "inventory"), default="generate",
-        help="Generate instances or only parse, compile, and inspect initial coverage",
-    )
+    parser.add_argument("--output", type=Path, help="Write one JSON object per query")
     parser.add_argument("--dbid", action="append", help="Select one or more database IDs")
     parser.add_argument("--index", action="append", help="Select one or more CSV index values")
-    parser.add_argument("--limit", type=int, default=10, help="Maximum selected cases; 0 runs all (default: 10)")
-    parser.add_argument("--solver-timeout-ms", type=int, default=3000)
+    parser.add_argument("--selection", type=Path,
+                        help="JSONL records selecting exact dbid/index/query triples")
     parser.add_argument(
-        "--max-attempts",
+        "--limit",
         type=int,
-        default=12,
-        help="Maximum coverage targets solved per query; 0 means unlimited",
+        default=10,
+        help="Maximum queries; 0 runs every statement in the CSV (default: 10)",
     )
-    parser.add_argument("--case-timeout-s", type=float, default=60)
+    parser.add_argument(
+        "--solver-timeout-ms",
+        type=int,
+        default=5_000,
+        help="Z3 budget for one attempt (default: 5000)",
+    )
+    parser.add_argument(
+        "--case-timeout-s",
+        type=float,
+        default=120,
+        help="Wall-clock limit for one query (default: 120)",
+    )
+    parser.add_argument(
+        "--sqlite-dir",
+        type=Path,
+        help="Write one SQLite database per generated instance under this directory",
+    )
+    parser.add_argument("--postgres-dsn", help="Replay the final database against this PostgreSQL server")
     args = parser.parse_args(argv)
     if (
         args.limit < 0
-        or args.max_attempts < 0
         or args.solver_timeout_ms <= 0
         or args.case_timeout_s <= 0
     ):
         parser.error("limit must be nonnegative; timeouts must be positive")
-    max_attempts = args.max_attempts or None
+    selection = None
+    if args.selection:
+        with args.selection.open(encoding="utf-8") as handle:
+            selection = {
+                (record["dbid"], str(record["index"]), record["query"])
+                for line in handle if line.strip()
+                for record in (json.loads(line),)
+                if all(key in record for key in ("dbid", "index", "query"))
+            }
 
     output = sys.stdout
     if args.output:
@@ -479,65 +284,41 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if args.index and row["index"] not in args.index:
                     continue
-                if args.limit and summary["cases"] >= args.limit:
-                    break
-                case = run_with_timeout(
-                    row,
-                    args.solver_timeout_ms,
-                    args.case_timeout_s,
-                    max_attempts,
-                    args.mode,
-                )
-                case["settings"] = {
-                    "mode": args.mode,
-                    "solver_timeout_ms": args.solver_timeout_ms,
-                    "case_timeout_s": args.case_timeout_s,
-                    "max_attempts": max_attempts,
-                }
-                summary["cases"] += 1
-                summary[f"{case['ground_truth'].lower()}_cases"] += 1
-                if case.get("status") == "timeout":
-                    summary["timeouts"] += 1
-                elif "catalog_error" in case or "worker_error" in case or "worker_exit_code" in case:
-                    summary["case_errors"] += 1
-                else:
-                    for query in case["queries"].values():
-                        if "error" in query:
-                            summary["query_errors"] += 1
-                        elif query.get("status") == "inventory_only":
-                            summary["inventoried_queries"] += 1
-                            summary["initial_neighbors"] += query["initial_neighbors"]
-                        else:
-                            summary["generated_queries"] += 1
-                            summary["targets"] += query["targets"]
-                            summary["covered"] += query["covered"]
-                            summary["bounded_unsat"] += query["bounded_unsat"]
-                            summary["unknown"] += query["unknown"]
-                            summary["unsupported"] += query["unsupported"]
-                            summary["not_attempted"] += query["not_attempted"]
-                    if case["comparison"]["status"] in {
-                        "no_difference_found", "difference_found"
-                    }:
-                        summary["compared_cases"] += 1
-                    elif case["comparison"]["status"] == "inconclusive":
-                        summary["inconclusive_comparisons"] += 1
-                    if case["comparison"]["bag_difference_found"]:
-                        summary["bag_differences"] += 1
-                        if case["ground_truth"] == "EQ":
-                            summary["eq_disagreements"] += 1
-                        elif case["ground_truth"] == "NEQ":
-                            summary["neq_witnesses"] += 1
-                    replay = case.get("sqlite_replay", {})
-                    summary[f"sqlite_{replay.get('status', 'missing')}"] += 1
-                    summary["sqlite_instances"] += replay.get("tested_instances", 0)
-                    summary["sqlite_query_executions"] += replay.get("query_executions", 0)
-                    summary["sqlite_semantic_mismatches"] += replay.get(
-                        "semantic_mismatches", 0
+                for query_name in QUERIES:
+                    if selection is not None and (row["dbid"], row["index"], query_name) not in selection:
+                        continue
+                    if args.limit and summary["queries"] >= args.limit:
+                        break
+                    record = run_with_timeout(
+                        row,
+                        query_name,
+                        args.solver_timeout_ms,
+                        args.case_timeout_s,
+                        args.sqlite_dir,
+                        args.postgres_dsn,
                     )
-                print(json.dumps(case, default=str), file=output, flush=True)
+                    summary["queries"] += 1
+                    summary["elapsed_s"] += record.get("elapsed_s", 0)
+                    if record.get("status") == "timeout":
+                        summary["timeouts"] += 1
+                    elif "error" in record:
+                        summary["errors"] += 1
+                    elif record.get("unsupported_generation"):
+                        summary["unsupported"] += 1
+                    elif record.get("productive"):
+                        summary["productive"] += 1
+                    elif record.get("populated"):
+                        summary["populated_no_output_change"] += 1
+                    else:
+                        summary["empty_only"] += 1
+                    print(json.dumps(record, default=str), file=output, flush=True)
+                else:
+                    continue
+                break
     finally:
         if args.output:
             output.close()
+    summary["elapsed_s"] = round(summary["elapsed_s"], 3)
     print(json.dumps({"summary": dict(summary)}), file=sys.stderr)
     return 0
 

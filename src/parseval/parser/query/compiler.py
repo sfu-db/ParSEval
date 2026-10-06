@@ -9,10 +9,11 @@ from sqlglot import exp
 
 from parseval.errors import CatalogError, DDLImportError, ErrorCode, fail
 from parseval.terms.context import AggregateKind, AggregateSpec
-from parseval.identifiers import Identifier, name_key
+from parseval.identifiers import Identifier, NameKey, name_key
 from parseval.terms.names import CollationId
 from parseval.terms.sorts import (
     BagSort,
+    DECIMAL,
     ScalarSort,
     SeqSort,
     FLOAT,
@@ -222,7 +223,7 @@ class QueryCompiler:
             column_name = self.context.dialect.identifier(expression.this).text
             table_name = (
                 self.context.dialect.identifier(
-                    expression.args["table"], is_table=True
+                    expression.args["table"]
                 ).text
                 if expression.args.get("table") is not None
                 else None
@@ -285,7 +286,7 @@ class QueryCompiler:
         wanted_name = self.context.dialect.identifier(expression.this).text
         wanted_table = (
             self.context.dialect.identifier(
-                expression.args["table"], is_table=True
+                expression.args["table"]
             ).text
             if expression.args.get("table") is not None
             else None
@@ -300,11 +301,11 @@ class QueryCompiler:
             alias_node = table.args.get("alias")
             alias_name = (
                 self.context.dialect.identifier(
-                    alias_node.this, is_table=True
+                    alias_node.this
                 ).text
                 if isinstance(alias_node, exp.TableAlias)
                 else self.context.dialect.identifier(
-                    table.this, is_table=True
+                    table.this
                 ).text
             )
             if wanted_table is not None and alias_name != wanted_table:
@@ -338,7 +339,7 @@ class QueryCompiler:
             if not isinstance(alias_node, exp.TableAlias):
                 continue
             alias_name = self.context.dialect.identifier(
-                alias_node.this, is_table=True
+                alias_node.this
             ).text
             if wanted_table is not None and alias_name != wanted_table:
                 continue
@@ -654,7 +655,6 @@ class QueryCompiler:
         )
         alias = self.context.dialect.identifier(
             cte.args["alias"].this,
-            is_table=True,
         )
         body_result: list[Relation] = []
 
@@ -744,7 +744,9 @@ class QueryCompiler:
         right = self._coerce_relation(right, target_fields, expression)
         left_term = self.as_bag(left)
         right_term = self.as_bag(right)
-        if isinstance(expression, exp.Union):
+        # In the pinned SQLGlot AST, Intersect and Except subclass Union.
+        # Dispatch on the actual set operator, not the shared AST base class.
+        if type(expression) is exp.Union:
             term = self.context.builder.union_all(left_term, right_term)
             if expression.args.get("distinct") is not False:
                 term = self.context.builder.distinct(term)
@@ -1194,7 +1196,6 @@ class QueryCompiler:
             return relation
         alias = self.context.dialect.identifier(
             alias_node.this,
-            is_table=True,
         )
         qualifiers = frozenset({(alias.text,)})
         aliases = tuple(alias_node.args.get("columns") or ())
@@ -1968,8 +1969,10 @@ class QueryCompiler:
             )
 
         if isinstance(expression, exp.Avg):
+            # The average of decimals keeps fractional digits beyond the
+            # argument's scale (PostgreSQL numeric, MySQL scale + 4).
             output_type = (
-                input_sort.sql_type
+                DECIMAL
                 if input_sort.sql_type.kind is TypeKind.DECIMAL
                 and self.context.dialect.name != "sqlite"
                 else FLOAT
@@ -2475,8 +2478,12 @@ class QueryResult:
     columns: tuple[QueryColumn, ...]
 
 
-def lower_query(sql: str, catalog, *, arena=None) -> QueryResult:
-    """Parse SQL with SQLGlot and lower the qualified query into checked terms."""
+def lower_query(sql: str, catalog, *, arena=None, ignore_root_limit: bool = False) -> QueryResult:
+    """Parse SQL with SQLGlot and lower the qualified query into checked terms.
+
+    Generation may ignore the outermost LIMIT to grow multiple output rows.
+    Nested query limits, ordering, and offsets retain their normal semantics.
+    """
     if arena is None:
         arena = TermArena(catalog.context)
     if not isinstance(arena, TermArena):
@@ -2500,6 +2507,13 @@ def lower_query(sql: str, catalog, *, arena=None) -> QueryResult:
             "Unsupported query root",
             node=tree,
         )
+
+    if ignore_root_limit:
+        outer = tree
+        while isinstance(outer, exp.Subquery) and outer.args.get("limit") is None:
+            outer = outer.this
+        if isinstance(outer.args.get("limit"), exp.Limit):
+            outer.set("limit", None)
 
     tree = normalize_query_syntax(tree, dialect=catalog.dialect.name)
     for select in tree.find_all(exp.Select):

@@ -179,6 +179,11 @@ class ScalarCompiler:
         if isinstance(expression, exp.Literal):
             if expected is not None:
                 sql_type = expected.sql_type
+            elif self.context.dialect.name == "postgres" and expression.is_number:
+                # PostgreSQL's unadorned decimal/exponent literals are NUMERIC.
+                # SQLGlot's generic FLOAT annotation is syntax metadata, not
+                # the SQL execution type; retaining it loses exact boundaries.
+                sql_type = INTEGER if expression.is_int else DECIMAL
             elif expression.type is None:
                 sql_type = (
                     STRING
@@ -522,6 +527,8 @@ class ScalarCompiler:
         left_kind = left.sql_type.kind
         right_kind = right.sql_type.kind
         nullable = left.nullable or right.nullable
+        if operator in {"div", "mod"} and self.context.dialect.division_by_zero_is_null:
+            nullable = True
         temporal = {TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP}
         numeric = {TypeKind.INTEGER, TypeKind.FLOAT, TypeKind.DECIMAL}
 

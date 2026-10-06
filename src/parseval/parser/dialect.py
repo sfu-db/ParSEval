@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from sqlglot import exp
@@ -37,7 +38,6 @@ class SQLDialect:
         value: str | Identifier | exp.Identifier,
         *,
         column: bool = False,
-        is_table: bool = False,
     ) -> Identifier:
         if isinstance(value, Identifier):
             node = exp.Identifier(this=value.text, quoted=value.quoted)
@@ -52,6 +52,17 @@ class SQLDialect:
 
     def sql(self, expression: exp.Expression) -> str:
         return expression.sql(dialect=self.name)
+
+    @property
+    def division_by_zero_is_null(self) -> bool:
+        """SQLite and MySQL return NULL for division by zero; others raise."""
+        return self.name in ("sqlite", "mysql")
+
+    @property
+    def lenient_conversions(self) -> bool:
+        """SQLite and MySQL convert any text to a number and accept negative
+        substring lengths instead of raising."""
+        return self.name in ("sqlite", "mysql")
 
     def common_scalar_sort(
         self,
@@ -163,10 +174,8 @@ class SQLDialect:
             )
         if sql_type.kind is TypeKind.INTEGER:
             return int(Decimal(text))
-        if sql_type.kind is TypeKind.FLOAT:
+        if sql_type.kind in (TypeKind.FLOAT, TypeKind.DECIMAL):
             return float(text)
-        if sql_type.kind is TypeKind.DECIMAL:
-            return Decimal(text)
         return text
 
     def parse_string_cast_literal(self, value: str, sql_type: ScalarType):
@@ -174,10 +183,8 @@ class SQLDialect:
             return value
         if sql_type.kind is TypeKind.INTEGER:
             return int(value)
-        if sql_type.kind is TypeKind.FLOAT:
+        if sql_type.kind in (TypeKind.FLOAT, TypeKind.DECIMAL):
             return float(value)
-        if sql_type.kind is TypeKind.DECIMAL:
-            return Decimal(value)
         if sql_type.kind in (TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP):
             return parse_iso_temporal_value(value, sql_type)
         if sql_type.kind is TypeKind.INTERVAL:
@@ -234,9 +241,10 @@ class SQLDialect:
         return tuple(values)
 
     def nulls_first(self, *, descending: bool) -> bool:
+        # SQLite and MySQL order NULL below every value, PostgreSQL above.
         if self.name in ("sqlite", "mysql"):
-            return descending
-        return not descending
+            return not descending
+        return descending
 
     def qualified_name(self, value: NameInput | exp.Table) -> QualifiedName:
         if isinstance(value, str):
@@ -309,12 +317,43 @@ class SQLDialect:
             return ScalarType(TypeKind.OPAQUE)
         raise DDLImportError(f"Unsupported SQL type: {datatype.sql(dialect=self.name)}")
 
+    def storage_type(self, declaration: str, sql_type: ScalarType) -> ScalarType:
+        """Refine a column's internal type with dialect-specific storage limits."""
+        datatype = exp.DataType.build(declaration, dialect=self.name)
+        t = exp.DataType.Type
+        length = sql_type.max_length
+        bits = sql_type.integer_bits
+        if sql_type.kind is TypeKind.STRING and datatype.is_type(*exp.DataType.TEXT_TYPES):
+            if datatype.expressions:
+                try:
+                    length = int(datatype.expressions[0].this.this)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise DDLImportError("String length must be an integer") from exc
+            elif (
+                self.name == "postgres" and datatype.is_type(t.CHAR)
+                or self.name == "mysql" and datatype.is_type(t.CHAR, t.NCHAR)
+            ):
+                length = 1
+        if sql_type.kind is TypeKind.INTEGER:
+            bits = {t.SMALLINT: 16, t.INT: 32, t.BIGINT: 64}.get(datatype.this, bits)
+        if self.name == "sqlite":
+            length = bits = None
+        return replace(sql_type, max_length=length, integer_bits=bits)
+
     def sql_type(self, datatype: exp.DataType | None) -> ScalarType:
         if datatype is None:
             raise DDLImportError("SQLGlot could not infer an expression type")
         return self.scalar_type(datatype)
 
     def type_sql(self, datatype: ScalarType) -> str:
+        if datatype.kind is TypeKind.STRING and datatype.max_length is not None:
+            return f"VARCHAR({datatype.max_length})"
+        if datatype.kind is TypeKind.INTEGER and datatype.integer_bits is not None:
+            names = {16: "SMALLINT", 32: "INT", 64: "BIGINT"}
+            try:
+                return names[datatype.integer_bits]
+            except KeyError as exc:
+                raise CatalogError(f"No SQL representation for {datatype!r}") from exc
         if datatype.kind is TypeKind.DECIMAL:
             if datatype.precision is None:
                 return "DECIMAL"
@@ -337,8 +376,8 @@ class SQLDialect:
             raise CatalogError(f"No SQL representation for {datatype!r}") from exc
 
     def parse_ddl(self, sql: str) -> list[exp.Expression | None]:
-        # Retain source spelling because SQLite distinguishes INTEGER PRIMARY KEY
-        # from other integer declarations when determining rowid/null semantics.
+        # Retain source spelling: storage limits (lengths, integer widths) and
+        # catalog metadata come from the declared type.
         class SourceTypeParser(self.sqlglot.parser_class):
             def _parse_types(
                 self, check_func=False, schema=False, allow_identifiers=True

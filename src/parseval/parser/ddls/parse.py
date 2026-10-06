@@ -169,6 +169,10 @@ def _collect(catalog: Catalog, node: exp.Expression) -> _Table:
                     collation = catalog.register_collation(kind.this.name)
                     continue
                 table.constraints.append(_Constraint(kind, constraint_name, (name,)))
+            if item.kind.this is exp.DataType.Type.ENUM:
+                # An ENUM column holds strings from its list: a CHECK membership.
+                member = exp.In(this=exp.column(item.this.copy()), expressions=[value.copy() for value in item.kind.expressions])
+                table.constraints.append(_Constraint(exp.CheckColumnConstraint(this=member), None, (name,)))
             table.columns.append(
                 ColumnDecl(
                     name,
@@ -193,7 +197,6 @@ def _collect(catalog: Catalog, node: exp.Expression) -> _Table:
 
 
 def _apply_primary_key_nullability(catalog: Catalog, table: _Table) -> None:
-    dialect = catalog.dialect
     keys = [
         c
         for c in table.constraints
@@ -202,20 +205,12 @@ def _apply_primary_key_nullability(catalog: Catalog, table: _Table) -> None:
     if len(keys) > 1:
         raise DDLImportError("A table may have only one primary key")
     if keys:
-        primary = keys[0]
-        key_names = {c.text for c in primary.columns}
+        # Primary keys are NOT NULL. SQLite accepts NULL in a primary key that
+        # is not an INTEGER rowid alias, a bug it keeps for compatibility;
+        # generated data never relies on it, so it loads into any backend.
+        key_names = {c.text for c in keys[0].columns}
         table.columns = [
-            replace(c, sort=replace(c.sort, nullable=False))
-            if c.name.text in key_names
-            and (
-                dialect.name != "sqlite"
-                or (
-                    len(key_names) == 1
-                    and c.declared_type.upper() == "INTEGER"
-                    and not primary.node.args.get("desc")
-                )
-            )
-            else c
+            replace(c, sort=replace(c.sort, nullable=False)) if c.name.text in key_names else c
             for c in table.columns
         ]
 

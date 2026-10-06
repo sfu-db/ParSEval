@@ -90,21 +90,3 @@ class CallSiteId:
 
     def __post_init__(self) -> None:
         _validate_nonnegative_int(self.value, "CallSiteId")
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class DefinitionId:
-    value: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value:
-            raise ValueError("DefinitionId must be a nonempty string")
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class TheoremId:
-    value: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value:
-            raise ValueError("TheoremId must be a nonempty string")
