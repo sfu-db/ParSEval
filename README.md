@@ -149,3 +149,31 @@ Disprove LeetCode (MySQL)), and select the latest successful run. You can
 download the generated result and metric files from the run's Artifacts
 section. The current false positives in the results come from aggregates with
 DISTINCT (such as `COUNT(DISTINCT x)`) and will be fixed soon.
+
+## Citation
+
+If you use ParSEval in your research, please cite:
+
+```bibtex
+@article{chen2025parseval,
+  title={ParSEval: Plan-aware Test Database Generation for SQL Equivalence Evaluation},
+  author={Chen, Chunyu and Miao, Zhengjie and Zhang, Yong and Wang, Jiannan},
+  journal={Proceedings of the VLDB Endowment},
+  volume={18},
+  number={11},
+  pages={4750--4762},
+  year={2025},
+  publisher={VLDB Endowment}
+}
+
+@article{chen2026parseval,
+  title={ParSEval: Interactive Counterexample-Driven Evaluation for Text-to-SQL},
+  author={Chen, Chunyu and Miao, Zhengjie and Zhang, Yong and Wang, Jiannan},
+  journal={Proceedings of the VLDB Endowment},
+  volume={19},
+  number={12},
+  pages={4846--4849},
+  year={2026},
+  publisher={VLDB Endowment}
+}
+```
