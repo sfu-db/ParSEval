@@ -5,40 +5,52 @@ on:
     branches: ["dev", "main"]
   workflow_dispatch:
 
+env:
+  # Pairs per job: small enough that a job of slow problems ends well within the job time limit.
+  SHARD_SIZE: 500
+
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      starts: ${{ steps.shards.outputs.starts }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shard the dataset
+        id: shards
+        run: |
+          lines=$(wc -l < data/mysql/leetcode.jsonlines)
+          echo "starts=$(python3 -c "import json; print(json.dumps(list(range(0, $lines, $SHARD_SIZE))))")" >> "$GITHUB_OUTPUT"
+
   mysql-experiment:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        start:
-          - 0
-          - 3000
-          - 6000
-          - 9000
-          - 12000
-          - 15000
-          - 18000
-          - 21000
-
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: rootpass
-          MYSQL_DATABASE: mydb
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prootpass"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
+        start: ${{ fromJSON(needs.plan.outputs.starts) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Every check creates and drops a scratch database, so DDL dominates
+      # MySQL's share of the run. A service container cannot take server
+      # options; this one keeps its data in memory and does not sync to disk.
+      - name: Start MySQL
+        run: |
+          docker run -d --name mysql -p 3306:3306 \
+            --tmpfs /var/lib/mysql:rw,size=4g \
+            -e MYSQL_ROOT_PASSWORD=rootpass -e MYSQL_DATABASE=mydb \
+            mysql:8.0 \
+            --disable-log-bin \
+            --innodb-flush-log-at-trx-commit=0 \
+            --innodb-doublewrite=OFF \
+            --innodb-buffer-pool-size=1G \
+            --skip-name-resolve
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -55,7 +67,7 @@ jobs:
 
       - name: Wait for MySQL
         run: |
-          for i in {1..30}; do
+          for i in {1..60}; do
             if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -prootpass --silent; then
               echo "MySQL is ready"
               exit 0
@@ -64,11 +76,14 @@ jobs:
             sleep 2
           done
           echo "MySQL did not become ready"
+          docker logs mysql
           exit 1
 
       - name: Install dependencies
         run: uv sync
 
+      # One worker per vCPU: generation is CPU-bound and its time limit is
+      # wall-clock, so more workers than cores turn slow pairs into timeouts.
       - name: Run disprove_leetcode
         env:
           PYTHONUNBUFFERED: "1"
@@ -81,9 +96,9 @@ jobs:
             --connection-string "$MYSQL_CONNECTION_STRING" \
             --output "results/disprove-leetcode-${{ matrix.start }}.jsonl" \
             --start "${{ matrix.start }}" \
-            --limit 3000 \
-            --workers 8 \
-            --case-timeout-s 30
+            --limit "$SHARD_SIZE" \
+            --workers "$(nproc)" \
+            --case-timeout-s 60
 
       - name: Publish metrics summary
         if: always()
