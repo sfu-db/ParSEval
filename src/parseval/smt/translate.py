@@ -16,14 +16,20 @@ from datetime import date, datetime, timedelta
 
 import z3
 
+from parseval.instance.domain import declared_temporal
 from parseval.instance.valuation import Valuation
 from parseval.terms import terms as nodes
 from parseval.terms.names import ParameterId
-from parseval.terms.sorts import IntervalValue, ScalarSort, TypeKind
+from parseval.terms.sorts import TIMESTAMP, IntervalValue, ScalarSort, ScalarType, TypeKind, parse_iso_temporal_value
 from parseval.terms.terms import TermId
 
 DAY = 86_400_000_000
 EPOCH = datetime(1, 1, 1)
+TEMPORAL = (TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP)
+INVALID = date.max.toordinal() * DAY
+"""A timed input's value for text that is no moment, with text temporals:
+above every moment, as its text ("x...") sorts after every ISO text."""
+_ISO = {TypeKind.DATE: "%Y-%m-%d", TypeKind.TIME: "%H:%M:%S", TypeKind.TIMESTAMP: "%Y-%m-%d %H:%M:%S"}
 
 
 class Unsupported(Exception):
@@ -93,6 +99,15 @@ def decode(value, kind: TypeKind):
     if kind is TypeKind.TIMESTAMP:
         return EPOCH + timedelta(microseconds=number)
     return number
+
+
+def _representable(value, kind: TypeKind):
+    """Day ordinals and microsecond counts of Python's date range."""
+    if kind is TypeKind.DATE:
+        return z3.And(value >= 1, value <= date.max.toordinal())
+    if kind is TypeKind.TIME:
+        return z3.And(value >= 0, value < DAY)
+    return z3.And(value >= 0, value < date.max.toordinal() * DAY)
 
 
 def _default(kind: TypeKind):
@@ -258,6 +273,36 @@ def _parse_format(pattern: str, text: str):
     return fields if position == len(text) else None
 
 
+def _moment(text: str):
+    """The timestamp an excluded text denotes, or None."""
+    try:
+        return parse_iso_temporal_value(text, TIMESTAMP)
+    except ValueError:
+        return None
+
+
+def _parsed(text: str, kind: TypeKind):
+    """The encoded moment of ``kind`` a text denotes, and whether it denotes none."""
+    try:
+        return encode(parse_iso_temporal_value(text, ScalarType(kind)), kind), z3.BoolVal(False)
+    except ValueError:
+        return z3.IntVal(0), z3.BoolVal(True)
+
+
+def _constants(value, leaf):
+    """The Z3 terms ``leaf`` gives for the constants an If-tree chooses
+    between, chosen the same way; None when a choice is not a constant."""
+    if z3.is_app_of(value, z3.Z3_OP_ITE):
+        condition, then, otherwise = value.children()
+        then, otherwise = _constants(then, leaf), _constants(otherwise, leaf)
+        if then is None or otherwise is None:
+            return None
+        return tuple(z3.If(condition, a, b) for a, b in zip(then, otherwise))
+    if z3.is_string_value(value):
+        return leaf(value.as_string())
+    return None
+
+
 def _lexicographic_less(left, right):
     result = z3.BoolVal(False)
     for a, b in reversed(list(zip(left, right))):
@@ -320,6 +365,110 @@ def equality_strings(valuation: Valuation, terms) -> frozenset[ParameterId]:
     return frozenset(item for item in strings if find(item) not in blocked)
 
 
+def temporal_strings(valuation: Valuation, terms, abstract: frozenset = frozenset()) -> dict[object, TypeKind]:
+    """String inputs solved as timestamps, with the kind of ISO text they render,
+    and the CASE Terms choosing between them (keyed by TermId).
+
+    Such inputs are only tested for NULL, read as temporals and compared with
+    each other or with constants in one ISO pattern, directly or through CASE
+    arms. Fixed-width ISO text orders like the moment it denotes, so the
+    solver avoids string reasoning.
+    Compared inputs share a pattern: their constants', else the date or time
+    type their columns were declared with, else a timestamp's when the inputs
+    are read as temporals.
+    """
+    arena = valuation.arena
+    parent: dict[object, object] = {}
+
+    def find(item):
+        parent.setdefault(item, item)
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def atom(child):
+        item = arena[child]
+        if (
+            isinstance(item, nodes.ExternalParameter) and item.payload.parameter in valuation.open
+            and item.sort.sql_type.kind is TypeKind.STRING and item.payload.parameter not in abstract
+        ):
+            return item.payload.parameter
+        if isinstance(item, nodes.Literal) and isinstance(item.payload.value, str):
+            return ("literal", item.payload.value)
+        if isinstance(item, nodes.Null):
+            return ("null",)
+        if isinstance(item, nodes.Case) and item.sort.sql_type.kind is TypeKind.STRING:
+            return ("case", child)
+        return None
+
+    reads = {f"cast_string_to_{kind.value}" for kind in TEMPORAL}
+    blocked, read = set(), set()
+    for term in arena.post_order(terms):
+        node = arena[term]
+        children = node.children[1:] if isinstance(node, nodes.Case) else node.children
+        atoms = [atom(child) for child in children]
+        members = [item for item in atoms if item is not None and item != ("null",)]
+        if isinstance(node, nodes.Case) and node.sort.sql_type.kind is TypeKind.STRING:
+            members.append(("case", term))
+        for item in members:
+            find(item)
+        if not any(item[0] != "literal" for item in members if isinstance(item, tuple)) and not any(
+            isinstance(item, ParameterId) for item in members
+        ):
+            continue
+        if isinstance(node, (nodes.IsNull, nodes.IsNotNull)):
+            continue
+        if isinstance(node, nodes.ScalarCall) and arena.context.function(node.payload.function).operator in reads:
+            read.update(members)
+        elif isinstance(node, (nodes.Eq3, nodes.Lt3, nodes.IsNotDistinct, nodes.Case)) and None not in atoms:
+            for other in members[1:]:
+                parent[find(other)] = find(members[0])
+        else:
+            blocked.update(members)
+
+    declared = _declared_kinds(valuation)
+    groups: dict[object, list] = {}
+    for item in parent:
+        groups.setdefault(find(item), []).append(item)
+    timed = {}
+    for members in groups.values():
+        inputs = [item for item in members if isinstance(item, ParameterId)]
+        if not inputs or any(item in blocked for item in members):
+            continue
+        constants = [item[1] for item in members if isinstance(item, tuple) and item[0] == "literal"]
+        kinds = {declared[item] for item in inputs if item in declared}
+        if constants:
+            kind = next((kind for kind in (TypeKind.TIMESTAMP, TypeKind.DATE) if all(_canonical(text, kind) for text in constants)), None)
+        elif kinds:
+            kind = next(iter(kinds)) if len(kinds) == 1 else None
+        else:
+            kind = TypeKind.TIMESTAMP if read & set(members) else None
+        if kind in (TypeKind.TIMESTAMP, TypeKind.DATE):
+            timed.update(dict.fromkeys(inputs, kind))
+            timed.update((item[1], kind) for item in members if isinstance(item, tuple) and item[0] == "case")
+    return timed
+
+
+def _declared_kinds(valuation: Valuation) -> dict[ParameterId, TypeKind]:
+    """Open text inputs of columns declared as dates or times."""
+    instance = valuation.instance
+    tables = {table.relation: table for table in instance.catalog.tables()}
+    kinds = {}
+    for slot in instance.all_slots():
+        for parameter, column in zip(slot.parameters, tables[slot.relation].columns):
+            if parameter in valuation.open and column.storage_type.kind is TypeKind.STRING:
+                declared = declared_temporal(column.declared_type)
+                if declared is not None:
+                    kinds[parameter] = declared.kind
+    return kinds
+
+
+def _canonical(text: str, kind: TypeKind) -> bool:
+    """Whether text is exactly the ISO rendering of a valid moment of ``kind``."""
+    return _parse_format(_ISO[kind], text) is not None and _moment(text) is not None
+
+
 def _names():
     """Short distinct strings, in order of length."""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -329,16 +478,23 @@ def _names():
 
 
 class Translator:
-    def __init__(self, valuation: Valuation, *, min_string_length: int = 0, abstract: frozenset = frozenset()):
+    def __init__(
+        self, valuation: Valuation, *, min_string_length: int = 0,
+        abstract: frozenset = frozenset(), timed: dict | None = None,
+    ):
         """``abstract`` string inputs are encoded as integer codes (see
-        ``equality_strings``)."""
+        ``equality_strings``), ``timed`` ones as timestamps (see
+        ``temporal_strings``)."""
         self.v = valuation
         self.min_string_length = min_string_length
         self.abstract = abstract
+        self.timed = timed or {}
         self.codes: dict[str, int] = {}
         self.arena = valuation.arena
         self.inputs: dict[ParameterId, Scalar] = {}
         self._memo: dict[TermId, tuple[Scalar | Truth, z3.BoolRef]] = {}
+        self._parsed = count()
+        self._timed_ids: set[int] = set()
 
     def code(self, text: str) -> z3.ArithRef:
         return z3.IntVal(self.codes.setdefault(text, len(self.codes)))
@@ -363,12 +519,21 @@ class Translator:
         constraints = []
         for parameter, scalar in self.inputs.items():
             kind = self.v.runtime.inputs[parameter].sort.sql_type.kind
-            if kind is TypeKind.DATE:
-                constraints.append(z3.And(scalar.value >= 1, scalar.value <= date.max.toordinal()))
-            elif kind is TypeKind.TIME:
-                constraints.append(z3.And(scalar.value >= 0, scalar.value < DAY))
-            elif kind is TypeKind.TIMESTAMP:
-                constraints.append(z3.And(scalar.value >= 0, scalar.value < date.max.toordinal() * DAY))
+            if parameter in self.timed:
+                # Whole seconds or days, so the ISO text keeps the whole value.
+                rendered = self.timed[parameter]
+                unit = DAY if rendered is TypeKind.DATE else 1_000_000
+                moment = z3.And(_representable(scalar.value, TypeKind.TIMESTAMP), scalar.value % unit == 0)
+                if self.v.runtime.semantics.text_temporals:
+                    moment = z3.Or(moment, scalar.value == INVALID)
+                constraints.append(moment)
+                constraints.extend(
+                    z3.Or(scalar.null, scalar.value != encode(_moment(text), TypeKind.TIMESTAMP))
+                    for text in self.v.excluded.get(parameter, ()) if _canonical(text, rendered)
+                )
+                continue
+            if kind in TEMPORAL:
+                constraints.append(_representable(scalar.value, kind))
             # Values the input never takes (Valuation.excluded); as codes,
             # abstract strings also keep fresh names off them.
             for value in self.v.excluded.get(parameter, ()):
@@ -394,6 +559,14 @@ class Translator:
             sort = self.v.runtime.inputs[parameter].sort
             if z3.is_true(model.eval(scalar.null, model_completion=True)):
                 values[parameter] = None
+            elif parameter in self.timed:
+                number = model.eval(scalar.value, model_completion=True).as_long()
+                moment = decode(z3.IntVal(min(number, INVALID - 1)), TypeKind.TIMESTAMP)
+                values[parameter] = (
+                    "x" * max(self.min_string_length, 1) if number == INVALID
+                    else moment.date().isoformat() if self.timed[parameter] is TypeKind.DATE
+                    else moment.isoformat(sep=" ")
+                )
             elif parameter in self.abstract:
                 number = model.eval(scalar.value, model_completion=True).as_long()
                 if number not in literals and number not in fresh:
@@ -439,15 +612,23 @@ class Translator:
         values = [value for value, _ in children]
         defined = z3.And(*(item for _, item in children)) if children else true
         if isinstance(node, nodes.Case):
-            condition, then, otherwise = values
+            condition = values[0]
+            then, otherwise = self._timed_operands(values[1:], term in self.timed)
             (_, condition_defined), (_, then_defined), (_, else_defined) = children
             result = Scalar(
                 z3.If(condition.true, then.value, otherwise.value),
                 z3.If(condition.true, then.null, otherwise.null),
             )
+            if term in self.timed:
+                self._timed_ids.add(result.value.get_id())
             return result, z3.And(condition_defined, z3.If(condition.true, then_defined, else_defined))
         if isinstance(node, nodes.ScalarCall):
             function = self.arena.context.function(node.payload.function)
+            source = self.arena[node.children[0]].sort.sql_type.kind if node.children else None
+            if (function.operator or "").startswith("cast_") and source is TypeKind.STRING:
+                number = self._formatted_number(node.children[0], function.result.sql_type.kind)
+                if number is not None and function.result.sql_type.kind in (TypeKind.INTEGER, TypeKind.FLOAT, TypeKind.DECIMAL):
+                    return number
             sorts = [self.arena[child].sort for child in node.children]
             literals = [self.arena[child] for child in node.children]
             result, condition = self._call(function.operator, values, sorts, function.result, literals)
@@ -463,22 +644,14 @@ class Translator:
         """
         left, right = node.children
         for formatted, constant, flipped in ((left, right, False), (right, left, True)):
-            call, literal = self.arena[formatted], self.arena[constant]
-            if not (isinstance(call, nodes.ScalarCall) and isinstance(literal, nodes.Literal)):
+            literal = self.arena[constant]
+            pattern = self._format_pattern(formatted)
+            if pattern is None or not isinstance(literal, nodes.Literal):
                 continue
-            if self.arena.context.function(call.payload.function).operator != "time_to_str":
-                continue
-            pattern = self.arena[call.children[1]]
-            if not isinstance(pattern, nodes.Literal):
-                continue
-            expected = _parse_format(pattern.payload.value, literal.payload.value)
+            expected = _parse_format(pattern, literal.payload.value)
             if expected is None:
                 continue
-            argument, defined = self.translate(call.children[0])
-            kind = self.arena[call.children[0]].sort.sql_type.kind
-            micros = argument.value if kind is not TypeKind.DATE else (argument.value - 1) * DAY
-            ordinal = argument.value if kind is TypeKind.DATE else micros / DAY + 1
-            fields = {**_civil(ordinal), **_clock(micros % DAY)}
+            argument, defined, fields = self._format_fields(formatted)
             actual = [fields[name] for name, _ in expected]
             values = [z3.IntVal(value) for _, value in expected]
             if isinstance(node, nodes.Eq3):
@@ -488,6 +661,55 @@ class Translator:
                 holds = _lexicographic_less(first, second)
             return Truth(z3.And(z3.Not(argument.null), holds), argument.null), defined
         return None
+
+    def _format_pattern(self, term: TermId) -> str | None:
+        """The constant pattern of a ``strftime`` call, or None for other Terms."""
+        call = self.arena[term]
+        if not isinstance(call, nodes.ScalarCall) or self.arena.context.function(call.payload.function).operator != "time_to_str":
+            return None
+        pattern = self.arena[call.children[1]]
+        return pattern.payload.value if isinstance(pattern, nodes.Literal) else None
+
+    def _format_fields(self, term: TermId):
+        """The formatted value, its definedness and its calendar fields."""
+        child = self.arena[term].children[0]
+        argument, defined = self.translate(child)
+        kind = self.arena[child].sort.sql_type.kind
+        micros = argument.value if kind is not TypeKind.DATE else (argument.value - 1) * DAY
+        ordinal = argument.value if kind is TypeKind.DATE else micros / DAY + 1
+        return argument, defined, {**_civil(ordinal), **_clock(micros % DAY)}
+
+    def _formatted_number(self, term: TermId, kind: TypeKind):
+        """``strftime`` text read as a number: the digits of its leading fields.
+
+        With lenient conversions text becomes the number in its numeric
+        prefix, which for a fixed-width pattern is its leading numeric fields.
+        """
+        pattern = self._format_pattern(term)
+        if pattern is None or not self.v.runtime.semantics.lenient_conversions or pattern[:1] != "%" or pattern[1:2] not in _FORMAT_FIELDS:
+            return None
+        argument, defined, fields = self._format_fields(term)
+        number = z3.IntVal(0)
+        while len(pattern) > 1 and pattern[0] == "%" and pattern[1] in _FORMAT_FIELDS:
+            name, width = _FORMAT_FIELDS[pattern[1]]
+            number = number * 10**width + fields[name]
+            pattern = pattern[2:]
+        value = number if kind is TypeKind.INTEGER else z3.ToReal(number)
+        return Scalar(value, argument.null), defined
+
+    def _timed_operands(self, values, timed: bool = False):
+        """A constant compared with a timed input becomes the moment it denotes."""
+        if not timed and not any(self._timed(value.value) for value in values):
+            return values
+        # A NULL operand's placeholder text denotes no moment.
+        return [
+            Scalar(encode(_moment(value.value.as_string()) or EPOCH, TypeKind.TIMESTAMP), value.null)
+            if z3.is_string_value(value.value) else value
+            for value in values
+        ]
+
+    def _timed(self, value) -> bool:
+        return z3.is_int(value) and value.get_id() in self._timed_ids
 
     def _equality_operands(self, values):
         """Operands of an equality; with an abstract side, both as integer codes."""
@@ -504,8 +726,10 @@ class Translator:
         if scalar is None:
             spec = self.v.runtime.inputs[parameter]
             name = f"p{parameter.value}"
-            sort = z3.IntSort() if parameter in self.abstract else _z3_sort(spec.sort.sql_type.kind)
+            sort = z3.IntSort() if parameter in self.abstract or parameter in self.timed else _z3_sort(spec.sort.sql_type.kind)
             value = z3.Const(name, sort)
+            if parameter in self.timed:
+                self._timed_ids.add(value.get_id())
             null = z3.Bool(f"{name}_null") if spec.sort.nullable else z3.BoolVal(False)
             scalar = self.inputs[parameter] = Scalar(value, null)
         return scalar
@@ -514,6 +738,8 @@ class Translator:
         false = z3.BoolVal(False)
         if any(isinstance(sort, ScalarSort) and sort.sql_type.kind is TypeKind.INTERVAL for sort in sorts):
             raise Unsupported("No Z3 encoding for symbolic intervals")
+        if isinstance(node, (nodes.Eq3, nodes.Lt3, nodes.IsNotDistinct)):
+            values = self._timed_operands(values)
         if isinstance(node, (nodes.Eq3, nodes.Lt3)):
             left, right = self._equality_operands(values) if isinstance(node, nodes.Eq3) else values
             unknown = z3.Or(left.null, right.null)
@@ -521,7 +747,7 @@ class Translator:
                 holds = left.value == right.value
             elif sorts[0].sql_type.kind is TypeKind.BOOLEAN:
                 holds = z3.And(z3.Not(left.value), right.value)
-            elif sorts[0].sql_type.kind is TypeKind.STRING:
+            elif sorts[0].sql_type.kind is TypeKind.STRING and not z3.is_int(left.value):
                 holds = _string_less(left.value, right.value)
             else:
                 holds = left.value < right.value
@@ -581,6 +807,8 @@ class Translator:
             left, right = values
             same = z3.And(z3.Not(right.null), left.value == right.value)
             return Scalar(left.value, z3.Or(left.null, same)), true
+        if operator.startswith("cast_") and kinds[0] is TypeKind.STRING and result.sql_type.kind in TEMPORAL:
+            return self._parse(values[0], result.sql_type.kind)
         if operator.startswith("cast_"):
             return Scalar(self._cast(values[0].value, kinds[0], result.sql_type.kind), null), self._cast_defined(values[0], kinds[0], result.sql_type.kind)
         if operator in ("add", "sub") and TypeKind.INTERVAL in kinds:
@@ -648,6 +876,38 @@ class Translator:
             return Scalar(temporal, null), true
         raise Unsupported(f"No Z3 encoding for {operator}")
 
+    def _parse(self, text: Scalar, kind: TypeKind):
+        """Text read as a temporal: the ISO rendering of a fresh value.
+
+        Other text is NULL with text temporals and an error otherwise; besides
+        ISO text the solver proposes, with text temporals, text that is no
+        moment. Timed inputs are already timestamps.
+        """
+        lenient = self.v.runtime.semantics.text_temporals
+        if z3.is_int(text.value):
+            micros = text.value
+            value = micros / DAY + 1 if kind is TypeKind.DATE else micros % DAY if kind is TypeKind.TIME else micros
+            return Scalar(value, z3.Or(text.null, micros == INVALID) if lenient else text.null), z3.BoolVal(True)
+        parsed = _constants(text.value, lambda constant: _parsed(constant, kind))
+        if parsed is not None:
+            value, invalid = parsed
+            if lenient:
+                return Scalar(value, z3.Or(text.null, invalid)), z3.BoolVal(True)
+            return Scalar(value, text.null), z3.Or(text.null, z3.Not(invalid))
+        value = z3.Int(f"parsed{next(self._parsed)}")
+        micros = value if kind is not TypeKind.DATE else (value - 1) * DAY
+        ordinal = value if kind is TypeKind.DATE else micros / DAY + 1
+        rendered = z3.And(
+            _representable(value, kind),
+            micros % 1_000_000 == 0,
+            text.value == _format(_ISO[kind], ordinal, micros % DAY),
+        )
+        if not lenient:
+            return Scalar(value, text.null), z3.Or(text.null, rendered)
+        # Text not starting with a digit is never a moment, so it reads as NULL.
+        invalid = z3.Not(z3.InRe(z3.SubString(text.value, 0, 1), z3.Range("0", "9")))
+        return Scalar(value, z3.Or(text.null, invalid)), z3.Or(text.null, invalid, rendered)
+
     def _temporal(self, operator: str, values, kinds, arguments):
         """Calendar functions over day ordinals and microsecond timestamps."""
         if operator == "date_part":
@@ -691,6 +951,13 @@ class Translator:
             # excluded by definedness otherwise.
             number = z3.StrToInt(value)
             number = z3.If(number >= 0, number, 0)
+            return number if target is TypeKind.INTEGER else z3.ToReal(number)
+        if source in TEMPORAL and target in (TypeKind.INTEGER, *numeric):
+            # Text temporals convert by the numeric prefix of their ISO text.
+            if source is TypeKind.TIME:
+                number = _clock(value)["hour"]
+            else:
+                number = _civil(value if source is TypeKind.DATE else value / DAY + 1)["year"]
             return number if target is TypeKind.INTEGER else z3.ToReal(number)
         if source is TypeKind.BOOLEAN and target is TypeKind.INTEGER:
             return z3.If(value, 1, 0)

@@ -17,7 +17,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from parseval.catalog import Catalog
-from parseval.coverage import Coverage, Recorder, Sites, Target
 from parseval.instance import (
     ExecutionError,
     Instance,
@@ -27,6 +26,7 @@ from parseval.instance import (
     Valuation,
 )
 from parseval.instance.constraints import Integrity
+from parseval.instance.domain import Provider, sequential
 from parseval.parser.query import lower_query
 from parseval.smt import Status, solve
 from parseval.speculate import speculate
@@ -35,8 +35,72 @@ from parseval.terms import terms as nodes
 from parseval.terms.terms import TermId
 from parseval.uexpr.lowering import UExprCompiler
 
-from .config import GenerationConfig
-from .model import Attempt, CoverageReport, GenerationResult
+from .coverage import Coverage, Recorder, Sites, Target
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationConfig:
+    """Generation settings.
+
+    ``timeout_ms`` bounds one solver call; ``time_limit_s`` bounds the whole
+    generation: when it passes, execution stops and the latest accepted
+    database is returned (``None`` runs until done). Generated non-NULL
+    strings have at least ``min_string_length`` characters. ``speculate`` samples rows from the
+    query before solving (``parseval.speculate``), reproducibly for a
+    ``seed``; without it generation starts from an empty database.
+    ``provider`` supplies the values of cells no constraint decides, in
+    speculated rows and candidate rows alike. With ``set_semantics`` the
+    query's result is read as a set, so duplicate output rows are not
+    generated for their own sake.
+
+    Each uncovered outcome is solved at most once per database version, and
+    a version only follows a solve that covers a new outcome, so generation
+    terminates without row or attempt limits.
+    """
+
+    timeout_ms: int = 5_000
+    time_limit_s: float | None = None
+    min_string_length: int = 1
+    speculate: bool = True
+    seed: int = 0
+    provider: Provider = sequential
+    set_semantics: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Attempt:
+    """One solve for an uncovered outcome and how it ended."""
+
+    target: Target
+    label: str
+    status: Status
+    accepted: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    """The generated database (None without rows) and the labels of the
+    outcomes its execution reaches and covers; ``timed_out`` when the time
+    limit stopped generation before every outcome was tried."""
+
+    instance: Instance | None
+    nonempty: bool
+    reached: tuple[str, ...] = ()
+    covered: tuple[str, ...] = ()
+    attempts: tuple[Attempt, ...] = ()
+    unsupported: str | None = None
+    timed_out: bool = False
+
+    @property
+    def failed(self) -> dict[str, str]:
+        """The status of the last failed solve of each outcome left uncovered."""
+        covered = set(self.covered)
+        return {
+            attempt.label: attempt.status.value
+            for attempt in self.attempts
+            if not attempt.accepted and attempt.label not in covered
+        }
 
 OUTPUT = Target(Sites.ROOT, "output")
 
@@ -51,7 +115,7 @@ MAX_BUDGET = 2
 WITNESSES = 4
 
 AttemptCallback = Callable[[Attempt], None]
-InstanceCallback = Callable[[Instance], None]
+InstanceCallback = Callable[[Instance], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +136,8 @@ class Session:
         self.config = config
         self.sql = sql
         query = lower_query(sql, catalog, ignore_root_limit=True)
-        self.distinct = distinct_rows(query.arena, query.root)
+        # Rows without a duplicate-row outcome: distinct by construction, or a set result.
+        self.distinct = config.set_semantics or distinct_rows(query.arena, query.root)
         self.empty = Instance(catalog)
         self.root = UExprCompiler(query.arena, self.empty.arena).compile(query.root).simplified_root
         self.sites = Sites()
@@ -343,7 +408,8 @@ class Session:
     def run(
         self, on_attempt: AttemptCallback | None = None, on_instance: InstanceCallback | None = None
     ) -> GenerationResult:
-        """Generate; ``on_instance`` receives every accepted database version.
+        """Generate; ``on_instance`` receives every accepted database version
+        and stops generation by returning a true value.
 
         Each uncovered outcome is tried once per version, first within
         ``BUDGET`` candidate rows per binding, then within ``MAX_BUDGET``: a
@@ -353,11 +419,11 @@ class Session:
         if self.config.time_limit_s is not None:
             self.deadline = time.monotonic() + self.config.time_limit_s
         seed = self.speculate()
-        if on_instance is not None and seed.row_count:
-            on_instance(seed)
+        if on_instance is not None and seed.row_count and on_instance(seed):
+            return GenerationResult(seed, True)
         attempts: list[Attempt] = []
-        failed: dict[Target, Status] = {}
         current = None
+        timed_out = False
         try:
             current = self.execute(self.with_candidates(seed))
             tried: set[Target] = set()
@@ -374,18 +440,24 @@ class Session:
                 if on_attempt is not None:
                     on_attempt(attempt)
                 if following is None:
-                    failed[target] = attempt.status
                     continue
                 current, tried = following, set()
-                if on_instance is not None:
-                    on_instance(current.instance)
-                failed = {item: status for item, status in failed.items() if item not in current.coverage.covered}
+                if on_instance is not None and on_instance(current.instance):
+                    break
         except TimeLimit:
-            pass
+            timed_out = True
         if current is None:
             # The time limit passed before the seed was executed.
-            return GenerationResult(seed if seed.row_count else None, bool(seed.row_count), CoverageReport((), ()), ())
-        return self._result(current, attempts, failed)
+            return GenerationResult(seed if seed.row_count else None, bool(seed.row_count), timed_out=True)
+        coverage, instance = current.coverage, current.instance
+        return GenerationResult(
+            instance if instance.row_count else None,
+            OUTPUT in coverage.covered,
+            tuple(map(self.label, sorted(coverage.reached))),
+            tuple(map(self.label, sorted(coverage.covered))),
+            tuple(attempts),
+            timed_out=timed_out,
+        )
 
     def _on_time(self) -> None:
         if self.deadline is not None and time.monotonic() > self.deadline:
@@ -397,21 +469,6 @@ class Session:
         if OUTPUT in pending:
             return OUTPUT
         return pending[0] if pending else None
-
-    def _result(self, current: Round, attempts: list[Attempt], failed: dict[Target, Status]) -> GenerationResult:
-        coverage = current.coverage
-        instance = current.instance
-        report = CoverageReport(
-            tuple(self.label(target) for target in sorted(coverage.reached)),
-            tuple(self.label(target) for target in sorted(coverage.covered)),
-            {self.label(target): status.value for target, status in sorted(failed.items())},
-        )
-        return GenerationResult(
-            instance if instance.row_count else None,
-            OUTPUT in coverage.covered,
-            report,
-            tuple(attempts),
-        )
 
 
 # Nodes whose rows are rows of their source.
@@ -469,7 +526,7 @@ def generate(
     try:
         return Session(catalog, sql, config or GenerationConfig()).run(on_attempt, on_instance)
     except UnsupportedQuery as error:
-        return GenerationResult(None, False, CoverageReport((), ()), (), str(error))
+        return GenerationResult(None, False, unsupported=str(error))
 
 
-__all__ = ["Session", "distinct_rows", "generate"]
+__all__ = ["Attempt", "GenerationConfig", "GenerationResult", "Session", "distinct_rows", "generate"]

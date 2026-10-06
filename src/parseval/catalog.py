@@ -124,10 +124,10 @@ class Catalog:
 
     @classmethod
     def from_ddl(cls, ddl: str, *, dialect: str = "postgres") -> Catalog:
-        from parseval.parser.ddls.parse import _populate_catalog
+        from parseval.parser.ddl import populate_catalog
 
         catalog = cls(dialect=dialect)
-        _populate_catalog(catalog, ddl)
+        populate_catalog(catalog, ddl)
         return catalog
 
     def tables(self) -> tuple[TableDecl, ...]:

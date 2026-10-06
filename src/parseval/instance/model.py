@@ -59,6 +59,7 @@ class Instance:
             semantics = Semantics(
                 division_by_zero_is_null=catalog.dialect.division_by_zero_is_null,
                 lenient_conversions=catalog.dialect.lenient_conversions,
+                text_temporals=catalog.dialect.text_temporals,
             )
             runtime = Runtime(TermArena(catalog.context), semantics=semantics)
         self.runtime = runtime

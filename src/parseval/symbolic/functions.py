@@ -7,13 +7,15 @@ COALESCE and NULLIF define their own NULL behavior.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 
 from parseval.terms.sorts import TIMESTAMP, IntervalValue, parse_iso_temporal_value
 
 _UNIX_EPOCH_JULIAN_DAY = 2440587.5
-REFERENCE_DATE = date(2000, 1, 1)
-"""The current date of STABLE functions, fixed so that execution is repeatable."""
+NOW = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+"""The current time of STABLE functions, in UTC like SQLite's 'now'. It is
+fixed when the module loads, so execution is repeatable within a process and
+agrees with the database that later runs the query."""
 
 
 def _strict(function):
@@ -28,8 +30,6 @@ def _strict(function):
 def _timestamp(value):
     if isinstance(value, datetime):
         return value
-    if value == "now":
-        return datetime.combine(REFERENCE_DATE, time())
     if isinstance(value, date):
         return datetime.combine(value, time())
     return parse_iso_temporal_value(value, TIMESTAMP)
@@ -80,8 +80,7 @@ def _time_to_str(value, pattern):
 
 
 def _age(value):
-    # A fixed reference date keeps AGE deterministic across runs.
-    today = REFERENCE_DATE
+    today = NOW.date()
     return today.year - value.year - ((today.month, today.day) < (value.month, value.day))
 
 
@@ -108,8 +107,8 @@ SQL_FUNCTIONS = {
     "date_part": _strict(lambda unit, value: _extract(unit.casefold(), value)),
     "time_to_str": _strict(_time_to_str),
     "age": _strict(_age),
-    "current_timestamp": lambda arguments: datetime.combine(REFERENCE_DATE, time()),
-    "curdate": lambda arguments: REFERENCE_DATE,
+    "current_timestamp": lambda arguments: NOW,
+    "curdate": lambda arguments: NOW.date(),
     "datetime": _strict(lambda value, *modifiers: _timestamp(value)),
     **{
         f"extract_{unit}": _strict(lambda value, unit=unit: _extract(unit, value))

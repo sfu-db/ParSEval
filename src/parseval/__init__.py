@@ -11,7 +11,7 @@ if TYPE_CHECKING:
         generate,
     )
     from parseval.db_manager import DBManager
-    from parseval.instantiate import instantiate_db
+    from parseval.main import RunResult, Verdict, disprove, instantiate_db
 
 
 _EXPORTS = {
@@ -20,7 +20,10 @@ _EXPORTS = {
     "GenerationResult": ("parseval.generator", "GenerationResult"),
     "generate": ("parseval.generator", "generate"),
     "DBManager": ("parseval.db_manager", "DBManager"),
-    "instantiate_db": ("parseval.instantiate", "instantiate_db"),
+    "instantiate_db": ("parseval.main", "instantiate_db"),
+    "disprove": ("parseval.main", "disprove"),
+    "RunResult": ("parseval.main", "RunResult"),
+    "Verdict": ("parseval.main", "Verdict"),
 }
 
 __all__ = list(_EXPORTS)

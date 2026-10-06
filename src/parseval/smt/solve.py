@@ -16,7 +16,7 @@ from parseval.terms.terms import TermId
 from .csp import Unsatisfiable as CSPUnsatisfiable
 from .csp import Unsupported as CSPUnsupported
 from .csp import search
-from .translate import Translator, Unsupported, equality_strings
+from .translate import Translator, Unsupported, equality_strings, temporal_strings
 
 
 class Status(str, Enum):
@@ -122,8 +122,10 @@ def _components(valuation: Valuation, groups: list[list[TermId]]):
 
 def _z3(valuation, groups, timeout_ms, absent, min_string_length, single=()) -> Solution:
     terms = [term for alternatives in groups for term in alternatives]
+    abstract = equality_strings(valuation, terms)
     translator = Translator(
-        valuation, min_string_length=min_string_length, abstract=equality_strings(valuation, terms)
+        valuation, min_string_length=min_string_length,
+        abstract=abstract, timed=temporal_strings(valuation, terms, abstract),
     )
     constraints = []
     for alternatives in groups:

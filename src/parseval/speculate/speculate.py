@@ -62,9 +62,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import islice, product
 from random import Random
+from typing import TYPE_CHECKING
 
 from parseval.catalog import Catalog
-from parseval.coverage import Coverage, Target
 from parseval.instance import ExecutionError, Instance, Slot, Valuation
 from parseval.instance.constraints import Integrity
 from parseval.instance.domain import Domain, Provider, Space, capacity, carrier, fits, placeholder, sequential
@@ -76,6 +76,9 @@ from parseval.terms.context import AggregateKind
 from parseval.terms.names import RelationId
 from parseval.terms.sorts import BagSort, ScalarSort, SeqSort
 from parseval.terms.terms import TermId
+
+if TYPE_CHECKING:
+    from parseval.generator.coverage import Coverage, Target
 
 # A column of one occurrence of a relation in the query: (occurrence, position).
 # Two references to one table (a self-join, or a subquery over the outer
@@ -102,7 +105,7 @@ class _Depends:
 # computing it. Copies join classes; copies and bounds form atoms; all three
 # receive constants.
 Origin = frozenset
-Evaluate = Callable[[Instance], Coverage]
+Evaluate = Callable[[Instance], "Coverage"]
 
 
 @dataclass(frozen=True, slots=True)

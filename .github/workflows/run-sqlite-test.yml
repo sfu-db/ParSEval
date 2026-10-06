@@ -1,4 +1,4 @@
-name: Run SQLite Experiment
+name: Disprove BIRD-dev (SQLite)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   sqlite-experiment:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -23,25 +23,36 @@ jobs:
         run: pip install uv
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv sync
-          uv pip install -e .
+        run: uv sync
 
-      - name: Run SQLite experiment
+      - name: Run disprove_bird
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
           source .venv/bin/activate
-          python -u scripts/exp_sqlite_disprover.py \
-            --schema_fp data/sqlite/schema.json \
-            --gold_fp data/sqlite/dev.json \
-            --preds_fp data/sqlite/dail.txt \
-            --output_dir results \
+          python -u scripts/disprove_bird.py \
+            --output results/disprove-bird.jsonl \
+            --limit 0 \
             --workers 8
 
+      - name: Publish metrics summary
+        if: always()
+        run: |
+          summary="results/disprove-bird.summary.json"
+          if [ ! -f "$summary" ]; then
+            echo "No BIRD summary was produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "## BIRD-dev (SQLite) disprove" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload results as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sqlite-experiment-results

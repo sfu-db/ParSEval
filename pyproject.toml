@@ -3,7 +3,7 @@ name = "parseval"
 version = "0.0.7"
 description = "Plan-aware Test Database Generation for SQL Equivalence Evaluation"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "cchen", email = "stuchunyu@gmail.com" }
 ]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,21 +13,9 @@ dependencies = [
     "sqlglot==23.12.1",
     "sqlalchemy>=2.0.43,<3.0.0",
     "z3-solver>=4.16.0.0",
-    "pandas>=2.3.3",
+    # Drivers SQLAlchemy loads for mysql+pymysql:// and postgresql:// backends.
     "pymysql>=1.2.0",
-    "datafusion>=50.1.0",
-    "pebble>=5.2.0",
     "psycopg2-binary>=2.9.12",
-]
-
-[project.optional-dependencies]
-dev = [
-    "func-timeout==4.3.5",
-    "py4j>=0.10.9.9,<0.11.0.0",
-    "python-dateutil>=2.9.0.post0,<3.0.0",
-    "ordered-set>=4.1.0,<5.0.0",
-    "z3-solver>=4.15.4.0,<5.0.0.0",
-    "pydot>=4.0.1,<5.0.0"
 ]
 
 [build-system]
@@ -40,5 +28,4 @@ packages = ["src/parseval"]
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
-    "tqdm>=4.67.3",
 ]

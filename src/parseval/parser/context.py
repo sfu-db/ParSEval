@@ -5,7 +5,7 @@ from typing import NoReturn
 from sqlglot import exp
 
 from parseval.catalog import Catalog
-from parseval.errors import ErrorCode, IRValidationError, expect, fail
+from parseval.errors import ErrorCode, fail
 from parseval.terms import TermArena
 from parseval.terms.builder import IRBuilder, TermRef
 from parseval.terms import terms as nodes
@@ -36,15 +36,8 @@ class LoweringSession:
         *,
         builder: IRBuilder | None = None,
     ) -> None:
-        expect(
-            arena.context is catalog.context,
-            "Catalog and TermArena must share the same IR context",
-            error=IRValidationError,
-        )
         self.catalog = catalog
         self.arena = arena
-        if builder is not None and builder.arena is not arena:
-            raise ValueError("Lowering builder must own the supplied arena")
         self.builder = builder if builder is not None else IRBuilder(arena)
         self.dialect = catalog.dialect
         self.binder = ColumnBinder(self.dialect)

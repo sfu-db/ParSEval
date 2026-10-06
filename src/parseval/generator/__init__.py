@@ -1,12 +1,9 @@
 """Concolic generation of databases covering a query's U-semiring branches."""
 
-from .config import GenerationConfig
-from .generate import Session, generate
-from .model import Attempt, CoverageReport, GenerationResult
+from .generate import Attempt, GenerationConfig, GenerationResult, Session, generate
 
 __all__ = (
     "Attempt",
-    "CoverageReport",
     "GenerationConfig",
     "GenerationResult",
     "Session",

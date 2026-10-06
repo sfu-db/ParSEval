@@ -6,63 +6,73 @@ from dataclasses import dataclass
 
 from sqlglot import exp
 
-from parseval.parser.dialect import SQLDialect
-from parseval.parser.scope import FieldSlot
-from parseval.parser.syntax import aggregate_expression, strip_alias
 from parseval.identifiers import Identifier
+from parseval.parser.dialect import SQLDialect
+from parseval.parser.helper import aggregate_expression, strip_alias
+from parseval.parser.scope import FieldSlot
 
 
 @dataclass(frozen=True, slots=True)
 class Projection:
+    """One SELECT-list item; ``source_slot`` when it copies a source field by ordinal."""
+
     expression: exp.Expression
     name: Identifier
-    expression_id: str
+    key: str
     source_slot: FieldSlot | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class QueryBlockFacts:
-    group_expressions: tuple[exp.Expression, ...]
+class SelectFacts:
+    """Clause facts of one SELECT block, each list without duplicate keys.
+
+    ``group_keys`` are the expressions of every grouping set; ``grouping_calls``
+    are GROUPING(...) calls; ``bare_columns`` are the columns of an aggregating
+    block that are neither group keys nor aggregate arguments.
+    """
+
+    group_keys: tuple[exp.Expression, ...]
     grouping_sets: tuple[tuple[exp.Expression, ...], ...] | None
-    grouping_expressions: tuple[exp.Anonymous, ...]
-    aggregate_expressions: tuple[exp.Expression, ...]
-    window_expressions: tuple[exp.Window, ...]
+    grouping_calls: tuple[exp.Anonymous, ...]
+    aggregates: tuple[exp.Expression, ...]
+    windows: tuple[exp.Window, ...]
     bare_columns: tuple[exp.Column, ...]
     having: exp.Expression | None
     qualify: exp.Expression | None
 
     @property
     def requires_aggregation(self) -> bool:
-        return self.grouping_sets is not None or bool(self.aggregate_expressions)
+        return self.grouping_sets is not None or bool(self.aggregates)
 
 
-class QueryBlockAnalyzer:
-    """Collect clause semantics for one SELECT block without planning execution."""
+class SelectAnalyzer:
+    """Collect clause semantics for SELECT blocks without planning execution."""
 
-    __slots__ = ("dialect", "_expression_ids", "_query_blocks")
+    __slots__ = ("dialect", "_keys", "_facts")
 
     def __init__(self, dialect: SQLDialect) -> None:
         self.dialect = dialect
-        self._expression_ids: dict[int, str] = {}
-        self._query_blocks: dict[int, QueryBlockFacts] = {}
+        self._keys: dict[int, str] = {}
+        self._facts: dict[int, SelectFacts] = {}
 
-    def expression_id(self, expression: exp.Expression) -> str:
+    def key(self, expression: exp.Expression) -> str:
+        """The identity of an expression: its SQL text in the dialect."""
         key = id(expression)
-        result = self._expression_ids.get(key)
+        result = self._keys.get(key)
         if result is None:
             result = expression.sql(dialect=self.dialect.name)
-            self._expression_ids[key] = result
+            self._keys[key] = result
         return result
 
-    def query_block(self, select: exp.Select) -> QueryBlockFacts:
+    def analyze(self, select: exp.Select) -> SelectFacts:
         key = id(select)
-        result = self._query_blocks.get(key)
+        result = self._facts.get(key)
         if result is not None:
             return result
 
         group = select.args.get("group")
         grouping_sets = self._grouping_sets(group)
-        groups = self._group_expressions(grouping_sets)
+        groups = self._group_keys(grouping_sets)
         having_node = select.args.get("having")
         having = having_node.this if isinstance(having_node, exp.Having) else None
         qualify_node = select.args.get("qualify")
@@ -86,24 +96,24 @@ class QueryBlockAnalyzer:
         seen: set[str] = set()
         for root in roots:
             for window in self._collect_windows(root):
-                identity = self.expression_id(window)
+                identity = self.key(window)
                 if identity not in window_seen:
                     window_seen.add(identity)
                     windows.append(window)
             for aggregate in self._collect_aggregates(root):
-                identity = self.expression_id(aggregate)
+                identity = self.key(aggregate)
                 if identity not in seen:
                     seen.add(identity)
                     aggregates.append(aggregate)
-            for grouping_function in self._collect_grouping_functions(root):
-                identity = self.expression_id(grouping_function)
+            for grouping_function in self._collect_grouping_calls(root):
+                identity = self.key(grouping_function)
                 if identity not in grouping_seen:
                     grouping_seen.add(identity)
                     grouping_functions.append(grouping_function)
 
         bare_columns: list[exp.Column] = []
         if groups or aggregates:
-            group_ids = {self.expression_id(item) for item in groups}
+            group_ids = {self.key(item) for item in groups}
             projection_aliases = {
                 item.alias
                 for item in select.expressions
@@ -112,7 +122,7 @@ class QueryBlockAnalyzer:
             bare_seen: set[str] = set()
 
             def visit_bare(node: exp.Expression) -> None:
-                if self.expression_id(node) in group_ids:
+                if self.key(node) in group_ids:
                     return
                 if aggregate_expression(node) is not None or isinstance(
                     node, (exp.Subquery, exp.Window)
@@ -121,7 +131,7 @@ class QueryBlockAnalyzer:
                 if isinstance(node, exp.Column):
                     if not node.table and node.name in projection_aliases:
                         return
-                    identity = self.expression_id(node)
+                    identity = self.key(node)
                     if identity not in bare_seen:
                         bare_seen.add(identity)
                         bare_columns.append(node)
@@ -132,7 +142,7 @@ class QueryBlockAnalyzer:
             for root in roots:
                 visit_bare(root)
 
-        result = QueryBlockFacts(
+        result = SelectFacts(
             groups,
             grouping_sets,
             tuple(grouping_functions),
@@ -142,7 +152,7 @@ class QueryBlockAnalyzer:
             having,
             qualify,
         )
-        self._query_blocks[key] = result
+        self._facts[key] = result
         return result
 
     def _collect_aggregates(
@@ -185,7 +195,7 @@ class QueryBlockAnalyzer:
         visit(expression)
         return tuple(result)
 
-    def _collect_grouping_functions(
+    def _collect_grouping_calls(
         self, expression: exp.Expression
     ) -> tuple[exp.Anonymous, ...]:
         result: list[exp.Anonymous] = []
@@ -242,7 +252,7 @@ class QueryBlockAnalyzer:
             result = tuple(prefix + suffix for prefix in result for suffix in component)
         return result
 
-    def _group_expressions(
+    def _group_keys(
         self,
         grouping_sets: tuple[tuple[exp.Expression, ...], ...] | None,
     ) -> tuple[exp.Expression, ...]:
@@ -250,7 +260,7 @@ class QueryBlockAnalyzer:
         seen: set[str] = set()
         for grouping_set in grouping_sets or ():
             for expression in grouping_set:
-                identity = self.expression_id(expression)
+                identity = self.key(expression)
                 if identity not in seen:
                     seen.add(identity)
                     result.append(expression)

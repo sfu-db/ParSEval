@@ -26,9 +26,9 @@ QUERIES = [
 ]
 
 
-def replay(instance, catalog, sql):
+def replay(instance, catalog, sql, ddl=DDL):
     connection = sqlite3.connect(":memory:")
-    connection.executescript(DDL)
+    connection.executescript(ddl)
     for table in catalog.tables():
         name = table.name.parts[-1].text
         for row in instance.rows(table.relation):
@@ -43,7 +43,7 @@ def test_generated_database_is_productive_and_valid(sql):
     result = generate(sql, catalog, config=GenerationConfig(timeout_ms=3000))
     assert result.nonempty
     assert replay(result.instance, catalog, sql)
-    assert result.coverage.covered
+    assert result.covered
     for table in catalog.tables():
         keys = [row[0] for row in result.instance.rows(table.relation)]
         assert None not in keys
@@ -74,7 +74,7 @@ def test_uncorrelated_both_outcomes_cannot_share_one_database():
     catalog = Catalog.from_ddl(DDL, dialect="sqlite")
     result = generate("SELECT COUNT(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM s)", catalog)
     assert result.nonempty
-    assert any(label.endswith("predicate.not3:false") for label in result.coverage.failed)
+    assert any(label.endswith("predicate.not3:false") for label in result.failed)
 
 
 @pytest.mark.parametrize(
@@ -100,6 +100,19 @@ def test_rows_distinct_by_construction_have_no_duplicate_outcome(sql, distinct):
     reached = session.execute(session.with_candidates(session.empty)).coverage.reached
     assert any(target.site == OUTPUT.site and target.outcome == "duplicate" for target in reached) is not distinct
 
+
+
+@pytest.mark.parametrize(("sql", "column"), [("SELECT g FROM t", False), ("SELECT g, x FROM t", True)])
+def test_set_semantics_has_no_duplicate_row_outcome(sql, column):
+    from parseval.generator.generate import OUTPUT
+
+    catalog = Catalog.from_ddl(DDL, dialect="sqlite")
+    session = Session(catalog, sql, GenerationConfig(timeout_ms=3000, set_semantics=True))
+    reached = session.execute(session.with_candidates(session.empty)).coverage.reached
+    duplicates = {target.site for target in reached if target.outcome == "duplicate"}
+    assert OUTPUT.site not in duplicates
+    # A repeated value in one column of several is still a set of distinct rows.
+    assert bool(duplicates) is column
 
 @pytest.mark.parametrize("speculate", [True, False])
 def test_rows_with_different_values_are_grown_when_needed(speculate):
@@ -142,7 +155,7 @@ def test_probed_filters_reach_what_replay_reaches(speculate):
     result = generate(sql, catalog, config=GenerationConfig(timeout_ms=3000, speculate=speculate))
     assert result.nonempty
     assert not [attempt for attempt in result.attempts if attempt.status.value == "sat" and not attempt.accepted]
-    assert "/bag.lambda:output" in result.coverage.covered
+    assert "/bag.lambda:output" in result.covered
 
 
 def test_outcomes_needing_two_new_rows_per_binding_are_covered():
@@ -154,10 +167,45 @@ def test_outcomes_needing_two_new_rows_per_binding_are_covered():
     sql = "SELECT p.v FROM c JOIN p ON c.id = p.id ORDER BY c.w DESC LIMIT 5, 1"
     result = generate(sql, catalog, config=GenerationConfig(timeout_ms=3000))
     assert result.nonempty
-    assert {"/order.map:duplicate", "-1/order.map:duplicate"} <= set(result.coverage.covered)
+    assert {"/order.map:duplicate", "-1/order.map:duplicate"} <= set(result.covered)
+
+
+def test_a_true_instance_callback_stops_generation():
+    catalog = Catalog.from_ddl(DDL, dialect="sqlite")
+    seen = []
+    result = generate(QUERIES[2], catalog, on_instance=lambda instance: seen.append(instance) or True)
+    assert len(seen) == 1 and result.instance is seen[0] and not result.attempts
 
 
 def test_generation_returns_its_best_database_at_the_time_limit():
     catalog = Catalog.from_ddl(DDL, dialect="sqlite")
     result = generate(QUERIES[2], catalog, config=GenerationConfig(time_limit_s=0))
     assert not result.attempts and not result.nonempty
+
+
+TEXT_DATES = "CREATE TABLE p(id INT PRIMARY KEY, born VARCHAR, seen DATETIME)"
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM p WHERE (JULIANDAY('now') - JULIANDAY(born)) / 365 >= 35",
+    "SELECT id FROM p WHERE datetime(CURRENT_TIMESTAMP) - datetime(born) < 31",
+    "SELECT DATETIME() - born FROM p WHERE STRFTIME('%Y', born) > '1990'",
+    "SELECT id FROM p WHERE seen = '2010-07-19 19:39:08.0'",
+    "SELECT id FROM p WHERE date(seen) = '2010-07-19' AND seen < CURRENT_TIMESTAMP",
+])
+def test_text_dates_agree_with_sqlite(sql):
+    # Dates kept as text and compared as text, SQLite's 'now' and its arithmetic on text.
+    catalog = Catalog.from_ddl(TEXT_DATES, dialect="sqlite")
+    result = generate(sql, catalog, config=GenerationConfig(timeout_ms=3000))
+    assert result.nonempty
+    assert replay(result.instance, catalog, sql, TEXT_DATES)
+
+
+def test_text_that_is_no_date_reads_as_null():
+    # SQLite: STRFTIME of text that is no date is NULL, even in a NOT NULL column.
+    ddl = "CREATE TABLE p(id INT PRIMARY KEY, seen DATE NOT NULL)"
+    catalog = Catalog.from_ddl(ddl, dialect="sqlite")
+    sql = "SELECT id FROM p WHERE STRFTIME('%Y', seen) = '1998' OR seen > '2001-01-01'"
+    result = generate(sql, catalog, config=GenerationConfig(timeout_ms=3000))
+    assert any(label.endswith("predicate.eq3:unknown") for label in result.covered)
+    assert replay(result.instance, catalog, sql, ddl)

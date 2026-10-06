@@ -30,7 +30,14 @@ from parseval.terms.builder import TermRef
 from .context import LoweringSession
 from .dialect import SQLDialect
 from .scope import EmitEnvironment, OuterScope, Relation
-from .syntax import boolean_literal, function_name, query_body, strip_alias
+from .helper import boolean_literal, function_name, query_body, strip_alias
+
+
+# Text temporals (SQLite): the patterns of the date functions and of the
+# CURRENT_* keywords, and the internal timestamp-valued current time.
+_TEXT_FORMATS = {"date": "%Y-%m-%d", "datetime": "%Y-%m-%d %H:%M:%S", "time": "%H:%M:%S"}
+_CURRENT = {exp.CurrentDate: "date", exp.CurrentTimestamp: "datetime", exp.CurrentTime: "time"}
+_NOW = "current_timestamp"
 
 
 class RelationalExpressionService(Protocol):
@@ -487,8 +494,6 @@ class ScalarCompiler:
         *,
         volatility: Volatility = Volatility.IMMUTABLE,
     ) -> ScalarPlan:
-        if len(plans) != len(parameters):
-            raise AssertionError("Scalar application arity mismatch")
         if (
             not self.capabilities.allow_non_immutable_functions
             and volatility is not Volatility.IMMUTABLE
@@ -532,7 +537,8 @@ class ScalarCompiler:
         temporal = {TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP}
         numeric = {TypeKind.INTEGER, TypeKind.FLOAT, TypeKind.DECIMAL}
 
-        if operator in {"add", "sub"}:
+        # With text temporals, arithmetic reads numbers from every operand.
+        if operator in {"add", "sub"} and not self.context.dialect.text_temporals:
             if left_kind is TypeKind.INTERVAL and right_kind is TypeKind.INTERVAL:
                 result = ScalarSort(INTERVAL, nullable)
                 return self._application_plan(
@@ -676,6 +682,21 @@ class ScalarCompiler:
             )
         else:
             operands = tuple(expression.iter_expressions())
+        if self.context.dialect.text_temporals:
+            # A missing time value or 'now' is the current time; DATE, DATETIME,
+            # TIME and CURRENT_* render text as STRFTIME does.
+            name = function_name(expression).casefold()
+            if isinstance(expression, exp.TsOrDsToTimestamp) or name in (*_TEXT_FORMATS, "julianday"):
+                value = operands[0] if operands else None
+                if value is None or (
+                    isinstance(value, exp.Literal) and value.is_string and value.name.casefold() == "now"
+                ):
+                    operands = (exp.Anonymous(this=_NOW), *operands[1:])
+            pattern = _TEXT_FORMATS.get(_CURRENT.get(type(expression), name))
+            if pattern is not None:
+                value = operands[0].copy() if operands else exp.Anonymous(this=_NOW)
+                rendered = exp.TimeToStr(this=exp.TsOrDsToTimestamp(this=value), format=exp.Literal.string(pattern))
+                return self.plan(rendered, environment)
         if isinstance(expression, (exp.Coalesce, exp.Nullif)) and any(
             isinstance(operand, exp.Null) for operand in operands
         ):
@@ -749,6 +770,13 @@ class ScalarCompiler:
             expression,
             code=ErrorCode.UNSUPPORTED_EXPRESSION,
         )
+
+    def _time_value(self, sort: ScalarSort) -> ScalarSort:
+        """The parameter of a date function's time value: text converts to a
+        timestamp, and to NULL where it does not parse with text temporals."""
+        if sort.sql_type.kind is not TypeKind.STRING:
+            return sort
+        return ScalarSort(TIMESTAMP, sort.nullable or self.context.dialect.text_temporals)
 
     def _builtin_signature(
         self,
@@ -868,16 +896,17 @@ class ScalarCompiler:
                 "year": INTEGER,
                 "ts_or_ds_to_timestamp": TIMESTAMP,
             }[name]
+            parameters = (self._time_value(arguments[0]),)
             return (
                 name,
-                arguments,
-                ScalarSort(output, arguments[0].nullable),
+                parameters,
+                ScalarSort(output, parameters[0].nullable),
                 Volatility.IMMUTABLE,
             )
 
         if name == "time_to_str" and len(arguments) == 2:
             parameters = (
-                arguments[0],
+                self._time_value(arguments[0]),
                 ScalarSort(STRING, arguments[1].nullable),
             )
             return (
@@ -891,20 +920,22 @@ class ScalarCompiler:
             output = TIMESTAMP if name == "current_timestamp" else DATE
             return name, (), ScalarSort(output, False), Volatility.STABLE
 
-        if name == "datetime":
+        if name == "datetime" and arguments:
+            parameters = (self._time_value(arguments[0]), *arguments[1:])
             return (
                 name,
-                arguments,
-                ScalarSort(TIMESTAMP, any(item.nullable for item in arguments)),
+                parameters,
+                ScalarSort(TIMESTAMP, any(item.nullable for item in parameters)),
                 Volatility.STABLE,
             )
 
         if name in {"time", "age"} and len(arguments) == 1:
             output = TIME if name == "time" else INTEGER
+            parameters = (self._time_value(arguments[0]),)
             return (
                 name,
-                arguments,
-                ScalarSort(output, arguments[0].nullable),
+                parameters,
+                ScalarSort(output, parameters[0].nullable),
                 Volatility.IMMUTABLE,
             )
 

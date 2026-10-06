@@ -262,6 +262,15 @@ def test_cast_precision_and_invalid_values():
         runtime.literal(float("inf"))
 
 
+def test_text_temporals_parse_text_and_read_numeric_prefixes():
+    runtime = Runtime(semantics=Semantics(lenient_conversions=True, text_temporals=True))
+    text = runtime.input("text", "bad-date")
+    assert text.cast(DATE).concrete is None
+    assert text.cast(DATE).evaluate({"text": "2020-02-03"}) == date(2020, 2, 3)
+    moment = runtime.input("moment", datetime(1990, 5, 1, 12))
+    assert moment.cast(INTEGER).concrete == 1990
+
+
 def test_input_identity_ownership_and_expression_type_checks():
     runtime = Runtime()
     x = runtime.input("x", 1)
@@ -308,7 +317,7 @@ import sys
 from importlib.abc import MetaPathFinder
 class Reject(MetaPathFinder):
     def find_spec(self,fullname,path=None,target=None):
-        if fullname == 'z3' or fullname.startswith(('parseval.smt','parseval.coverage','parseval.instance','parseval.generator')):
+        if fullname == 'z3' or fullname.startswith(('parseval.smt','parseval.instance','parseval.generator')):
             raise AssertionError(fullname)
 sys.meta_path.insert(0,Reject())
 from parseval.symbolic import Runtime

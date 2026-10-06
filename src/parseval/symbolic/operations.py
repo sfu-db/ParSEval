@@ -20,6 +20,7 @@ from parseval.terms.sorts import (
 )
 
 NUMERIC = frozenset((TypeKind.INTEGER, TypeKind.FLOAT, TypeKind.DECIMAL))
+TEMPORAL = frozenset((TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP))
 ARITHMETIC = {"add", "sub", "mul", "div", "mod"}
 COMPARISONS = {"eq", "ne", "lt", "le", "gt", "ge", "is_not_distinct"}
 OPERATIONS = (
@@ -218,11 +219,19 @@ def cast(value, source, target, semantics):
             (TypeKind.DATE, TypeKind.TIMESTAMP),
             (TypeKind.TIMESTAMP, TypeKind.DATE),
         }
+        or (a in TEMPORAL and b in NUMERIC and semantics.text_temporals)
     )
     if not supported:
         raise TypeError(f"Unsupported cast: {a.value} to {b.value}")
     if value is None:
         return None
+    if semantics.text_temporals and a is TypeKind.STRING and b in TEMPORAL:
+        try:
+            return parse_iso_temporal_value(value, target)
+        except ValueError:
+            return None
+    if semantics.text_temporals and a in TEMPORAL and b in NUMERIC:
+        value, a = cast(value, source, STRING, semantics), TypeKind.STRING
     if a is TypeKind.STRING and b in NUMERIC and semantics.lenient_conversions:
         match = _NUMERIC_PREFIX.match(value)
         value = float(match[0]) if match else 0

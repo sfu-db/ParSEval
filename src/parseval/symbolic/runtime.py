@@ -213,10 +213,14 @@ class Runtime:
         value = self.coerce(value)
         sql_type = sql_type.value_type
         operator = f"cast_{value.sort.sql_type.kind.value}_to_{sql_type.kind.value}"
+        # Text temporals read unparsable text as NULL.
+        parsed = self.semantics.text_temporals and value.sort.sql_type.kind is TypeKind.STRING and sql_type.kind in (
+            TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP,
+        )
         term = self.builder.apply(
             operator,
             (value.expression.root,),
-            ScalarSort(sql_type, value.sort.nullable),
+            ScalarSort(sql_type, value.sort.nullable or parsed),
         )
         return self._scalar_value(term, (value,))
 

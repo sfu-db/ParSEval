@@ -1,17 +1,13 @@
 # ParSEval
 
-ParSEval compiles SQL into a typed U-expression and generates small concrete
-databases by concolic execution of that U-expression. Every stored cell and
-row multiplicity is a symbolic input; executing the query on the data covers
-branch outcomes of the U-semiring (predicate truth, NULLs, empty and nonempty
-subqueries, join contributions, groups, duplicates), and a solver appends rows
-that cover the outcomes the data does not cover yet.
+ParSEval generates minimal test database instances that exercise all execution branches of a SQL query's logical plan. It uses branch-coverage-driven symbolic reasoning, speculative data generation, and SMT solving (Z3) to produce databases that make queries return non-empty, distinguishing results.
 
 ## Quick start
 
 ```bash
 uv sync
 uv run pytest
+uv pip install -e .
 ```
 
 ```python
@@ -24,18 +20,92 @@ catalog = Catalog.from_ddl(
 result = generate(
     "SELECT name FROM users WHERE age > 25",
     catalog,
-    config=GenerationConfig(timeout_ms=1_000, max_fail_retry=3),
+    config=GenerationConfig(timeout_ms=1_000, time_limit_s=60),
 )
 
-print(result.coverage.ratio)
+print(len(result.covered), "of", len(result.reached), "outcomes covered")
 print(result.instance)
 ```
 
-`GenerationConfig` controls solver time, candidate rows and the symbolic
-budget. Generation returns one database containing productive and rejected
-query paths as `result.instance` (`None` if none was found);
-`result.nonempty` tells whether the query output is productive, and outcomes
-that could not be covered stay visible in `result.coverage.failed`.
+`GenerationConfig` controls the solver and generation time limits,
+speculation, and the provider of unconstrained values. Generation returns one
+database, `result.instance`, that covers both productive and rejected query
+paths (`None` if no database was found); `result.nonempty` tells whether the
+query output is productive, and outcomes that could not be covered remain
+visible in `result.failed`.
+
+`instantiate_db` generates a database for a query and loads it into a backend
+given by an SQLAlchemy URL. `disprove` checks two queries: it generates a
+database for each, runs both queries on each database, and compares the
+results.
+
+```python
+from parseval import Verdict, disprove
+
+result = disprove(
+    "SELECT name FROM users WHERE age > 25",
+    "SELECT name FROM users WHERE age >= 25",
+    "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    "sqlite:///check.sqlite",
+    "sqlite",
+)
+assert result.verdict is Verdict.NEQ
+print(result.counterexample, result.results)
+```
+
+The verdict is `NEQ` with a counterexample database, `EQ` when the queries
+agree on every generated database (evidence, not a proof), `SYNTAX_ERROR`,
+`TIMEOUT`, or `UNKNOWN` when the generator does not support a query or its
+database gives neither query rows.
+
+## Schema input
+
+The schema is a string of DDL statements in the given dialect, separated by
+semicolons. Only two statement forms are accepted:
+
+- `CREATE TABLE` (optionally `IF NOT EXISTS`) with explicit columns: types,
+  `NOT NULL`, `DEFAULT`, `CHECK`, and inline or table-level `PRIMARY KEY`,
+  `UNIQUE`, and `FOREIGN KEY` constraints.
+- `ALTER TABLE ... ADD CONSTRAINT` for keys, foreign keys, and `CHECK`
+  constraints on tables created in the same string.
+
+Tables may reference tables declared later in the string. Any other statement
+(views, `CREATE TABLE ... AS SELECT`, `ALTER TABLE ... ADD COLUMN`, `INSERT`)
+raises `DDLImportError`.
+
+```python
+from parseval import Catalog
+
+schema = """
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    age INT CHECK (age >= 0)
+);
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT,
+    total DECIMAL(10, 2)
+);
+ALTER TABLE orders ADD CONSTRAINT fk_orders_user
+    FOREIGN KEY (user_id) REFERENCES users (id);
+"""
+catalog = Catalog.from_ddl(schema, dialect="postgres")
+```
+
+`instantiate_db` and `disprove` also run the schema on the backend, so it must
+be valid there too. SQLite, for example, has no `ALTER TABLE ... ADD
+CONSTRAINT`; declare its keys inside `CREATE TABLE` instead.
+
+## What is new
+
+- **Richer U-semiring model**: `UAgg` models aggregation and `UOrder` models
+  ordering.
+- **CSP solver**: simple constraints are solved by a CSP model, leaving Z3 for
+  the rest.
+- **Extensive query parser**: broader SQL coverage when lowering queries into
+  typed relational terms.
+- **Multiple dialects**: SQLite, MySQL, and PostgreSQL are supported.
 
 ## Architecture
 
@@ -46,38 +116,41 @@ that could not be covered stay visible in `result.coverage.failed`.
   term per operation, with one set of SQL semantics.
 - `instance/` stores databases as symbolic inputs and executes U-expressions
   over them (the concolic machine).
-- `coverage/` records the U-semiring branch outcomes an execution reaches.
 - `smt/` solves for candidate rows: a CSP for simple constraints, Z3 for the rest.
-- `generator/` runs the concolic loop.
+- `generator/` records the U-semiring branch outcomes an execution reaches
+  and runs the concolic loop.
 
 Generation first targets productive output, then appends rows that cover
 further outcomes while preserving the covered ones. Coverage always describes
 the final database.
 
-## PostgreSQL corpus experiment
+Each package's design is described in [docs/](docs/): [parser](docs/parser.md),
+[terms](docs/terms.md), [uexpr](docs/uexpr.md), [symbolic](docs/symbolic.md),
+[instance](docs/instance.md), [smt](docs/smt.md), [speculate](docs/speculate.md)
+and [generator](docs/generator.md).
 
-Experimental replay and outcome reporting live in `scripts/experiments/`,
-outside the installed `parseval` package.
+## Disprove benchmarks
 
-`data/postgres.csv` contains 709 query pairs (1,418 statements). The benchmark
-uses the original SQL and DDL and exports one SQLite file per generated database.
-SQLite exports are data artifacts; PostgreSQL replay uses the original schema.
+`scripts/disprove_bird.py` checks DAIL-SQL's BIRD-dev predictions against the
+gold queries on SQLite; `scripts/disprove_leetcode.py` checks LeetCode query
+pairs on a MySQL server, recovering each problem's DDL from the dataset's JSON
+schema and constraints and skipping pairs with a non-SELECT query. Each writes
+one JSON record per pair and a `<output stem>.summary.json` with verdict counts.
 
 ```bash
-uv run python scripts/benchmark_postgres_coverage.py \
-  --limit 10 --max-fail-retry 3 \
-  --sqlite-dir results/postgres-corpus --output results/postgres-data.jsonl
+uv run python scripts/disprove_bird.py --limit 0 --workers 8
 
-uv run python scripts/audit_postgres_dataset.py \
-  --output results/postgres-audit.jsonl --workers 4 \
-  --postgres-dsn 'dbname=parseval_test'
-
-PARSEVAL_POSTGRES_DSN='dbname=parseval_test' \
-  uv run pytest tests/generator/test_postgres_dataset.py
+uv run python scripts/disprove_leetcode.py --limit 0 --workers 8 \
+  --connection-string mysql+pymysql://root:rootpass@127.0.0.1:3306/mydb
 ```
 
-Set `PARSEVAL_FULL_POSTGRES_DATASET=1` to test every original statement.
-The PostgreSQL connection must permit temporary schema creation; replay rolls
-back each case. Dataset errors and timeouts are reported explicitly. See
-[coverage](src/parseval/coverage/README.md) and
-[generation](src/parseval/generator/README.md) for the design.
+The GitHub workflows `run-sqlite-test.yml` and `run-mysql-test.yml` run them.
+
+## Experimental results
+
+Experiment outputs are available on GitHub Actions. Open the repository's
+Actions tab, choose the relevant workflow (Disprove BIRD-dev (SQLite) or
+Disprove LeetCode (MySQL)), and select the latest successful run. You can
+download the generated result and metric files from the run's Artifacts
+section. The current false positives in the results come from aggregates with
+DISTINCT (such as `COUNT(DISTINCT x)`) and will be fixed soon.

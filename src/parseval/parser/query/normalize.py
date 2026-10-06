@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from parseval.parser.helper import strip_alias
 
 _COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
 
+# Meta flag of a SELECT whose list held a star before qualification expanded it.
+EXPANDED_STAR = "parseval_expanded_star"
 
-def normalize_query_syntax(
+
+def normalize_syntax(
     expression: exp.Expression,
     *,
     dialect: str,
@@ -18,11 +22,17 @@ def normalize_query_syntax(
     SQLGlot 23 parses PostgreSQL ``a = b IS TRUE`` as
     ``a = (b IS TRUE)`` even though PostgreSQL gives the comparison higher
     precedence.  Repair that syntax-level discrepancy here, before either
-    qualification or semantic analysis observes the tree.
+    qualification or semantic analysis observes the tree. SELECT lists with a
+    star are flagged ``EXPANDED_STAR``, since qualification expands the star.
+    MySQL column names and aliases are case-insensitive, so they are
+    lowercased as the catalog stores them.
     """
 
     expression = expression.copy()
     _expand_named_windows(expression)
+    _mark_stars(expression)
+    if dialect == "mysql":
+        _lowercase_columns(expression)
     if dialect != "postgres":
         return expression
 
@@ -97,3 +107,22 @@ def _expand_named_windows(expression: exp.Expression) -> None:
                 window.set("spec", spec.copy() if spec is not None else None)
             window.set("alias", None)
         select.set("windows", None)
+
+
+def _mark_stars(expression: exp.Expression) -> None:
+    for select in expression.find_all(exp.Select):
+        if any(
+            isinstance(core := strip_alias(item), exp.Star)
+            or isinstance(core, exp.Column) and isinstance(core.this, exp.Star)
+            for item in select.expressions
+        ):
+            select.meta[EXPANDED_STAR] = True
+
+
+def _lowercase_columns(expression: exp.Expression) -> None:
+    names = [column.this for column in expression.find_all(exp.Column)]
+    names += [alias.args["alias"] for alias in expression.find_all(exp.Alias) if alias.args.get("alias")]
+    names += [name for alias in expression.find_all(exp.TableAlias) for name in alias.args.get("columns") or ()]
+    for name in names:
+        if isinstance(name, exp.Identifier):
+            name.set("this", name.name.lower())

@@ -199,8 +199,9 @@ class Connect:
         return ";\n".join(str(CreateTable(table).compile(self.engine)) for table in self.metadata.tables.values())
 
     def get_table_rows(self, name: str) -> list[tuple]:
+        """Rows as the driver returns them: SQLite date columns may hold any text."""
         with self.begin() as connection:
-            result = connection.execute(self.metadata.tables[name].select())
+            result = connection.exec_driver_sql(str(self.metadata.tables[name].select().compile(self.engine)))
             return [tuple(result.keys()), *map(tuple, result)]
 
     def get_all_table_rows(self) -> dict[str, list[tuple]]:

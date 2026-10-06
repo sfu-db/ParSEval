@@ -112,8 +112,9 @@ class Machine:
     # Entry point.
 
     def run(self, root: TermId, site: int = 0, *, distinct: bool = False) -> Execution:
-        """``distinct``: the query's rows are distinct by construction, so its
-        result has no duplicate-row outcome."""
+        """``distinct``: the query's rows are distinct by construction, or
+        duplicates do not matter (set semantics), so its result has no
+        duplicate-row outcome."""
         relation = self.relation(root, Environment(), self.v.one, site)
         self._projection(root, relation, site, distinct)
         return Execution(self.v.instance, relation, self._output(root, relation))
@@ -135,7 +136,9 @@ class Machine:
 
     def _projection(self, root: TermId, relation: Relation, site: int, distinct: bool) -> None:
         """Outcomes of the final projection: duplicate rows, and per column a
-        NULL, a repeated non-NULL value and two different values.
+        NULL, a repeated non-NULL value and two different values. Without the
+        duplicate-row outcome (``distinct``), a single column has no repeated
+        value outcome either: a repeated value would be a duplicate row.
 
         Column ``c`` uses the site ``child(site, -1 - c)``.
         """
@@ -150,10 +153,11 @@ class Machine:
         if not distinct:
             self._occurrences(site, root, v.one, entries, ("duplicate",))
         width = len(self.arena.context.schema(relation.schema).fields)
+        outcomes = ("null", "distinct") if distinct and width == 1 else ("null", "duplicate", "distinct")
         for column in range(width):
             column_site = self.observer.child(site, -1 - column)
             items = [(weight, (cells[column],)) for weight, cells in entries]
-            self._occurrences(column_site, root, v.one, items, ("null", "duplicate", "distinct"))
+            self._occurrences(column_site, root, v.one, items, outcomes)
 
     def _occurrences(self, site: int, term: TermId, context: TermId, items, outcomes) -> None:
         """Report value outcomes over weighted occurrences of value tuples.
@@ -216,6 +220,8 @@ class Machine:
             for condition in self._symbolic_witnesses(outcome, symbolic, valid, null, repeated, pair):
                 if not self.observer.wants(site, outcome, witness is not None):
                     break
+                # Pairs of occurrences grow quadratically with the rows.
+                self._on_time()
                 self.observer.observe(site, term, outcome, False, condition)
 
     @staticmethod

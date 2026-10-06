@@ -14,13 +14,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from functools import cache
 from itertools import chain, count
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
+from sqlglot import exp
+
 from parseval.catalog import ColumnBinding, TableDecl
 from parseval.symbolic.operations import like as _like
-from parseval.terms.sorts import DATE, TIMESTAMP, IntervalValue, ScalarSort, ScalarType, TypeKind, parse_iso_temporal_value
+from parseval.terms.sorts import DATE, TIME, TIMESTAMP, IntervalValue, ScalarSort, ScalarType, TypeKind, parse_iso_temporal_value
 
 _PLACEHOLDERS = {
     TypeKind.BOOLEAN: False,
@@ -65,20 +68,38 @@ given and must fit the column.
 
 def sequential(table: TableDecl, column: ColumnBinding, existing: Collection[object], unique: bool):
     """An unused value of 1, 2, ...; "a", "b", ...; days from 2000-01-01 that
-    fits the column; one repeats once every fitting value is in use.
+    fits the column; one repeats once every fitting value is in use. Text
+    columns declared as dates or times (SQLite) get the days' ISO text.
 
     The search starts after as many values as are in use, so it meets few of
     them, and wraps around within the column's capacity.
     """
     storage = column.storage_type
-    size = capacity(storage)
+    temporal = declared_temporal(column.declared_type) if storage.kind is TypeKind.STRING else None
+    if temporal is None:
+        nth = lambda index: _nth(storage, index)  # noqa: E731
+    else:
+        nth = lambda index: str(_nth(temporal, index))  # noqa: E731
+    size = capacity(storage if temporal is None else temporal)
     start = len(existing)
     if size is None:
         indexes = count(start)
     else:
         indexes = chain(range(min(start, size), size), range(min(start, size)))
-    return next((value for value in map(lambda index: _nth(storage, index), indexes) if value not in existing),
-                _nth(storage, 0))
+    return next((value for value in map(nth, indexes) if value not in existing), nth(0))
+
+
+@cache
+def declared_temporal(declared: str) -> ScalarType | None:
+    """The date or time type a column was declared with."""
+    datatype = exp.DataType.build(declared)
+    if datatype.is_type(exp.DataType.Type.DATE):
+        return DATE
+    if datatype.is_type(exp.DataType.Type.TIME, exp.DataType.Type.TIMETZ):
+        return TIME
+    if datatype.is_type(*exp.DataType.TEMPORAL_TYPES):
+        return TIMESTAMP
+    return None
 
 
 def limit(storage: ScalarType) -> tuple[str, float] | None:
@@ -184,6 +205,9 @@ class Domain:
                 yield from (constant, filled, filled + "a", "a" + filled, constant + "a")
             elif number is not None:
                 yield str(constant)
+            # Text read as a time value: the ISO text of the moment and its neighbours.
+            for moment in Domain(TypeKind.TIMESTAMP).around(constant):
+                yield moment.isoformat(sep=" ")
         elif kind in (TypeKind.DATE, TypeKind.TIMESTAMP):
             # Neighbours lie one unit of the constant's own precision away:
             # '1991' is a year, so 1990 and 1992 lie around it.
@@ -243,7 +267,8 @@ class Space:
         """Apply one atom; False when no value remains."""
         if op == "test":
             # Checked against candidate values when they are picked.
-            self.tests += (value,)
+            if value not in self.tests:
+                self.tests += (value,)
             return True
         if op == "null":
             if self.null is False or not self.nullable:
@@ -353,4 +378,4 @@ def _shift(moment, unit: str, direction: int):
         return None
 
 
-__all__ = ["Domain", "Provider", "Space", "capacity", "carrier", "fits", "like", "limit", "placeholder", "sequential"]
+__all__ = ["Domain", "Provider", "Space", "capacity", "carrier", "declared_temporal", "fits", "like", "limit", "placeholder", "sequential"]

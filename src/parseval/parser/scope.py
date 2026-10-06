@@ -12,7 +12,7 @@ from parseval.identifiers import Identifier, NameKey
 from parseval.terms.names import CollationId, SchemaId
 from parseval.terms.sorts import ScalarSort
 
-from .syntax import strip_alias
+from .helper import strip_alias
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +62,7 @@ class ColumnBinder:
         self, expression: exp.Expression
     ) -> tuple[Identifier, NameKey | None]:
         expression = strip_alias(expression)
-        if not isinstance(expression, exp.Column):
-            raise TypeError("Expected a SQL column expression")
-        name = self.dialect.identifier(expression.this)
+        name = self.dialect.identifier(expression.this, column=True)
         parts = tuple(
             self.dialect.identifier(
                 expression.args[key],

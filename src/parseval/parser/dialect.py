@@ -64,6 +64,15 @@ class SQLDialect:
         substring lengths instead of raising."""
         return self.name in ("sqlite", "mysql")
 
+    @property
+    def text_temporals(self) -> bool:
+        """SQLite keeps dates and times as text: date and time columns hold
+        text and compare as text, DATE, DATETIME, TIME and CURRENT_* render
+        text as STRFTIME does, date functions read text time values ('now' or
+        none is the current time, unparsable text is NULL), and arithmetic
+        reads the text's numeric prefix."""
+        return self.name == "sqlite"
+
     def common_scalar_sort(
         self,
         left: ScalarSort,
@@ -339,6 +348,13 @@ class SQLDialect:
         if self.name == "sqlite":
             length = bits = None
         return replace(sql_type, max_length=length, integer_bits=bits)
+
+    def column_type(self, datatype: exp.DataType) -> ScalarType:
+        """A column's type: with text temporals, declared dates and times hold text."""
+        sql_type = self.scalar_type(datatype)
+        if self.text_temporals and sql_type.kind in (TypeKind.DATE, TypeKind.TIME, TypeKind.TIMESTAMP):
+            return STRING
+        return sql_type
 
     def sql_type(self, datatype: exp.DataType | None) -> ScalarType:
         if datatype is None:

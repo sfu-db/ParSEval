@@ -30,10 +30,14 @@ class Semantics:
     ``lenient_conversions``, text converts to the number in its numeric
     prefix (zero if none) and a negative substring length selects the
     characters before the start, as in SQLite; otherwise both raise.
+    With ``text_temporals`` (SQLite), temporal values are ISO text: text that
+    does not parse as one converts to NULL, and a temporal converts to the
+    number in its text's numeric prefix (the year, or the hour of a time).
     """
 
     division_by_zero_is_null: bool = False
     lenient_conversions: bool = False
+    text_temporals: bool = False
 
 
 _CARRIERS = {

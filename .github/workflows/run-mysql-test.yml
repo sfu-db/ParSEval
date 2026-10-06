@@ -1,4 +1,4 @@
-name: Execute MySQL Script
+name: Disprove LeetCode (MySQL)
 
 on:
   push:
@@ -67,12 +67,9 @@ jobs:
           exit 1
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv sync
-          uv pip install -e .
+        run: uv sync
 
-      - name: Execute script
+      - name: Run disprove_leetcode
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
@@ -80,28 +77,27 @@ jobs:
         run: |
           source .venv/bin/activate
 
-          python -u scripts/exp_mysql_disprover_new.py \
-            --data_fp data/mysql/leetcode-new.jsonlines \
-            --connection_string "$MYSQL_CONNECTION_STRING" \
-            --output_dir results \
+          python -u scripts/disprove_leetcode.py \
+            --connection-string "$MYSQL_CONNECTION_STRING" \
+            --output "results/disprove-leetcode-${{ matrix.start }}.jsonl" \
             --start "${{ matrix.start }}" \
             --limit 3000 \
             --workers 8 \
-            --timeout 30
+            --case-timeout-s 30
 
       - name: Publish metrics summary
         if: always()
         run: |
-          latest_metrics="$(ls -t results/mysql_metrics_*.json 2>/dev/null | head -n 1 || true)"
-          if [ -z "$latest_metrics" ]; then
-            echo "No MySQL metrics file was produced." >> "$GITHUB_STEP_SUMMARY"
+          summary="results/disprove-leetcode-${{ matrix.start }}.summary.json"
+          if [ ! -f "$summary" ]; then
+            echo "No LeetCode summary was produced." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          echo "## MySQL experiment metrics" >> "$GITHUB_STEP_SUMMARY"
+          echo "## LeetCode (MySQL) disprove, pairs from ${{ matrix.start }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat "$latest_metrics" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results as artifact

@@ -358,6 +358,7 @@ def search(
     sorts = valuation.runtime.inputs
     branches = [BRANCHES]
     inconclusive = [False]
+    trials: dict = {}
 
     def narrow(item, spaces: dict, links: list, choices: list) -> bool:
         """Apply units and conjunctions; collect disjunctions for later."""
@@ -425,7 +426,7 @@ def search(
         if choices is None:
             return None
         if not choices:
-            assignment = _assign(valuation, spaces, links, absent, min_string_length)
+            assignment = _assign(valuation, spaces, links, absent, min_string_length, trials)
             if assignment is not None and all(
                 any(valuation.trial(term, assignment) is True for term in requirement) for requirement in requirements
             ):
@@ -514,8 +515,12 @@ def _consistent(links: list, new: Atom) -> bool:
     )
 
 
-def _assign(valuation: Valuation, spaces: dict, links: list, absent, min_string_length):
-    """Pick one value per input; inputs linked by equality share it."""
+def _assign(valuation: Valuation, spaces: dict, links: list, absent, min_string_length, trials: dict):
+    """Pick one value per input; inputs linked by equality share it.
+
+    ``trials`` keeps the outcome of each test on each candidate for the whole
+    search: a test reads one input, so its outcome depends on the candidate
+    alone, and later branches meet the same tests again."""
     parent: dict[ParameterId, ParameterId] = {}
 
     def root(item):
@@ -556,7 +561,13 @@ def _assign(valuation: Valuation, spaces: dict, links: list, absent, min_string_
             if sort.sql_type.kind is TypeKind.STRING and candidate is not None and len(candidate) < min_string_length:
                 return False
             values = {parameter: candidate for parameter in members}
-            return all(valuation.trial(test, values) is True for test in space.tests)
+            for test in space.tests:
+                key = (test, type(candidate), candidate)
+                if key not in trials:
+                    trials[key] = valuation.trial(test, values) is True
+                if not trials[key]:
+                    return False
+            return True
 
         if space.null is True:
             value = None if passes(None) else _MISSING

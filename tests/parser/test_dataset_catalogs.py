@@ -65,7 +65,7 @@ def _expected_tables(dialect: SQLDialect, statements):
                 tuple(
                     (
                         dialect.identifier(column.this, column=True),
-                        dialect.scalar_type(column.kind),
+                        dialect.column_type(column.kind),
                     )
                     for column in statement.this.expressions
                     if isinstance(column, exp.ColumnDef)
