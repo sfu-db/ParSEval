@@ -124,11 +124,6 @@ Generation first targets productive output, then appends rows that cover
 further outcomes while preserving the covered ones. Coverage always describes
 the final database.
 
-Each package's design is described in [docs/](docs/): [parser](docs/parser.md),
-[terms](docs/terms.md), [uexpr](docs/uexpr.md), [symbolic](docs/symbolic.md),
-[instance](docs/instance.md), [smt](docs/smt.md), [speculate](docs/speculate.md)
-and [generator](docs/generator.md).
-
 ## Disprove benchmarks
 
 `scripts/disprove_bird.py` checks DAIL-SQL's BIRD-dev predictions against the
