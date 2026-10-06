@@ -812,7 +812,10 @@ class Speculator:
                 continue
             cls = atom.column
             if cls not in spaces:
-                spaces[cls] = Space(self.domains[cls].kind, self.nullable[cls])
+                spaces[cls] = Space(
+                    self.domains[cls].kind, self.nullable[cls],
+                    case_insensitive=self.valuation.runtime.semantics.case_insensitive_text,
+                )
             if atom.op == "test" and truth != "unknown":
                 tests.setdefault(cls, []).append((atom, truth))
                 continue

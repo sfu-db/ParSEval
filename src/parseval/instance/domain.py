@@ -69,7 +69,9 @@ given and must fit the column.
 def sequential(table: TableDecl, column: ColumnBinding, existing: Collection[object], unique: bool):
     """An unused value of 1, 2, ...; "a", "b", ...; days from 2000-01-01 that
     fits the column; one repeats once every fitting value is in use. Text
-    columns declared as dates or times (SQLite) get the days' ISO text.
+    columns declared as dates or times (SQLite) get the days' ISO text. Text
+    differing from a used value only by case counts as used, so the value
+    is new under case-insensitive collations too.
 
     The search starts after as many values as are in use, so it meets few of
     them, and wraps around within the column's capacity.
@@ -86,7 +88,11 @@ def sequential(table: TableDecl, column: ColumnBinding, existing: Collection[obj
         indexes = count(start)
     else:
         indexes = chain(range(min(start, size), size), range(min(start, size)))
-    return next((value for value in map(nth, indexes) if value not in existing), nth(0))
+    used = {value.casefold() if isinstance(value, str) else value for value in existing}
+    return next(
+        (value for value in map(nth, indexes) if (value.casefold() if isinstance(value, str) else value) not in used),
+        nth(0),
+    )
 
 
 @cache
@@ -262,6 +268,8 @@ class Space:
     patterns: tuple = ()
     rejected: tuple = ()
     tests: tuple = ()
+    # Text differing from an excluded value only by case is excluded too.
+    case_insensitive: bool = False
 
     def narrow(self, op: str, value) -> bool:
         """Apply one atom; False when no value remains."""
@@ -304,6 +312,10 @@ class Space:
         if value is None:
             return self.null is not False and self.nullable
         if self.null is True or value in self.excluded:
+            return False
+        if self.case_insensitive and isinstance(value, str) and any(
+            isinstance(item, str) and item.casefold() == value.casefold() for item in self.excluded
+        ):
             return False
         if self.equals is not None and value != self.equals:
             return False

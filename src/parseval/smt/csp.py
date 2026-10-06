@@ -378,7 +378,8 @@ def search(
                 if item.input not in spaces:
                     sort = sorts[item.input].sort
                     spaces[item.input] = Space(
-                        sort.sql_type.kind, sort.nullable, excluded=set(valuation.excluded.get(item.input, ()))
+                        sort.sql_type.kind, sort.nullable, excluded=set(valuation.excluded.get(item.input, ())),
+                        case_insensitive=valuation.runtime.semantics.case_insensitive_text,
                     )
                 if not spaces[item.input].narrow(item.op, item.value):
                     return False
@@ -544,6 +545,7 @@ def _assign(valuation: Valuation, spaces: dict, links: list, absent, min_string_
         space = Space(
             sort.sql_type.kind, all(sorts[p].sort.nullable for p in members),
             excluded={value for p in members for value in valuation.excluded.get(p, ())},
+            case_insensitive=valuation.runtime.semantics.case_insensitive_text,
         )
         for parameter in members:
             for op, value in _atoms(spaces.get(parameter)):

@@ -75,12 +75,14 @@ class Integrity:
         return self._candidates[relation]
 
     def _stored(self, relation, positions: tuple[int, ...]) -> Counter:
-        """How often each key occurs among stored rows that no input leaves open."""
+        """How often each key occurs among stored rows that no input leaves open,
+        telling text apart as the backend does."""
         key = (relation, positions)
         if key not in self._keys:
             instance = self.v.instance
+            text_key = self.v.runtime.semantics.text_key
             self._keys[key] = Counter(
-                tuple(row[position] for position in positions)
+                tuple(text_key(row[position]) for position in positions)
                 for slot in instance.slots(relation)
                 if self._closed(slot) and instance.multiplicity(slot)
                 for row in (instance.row(slot),)
@@ -153,7 +155,7 @@ class Integrity:
         if closed:
             if not v.instance.multiplicity(slot):
                 return []
-            value = tuple(v.instance.row(slot)[position] for position in positions)
+            value = tuple(v.runtime.semantics.text_key(v.instance.row(slot)[position]) for position in positions)
             if not (distinct_nulls and None in value) and self._stored(slot.relation, tuple(positions))[value] > 1:
                 return [v.false]
         # An open single-column key avoids stored keys by its domain (Valuation.excluded).

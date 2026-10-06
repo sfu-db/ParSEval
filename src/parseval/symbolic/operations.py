@@ -195,6 +195,9 @@ _OPERATORS = {
     "endswith": str.endswith,
 }
 
+# Text operations whose outcome a case-insensitive collation can change.
+_CASED = {"eq": operator.eq, "ne": operator.ne, "is_not_distinct": operator.eq, "like": like}
+
 
 def cast(value, source, target, semantics):
     """Explicit conversions; implicit numeric promotion is handled by Runtime."""
@@ -286,6 +289,9 @@ def execute(op, args, sorts, result, semantics):
         return cast(args[0], sorts[0].sql_type, result.sql_type, semantics)
     if op not in OPERATIONS:
         raise NotImplementedError(f"Unsupported concolic operation: {op}")
+    if semantics.case_insensitive_text and op in _CASED and all(isinstance(arg, str) for arg in args):
+        if _CASED[op](*args) != _CASED[op](*(arg.casefold() for arg in args)):
+            raise ValueError(f"Text {args[0]!r} and {args[1]!r} compare differently without regard to case")
     if op == "is_null" or op == "is_unknown":
         return args[0] is None
     if op == "is_not_null":

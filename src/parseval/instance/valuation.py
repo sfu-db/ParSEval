@@ -205,9 +205,11 @@ class Valuation:
             node = self.arena[term]
             if self.excluded and isinstance(node, (nodes.Eq3, nodes.IsNotDistinct)):
                 left, right = (self.arena[child] for child in node.children)
+                key = self.runtime.semantics.text_key
                 for cell, other in ((left, right), (right, left)):
-                    if isinstance(cell, nodes.ExternalParameter) and isinstance(other, nodes.Literal) \
-                            and other.payload.value in self.excluded.get(cell.payload.parameter, ()):
+                    if isinstance(cell, nodes.ExternalParameter) and isinstance(other, nodes.Literal) and key(
+                        other.payload.value
+                    ) in map(key, self.excluded.get(cell.payload.parameter, ())):
                         return self.false
             return term
         value = self.value(term)

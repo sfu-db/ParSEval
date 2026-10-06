@@ -73,6 +73,11 @@ class SQLDialect:
         reads the text's numeric prefix."""
         return self.name == "sqlite"
 
+    @property
+    def case_insensitive_text(self) -> bool:
+        """MySQL's default collation compares text without regard to case."""
+        return self.name == "mysql"
+
     def common_scalar_sort(
         self,
         left: ScalarSort,

@@ -470,8 +470,8 @@ def _canonical(text: str, kind: TypeKind) -> bool:
 
 
 def _names():
-    """Short distinct strings, in order of length."""
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    """Short distinct strings, in order of length, in the provider's lower case."""
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
     for length in count(1):
         for letters in product(alphabet, repeat=length):
             yield "".join(letters)
@@ -554,7 +554,9 @@ class Translator:
         values = {}
         literals = {code: text for text, code in self.codes.items()}
         fresh: dict[int, str] = {}
-        names = (name for name in _names() if name not in self.codes)
+        # Fresh names differ from every known string even without regard to case.
+        known = {text.casefold() for text in self.codes}
+        names = (name for name in _names() if name not in known)
         for parameter, scalar in self.inputs.items():
             sort = self.v.runtime.inputs[parameter].sort
             if z3.is_true(model.eval(scalar.null, model_completion=True)):

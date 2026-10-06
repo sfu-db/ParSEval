@@ -33,11 +33,21 @@ class Semantics:
     With ``text_temporals`` (SQLite), temporal values are ISO text: text that
     does not parse as one converts to NULL, and a temporal converts to the
     number in its text's numeric prefix (the year, or the hour of a time).
+    With ``case_insensitive_text`` (MySQL's default collation), text
+    equality and LIKE whose outcome depends on case raise: generated text
+    then never differs from a value it meets only by case, so case-sensitive
+    evaluation agrees with the backend.
     """
 
     division_by_zero_is_null: bool = False
     lenient_conversions: bool = False
     text_temporals: bool = False
+    case_insensitive_text: bool = False
+
+    def text_key(self, value):
+        """The value as the backend tells text apart: casefolded under
+        ``case_insensitive_text``."""
+        return value.casefold() if self.case_insensitive_text and isinstance(value, str) else value
 
 
 _CARRIERS = {
