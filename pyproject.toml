@@ -1,6 +1,6 @@
 [project]
 name = "parseval"
-version = "1.0.0"
+version = "1.0.1"
 description = "Plan-aware Test Database Generation for SQL Equivalence Evaluation"
 authors = [
     { name = "cchen", email = "stuchunyu@gmail.com" }
